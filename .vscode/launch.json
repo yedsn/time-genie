@@ -1,0 +1,40 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "command": "npm run tauri:dev",
+      "name": "Tauri 开发模式",
+      "request": "launch",
+      "type": "node-terminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "command": "npm run dev",
+      "name": "仅启动前端预览",
+      "request": "launch",
+      "type": "node-terminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "command": "npm run typecheck",
+      "name": "前端类型检查",
+      "request": "launch",
+      "type": "node-terminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "command": "cargo check",
+      "name": "Rust 检查",
+      "request": "launch",
+      "type": "node-terminal",
+      "cwd": "${workspaceFolder}/src-tauri"
+    },
+    {
+      "command": "npm run tauri:build",
+      "name": "Tauri 构建安装包",
+      "request": "launch",
+      "type": "node-terminal",
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

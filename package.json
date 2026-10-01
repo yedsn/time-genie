@@ -1,0 +1,39 @@
+{
+  "name": "timegenie",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vue-tsc --noEmit && vite build",
+    "typecheck": "vue-tsc --noEmit",
+    "test:allocation-math": "tsc src-ui/src/services/allocationMath.ts --outDir .tmp-allocation-math-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-allocation-math.mjs",
+    "test:completion-feedback": "tsc src-ui/src/services/completionFeedbackCore.ts --outDir .tmp-completion-feedback-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-completion-feedback.mjs && node scripts/verify-completion-sound.mjs",
+    "test:supabase:e2e": "cargo test --manifest-path src-tauri/Cargo.toml cloud_e2e::real_supabase_two_device_flow -- --ignored --nocapture",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "canvas-confetti": "^1.9.4",
+    "element-plus": "^2.14.5",
+    "howler": "^2.2.4",
+    "lucide-vue-next": "^0.468.0",
+    "md-editor-v3": "^7.0.0",
+    "pinia": "^2.3.0",
+    "sortablejs": "^1.15.7",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.4",
+    "@types/canvas-confetti": "^1.9.0",
+    "@types/howler": "^2.2.13",
+    "@types/sortablejs": "^1.15.9",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3",
+    "vue-tsc": "^2.1.10"
+  }
+}
