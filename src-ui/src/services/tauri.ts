@@ -21,6 +21,26 @@ export type SettingsSnapshot = {
   };
 };
 
+export type AppUpdateSummary = {
+  version: string;
+  currentVersion: string;
+  notes?: string;
+};
+
+export type AppUpdateCheckResult = {
+  available: boolean;
+  currentVersion: string;
+  update?: AppUpdateSummary;
+};
+
+export type AppUpdateEventPayload = {
+  stage: "download_started" | "download_progress" | "download_finished" | "installed" | "failed" | string;
+  downloadedBytes?: number;
+  chunkLength?: number;
+  contentLength?: number;
+  message?: string;
+};
+
 export type AutomationHookEvent = "timer.started" | "timer.stopped" | "task.completed";
 export type AutomationHookAction = "uri" | "process";
 
@@ -854,6 +874,22 @@ export async function updateIntegrationConfig(
   });
 }
 
+export async function getAppVersion(): Promise<string> {
+  return await invoke<string>("get_app_version");
+}
+
+export async function checkAppUpdate(): Promise<AppUpdateCheckResult> {
+  return await invoke<AppUpdateCheckResult>("check_app_update");
+}
+
+export async function downloadAndInstallUpdate(): Promise<void> {
+  await invoke("download_and_install_update");
+}
+
+export async function restartApp(): Promise<void> {
+  await invoke("restart_app");
+}
+
 export async function setIntegrationSecret(provider: "seatable" | "supabase", value: string): Promise<SettingsSnapshot> {
   return await invoke<SettingsSnapshot>("integration_secret_set", { request: { provider, value } });
 }
@@ -1047,6 +1083,22 @@ export async function onCloudSyncStateChanged(handler: (payload: StorageModeSnap
     return await listen("cloud-sync-state-changed", ({ payload }) => {
       handler(payload as StorageModeSnapshot & { error?: string });
     });
+  } catch {
+    return () => {};
+  }
+}
+
+export async function onTrayCheckUpdate(handler: () => void) {
+  try {
+    return await listen("tray-check-update", () => handler());
+  } catch {
+    return () => {};
+  }
+}
+
+export async function onAppUpdateEvent(handler: (payload: AppUpdateEventPayload) => void) {
+  try {
+    return await listen("app-update-event", ({ payload }) => handler(payload as AppUpdateEventPayload));
   } catch {
     return () => {};
   }

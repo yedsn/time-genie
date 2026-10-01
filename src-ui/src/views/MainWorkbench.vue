@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import { CalendarDays, Clock3, Copy, FileText, Folder, Home, Minus, Pencil, Plus, Settings, Square, X } from "lucide-vue-next";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useWorkdayStore, type Task } from "../store";
-import { closeMainWindow, confirmObsidianPlan, configureCloud, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudSyncConflicts, minimizeMainWindow, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, previewObsidianPlan, previewSeaTableTaskSync, previewStorageMigration, pushCloudSync, registerCloudDevice, resolveCloudSyncConflict, retryFailedSeaTableSync, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type CloudSessionSnapshot, type CloudSyncConflict, type PlanImportPreviewResult, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
+import { checkAppUpdate, closeMainWindow, confirmObsidianPlan, configureCloud, downloadAndInstallUpdate, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudSyncConflicts, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onTrayCheckUpdate, previewObsidianPlan, previewSeaTableTaskSync, previewStorageMigration, pushCloudSync, registerCloudDevice, resolveCloudSyncConflict, restartApp, retryFailedSeaTableSync, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudSessionSnapshot, type CloudSyncConflict, type PlanImportPreviewResult, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
 import PlanListEditor from "../components/PlanListEditor.vue";
 import GlobalTimerBar from "../components/GlobalTimerBar.vue";
 import UnassignedTimeIndicator from "../components/UnassignedTimeIndicator.vue";
@@ -35,6 +35,10 @@ const windowMaximized = ref(false);
 const settingsSnapshot = ref<SettingsSnapshot>();
 const settingsLoaded = ref(false);
 const settingsSaving = ref(false);
+const updateChecking = ref(false);
+const updateInstalling = ref(false);
+const updateStatusText = ref("未检查更新");
+const updateProgressText = ref("");
 const cloudWorking = ref(false);
 const cloudSession = ref<CloudSessionSnapshot>();
 const storageState = ref<StorageModeSnapshot>();
@@ -79,6 +83,8 @@ const settingsDraft = reactive({
 let unlistenWindowResize: (() => void) | undefined;
 let unlistenNavigatePage: (() => void) | undefined;
 let unlistenCloudSyncState: (() => void) | undefined;
+let unlistenTrayCheckUpdate: (() => void) | undefined;
+let unlistenAppUpdateEvent: (() => void) | undefined;
 const completingTaskIds = new Set<string>();
 const recentCompletedTaskId = ref("");
 let recentCompletedTimer: number | undefined;
@@ -369,6 +375,85 @@ async function checkSeaTableConnection() {
   }
 }
 
+function updateProgressLabel(event: AppUpdateEventPayload) {
+  if (event.stage === "download_progress" && event.contentLength && event.downloadedBytes !== undefined) {
+    const percent = Math.min(100, Math.round((event.downloadedBytes / event.contentLength) * 100));
+    updateProgressText.value = `下载中 ${percent}%`;
+    return;
+  }
+  if (event.message) updateProgressText.value = event.message;
+}
+
+async function installCheckedUpdate(result: AppUpdateCheckResult) {
+  const nextVersion = result.update?.version;
+  if (!nextVersion) return;
+  try {
+    await ElMessageBox.confirm(
+      `发现新版本 ${nextVersion}。当前版本：${result.currentVersion}。`,
+      "发现新版本",
+      { type: "info", confirmButtonText: "立即安装", cancelButtonText: "稍后", closeOnClickModal: false, customClass: "work-confirm-dialog" },
+    );
+  } catch { return; }
+
+  updateInstalling.value = true;
+  updateStatusText.value = `正在安装 ${nextVersion}`;
+  updateProgressText.value = "准备下载更新";
+  try {
+    await downloadAndInstallUpdate();
+    updateStatusText.value = `版本 ${nextVersion} 已安装`;
+    updateProgressText.value = "重启应用后生效";
+    try {
+      await ElMessageBox.confirm(
+        `版本 ${nextVersion} 已安装完成，是否现在重启应用？`,
+        "更新已安装",
+        { type: "success", confirmButtonText: "立即重启", cancelButtonText: "稍后", closeOnClickModal: false, customClass: "work-confirm-dialog" },
+      );
+      await restartApp();
+    } catch { /* 用户选择稍后重启 */ }
+  } catch (error) {
+    updateStatusText.value = "更新安装失败";
+    updateProgressText.value = "";
+    ElMessageBox.alert(error instanceof Error ? error.message : String(error), "更新失败", {
+      type: "error",
+      confirmButtonText: "知道了",
+      customClass: "work-confirm-dialog",
+    });
+  } finally {
+    updateInstalling.value = false;
+  }
+}
+
+async function handleCheckUpdate() {
+  if (updateChecking.value || updateInstalling.value) return;
+  store.activePage = "settings";
+  updateChecking.value = true;
+  updateStatusText.value = "正在检查更新";
+  updateProgressText.value = "";
+  try {
+    const result = await checkAppUpdate();
+    if (!result.available) {
+      updateStatusText.value = "已是最新版本";
+      ElMessageBox.alert(`当前版本 ${result.currentVersion} 已是最新版本。`, "已是最新版本", {
+        type: "success",
+        confirmButtonText: "知道了",
+        customClass: "work-confirm-dialog",
+      });
+      return;
+    }
+    updateStatusText.value = `发现新版本 ${result.update?.version ?? ""}`.trim();
+    await installCheckedUpdate(result);
+  } catch (error) {
+    updateStatusText.value = "检查更新失败";
+    ElMessageBox.alert(error instanceof Error ? error.message : String(error), "检查更新失败", {
+      type: "error",
+      confirmButtonText: "知道了",
+      customClass: "work-confirm-dialog",
+    });
+  } finally {
+    updateChecking.value = false;
+  }
+}
+
 async function toggleWindowMaximize() {
   windowMaximized.value = await toggleMainWindowMaximize();
 }
@@ -390,12 +475,18 @@ onMounted(async () => {
   unlistenCloudSyncState = await onCloudSyncStateChanged((state) => {
     storageState.value = state;
   });
+  unlistenTrayCheckUpdate = await onTrayCheckUpdate(() => {
+    void handleCheckUpdate();
+  });
+  unlistenAppUpdateEvent = await onAppUpdateEvent(updateProgressLabel);
 });
 
 onUnmounted(() => {
   unlistenWindowResize?.();
   unlistenNavigatePage?.();
   unlistenCloudSyncState?.();
+  unlistenTrayCheckUpdate?.();
+  unlistenAppUpdateEvent?.();
   if (recentCompletedTimer) window.clearTimeout(recentCompletedTimer);
 });
 
@@ -838,6 +929,17 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
 
         <div class="work-panel settings-panel settings-hooks-panel">
           <AutomationHooksSettings />
+        </div>
+
+        <div class="work-panel settings-panel">
+          <div class="panel-title"><h2>应用更新</h2><span>v{{ appVersion }}</span></div>
+          <div class="update-state-row">
+            <div>
+              <strong>{{ updateStatusText }}</strong>
+              <small>{{ updateProgressText || '托盘右键菜单也可以检查更新' }}</small>
+            </div>
+            <button class="secondary-button compact" type="button" :disabled="updateChecking || updateInstalling" @click="handleCheckUpdate">{{ updateChecking ? '检查中...' : updateInstalling ? '安装中...' : '检查更新' }}</button>
+          </div>
         </div>
 
         <div class="work-panel settings-panel">

@@ -143,6 +143,7 @@ jobs:
 
   sync-gitee:
     name: Sync release to Gitee
+    if: ${{ vars.ENABLE_GITEE_SYNC == 'true' }}
     runs-on: [self-hosted, linux, x64, gitee-sync]
     needs: publish
     env:

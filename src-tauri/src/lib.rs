@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, Rect};
@@ -42,6 +43,11 @@ const HOVER_POSITION_CHECK_INTERVAL: Duration = Duration::from_millis(150);
 const HOVER_WINDOW_GAP: i32 = 8;
 const TRAY_MENU_SUPPRESS: Duration = Duration::from_millis(1200);
 const UPDATE_CHECK_MENU_LABEL: &str = "检查更新";
+const APP_UPDATE_EVENT: &str = "app-update-event";
+const TRAY_CHECK_UPDATE_EVENT: &str = "tray-check-update";
+const DEFAULT_UPDATER_ENDPOINT: &str =
+    "https://github.com/OWNER/REPO/releases/latest/download/latest.json";
+const DEFAULT_UPDATER_PUBKEY: &str = "REPLACE_WITH_TAURI_UPDATER_PUBLIC_KEY";
 static HOVER_STATE: OnceLock<Arc<Mutex<HoverState>>> = OnceLock::new();
 static UPDATE_CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -71,6 +77,49 @@ enum TrayTimerAction {
     Pause,
     Resume,
     Stop,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppUpdateSummary {
+    version: String,
+    current_version: String,
+    notes: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppUpdateCheckResult {
+    available: bool,
+    current_version: String,
+    update: Option<AppUpdateSummary>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppUpdateEventPayload {
+    stage: String,
+    downloaded_bytes: Option<u64>,
+    chunk_length: Option<u64>,
+    content_length: Option<u64>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdaterPluginRuntimeConfig {
+    #[serde(default)]
+    endpoints: Vec<String>,
+    #[serde(default)]
+    pubkey: String,
+}
+
+struct UpdateCheckPermit;
+
+impl Drop for UpdateCheckPermit {
+    fn drop(&mut self) {
+        UPDATE_CHECK_RUNNING.store(false, Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -162,6 +211,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show(app, "main");
         }))
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
@@ -302,6 +352,10 @@ pub fn run() {
             window_is_main_maximized,
             window_open_main_overview,
             window_hide_hover_after_keyboard_close,
+            get_app_version,
+            check_app_update,
+            download_and_install_update,
+            restart_app,
             database::database_status,
             automation_hooks::automation_hook_list,
             automation_hooks::automation_hook_create,
@@ -502,6 +556,28 @@ fn window_hide_hover_after_keyboard_close(app: AppHandle) {
     hide(&app, "hover");
 }
 
+#[tauri::command]
+fn get_app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+#[tauri::command]
+async fn check_app_update(app: AppHandle) -> Result<AppUpdateCheckResult, String> {
+    let _permit = acquire_update_check_permit("已有更新检查正在进行，请稍后再试")?;
+    check_app_update_impl(&app).await
+}
+
+#[tauri::command]
+async fn download_and_install_update(app: AppHandle) -> Result<(), String> {
+    let _permit = acquire_update_check_permit("已有更新任务正在进行，请稍后再试")?;
+    download_and_install_update_impl(&app).await
+}
+
+#[tauri::command]
+fn restart_app(app: AppHandle) {
+    app.restart();
+}
+
 fn show_main_after_startup(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         for delay in [350, 850, 1_500, 2_400, 3_600] {
@@ -540,59 +616,16 @@ fn retry_tray_registration(app: AppHandle) {
 }
 
 fn run_tray_update_check(app: AppHandle, menu_item: MenuItem<tauri::Wry>) {
-    if UPDATE_CHECK_RUNNING
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return;
-    }
-
     let _ = menu_item.set_enabled(false);
     let _ = menu_item.set_text("正在检查更新...");
     tauri::async_runtime::spawn(async move {
-        let result = check_download_and_install_update(&app, &menu_item).await;
-        UPDATE_CHECK_RUNNING.store(false, Ordering::SeqCst);
-
-        match result {
-            Ok(UpdateCheckResult::NoUpdate) => {
-                set_update_menu_status(menu_item, "已是最新版本", true, true);
-            }
-            Ok(UpdateCheckResult::Installed { version }) => {
-                let text = format!("更新 {version} 已安装，重启生效");
-                set_update_menu_status(menu_item, text, true, false);
-            }
-            Err(error) => {
-                eprintln!("检查更新失败: {error}");
-                set_update_menu_status(menu_item, "检查更新失败", true, true);
-            }
+        show(&app, "main");
+        let result = app.emit(TRAY_CHECK_UPDATE_EVENT, serde_json::json!({}));
+        if let Err(error) = result {
+            eprintln!("触发托盘检查更新失败: {error}");
         }
+        set_update_menu_status(menu_item, UPDATE_CHECK_MENU_LABEL, true, false);
     });
-}
-
-enum UpdateCheckResult {
-    NoUpdate,
-    Installed { version: String },
-}
-
-async fn check_download_and_install_update(
-    app: &AppHandle,
-    menu_item: &MenuItem<tauri::Wry>,
-) -> Result<UpdateCheckResult, String> {
-    let updater = app.updater().map_err(|error| error.to_string())?;
-    let Some(update) = updater.check().await.map_err(|error| error.to_string())? else {
-        return Ok(UpdateCheckResult::NoUpdate);
-    };
-
-    let version = update.version.clone();
-    let _ = menu_item.set_text(format!("正在下载更新 {version}..."));
-    update
-        .download_and_install(
-            |_, _| {},
-            || {},
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(UpdateCheckResult::Installed { version })
 }
 
 fn set_update_menu_status(
@@ -609,6 +642,168 @@ fn set_update_menu_status(
             let _ = menu_item.set_text(UPDATE_CHECK_MENU_LABEL);
         });
     }
+}
+
+fn acquire_update_check_permit(message: &str) -> Result<UpdateCheckPermit, String> {
+    UPDATE_CHECK_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .map(|_| UpdateCheckPermit)
+        .map_err(|_| message.to_string())
+}
+
+fn updater_runtime_config(app: &AppHandle) -> Result<UpdaterPluginRuntimeConfig, String> {
+    let value = app
+        .config()
+        .plugins
+        .0
+        .get("updater")
+        .cloned()
+        .ok_or_else(|| "未找到 updater 配置".to_string())?;
+    serde_json::from_value(value).map_err(|error| format!("解析 updater 配置失败: {error}"))
+}
+
+fn ensure_updater_is_configured(app: &AppHandle) -> Result<(), String> {
+    let config = updater_runtime_config(app)?;
+    let endpoints_ready = !config.endpoints.is_empty()
+        && config.endpoints.iter().all(|endpoint| {
+            let trimmed = endpoint.trim();
+            !trimmed.is_empty()
+                && trimmed != DEFAULT_UPDATER_ENDPOINT
+                && !trimmed.contains("github.com/OWNER/REPO")
+                && !trimmed.contains('<')
+                && !trimmed.contains('>')
+        });
+    let pubkey_ready = {
+        let trimmed = config.pubkey.trim();
+        !trimmed.is_empty() && trimmed != DEFAULT_UPDATER_PUBKEY
+    };
+    if endpoints_ready && pubkey_ready {
+        Ok(())
+    } else {
+        Err("更新功能尚未完成发布配置，请先填写 GitHub/Gitee Releases 地址和 updater 公钥。".to_string())
+    }
+}
+
+async fn check_app_update_impl(app: &AppHandle) -> Result<AppUpdateCheckResult, String> {
+    ensure_updater_is_configured(app)?;
+
+    let current_version = app.package_info().version.to_string();
+    let updater = app
+        .updater_builder()
+        .build()
+        .map_err(|error| format!("初始化更新器失败: {error}"))?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|error| format!("检查更新失败: {error}"))?;
+
+    let update = update.map(|update| AppUpdateSummary {
+        version: update.version,
+        current_version: update.current_version,
+        notes: update.body,
+    });
+
+    Ok(AppUpdateCheckResult {
+        available: update.is_some(),
+        current_version,
+        update,
+    })
+}
+
+fn emit_app_update_event(app: &AppHandle, payload: AppUpdateEventPayload) {
+    if let Err(error) = app.emit(APP_UPDATE_EVENT, payload) {
+        eprintln!("发送更新状态失败: {error}");
+    }
+}
+
+async fn download_and_install_update_impl(app: &AppHandle) -> Result<(), String> {
+    ensure_updater_is_configured(app)?;
+
+    let updater = app
+        .updater_builder()
+        .build()
+        .map_err(|error| format!("初始化更新器失败: {error}"))?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|error| format!("检查更新失败: {error}"))?
+        .ok_or_else(|| "当前已是最新版本，无需更新".to_string())?;
+
+    let mut first_chunk = true;
+    let mut downloaded_bytes = 0_u64;
+    let app_handle = app.clone();
+
+    update
+        .download_and_install(
+            move |chunk_length, content_length| {
+                downloaded_bytes = downloaded_bytes.saturating_add(chunk_length as u64);
+                if first_chunk {
+                    first_chunk = false;
+                    emit_app_update_event(
+                        &app_handle,
+                        AppUpdateEventPayload {
+                            stage: "download_started".to_string(),
+                            downloaded_bytes: Some(0),
+                            chunk_length: None,
+                            content_length,
+                            message: Some("开始下载更新".to_string()),
+                        },
+                    );
+                }
+                emit_app_update_event(
+                    &app_handle,
+                    AppUpdateEventPayload {
+                        stage: "download_progress".to_string(),
+                        downloaded_bytes: Some(downloaded_bytes),
+                        chunk_length: Some(chunk_length as u64),
+                        content_length,
+                        message: None,
+                    },
+                );
+            },
+            {
+                let app_handle = app.clone();
+                move || {
+                    emit_app_update_event(
+                        &app_handle,
+                        AppUpdateEventPayload {
+                            stage: "download_finished".to_string(),
+                            downloaded_bytes: None,
+                            chunk_length: None,
+                            content_length: None,
+                            message: Some("下载完成，正在安装更新".to_string()),
+                        },
+                    );
+                }
+            },
+        )
+        .await
+        .map_err(|error| {
+            emit_app_update_event(
+                app,
+                AppUpdateEventPayload {
+                    stage: "failed".to_string(),
+                    downloaded_bytes: None,
+                    chunk_length: None,
+                    content_length: None,
+                    message: Some(format!("安装更新失败: {error}")),
+                },
+            );
+            format!("安装更新失败: {error}")
+        })?;
+
+    emit_app_update_event(
+        app,
+        AppUpdateEventPayload {
+            stage: "installed".to_string(),
+            downloaded_bytes: None,
+            chunk_length: None,
+            content_length: None,
+            message: Some("更新已安装完成".to_string()),
+        },
+    );
+
+    Ok(())
 }
 
 fn spawn_tray_timer_menu_refresh(database: Database, menu: TrayTimerMenu) {

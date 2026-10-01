@@ -16,8 +16,8 @@
 - `Settings -> Actions -> General`：启用 Actions，并允许工作流写入 Release。
 - `Settings -> Secrets and variables -> Actions -> Secrets`：配置 `TAURI_SIGNING_PRIVATE_KEY` 和 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。
 - 配置 `GITEE_ACCESS_TOKEN`，发布完成后会自动同步到 Gitee latest Release。
+- `Settings -> Secrets and variables -> Actions -> Variables`：配置 `ENABLE_GITEE_SYNC=true` 开启 Gitee 同步；如自建 runner 下载 GitHub Release 资产需要代理，配置 `GITEE_SYNC_PROXY`。
 - `Settings -> Actions -> Runners` 中确认自建 runner 在线，标签为 `self-hosted, linux, x64, gitee-sync`。
-- 如自建 runner 访问 GitHub 需要代理，可在 `Variables` 中设置 `GITEE_SYNC_PROXY`。
 
 ## 更新器验证
 

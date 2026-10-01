@@ -2,7 +2,7 @@ use std::mem::size_of;
 use std::ptr;
 use std::sync::OnceLock;
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
@@ -23,7 +23,8 @@ const MENU_START: usize = 2;
 const MENU_PAUSE: usize = 3;
 const MENU_RESUME: usize = 4;
 const MENU_STOP: usize = 5;
-const MENU_QUIT: usize = 6;
+const MENU_CHECK_UPDATE: usize = 6;
+const MENU_QUIT: usize = 7;
 static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 
 pub fn start_if_tauri_tray_missing(app: AppHandle) {
@@ -138,6 +139,8 @@ unsafe fn show_menu(window: HWND) {
     append_item(menu, MENU_RESUME, "继续计时");
     append_item(menu, MENU_STOP, "结束本段");
     AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+    append_item(menu, MENU_CHECK_UPDATE, "检查更新");
+    AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
     append_item(menu, MENU_QUIT, "退出");
 
     let mut cursor = POINT::default();
@@ -163,6 +166,10 @@ unsafe fn show_menu(window: HWND) {
         MENU_PAUSE => super::run_native_tray_timer_action(app, super::TrayTimerAction::Pause),
         MENU_RESUME => super::run_native_tray_timer_action(app, super::TrayTimerAction::Resume),
         MENU_STOP => super::run_native_tray_timer_action(app, super::TrayTimerAction::Stop),
+        MENU_CHECK_UPDATE => {
+            super::show(app, "main");
+            let _ = app.emit(super::TRAY_CHECK_UPDATE_EVENT, serde_json::json!({}));
+        }
         MENU_QUIT => app.exit(0),
         _ => {}
     }
