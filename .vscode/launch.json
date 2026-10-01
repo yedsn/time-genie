@@ -2,46 +2,29 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "command": "codex-dsp",
+      "name": "codex",
+      "request": "launch",
+      "type": "node-terminal"
+    },
+    {
       "command": "npm run tauri:dev",
-      "name": "Tauri 开发模式",
+      "name": "dev",
       "request": "launch",
-      "type": "node-terminal",
-      "cwd": "${workspaceFolder}"
-    },
-    {
-      "command": "npm run dev",
-      "name": "仅启动前端预览",
-      "request": "launch",
-      "type": "node-terminal",
-      "cwd": "${workspaceFolder}"
-    },
-    {
-      "command": "npm run typecheck",
-      "name": "前端类型检查",
-      "request": "launch",
-      "type": "node-terminal",
-      "cwd": "${workspaceFolder}"
-    },
-    {
-      "command": "cargo check",
-      "name": "Rust 检查",
-      "request": "launch",
-      "type": "node-terminal",
-      "cwd": "${workspaceFolder}/src-tauri"
+      "type": "node-terminal"
     },
     {
       "command": "npm run tauri:build",
-      "name": "Tauri 构建安装包",
+      "name": "build",
       "request": "launch",
-      "type": "node-terminal",
-      "cwd": "${workspaceFolder}"
+      "type": "node-terminal"
     },
     {
       "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release/release.ps1 -Push",
+      "cwd": "${workspaceFolder}",
       "name": "release",
       "request": "launch",
-      "type": "node-terminal",
-      "cwd": "${workspaceFolder}"
+      "type": "node-terminal"
     }
   ]
 }
