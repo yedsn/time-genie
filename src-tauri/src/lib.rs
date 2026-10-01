@@ -274,6 +274,7 @@ pub fn run() {
                 .build(app)?;
             app.manage(AppTrayIcon { _icon: tray_icon });
             retry_tray_registration(app.handle().clone());
+            #[cfg(target_os = "windows")]
             native_tray::start_if_tauri_tray_missing(app.handle().clone());
             verify_tray_registered(app.handle().clone());
             show(app.handle(), "main");
