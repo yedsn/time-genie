@@ -1,0 +1,178 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_HTTP_TIMEOUT: 600
+  CARGO_HTTP_LOW_SPEED_LIMIT: 1
+  CARGO_HTTP_LOW_SPEED_TIME: 600
+
+jobs:
+  publish:
+    name: Build ${{ matrix.name }} bundle
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Apple Silicon
+            os: macos-latest
+            rust_target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin --bundles app,dmg
+          - name: macOS Intel
+            os: macos-latest
+            rust_target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin --bundles app,dmg
+          - name: Windows x64
+            os: windows-latest
+            rust_target: ""
+            args: --bundles nsis
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Validate release tag version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^v(.+)$') { throw "Release tag must start with v." }
+          $version = $Matches[1]
+          $package = Get-Content package.json -Raw -Encoding UTF8 | ConvertFrom-Json
+          if ($package.version -ne $version) { throw "package.json version $($package.version) does not match tag $tag." }
+          $tauri = Get-Content src-tauri/tauri.conf.json -Raw -Encoding UTF8 | ConvertFrom-Json
+          if ($tauri.version -ne $version) { throw "tauri.conf.json version $($tauri.version) does not match tag $tag." }
+          $cargo = Get-Content src-tauri/Cargo.toml -Raw -Encoding UTF8
+          $cargoVersionMatch = [regex]::Match($cargo, '(?m)^version\s*=\s*"([^"]+)"\s*$')
+          if (-not $cargoVersionMatch.Success) { throw "Cargo.toml version field was not found." }
+          $cargoVersion = $cargoVersionMatch.Groups[1].Value
+          if ($cargoVersion -ne $version) { throw "Cargo.toml version $cargoVersion does not match tag $tag." }
+
+      - name: Validate updater configuration
+        shell: pwsh
+        run: |
+          $tauri = Get-Content src-tauri/tauri.conf.json -Raw -Encoding UTF8 | ConvertFrom-Json
+          if ($tauri.bundle.createUpdaterArtifacts -ne $true) { throw 'bundle.createUpdaterArtifacts must be true.' }
+          $updater = $tauri.plugins.updater
+          if (-not $updater) { throw 'src-tauri/tauri.conf.json is missing plugins.updater.' }
+          if (-not $updater.pubkey -or $updater.pubkey -eq 'REPLACE_WITH_TAURI_UPDATER_PUBLIC_KEY') {
+            throw 'src-tauri/tauri.conf.json plugins.updater.pubkey is still a placeholder.'
+          }
+          if (-not $updater.endpoints -or $updater.endpoints.Count -eq 0) {
+            throw 'src-tauri/tauri.conf.json plugins.updater.endpoints is empty.'
+          }
+          foreach ($endpoint in $updater.endpoints) {
+            if ($endpoint -match '<[^>]+>') { throw "Updater endpoint still contains placeholder: $endpoint" }
+            if ($endpoint -notmatch '^https://') { throw "Updater endpoint must use HTTPS: $endpoint" }
+          }
+
+      - name: Validate updater signing secrets
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw 'Missing repository secret TAURI_SIGNING_PRIVATE_KEY.' }
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) { throw 'Missing repository secret TAURI_SIGNING_PRIVATE_KEY_PASSWORD.' }
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install extra Rust target
+        if: matrix.rust_target != ''
+        run: rustup target add ${{ matrix.rust_target }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> src-tauri/target
+
+      - name: Build bundles and publish release assets
+        uses: tauri-apps/tauri-action@v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 时序 ${{ github.ref_name }}
+          releaseBody: |
+            Automated GitHub Release for 时序.
+
+            - Includes the Windows NSIS installer.
+            - Includes macOS Apple Silicon and Intel DMG packages.
+            - Includes latest.json for the Tauri updater flow.
+            - Built from the tagged source with Tauri.
+
+            macOS users may need to run this after moving the app to Applications:
+
+            ```bash
+            xattr -cr /Applications/时序.app
+            ```
+          releaseDraft: false
+          prerelease: false
+          includeDebug: false
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: ${{ matrix.args }}
+
+  sync-gitee:
+    name: Sync release to Gitee
+    if: ${{ vars.ENABLE_GITEE_SYNC == 'true' }}
+    runs-on: [self-hosted, linux, x64, gitee-sync]
+    needs: publish
+    env:
+      PYTHONUNBUFFERED: "1"
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITEE_ACCESS_TOKEN: ${{ secrets.GITEE_ACCESS_TOKEN }}
+      GITEE_SYNC_PROXY: ${{ vars.GITEE_SYNC_PROXY }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Sync GitHub release assets to Gitee
+        shell: bash
+        run: |
+          if [ -z "${GITEE_ACCESS_TOKEN:-}" ]; then
+            echo "GITEE_ACCESS_TOKEN is not configured."
+            exit 1
+          fi
+          args=(
+            scripts/release/sync_gitee_release.py
+            --tag "${{ github.ref_name }}"
+            --github-owner yedsn
+            --github-repo time-genie
+            --gitee-owner hongxiaojian
+            --gitee-repo time-genie
+            --target-commitish main
+          )
+          if [ -n "${GITEE_SYNC_PROXY:-}" ]; then
+            args+=(--proxy "$GITEE_SYNC_PROXY")
+          fi
+          python3 "${args[@]}"

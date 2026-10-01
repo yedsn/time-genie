@@ -35,6 +35,13 @@
       "request": "launch",
       "type": "node-terminal",
       "cwd": "${workspaceFolder}"
+    },
+    {
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release/release.ps1 -Push",
+      "name": "release",
+      "request": "launch",
+      "type": "node-terminal",
+      "cwd": "${workspaceFolder}"
     }
   ]
 }

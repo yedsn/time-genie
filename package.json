@@ -13,7 +13,10 @@
     "test:supabase:e2e": "cargo test --manifest-path src-tauri/Cargo.toml cloud_e2e::real_supabase_two_device_flow -- --ignored --nocapture",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",
@@ -34,6 +37,7 @@
     "@vitejs/plugin-vue": "^5.2.1",
     "typescript": "^5.7.2",
     "vite": "^6.0.3",
-    "vue-tsc": "^2.1.10"
+    "vue-tsc": "^2.1.10",
+    "vitepress": "^1.6.4"
   }
 }

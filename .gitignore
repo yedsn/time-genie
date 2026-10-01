@@ -6,3 +6,7 @@ src-tauri/target/
 *.tmp
 .tmp-*
 .tmp-edge-profile
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+
+__pycache__/

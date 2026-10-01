@@ -10,6 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
@@ -43,7 +44,20 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": "all",
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU5NUY3Q0UxNkI4RDAwQTgKUldTb0FJMXI0WHhmNmRNcSsvQzduRFhVVFJMdmtGRExWM29MSVhpOTd3RDd4MUhmN2JHRUMyeGwK",
+      "endpoints": [
+        "https://gitee.com/hongxiaojian/time-genie/releases/download/latest/latest.json",
+        "https://github.com/yedsn/time-genie/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }
