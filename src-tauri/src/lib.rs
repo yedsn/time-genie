@@ -1,9 +1,11 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, Rect};
+use tauri_plugin_updater::UpdaterExt;
 use uuid::Uuid;
 
 mod database;
@@ -39,7 +41,9 @@ const HOVER_HIDE_DELAY: Duration = Duration::from_secs(3);
 const HOVER_POSITION_CHECK_INTERVAL: Duration = Duration::from_millis(150);
 const HOVER_WINDOW_GAP: i32 = 8;
 const TRAY_MENU_SUPPRESS: Duration = Duration::from_millis(1200);
+const UPDATE_CHECK_MENU_LABEL: &str = "检查更新";
 static HOVER_STATE: OnceLock<Arc<Mutex<HoverState>>> = OnceLock::new();
+static UPDATE_CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
 struct HoverState {
@@ -180,6 +184,8 @@ pub fn run() {
                 stop: MenuItem::with_id(app, "stop_timer", "结束本段", false, None::<&str>)?,
             };
             let show_today = MenuItem::with_id(app, "show_today", "查看今日", true, None::<&str>)?;
+            let check_update =
+                MenuItem::with_id(app, "check_update", UPDATE_CHECK_MENU_LABEL, true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(
                 app,
@@ -190,6 +196,7 @@ pub fn run() {
                     &timer_menu.resume,
                     &timer_menu.stop,
                     &show_today,
+                    &check_update,
                     &quit,
                 ],
             )?;
@@ -207,11 +214,15 @@ pub fn run() {
                 .on_menu_event({
                     let database = database.clone();
                     let timer_menu = timer_menu.clone();
+                    let check_update = check_update.clone();
                     move |app, event| {
                         suppress_hover();
                         hide(app, "hover");
                         match event.id().as_ref() {
                             "show_main" | "show_today" => show(app, "main"),
+                            "check_update" => {
+                                run_tray_update_check(app.clone(), check_update.clone())
+                            }
                             "start_timer" => run_tray_timer_action(
                                 app.clone(),
                                 database.clone(),
@@ -526,6 +537,78 @@ fn retry_tray_registration(app: AppHandle) {
             }
         }
     });
+}
+
+fn run_tray_update_check(app: AppHandle, menu_item: MenuItem<tauri::Wry>) {
+    if UPDATE_CHECK_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    let _ = menu_item.set_enabled(false);
+    let _ = menu_item.set_text("正在检查更新...");
+    tauri::async_runtime::spawn(async move {
+        let result = check_download_and_install_update(&app, &menu_item).await;
+        UPDATE_CHECK_RUNNING.store(false, Ordering::SeqCst);
+
+        match result {
+            Ok(UpdateCheckResult::NoUpdate) => {
+                set_update_menu_status(menu_item, "已是最新版本", true, true);
+            }
+            Ok(UpdateCheckResult::Installed { version }) => {
+                let text = format!("更新 {version} 已安装，重启生效");
+                set_update_menu_status(menu_item, text, true, false);
+            }
+            Err(error) => {
+                eprintln!("检查更新失败: {error}");
+                set_update_menu_status(menu_item, "检查更新失败", true, true);
+            }
+        }
+    });
+}
+
+enum UpdateCheckResult {
+    NoUpdate,
+    Installed { version: String },
+}
+
+async fn check_download_and_install_update(
+    app: &AppHandle,
+    menu_item: &MenuItem<tauri::Wry>,
+) -> Result<UpdateCheckResult, String> {
+    let updater = app.updater().map_err(|error| error.to_string())?;
+    let Some(update) = updater.check().await.map_err(|error| error.to_string())? else {
+        return Ok(UpdateCheckResult::NoUpdate);
+    };
+
+    let version = update.version.clone();
+    let _ = menu_item.set_text(format!("正在下载更新 {version}..."));
+    update
+        .download_and_install(
+            |_, _| {},
+            || {},
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(UpdateCheckResult::Installed { version })
+}
+
+fn set_update_menu_status(
+    menu_item: MenuItem<tauri::Wry>,
+    text: impl Into<String>,
+    enabled: bool,
+    reset_text_later: bool,
+) {
+    let _ = menu_item.set_enabled(enabled);
+    let _ = menu_item.set_text(text.into());
+    if reset_text_later {
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            let _ = menu_item.set_text(UPDATE_CHECK_MENU_LABEL);
+        });
+    }
 }
 
 fn spawn_tray_timer_menu_refresh(database: Database, menu: TrayTimerMenu) {
