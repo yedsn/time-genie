@@ -15,9 +15,9 @@
 
 - `Settings -> Actions -> General`：启用 Actions，并允许工作流写入 Release。
 - `Settings -> Secrets and variables -> Actions -> Secrets`：配置 `TAURI_SIGNING_PRIVATE_KEY` 和 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。
-- 如果需要同步 Gitee：配置 `GITEE_ACCESS_TOKEN`。
-- 如果需要同步 Gitee：在 `Variables` 中设置 `ENABLE_GITEE_SYNC=true`；如自建 runner 访问 GitHub 需要代理，可设置 `GITEE_SYNC_PROXY`。
-- 如果需要同步 Gitee：`Settings -> Actions -> Runners` 中确认自建 runner 在线，标签为 `self-hosted, linux, x64, gitee-sync`。
+- 配置 `GITEE_ACCESS_TOKEN`，发布完成后会自动同步到 Gitee latest Release。
+- `Settings -> Actions -> Runners` 中确认自建 runner 在线，标签为 `self-hosted, linux, x64, gitee-sync`。
+- 如自建 runner 访问 GitHub 需要代理，可在 `Variables` 中设置 `GITEE_SYNC_PROXY`。
 
 ## 更新器验证
 
@@ -25,7 +25,7 @@
 
 - GitHub Release 中存在安装包、签名文件和 `latest.json`。
 - `https://github.com/yedsn/time-genie/releases/latest/download/latest.json` 可下载。
-- 启用 Gitee 同步后，`https://gitee.com/hongxiaojian/time-genie/releases/download/latest/latest.json` 可下载，且其中安装包 URL 指向 Gitee。
+- `https://gitee.com/hongxiaojian/time-genie/releases/download/latest/latest.json` 可下载，且其中安装包 URL 指向 Gitee。
 - 用旧版本客户端检查更新、下载安装、重启后，应用版本变为新版本。
 
 ## macOS 分发说明
