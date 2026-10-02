@@ -18,6 +18,7 @@
 - 配置 `GITEE_ACCESS_TOKEN`，发布完成后会自动同步到 Gitee latest Release。
 - `Settings -> Secrets and variables -> Actions -> Variables`：配置 `ENABLE_GITEE_SYNC=true` 开启 Gitee 同步；如自建 runner 下载 GitHub Release 资产需要代理，配置 `GITEE_SYNC_PROXY`。
 - `Settings -> Actions -> Runners` 中确认自建 runner 在线，标签为 `self-hosted, linux, x64, gitee-sync`。
+- 更新端点顺序必须保持 Gitee 在前、GitHub 在后：客户端会优先读取 Gitee `latest.json`，Gitee 不可用时再回退到 GitHub。
 
 ## 更新器验证
 
@@ -26,6 +27,7 @@
 - GitHub Release 中存在安装包、签名文件和 `latest.json`。
 - `https://github.com/yedsn/time-genie/releases/latest/download/latest.json` 可下载。
 - `https://gitee.com/hongxiaojian/time-genie/releases/download/latest/latest.json` 可下载，且其中安装包 URL 指向 Gitee。
+- 断开或临时阻断 Gitee 端点时，旧客户端可以回退到 GitHub `latest.json` 检查更新。
 - 用旧版本客户端检查更新、下载安装、重启后，应用版本变为新版本。
 
 ## macOS 分发说明

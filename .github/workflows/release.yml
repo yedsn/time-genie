@@ -76,6 +76,15 @@ jobs:
           if (-not $updater.endpoints -or $updater.endpoints.Count -eq 0) {
             throw 'src-tauri/tauri.conf.json plugins.updater.endpoints is empty.'
           }
+          if ($updater.endpoints.Count -lt 2) {
+            throw 'src-tauri/tauri.conf.json plugins.updater.endpoints must include Gitee first and GitHub second.'
+          }
+          if ($updater.endpoints[0] -notmatch '^https://gitee.com/.+/releases/download/latest/latest\.json$') {
+            throw "The first updater endpoint must be the Gitee latest.json mirror: $($updater.endpoints[0])"
+          }
+          if ($updater.endpoints[1] -notmatch '^https://github.com/.+/releases/latest/download/latest\.json$') {
+            throw "The second updater endpoint must be the GitHub latest.json fallback: $($updater.endpoints[1])"
+          }
           foreach ($endpoint in $updater.endpoints) {
             if ($endpoint -match '<[^>]+>') { throw "Updater endpoint still contains placeholder: $endpoint" }
             if ($endpoint -notmatch '^https://') { throw "Updater endpoint must use HTTPS: $endpoint" }
