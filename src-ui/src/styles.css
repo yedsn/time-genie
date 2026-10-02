@@ -1932,7 +1932,7 @@ pre {
 .time-history-head span { color: var(--muted); font-size: 12px; }
 .manual-entry-row {
   display: grid;
-  grid-template-columns: minmax(220px, 1.4fr) 110px minmax(180px, 1fr) auto;
+  grid-template-columns: minmax(220px, 1.4fr) 110px minmax(180px, 1fr) 96px auto;
   align-items: end;
   gap: 8px;
   border: 1px solid var(--line);
@@ -1942,6 +1942,7 @@ pre {
 }
 .manual-entry-row label { display: grid; gap: 4px; color: var(--muted); font-size: 10px; }
 .manual-entry-row input { height: 38px; padding: 7px 9px; }
+.manual-complete-toggle { min-height: 38px; align-self: end; }
 .task-autocomplete {
   width: 100%;
   --el-color-primary: var(--accent);
@@ -2057,7 +2058,7 @@ pre {
   width: 100%;
   min-height: 68px;
   display: grid;
-  grid-template-columns: 28px 108px minmax(180px, 1fr) 92px 72px 18px;
+  grid-template-columns: 28px 108px minmax(180px, 1fr) 116px 72px 18px;
   align-items: center;
   gap: 10px;
   padding: 9px 12px;
@@ -2382,9 +2383,10 @@ pre {
   .time-focus-overview > time { font-size: 44px; }
   .time-focus-controls { grid-template-columns: 1fr; align-items: stretch; }
   .time-focus-actions { justify-content: flex-start; }
-  .time-entry-summary { grid-template-columns: 28px 92px minmax(140px, 1fr) 82px 66px 16px; gap: 8px; }
+  .time-entry-summary { grid-template-columns: 28px 92px minmax(140px, 1fr) 104px 66px 16px; gap: 8px; }
   .manual-entry-row { grid-template-columns: 1fr 100px; }
   .manual-entry-row > input { grid-column: 1 / -1; }
+  .manual-complete-toggle { justify-content: flex-start; }
   .report-workspace { height: 100%; min-height: 0; grid-template-columns: 260px minmax(0, 1fr); }
   .report-editor-head { align-items: flex-start; }
   .report-editor-actions { max-width: 310px; }

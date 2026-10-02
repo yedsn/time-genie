@@ -130,10 +130,13 @@ pub fn resolve_work(
         }
     }
     let total: i64 = merged.values().map(|(minutes, _, _)| *minutes).sum();
-    if total != state.required_minutes {
+    if total <= 0 {
+        return Err("VALIDATION_ERROR: 请至少分配 1 分钟到事项".to_string());
+    }
+    if total > state.required_minutes {
         return Err(format!(
-            "ALLOCATION_NOT_COMPLETE: 未归属时间需要完整分配 {} 分钟，当前已分配 {} 分钟",
-            state.required_minutes, total
+            "ALLOCATION_EXCEEDS_DURATION: 分配时间超出未归属时间 {} 分钟",
+            total - state.required_minutes
         ));
     }
 
@@ -917,24 +920,54 @@ mod tests {
     }
 
     #[test]
-    fn rejects_incomplete_allocation_and_can_discard() {
-        let (database, _) = setup();
+    fn allows_partial_allocation_and_can_discard_empty_allocation() {
+        let (database, task_id) = setup();
         let initial = get_state(&database).unwrap().unwrap();
         let connection = database.open().unwrap();
         connection
             .execute(
-                "UPDATE unassigned_segments SET started_at = started_at - 60000 WHERE session_id = ?1 AND ended_at IS NULL",
+                "UPDATE unassigned_segments SET started_at = started_at - 120000 WHERE session_id = ?1 AND ended_at IS NULL",
                 [&initial.session_id],
             )
             .unwrap();
         drop(connection);
         let initial = get_state(&database).unwrap().unwrap();
-        assert!(resolve_work(
+        assert!(initial.required_minutes >= 2);
+        let result = resolve_work(
             &database,
             ResolveWorkRequest {
                 session_id: initial.session_id.clone(),
-                allocations: Vec::new(),
+                allocations: vec![UnassignedAllocationInput {
+                    task_id,
+                    minutes: 1,
+                    complete_task: false,
+                    task_expected_version: None,
+                }],
                 expected_version: initial.version,
+                operation_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(result.resolution_type, "work");
+        let entry_id = result.generated_entry_id.unwrap();
+        let allocated: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(SUM(minutes), 0) FROM time_allocations WHERE entry_id = ?1",
+                [&entry_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(allocated, 1);
+
+        let next = get_state(&database).unwrap().unwrap();
+        assert!(resolve_work(
+            &database,
+            ResolveWorkRequest {
+                session_id: next.session_id.clone(),
+                allocations: Vec::new(),
+                expected_version: next.version,
                 operation_id: Uuid::now_v7().to_string(),
             }
         )

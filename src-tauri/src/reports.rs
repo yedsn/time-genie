@@ -1671,6 +1671,8 @@ mod tests {
                 ended_at: None,
                 minutes: Some(30),
                 note: None,
+                complete_task: false,
+                task_expected_version: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )
@@ -1880,6 +1882,8 @@ mod tests {
                 ended_at: None,
                 minutes: Some(15),
                 note: None,
+                complete_task: false,
+                task_expected_version: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )

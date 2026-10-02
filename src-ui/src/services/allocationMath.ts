@@ -29,3 +29,26 @@ export function rebalanceAllocationMinutes(
   if (pairedIndex >= 0) next[pairedIndex] = maximum - current;
   return next;
 }
+
+export function partialAllocationMaximum(minutes: unknown[], index: number, totalMinutes: number) {
+  const total = normalizeAllocationMinutes(totalMinutes);
+  const fixedMinutes = minutes.reduce<number>((sum, value, currentIndex) => {
+    if (currentIndex === index) return sum;
+    return sum + normalizeAllocationMinutes(value);
+  }, 0);
+  return Math.max(0, total - fixedMinutes);
+}
+
+export function clampPartialAllocationMinutes(
+  minutes: unknown[],
+  index: number,
+  requestedMinutes: unknown,
+  totalMinutes: number,
+) {
+  const next = minutes.map(normalizeAllocationMinutes);
+  if (index < 0 || index >= next.length) return next;
+
+  const maximum = partialAllocationMaximum(next, index, totalMinutes);
+  next[index] = Math.min(normalizeAllocationMinutes(requestedMinutes), maximum);
+  return next;
+}

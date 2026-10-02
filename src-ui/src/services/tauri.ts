@@ -667,6 +667,8 @@ export async function createManualTimeEntry(request: {
   endedAt?: number;
   minutes?: number;
   note?: string;
+  completeTask?: boolean;
+  taskExpectedVersion?: number;
 }): Promise<TimeEntryRecord> {
   return await invoke<TimeEntryRecord>("time_entry_create_manual", {
     request: { ...request, clientRequestId: crypto.randomUUID() },

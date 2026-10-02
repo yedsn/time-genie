@@ -5,7 +5,7 @@ import { Check, ChevronDown, ChevronRight, CircleDot, Clock3, Coffee, Pause, Pla
 import { useWorkdayStore, type TimeEntry } from "../store";
 import TaskSelectControl from "./TaskSelectControl.vue";
 import { playCompletionFeedback } from "../services/completionFeedback";
-import { allocationMaximum, normalizeAllocationMinutes, rebalanceAllocationMinutes } from "../services/allocationMath";
+import { clampPartialAllocationMinutes, partialAllocationMaximum } from "../services/allocationMath";
 
 type AllocationDraft = {
   id: string;
@@ -28,6 +28,7 @@ const manualOpen = ref(false);
 const manualTaskId = ref(store.selectedTaskId);
 const manualMinutes = ref(30);
 const manualNote = ref("");
+const manualCompleteTask = ref(false);
 const timerNote = ref("");
 const recentManualEntryId = ref("");
 const allocationDrafts = reactive<Record<string, AllocationDraft[]>>({});
@@ -73,6 +74,11 @@ function formatMinutes(minutes: number) {
   const hours = Math.floor(minutes / 60);
   const rest = minutes % 60;
   return rest ? `${hours} 小时 ${rest} 分钟` : `${hours} 小时`;
+}
+
+function formatAllocationProgress(entry: TimeEntry) {
+  if (entry.kind === "break") return formatMinutes(entryMinutes(entry));
+  return `${entry.allocated} / ${entryMinutes(entry)} 分钟`;
 }
 
 function entryMinutes(entry: TimeEntry) {
@@ -157,20 +163,17 @@ function removeAllocation(entry: TimeEntry, allocationId: string) {
   if (drafts.length === 1) return;
   const index = drafts.findIndex((item) => item.id === allocationId);
   if (index < 0) return;
-  const removedMinutes = normalizeAllocationMinutes(drafts[index].minutes);
   drafts.splice(index, 1);
-  const targetIndex = index > 0 ? index - 1 : 0;
-  drafts[targetIndex].minutes = normalizeAllocationMinutes(drafts[targetIndex].minutes) + removedMinutes;
 }
 
 function allocationInputMaximum(entry: TimeEntry, index: number) {
-  return allocationMaximum(ensureDraft(entry).map((item) => item.minutes), index, entry.minutes);
+  return partialAllocationMaximum(ensureDraft(entry).map((item) => item.minutes), index, entry.minutes);
 }
 
 function updateAllocationMinutes(entry: TimeEntry, index: number, event: Event) {
   const input = event.currentTarget as HTMLInputElement;
   const drafts = ensureDraft(entry);
-  const nextMinutes = rebalanceAllocationMinutes(
+  const nextMinutes = clampPartialAllocationMinutes(
     drafts.map((item) => item.minutes),
     index,
     input.value,
@@ -257,12 +260,15 @@ async function submitManualEntry() {
   }
   manualSaving.value = true;
   try {
-    const entryId = await store.addManualEntry(taskId || undefined, Math.round(minutes), manualNote.value.trim());
+    const result = await store.addManualEntry(taskId || undefined, Math.round(minutes), manualNote.value.trim(), manualCompleteTask.value);
+    const entryId = result.entryId;
     recentManualEntryId.value = entryId;
     manualOpen.value = false;
     manualMinutes.value = 30;
     manualNote.value = "";
+    manualCompleteTask.value = false;
     ElMessage.success("已补录用时");
+    if (result.completedCount) playCompletionFeedback({ completedCount: result.completedCount });
     void nextTick(() => {
       document.querySelector<HTMLElement>(`[data-entry-id="${entryId}"]`)?.scrollIntoView({ behavior: "smooth", block: "nearest" });
     });
@@ -355,6 +361,10 @@ function errorText(error: unknown, fallback: string) {
       />
       <label><span>分钟</span><input v-model.number="manualMinutes" min="1" type="number" /></label>
       <input v-model="manualNote" placeholder="备注（可选）" />
+      <label class="allocation-complete-toggle manual-complete-toggle" title="保存补录工时时同时完成这个事项">
+        <input v-model="manualCompleteTask" type="checkbox" />
+        <span>同时完成</span>
+      </label>
       <button class="primary-button compact" type="submit" :disabled="!manualMinutesValid || manualSaving"><Check :size="14" />{{ manualSaving ? '保存中' : '保存' }}</button>
     </form>
 
@@ -375,7 +385,7 @@ function errorText(error: unknown, fallback: string) {
           </span>
           <span class="time-entry-range">{{ formatTime(entry.startedAt) }} - {{ formatTime(entry.endedAt) }}</span>
           <span class="time-entry-title"><strong>{{ store.timeEntryLabel(entry) }}</strong><small>{{ entry.note || '无备注' }}</small></span>
-          <span class="time-entry-duration">{{ formatMinutes(entryMinutes(entry)) }}</span>
+          <span class="time-entry-duration">{{ formatAllocationProgress(entry) }}</span>
           <span class="time-entry-status" :class="entryStatusClass(entry)">{{ entryStatus(entry) }}</span>
           <ChevronDown v-if="entry.kind !== 'break' && entry.state === 'ended' && expandedEntryId === entry.id" :size="15" />
           <ChevronRight v-else-if="entry.kind !== 'break' && entry.state === 'ended'" :size="15" />

@@ -936,20 +936,29 @@ export const useWorkdayStore = defineStore("workday", () => {
     return { completedCount: completedTaskIds.length, completedTaskIds };
   }
 
-  async function addManualEntry(taskId: string | undefined, minutes: number, note = "") {
+  async function addManualEntry(taskId: string | undefined, minutes: number, note = "", completeTask = false) {
     const persistedTaskId = await persistTimerTask(taskId);
     if (taskId && !persistedTaskId) throw new Error("补录事项保存失败");
+    const completionCandidate = completeTask && persistedTaskId && tasks.find((task) => task.id === persistedTaskId)?.status !== "done"
+      ? persistedTaskId
+      : undefined;
+    const task = persistedTaskId ? tasks.find((candidate) => candidate.id === persistedTaskId) : undefined;
     const entry = toUiTimeEntry(await createManualTimeEntry({
       taskId: persistedTaskId,
       workDate: formatLocalDate(new Date()),
       minutes: Math.round(minutes),
       note: note.trim() || undefined,
+      completeTask,
+      taskExpectedVersion: completeTask ? task?.version : undefined,
     }));
     entries.unshift(entry);
     selectedEntryId.value = entry.id;
     await loadWorkspaceData();
     await loadTodayOverview();
-    return entry.id;
+    const completedTaskIds = completionCandidate && tasks.find((item) => item.id === completionCandidate)?.status === "done"
+      ? [completionCandidate]
+      : [];
+    return { entryId: entry.id, completedCount: completedTaskIds.length, completedTaskIds };
   }
 
   async function correctTimeEntry(entryId: string, startedAt: number, endedAt: number, note = "") {

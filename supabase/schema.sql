@@ -630,11 +630,14 @@ begin
   update public.unassigned_segments set ended_at = now(), duration_seconds = greatest(0, extract(epoch from (now() - started_at))::bigint) where session_id = p_session_id and ended_at is null;
   select coalesce(sum(duration_seconds),0) into elapsed from public.unassigned_segments where session_id = p_session_id;
   required_minutes := case when elapsed > 0 then greatest(1, ceil(elapsed / 60.0)::integer) else 0 end;
+  if exists(select 1 from jsonb_array_elements(coalesce(p_allocations,'[]'::jsonb)) where (value->>'minutes')::integer < 0) then raise exception 'VALIDATION_ERROR: allocation minutes must be non-negative'; end if;
   select coalesce(sum((value->>'minutes')::integer),0) into supplied_minutes from jsonb_array_elements(coalesce(p_allocations,'[]'::jsonb));
-  if supplied_minutes <> required_minutes then raise exception 'ALLOCATION_NOT_COMPLETE: required=% supplied=%', required_minutes, supplied_minutes; end if;
+  if supplied_minutes <= 0 then raise exception 'VALIDATION_ERROR: allocation required'; end if;
+  if supplied_minutes > required_minutes then raise exception 'ALLOCATION_EXCEEDS_DURATION: required=% supplied=%', required_minutes, supplied_minutes; end if;
   insert into public.time_entries(workspace_id, work_date, kind, source_type, state, label_snapshot, started_at, ended_at, duration_seconds, origin_unassigned_session_id, created_by_device_id, updated_by_device_id)
   values(p_workspace_id, session_row.work_date, 'work', 'unassigned', 'ended', '未归属工作时间', session_row.first_started_at, now(), elapsed, session_row.id, p_device_id, p_device_id) returning id into entry_id;
   for allocation in select value from jsonb_array_elements(p_allocations) loop
+    if (allocation->>'minutes')::integer <= 0 then continue; end if;
     if not exists(select 1 from public.tasks t where t.id = (allocation->>'taskId')::uuid and t.workspace_id = p_workspace_id and t.deleted_at is null and not exists(select 1 from public.tasks c where c.parent_id = t.id and c.deleted_at is null)) then raise exception 'INVALID_TASK'; end if;
     insert into public.time_allocations(workspace_id, entry_id, task_id, minutes) values(p_workspace_id, entry_id, (allocation->>'taskId')::uuid, (allocation->>'minutes')::integer);
   end loop;

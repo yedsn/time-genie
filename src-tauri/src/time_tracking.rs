@@ -96,6 +96,9 @@ pub struct ManualEntryRequest {
     pub ended_at: Option<i64>,
     pub minutes: Option<i64>,
     pub note: Option<String>,
+    #[serde(default)]
+    pub complete_task: bool,
+    pub task_expected_version: Option<i64>,
     pub client_request_id: String,
 }
 
@@ -540,6 +543,15 @@ pub fn create_manual_entry(
     if let Some(task_id) = request.task_id {
         let minutes = settlement_minutes(duration_seconds);
         if minutes > 0 {
+            if request.complete_task {
+                validate_task_completion(
+                    &transaction,
+                    &workspace_id,
+                    &task_id,
+                    request.task_expected_version,
+                    &request.work_date,
+                )?;
+            }
             crate::recurring::ensure_occurrence_if_recurring(
                 &transaction,
                 &workspace_id,
@@ -554,6 +566,16 @@ pub fn create_manual_entry(
                     params![Uuid::now_v7().to_string(), workspace_id, id, task_id, minutes, now],
                 )
                 .map_err(|error| error.to_string())?;
+            if request.complete_task {
+                complete_task_if_open(
+                    &transaction,
+                    &workspace_id,
+                    &task_id,
+                    request.task_expected_version,
+                    &request.work_date,
+                    now,
+                )?;
+            }
         }
     }
     bump_revision(&transaction)?;
@@ -1652,6 +1674,8 @@ mod tests {
                 ended_at: None,
                 minutes: Some(30),
                 note: Some("补录".to_string()),
+                complete_task: false,
+                task_expected_version: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )
@@ -1688,6 +1712,94 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[test]
+    fn manual_entry_can_complete_selected_task() {
+        let (database, _, task_id) = setup();
+        let task_version: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT version FROM tasks WHERE id = ?1",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let manual = create_manual_entry(
+            &database,
+            ManualEntryRequest {
+                task_id: Some(task_id.clone()),
+                work_date: local_date(),
+                started_at: None,
+                ended_at: None,
+                minutes: Some(25),
+                note: Some("补录并完成".to_string()),
+                complete_task: true,
+                task_expected_version: Some(task_version),
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(manual.allocated_minutes, 25);
+        let connection = database.open().unwrap();
+        let status: String = connection
+            .query_row("SELECT status FROM tasks WHERE id = ?1", [&task_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let done_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_status_events WHERE task_id = ?1 AND status = 'done'",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "done");
+        assert_eq!(done_events, 1);
+    }
+
+    #[test]
+    fn allocation_can_leave_minutes_unassigned() {
+        let (database, _, task_id) = setup();
+        let manual = create_manual_entry(
+            &database,
+            ManualEntryRequest {
+                task_id: None,
+                work_date: local_date(),
+                started_at: None,
+                ended_at: None,
+                minutes: Some(30),
+                note: Some("只归属一部分".to_string()),
+                complete_task: false,
+                task_expected_version: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+
+        let allocated = replace_allocations(
+            &database,
+            AllocationReplaceRequest {
+                entry_id: manual.id,
+                allocations: vec![AllocationInput {
+                    task_id,
+                    minutes: 20,
+                    note: None,
+                    complete_task: false,
+                    task_expected_version: None,
+                }],
+                expected_version: manual.version,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(allocated.settlement_minutes, 30);
+        assert_eq!(allocated.allocated_minutes, 20);
+        assert_eq!(allocated.allocations.len(), 1);
+        assert_eq!(allocated.allocations[0].minutes, 20);
     }
 
     #[test]
@@ -1734,6 +1846,8 @@ mod tests {
                 ended_at: None,
                 minutes: Some(90),
                 note: None,
+                complete_task: false,
+                task_expected_version: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )
@@ -1886,6 +2000,8 @@ mod tests {
                 ended_at: None,
                 minutes: Some(60),
                 note: None,
+                complete_task: false,
+                task_expected_version: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )
@@ -1953,6 +2069,8 @@ mod tests {
                 ended_at: None,
                 minutes: Some(30),
                 note: None,
+                complete_task: false,
+                task_expected_version: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )
@@ -2025,6 +2143,8 @@ mod tests {
                 ended_at: None,
                 minutes: Some(30),
                 note: None,
+                complete_task: false,
+                task_expected_version: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )

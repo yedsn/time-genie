@@ -6,7 +6,7 @@ import { useWorkdayStore } from "../store";
 import TaskSelectControl from "./TaskSelectControl.vue";
 import { playCompletionFeedback } from "../services/completionFeedback";
 import { remainingOpenTaskCount } from "../services/completionFeedbackCore";
-import { allocationMaximum, normalizeAllocationMinutes, rebalanceAllocationMinutes } from "../services/allocationMath";
+import { clampPartialAllocationMinutes, partialAllocationMaximum } from "../services/allocationMath";
 
 type TaskSelectControlInstance = { commit: () => string | undefined };
 type AllocationDraft = { id: string; taskId: string; minutes: number; completeTask: boolean };
@@ -52,6 +52,7 @@ watch(() => store.unassignedDialogOpen, (open) => {
 
 watch(requiredMinutes, (current, previous) => {
   if (!store.unassignedDialogOpen || !allocations.length || current <= previous) return;
+  if (allocatedMinutes.value < previous) return;
   allocations[allocations.length - 1].minutes += current - previous;
 });
 
@@ -85,18 +86,16 @@ function removeAllocation(id: string) {
   if (allocations.length === 1) return;
   const index = allocations.findIndex((allocation) => allocation.id === id);
   if (index < 0) return;
-  const [removed] = allocations.splice(index, 1);
-  const targetIndex = index > 0 ? index - 1 : 0;
-  allocations[targetIndex].minutes = normalizeAllocationMinutes(allocations[targetIndex].minutes) + normalizeAllocationMinutes(removed.minutes);
+  allocations.splice(index, 1);
 }
 
 function allocationInputMaximum(index: number) {
-  return allocationMaximum(allocations.map((item) => item.minutes), index, requiredMinutes.value);
+  return partialAllocationMaximum(allocations.map((item) => item.minutes), index, requiredMinutes.value);
 }
 
 function updateAllocationMinutes(index: number, event: Event) {
   const input = event.currentTarget as HTMLInputElement;
-  const nextMinutes = rebalanceAllocationMinutes(
+  const nextMinutes = clampPartialAllocationMinutes(
     allocations.map((item) => item.minutes),
     index,
     input.value,
@@ -111,24 +110,31 @@ async function assignTime(event?: MouseEvent) {
     const committedTaskId = taskControls.get(allocation.id)?.commit();
     if (committedTaskId) allocation.taskId = committedTaskId;
   }
-  if (allocations.some((allocation) => !allocation.taskId || !store.tasks.some((task) => task.id === allocation.taskId))) {
+  const positiveAllocations = allocations
+    .map((allocation) => ({
+      taskId: allocation.taskId,
+      minutes: Math.max(0, Number(allocation.minutes) || 0),
+      completeTask: allocation.completeTask,
+    }))
+    .filter((allocation) => allocation.minutes > 0);
+  if (!positiveAllocations.length) {
+    ElMessage.warning("请至少分配 1 分钟到事项");
+    return;
+  }
+  if (positiveAllocations.some((allocation) => !allocation.taskId || !store.tasks.some((task) => task.id === allocation.taskId))) {
     ElMessage.warning("请为每一行选择一个具体事项");
     return;
   }
-  if (remainingMinutes.value !== 0) {
-    ElMessage.warning(remainingMinutes.value > 0 ? `还有 ${remainingMinutes.value} 分钟未分配` : `分配时间超出 ${Math.abs(remainingMinutes.value)} 分钟`);
+  if (remainingMinutes.value < 0) {
+    ElMessage.warning(`分配时间超出 ${Math.abs(remainingMinutes.value)} 分钟`);
     return;
   }
   saving.value = true;
   const openBefore = currentOpenTaskCount();
   try {
-    const saved = await store.resolveUnassignedTime("work", allocations.map((allocation) => ({
-      taskId: allocation.taskId,
-      minutes: Math.max(0, Number(allocation.minutes) || 0),
-      completeTask: allocation.completeTask,
-    })));
+    const saved = await store.resolveUnassignedTime("work", positiveAllocations);
     if (!saved) {
-      ElMessage.warning("分配时间需要等于当前未归属时间");
+      ElMessage.warning("未归属时间已变化，请刷新后重试");
       return;
     }
     ElMessage.success("未归属时间已分配到事项");
