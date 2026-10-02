@@ -19,6 +19,7 @@ DEFAULT_GITHUB_OWNER = "yedsn"
 DEFAULT_GITHUB_REPO = "time-genie"
 DEFAULT_GITEE_OWNER = "hongxiaojian"
 DEFAULT_GITEE_REPO = "time-genie"
+DEFAULT_ASSET_PREFIX = "TimeGenie"
 LATEST_RELEASE_TAG = "latest"
 HTTP_TIMEOUT_SECS = 60
 DOWNLOAD_TIMEOUT_SECS = 600
@@ -128,14 +129,24 @@ def strip_version_from_filename(name: str) -> str:
     return name
 
 
-def rewrite_latest_json_urls(source_path: Path, target_path: Path, *, gitee_owner: str, gitee_repo: str) -> None:
+def gitee_asset_name(name: str, *, asset_prefix: str) -> str:
+    if name == "latest.json":
+        return name
+    normalized = strip_version_from_filename(name).lstrip("_-. ")
+    prefix = asset_prefix.strip()
+    if not prefix or normalized.lower().startswith((f"{prefix.lower()}_", f"{prefix.lower()}-")):
+        return normalized
+    return f"{prefix}_{normalized}"
+
+
+def rewrite_latest_json_urls(source_path: Path, target_path: Path, *, gitee_owner: str, gitee_repo: str, asset_prefix: str) -> None:
     payload = json.loads(source_path.read_text(encoding="utf-8"))
     platforms = payload.get("platforms", {})
     for item in platforms.values():
         url = item.get("url")
         if not url:
             continue
-        filename = strip_version_from_filename(Path(urllib.parse.urlparse(url).path).name)
+        filename = gitee_asset_name(Path(urllib.parse.urlparse(url).path).name, asset_prefix=asset_prefix)
         item["url"] = f"https://gitee.com/{gitee_owner}/{gitee_repo}/releases/download/{LATEST_RELEASE_TAG}/{filename}"
     target_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
@@ -183,6 +194,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--github-repo", default=DEFAULT_GITHUB_REPO)
     parser.add_argument("--gitee-owner", default=DEFAULT_GITEE_OWNER)
     parser.add_argument("--gitee-repo", default=DEFAULT_GITEE_REPO)
+    parser.add_argument("--asset-prefix", default=DEFAULT_ASSET_PREFIX, help="Prefix for Gitee asset filenames. Use an empty string to keep source names.")
     parser.add_argument("--target-commitish", default="main")
     parser.add_argument("--proxy", help="Proxy server for downloading from GitHub, for example http://127.0.0.1:7890.")
     return parser
@@ -220,14 +232,14 @@ def main() -> None:
             source_path = tmp_root / name
             log(f"[sync-gitee] Downloading {name}")
             download_file(download_url, source_path, args.proxy, asset_download_headers)
-            gitee_name = strip_version_from_filename(name)
+            gitee_name = gitee_asset_name(name, asset_prefix=args.asset_prefix)
             gitee_path = tmp_root / gitee_name
             if gitee_name != name:
                 copyfile(source_path, gitee_path)
             else:
                 gitee_path = source_path
             if gitee_path.name == "latest.json":
-                rewrite_latest_json_urls(gitee_path, gitee_path, gitee_owner=args.gitee_owner, gitee_repo=args.gitee_repo)
+                rewrite_latest_json_urls(gitee_path, gitee_path, gitee_owner=args.gitee_owner, gitee_repo=args.gitee_repo, asset_prefix=args.asset_prefix)
             files.append(gitee_path)
 
         release = ensure_release(

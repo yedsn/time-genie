@@ -29,6 +29,7 @@
 - GitHub Release 中存在安装包、签名文件和 `latest.json`。
 - `https://github.com/yedsn/time-genie/releases/latest/download/latest.json` 可下载。
 - `https://gitee.com/hongxiaojian/time-genie/releases/download/latest/latest.json` 可下载，且其中安装包 URL 指向 Gitee。
+- Gitee latest Release 中除 `latest.json` 外，安装包、更新归档和签名文件统一使用 `TimeGenie` 英文前缀，例如 `TimeGenie_0.1.9_x64-setup.exe`。
 - 断开或临时阻断 Gitee 端点时，旧客户端可以回退到 GitHub `latest.json` 检查更新。
 - 用旧版本客户端检查更新、下载安装、重启后，应用版本变为新版本。
 

@@ -223,6 +223,7 @@ jobs:
             --github-repo time-genie
             --gitee-owner hongxiaojian
             --gitee-repo time-genie
+            --asset-prefix TimeGenie
             --target-commitish main
           )
           if [ -n "${GITEE_SYNC_PROXY:-}" ]; then
