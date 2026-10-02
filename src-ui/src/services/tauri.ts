@@ -685,6 +685,14 @@ export async function updateTimeEntry(request: {
   return await invoke<TimeEntryRecord>("time_entry_update", { request });
 }
 
+export async function updateTimeEntryDisposition(request: {
+  entryId: string;
+  expectedVersion: number;
+  disposition: "break" | "discard";
+}): Promise<TimeEntryRecord> {
+  return await invoke<TimeEntryRecord>("time_entry_update_disposition", { request });
+}
+
 export async function replaceTimeAllocations(
   entryId: string,
   expectedVersion: number,

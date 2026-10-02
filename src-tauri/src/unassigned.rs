@@ -296,7 +296,7 @@ fn resolve_without_allocations(
         request.expected_version,
         now,
     )?;
-    let entry_id = if resolution_type == "break" {
+    let entry_id = if resolution_type == "break" || resolution_type == "discard" {
         let id = Uuid::now_v7().to_string();
         insert_generated_entry(
             &transaction,
@@ -305,7 +305,7 @@ fn resolve_without_allocations(
             &id,
             &state,
             "break",
-            "休息时间",
+            if resolution_type == "break" { "休息时间" } else { "无效时间" },
             now,
         )?;
         Some(id)
@@ -983,6 +983,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.resolution_type, "discard");
-        assert!(result.generated_entry_id.is_none());
+        assert!(result.generated_entry_id.is_some());
     }
 }

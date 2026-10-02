@@ -112,6 +112,14 @@ pub struct TimeEntryUpdateRequest {
     pub expected_version: i64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeEntryDispositionRequest {
+    pub entry_id: String,
+    pub expected_version: i64,
+    pub disposition: String,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AllocationReplaceRequest {
@@ -665,6 +673,71 @@ pub fn update_time_entry(
     Ok(result)
 }
 
+pub fn update_time_entry_disposition(
+    database: &Database,
+    request: TimeEntryDispositionRequest,
+) -> Result<TimeEntryDto, String> {
+    let mut connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    let current = load_entry(&connection, &request.entry_id, now_millis())?;
+    if current.version != request.expected_version {
+        return Err("VERSION_CONFLICT: 时间记录已被更新".to_string());
+    }
+    if current.state != "ended" {
+        return Err("VALIDATION_ERROR: 只能处理已结束的时间记录".to_string());
+    }
+    if request.disposition != "break" && request.disposition != "discard" {
+        return Err("VALIDATION_ERROR: 处理方式必须是休息或无效".to_string());
+    }
+
+    let now = now_millis();
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM time_allocations WHERE entry_id = ?1",
+            [&request.entry_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if request.disposition == "break" {
+        transaction
+            .execute(
+                "UPDATE time_entries
+                 SET kind = 'break', default_task_id = NULL, label_snapshot = '休息时间',
+                     note = '已标记为休息时间', updated_at = ?1, version = version + 1
+                 WHERE id = ?2 AND version = ?3 AND deleted_at IS NULL",
+                params![now, request.entry_id, request.expected_version],
+            )
+            .map_err(|error| error.to_string())?;
+    } else {
+        transaction
+            .execute(
+                "UPDATE time_entries
+                 SET default_task_id = NULL, note = '已标记为无效时间',
+                     deleted_at = ?1, updated_at = ?1, version = version + 1
+                 WHERE id = ?2 AND version = ?3 AND deleted_at IS NULL",
+                params![now, request.entry_id, request.expected_version],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    clear_workday_settlement(&transaction, &workspace_id, &request.entry_id)?;
+    bump_revision(&transaction)?;
+    let result = if request.disposition == "break" {
+        load_entry(&transaction, &request.entry_id, now)?
+    } else {
+        let mut result = current;
+        result.version += 1;
+        result.default_task_id = None;
+        result.allocated_minutes = 0;
+        result.allocations.clear();
+        result.note = Some("已标记为无效时间".to_string());
+        result
+    };
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(result)
+}
+
 pub fn replace_allocations(
     database: &Database,
     request: AllocationReplaceRequest,
@@ -675,8 +748,11 @@ pub fn replace_allocations(
     if current.version != request.expected_version {
         return Err("VERSION_CONFLICT: 时间记录已被更新".to_string());
     }
-    if current.state != "ended" || current.kind != "work" {
-        return Err("VALIDATION_ERROR: 只能分配已结束的工作记录".to_string());
+    if current.state != "ended" {
+        return Err("VALIDATION_ERROR: 只能分配已结束的时间记录".to_string());
+    }
+    if current.kind != "work" && !(current.kind == "break" && current.source_type == "unassigned") {
+        return Err("VALIDATION_ERROR: 只能分配工作记录或未归属处理记录".to_string());
     }
     let mut merged = HashMap::<String, (i64, Option<String>, bool, Option<i64>)>::new();
     for allocation in request.allocations {
@@ -760,11 +836,17 @@ pub fn replace_allocations(
             )?;
         }
     }
+    let should_convert_to_work = current.kind == "break" && total > 0;
     transaction
         .execute(
-            "UPDATE time_entries SET updated_at = ?1, version = version + 1
+            "UPDATE time_entries
+             SET kind = CASE WHEN ?4 THEN 'work' ELSE kind END,
+                 label_snapshot = CASE WHEN ?4 THEN '未归属时间重新分配' ELSE label_snapshot END,
+                 note = CASE WHEN ?4 THEN '从休息或无效时间重新分配' ELSE note END,
+                 updated_at = ?1,
+                 version = version + 1
              WHERE id = ?2 AND version = ?3 AND deleted_at IS NULL",
-            params![now, request.entry_id, request.expected_version],
+            params![now, request.entry_id, request.expected_version, should_convert_to_work],
         )
         .map_err(|error| error.to_string())?;
     clear_workday_settlement(&transaction, &workspace_id, &request.entry_id)?;
@@ -1328,6 +1410,25 @@ pub fn time_entry_update(
     crate::cloud_sync::enqueue_entity(
         &database,
         "time_entry_update",
+        "time_entry",
+        Some(&result.id),
+        Some(base_version),
+        None,
+    )?;
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn time_entry_update_disposition(
+    database: tauri::State<'_, Database>,
+    request: TimeEntryDispositionRequest,
+) -> Result<TimeEntryDto, String> {
+    crate::supabase::ensure_repository_write_mode(&database)?;
+    let base_version = request.expected_version;
+    let result = update_time_entry_disposition(&database, request)?;
+    crate::cloud_sync::enqueue_entity(
+        &database,
+        "time_entry_update_disposition",
         "time_entry",
         Some(&result.id),
         Some(base_version),
@@ -2196,5 +2297,97 @@ mod tests {
         assert_eq!(reallocated.settlement_minutes, 25);
         assert_eq!(reallocated.allocated_minutes, 25);
         assert_eq!(reallocated.allocations.len(), 1);
+    }
+
+    #[test]
+    fn unassigned_break_entry_can_be_reallocated_to_work() {
+        let (database, workspace_id, task_id) = setup();
+        let entry_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "INSERT INTO time_entries(
+                   id, workspace_id, work_date, kind, source_type, state, label_snapshot,
+                   started_at, ended_at, duration_seconds, note, created_at, updated_at, version
+                 ) VALUES (?1, ?2, ?3, 'break', 'unassigned', 'ended', '误记为休息', ?4, ?5, 600, '稍后重新分配', ?5, ?5, 1)",
+                params![entry_id, workspace_id, local_date(), now - 600_000, now],
+            )
+            .unwrap();
+
+        let updated = replace_allocations(
+            &database,
+            AllocationReplaceRequest {
+                entry_id: entry_id.clone(),
+                expected_version: 1,
+                allocations: vec![AllocationInput {
+                    task_id,
+                    minutes: 10,
+                    note: None,
+                    complete_task: false,
+                    task_expected_version: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(updated.kind, "work");
+        assert_eq!(updated.allocated_minutes, 10);
+        assert_eq!(updated.allocations.len(), 1);
+    }
+
+    #[test]
+    fn ended_entry_can_be_marked_break_or_discarded() {
+        let (database, _, task_id) = setup();
+        let manual = create_manual_entry(
+            &database,
+            ManualEntryRequest {
+                task_id: Some(task_id.clone()),
+                work_date: local_date(),
+                started_at: None,
+                ended_at: None,
+                minutes: Some(15),
+                note: None,
+                complete_task: false,
+                task_expected_version: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(manual.kind, "work");
+        assert_eq!(manual.allocated_minutes, 15);
+
+        let marked_break = update_time_entry_disposition(
+            &database,
+            TimeEntryDispositionRequest {
+                entry_id: manual.id.clone(),
+                expected_version: manual.version,
+                disposition: "break".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(marked_break.kind, "break");
+        assert_eq!(marked_break.allocated_minutes, 0);
+
+        update_time_entry_disposition(
+            &database,
+            TimeEntryDispositionRequest {
+                entry_id: manual.id.clone(),
+                expected_version: marked_break.version,
+                disposition: "discard".to_string(),
+            },
+        )
+        .unwrap();
+        let deleted_at: Option<i64> = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT deleted_at FROM time_entries WHERE id = ?1",
+                [&manual.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(deleted_at.is_some());
     }
 }

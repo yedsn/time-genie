@@ -42,6 +42,7 @@ import {
   stopTimerRecord,
   updateTask as updateTaskRecord,
   updateTimeEntry,
+  updateTimeEntryDisposition,
   type TimeEntryRecord,
   type TaskRecord,
   type TodayWorkOverviewRecord,
@@ -975,6 +976,27 @@ export const useWorkdayStore = defineStore("workday", () => {
     await loadTodayOverview();
   }
 
+  async function setTimeEntryDisposition(entryId: string, disposition: "break" | "discard") {
+    const entry = entries.find((item) => item.id === entryId);
+    if (!entry) return;
+    const updated = toUiTimeEntry(await updateTimeEntryDisposition({
+      entryId,
+      expectedVersion: entry.version,
+      disposition,
+    }));
+    if (disposition === "discard") {
+      const index = entries.findIndex((item) => item.id === entryId);
+      if (index >= 0) entries.splice(index, 1);
+      if (selectedEntryId.value === entryId) selectedEntryId.value = entries[0]?.id ?? "";
+    } else {
+      const index = entries.findIndex((item) => item.id === updated.id);
+      if (index >= 0) entries.splice(index, 1, updated);
+      else entries.unshift(updated);
+    }
+    await loadWorkspaceData();
+    await loadTodayOverview();
+  }
+
   async function createReport(request: { type: ReportType; referenceDate: string; subjectId: string; taskIds: string[] }) {
     const result = await createReportRecord({
       reportType: request.type,
@@ -1113,7 +1135,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     now, todayMinutes, allocatedMinutes, pendingMinutes, doneCount, unassignedSeconds, unassignedStartedAt,
     unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen,
     workspaceLoaded, workspaceLoading, loadWorkspaceData, loadTimeData, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addChildTask, saveTask, duplicateTask, deleteTask, moveTask, reorderTask,
-    indentTask, outdentTask, startTimer, pauseTimer, resumeTimer, stopTimer, allocate, addManualEntry, correctTimeEntry, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, publicReportText, previewObsidianReport, writeObsidianReport,
+    indentTask, outdentTask, startTimer, pauseTimer, resumeTimer, stopTimer, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, publicReportText, previewObsidianReport, writeObsidianReport,
     beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, resolveUnassignedTime
   };
 });

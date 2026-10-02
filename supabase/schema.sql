@@ -663,9 +663,9 @@ begin
   if session_row.version <> p_expected_version then raise exception 'VERSION_CONFLICT'; end if;
   update public.unassigned_segments set ended_at = now(), duration_seconds = greatest(0, extract(epoch from (now() - started_at))::bigint) where session_id = p_session_id and ended_at is null;
   select coalesce(sum(duration_seconds),0) into elapsed from public.unassigned_segments where session_id = p_session_id;
-  if p_resolution_type = 'break' then
+  if p_resolution_type in ('break','discard') then
     insert into public.time_entries(workspace_id, work_date, kind, source_type, state, label_snapshot, started_at, ended_at, duration_seconds, origin_unassigned_session_id, created_by_device_id, updated_by_device_id)
-    values(p_workspace_id, session_row.work_date, 'break', 'unassigned', 'ended', '休息时间', session_row.first_started_at, now(), elapsed, session_row.id, p_device_id, p_device_id) returning id into entry_id;
+    values(p_workspace_id, session_row.work_date, 'break', 'unassigned', 'ended', case when p_resolution_type = 'break' then '休息时间' else '无效时间' end, session_row.first_started_at, now(), elapsed, session_row.id, p_device_id, p_device_id) returning id into entry_id;
   end if;
   update public.unassigned_sessions set state = case when p_resolution_type = 'discard' then 'discarded' else 'resolved' end, resolution_type = p_resolution_type, generated_entry_id = entry_id, duration_seconds = elapsed, last_ended_at = now(), resolved_at = now(), updated_at = now(), version = version + 1 where id = p_session_id;
   cached := jsonb_build_object('sessionId', p_session_id, 'generatedEntryId', entry_id, 'resolutionType', p_resolution_type, 'elapsedSeconds', elapsed, 'requiredMinutes', case when elapsed > 0 then greatest(1, ceil(elapsed / 60.0)::integer) else 0 end);

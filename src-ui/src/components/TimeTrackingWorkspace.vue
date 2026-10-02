@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, reactive, ref, watch } from "vue";
 import { ElMessage } from "element-plus";
-import { Check, ChevronDown, ChevronRight, CircleDot, Clock3, Coffee, Pause, Play, Plus, Split, Square, Trash2 } from "lucide-vue-next";
+import { Check, ChevronDown, ChevronRight, CircleDot, Clock3, Coffee, Eraser, Pause, Play, Plus, RotateCcw, Split, Square, Trash2 } from "lucide-vue-next";
 import { useWorkdayStore, type TimeEntry } from "../store";
 import TaskSelectControl from "./TaskSelectControl.vue";
 import { playCompletionFeedback } from "../services/completionFeedback";
@@ -62,6 +62,21 @@ watch(() => store.runningEntry?.id, (currentId, previousId) => {
   if (!currentId && previousId) expandedEntryId.value = store.selectedEntryId;
 });
 
+watch(manualOpen, (open) => {
+  if (!open) return;
+  manualTaskId.value = store.selectedTaskId;
+  manualMinutes.value = defaultManualMinutes(manualTaskId.value);
+});
+
+watch(manualTaskId, (taskId) => {
+  if (!manualOpen.value) return;
+  manualMinutes.value = defaultManualMinutes(taskId);
+});
+
+watch(() => store.selectedTaskId, (taskId) => {
+  if (!manualOpen.value) manualTaskId.value = taskId;
+});
+
 function formatClock(seconds: number) {
   const hours = Math.floor(seconds / 3_600);
   const minutes = Math.floor((seconds % 3_600) / 60);
@@ -79,6 +94,11 @@ function formatMinutes(minutes: number) {
 function formatAllocationProgress(entry: TimeEntry) {
   if (entry.kind === "break") return formatMinutes(entryMinutes(entry));
   return `${entry.allocated} / ${entryMinutes(entry)} 分钟`;
+}
+
+function defaultManualMinutes(taskId?: string) {
+  const task = store.tasks.find((item) => item.id === taskId);
+  return task?.todayEstimate ?? task?.estimate ?? 30;
 }
 
 function entryMinutes(entry: TimeEntry) {
@@ -107,7 +127,7 @@ function entryStatusClass(entry: TimeEntry) {
 
 function toggleEntry(entry: TimeEntry) {
   store.selectedEntryId = entry.id;
-  if (entry.state !== "ended" || entry.kind === "break") return;
+  if (entry.state !== "ended") return;
   expandedEntryId.value = expandedEntryId.value === entry.id ? "" : entry.id;
   ensureDraft(entry);
   ensureCorrectionDraft(entry);
@@ -125,7 +145,7 @@ function ensureDraft(entry: TimeEntry) {
     : [{
       id: `${entry.id}-allocation-1`,
       taskId: entry.defaultTask ?? store.selectedTaskId,
-      minutes: entry.allocated || entry.minutes,
+      minutes: entry.allocated,
       completeTask: false,
     }];
   return allocationDrafts[entry.id];
@@ -211,6 +231,25 @@ async function saveAllocation(entry: TimeEntry) {
   }
 }
 
+async function clearAllocation(entry: TimeEntry) {
+  for (const draft of ensureDraft(entry)) draft.minutes = 0;
+  ElMessage.info("已清空草稿用时，点击确认归属后保存");
+}
+
+async function markEntryDisposition(entry: TimeEntry, disposition: "break" | "discard") {
+  allocationSavingId.value = entry.id;
+  try {
+    await store.setTimeEntryDisposition(entry.id, disposition);
+    delete allocationDrafts[entry.id];
+    expandedEntryId.value = "";
+    ElMessage.success(disposition === "break" ? "已标记为休息时间" : "已标记为无效时间");
+  } catch (error) {
+    ElMessage.error(errorText(error, disposition === "break" ? "休息时间保存失败" : "无效时间保存失败"));
+  } finally {
+    allocationSavingId.value = "";
+  }
+}
+
 async function startSelectedTimer() {
   const taskId = timerTaskControl.value?.commit() ?? store.selectedTaskId;
   timerBusy.value = true;
@@ -264,7 +303,7 @@ async function submitManualEntry() {
     const entryId = result.entryId;
     recentManualEntryId.value = entryId;
     manualOpen.value = false;
-    manualMinutes.value = 30;
+    manualMinutes.value = defaultManualMinutes(manualTaskId.value);
     manualNote.value = "";
     manualCompleteTask.value = false;
     ElMessage.success("已补录用时");
@@ -387,13 +426,12 @@ function errorText(error: unknown, fallback: string) {
           <span class="time-entry-title"><strong>{{ store.timeEntryLabel(entry) }}</strong><small>{{ entry.note || '无备注' }}</small></span>
           <span class="time-entry-duration">{{ formatAllocationProgress(entry) }}</span>
           <span class="time-entry-status" :class="entryStatusClass(entry)">{{ entryStatus(entry) }}</span>
-          <ChevronDown v-if="entry.kind !== 'break' && entry.state === 'ended' && expandedEntryId === entry.id" :size="15" />
-          <ChevronRight v-else-if="entry.kind !== 'break' && entry.state === 'ended'" :size="15" />
-          <span v-else-if="entry.kind === 'break'" class="time-entry-chevron-space" aria-hidden="true"></span>
+          <ChevronDown v-if="entry.state === 'ended' && expandedEntryId === entry.id" :size="15" />
+          <ChevronRight v-else-if="entry.state === 'ended'" :size="15" />
           <span v-else class="time-entry-live" aria-hidden="true"></span>
         </button>
 
-        <div v-if="entry.kind !== 'break' && entry.state === 'ended' && expandedEntryId === entry.id" class="inline-allocation-editor">
+        <div v-if="entry.state === 'ended' && expandedEntryId === entry.id" class="inline-allocation-editor">
           <div class="time-correction-row">
             <label><span>开始</span><input v-model="ensureCorrectionDraft(entry).startedAt" type="datetime-local" /></label>
             <label><span>结束</span><input v-model="ensureCorrectionDraft(entry).endedAt" type="datetime-local" /></label>
@@ -421,9 +459,17 @@ function errorText(error: unknown, fallback: string) {
             </label>
             <button class="icon-button subtle" type="button" title="删除此分配" :disabled="ensureDraft(entry).length === 1" @click="removeAllocation(entry, allocation.id)"><Trash2 :size="14" /></button>
           </div>
+          <button class="inline-add-allocation" type="button" @click="addAllocation(entry)"><Plus :size="14" />添加事项</button>
           <div class="inline-allocation-actions">
-            <button class="secondary-button compact" type="button" @click="addAllocation(entry)"><Plus :size="14" />拆分到其他事项</button>
-            <button class="primary-button compact" type="button" :disabled="allocationRemaining(entry) < 0 || allocationSavingId === entry.id" @click="saveAllocation(entry)"><Check :size="14" />确认归属</button>
+            <div class="inline-allocation-secondary-actions">
+              <button class="secondary-button compact" type="button" :disabled="allocationSavingId === entry.id" @click="markEntryDisposition(entry, 'break')"><Coffee :size="14" />休息时间</button>
+              <button class="secondary-button compact discard" type="button" :disabled="allocationSavingId === entry.id" @click="markEntryDisposition(entry, 'discard')"><Trash2 :size="14" />无效时间</button>
+            </div>
+            <div class="inline-allocation-primary-actions">
+              <button class="secondary-button compact" type="button" :disabled="allocationSavingId === entry.id || allocationTotal(entry) <= 0" @click="clearAllocation(entry)"><Eraser :size="14" />清空用时</button>
+              <button class="secondary-button compact" type="button" :disabled="allocationSavingId === entry.id" @click="ensureDraft(entry).forEach((draft) => draft.minutes = draft.taskId === (entry.defaultTask ?? store.selectedTaskId) ? entry.minutes : 0)"><RotateCcw :size="14" />填满用时</button>
+              <button class="primary-button compact" type="button" :disabled="allocationRemaining(entry) < 0 || allocationSavingId === entry.id" @click="saveAllocation(entry)"><Check :size="14" />确认归属</button>
+            </div>
           </div>
         </div>
       </article>

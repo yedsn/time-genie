@@ -430,6 +430,7 @@ pub fn run() {
             time_tracking::time_entry_list,
             time_tracking::time_entry_create_manual,
             time_tracking::time_entry_update,
+            time_tracking::time_entry_update_disposition,
             time_tracking::time_allocation_replace,
             unassigned::unassigned_get_state,
             unassigned::unassigned_resolve_work,

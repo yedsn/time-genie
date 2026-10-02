@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from "vue";
-import { Check, ClockAlert, Coffee, Minus, Plus, Trash2 } from "lucide-vue-next";
+import { Check, ClockAlert, Coffee, Eraser, Minus, Plus, Trash2 } from "lucide-vue-next";
 import { ElMessage } from "element-plus";
 import { useWorkdayStore } from "../store";
 import TaskSelectControl from "./TaskSelectControl.vue";
@@ -103,6 +103,11 @@ function updateAllocationMinutes(index: number, event: Event) {
   );
   nextMinutes.forEach((minutes, currentIndex) => allocations[currentIndex].minutes = minutes);
   input.value = String(nextMinutes[index]);
+}
+
+function clearAllocations() {
+  allocations.forEach((allocation) => allocation.minutes = 0);
+  ElMessage.info("已清空草稿用时，点击分配给事项后保存");
 }
 
 async function assignTime(event?: MouseEvent) {
@@ -237,7 +242,10 @@ function errorText(error: unknown, fallback: string) {
         <button class="secondary-button" type="button" :disabled="saving" @click="markAsBreak"><Coffee :size="14" />休息时间</button>
         <button class="secondary-button discard" type="button" :disabled="saving" @click="discardTime"><Trash2 :size="14" />无效时间</button>
       </div>
-      <button class="primary-button" type="button" :disabled="saving" @click="assignTime($event)"><Check :size="15" />分配给事项</button>
+      <div class="unassigned-primary-actions">
+        <button class="secondary-button" type="button" :disabled="saving || allocatedMinutes <= 0" @click="clearAllocations"><Eraser :size="14" />清空用时</button>
+        <button class="primary-button" type="button" :disabled="saving" @click="assignTime($event)"><Check :size="15" />分配给事项</button>
+      </div>
     </div>
   </el-dialog>
 </template>

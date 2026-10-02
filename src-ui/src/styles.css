@@ -738,8 +738,11 @@ pre {
 .unassigned-allocation-row .task-select-composite { min-width: 0; }
 .unassigned-add-allocation { width: max-content; min-height: 28px; display: inline-flex; align-items: center; gap: 5px; padding: 4px 7px; border-radius: 5px; color: #a8b5ae; background: transparent; font-size: 11px; }
 .unassigned-add-allocation:hover { color: var(--text); background: var(--surface-soft); }
+.inline-add-allocation { width: max-content; min-height: 28px; display: inline-flex; align-items: center; gap: 5px; padding: 4px 7px; border-radius: 5px; color: #a8b5ae; background: transparent; font-size: 11px; }
+.inline-add-allocation:hover { color: var(--text); background: var(--surface-soft); }
 .unassigned-dialog-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line-soft); }
 .unassigned-secondary-actions { display: flex; align-items: center; gap: 7px; }
+.unassigned-primary-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
 .unassigned-secondary-actions .discard { color: #b8c3bd; }
 
 @media (max-width: 800px) {
@@ -2101,6 +2104,9 @@ pre {
 .task-schedule.overdue { color: #e6a05f; }
 .work-task-table .el-table__row.overdue td { background-image: linear-gradient(90deg, rgba(230,160,95,0.045), transparent 45%); }
 .inline-allocation-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 2px; }
+.inline-allocation-secondary-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.inline-allocation-secondary-actions .discard { color: #b8c3bd; }
+.inline-allocation-primary-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 .primary-button:disabled { opacity: 0.42; cursor: default; }
 
 .entry-list { display: grid; gap: 8px; }
@@ -2468,6 +2474,7 @@ pre {
   .unassigned-allocation-row { grid-template-columns: 108px minmax(84px, auto) 28px; }
   .unassigned-dialog-actions { align-items: stretch; flex-direction: column-reverse; }
   .unassigned-dialog-actions button { width: 100%; }
+  .unassigned-primary-actions { width: 100%; }
   .unassigned-secondary-actions { width: 100%; }
   .unassigned-secondary-actions button { flex: 1; }
 }
