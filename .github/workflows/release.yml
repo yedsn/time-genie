@@ -150,11 +150,55 @@ jobs:
           updaterJsonPreferNsis: true
           args: ${{ matrix.args }}
 
+  publish-updater-json:
+    name: Publish updater latest.json
+    runs-on: ubuntu-latest
+    needs: publish
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Generate and upload latest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/release/publish_updater_json.py \
+            --tag "${{ github.ref_name }}" \
+            --github-owner yedsn \
+            --github-repo time-genie
+
+      - name: Verify latest.json asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.request
+
+          tag = "${{ github.ref_name }}"
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/yedsn/time-genie/releases/tags/{tag}",
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                  "User-Agent": "time-genie-release-verify",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(req, timeout=60) as response:
+              release = json.load(response)
+          if not any(asset.get("name") == "latest.json" for asset in release.get("assets", [])):
+              print("latest.json was not found on the GitHub Release", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
   sync-gitee:
     name: Sync release to Gitee
     if: ${{ vars.ENABLE_GITEE_SYNC == 'true' }}
     runs-on: [self-hosted, linux, x64, gitee-sync]
-    needs: publish
+    needs: publish-updater-json
     env:
       PYTHONUNBUFFERED: "1"
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
