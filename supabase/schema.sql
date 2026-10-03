@@ -138,6 +138,53 @@ create table if not exists timegenie.task_status_events (
   created_at timestamptz not null default now()
 );
 
+create table if not exists timegenie.task_daily_estimates (
+  workspace_id uuid not null references timegenie.workspaces(id) on delete cascade,
+  task_id uuid not null references timegenie.tasks(id) on delete cascade,
+  work_date date not null,
+  estimate_minutes integer not null check (estimate_minutes > 0),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  version bigint not null default 1,
+  primary key(task_id, work_date)
+);
+create index if not exists idx_task_daily_estimates_date on timegenie.task_daily_estimates(workspace_id, work_date, task_id);
+
+create table if not exists timegenie.task_recurrence_rules (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references timegenie.workspaces(id) on delete cascade,
+  task_id uuid not null references timegenie.tasks(id) on delete cascade,
+  frequency text not null check (frequency in ('daily', 'weekdays', 'weekly')),
+  weekdays_mask integer check (weekdays_mask is null or weekdays_mask between 1 and 127),
+  effective_start date not null,
+  effective_end date,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  version bigint not null default 1,
+  check (frequency = 'weekly' or weekdays_mask is null),
+  check (frequency <> 'weekly' or weekdays_mask is not null),
+  check (effective_end is null or effective_end >= effective_start),
+  unique(task_id, effective_start)
+);
+create unique index if not exists uq_task_recurrence_rules_open on timegenie.task_recurrence_rules(task_id) where effective_end is null;
+create index if not exists idx_task_recurrence_rules_workspace_dates on timegenie.task_recurrence_rules(workspace_id, effective_start, effective_end, task_id);
+create index if not exists idx_task_recurrence_rules_task_dates on timegenie.task_recurrence_rules(task_id, effective_start, effective_end);
+
+create table if not exists timegenie.task_occurrences (
+  workspace_id uuid not null references timegenie.workspaces(id) on delete cascade,
+  task_id uuid not null references timegenie.tasks(id) on delete cascade,
+  occurrence_date date not null,
+  origin text not null check (origin in ('scheduled', 'manual')),
+  status text not null default 'open' check (status in ('open', 'done')),
+  completed_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  version bigint not null default 1,
+  primary key(task_id, occurrence_date),
+  check ((status = 'done' and completed_at is not null) or status = 'open')
+);
+create index if not exists idx_task_occurrences_workspace_date on timegenie.task_occurrences(workspace_id, occurrence_date, status, task_id);
+
 create table if not exists timegenie.time_entries (
   id uuid primary key default gen_random_uuid(),
   workspace_id uuid not null references timegenie.workspaces(id) on delete cascade,
@@ -316,6 +363,9 @@ alter table timegenie.work_days enable row level security;
 alter table timegenie.app_settings enable row level security;
 alter table timegenie.tasks enable row level security;
 alter table timegenie.task_status_events enable row level security;
+alter table timegenie.task_daily_estimates enable row level security;
+alter table timegenie.task_recurrence_rules enable row level security;
+alter table timegenie.task_occurrences enable row level security;
 alter table timegenie.time_entries enable row level security;
 alter table timegenie.time_segments enable row level security;
 alter table timegenie.time_allocations enable row level security;
@@ -333,7 +383,7 @@ create policy workspaces_owner on timegenie.workspaces for all using(owner_user_
 do $$
 declare table_name text;
 begin
-  foreach table_name in array array['devices','tracking_leases','workspace_changes','processed_operations','subjects','work_days','app_settings','tasks','task_status_events','time_entries','time_segments','time_allocations','unassigned_sessions','unassigned_segments','report_templates','reports','report_tasks','integration_configs','external_bindings'] loop
+  foreach table_name in array array['devices','tracking_leases','workspace_changes','processed_operations','subjects','work_days','app_settings','tasks','task_status_events','task_daily_estimates','task_recurrence_rules','task_occurrences','time_entries','time_segments','time_allocations','unassigned_sessions','unassigned_segments','report_templates','reports','report_tasks','integration_configs','external_bindings'] loop
     execute format('drop policy if exists workspace_owner on timegenie.%I', table_name);
     execute format(
       'create policy workspace_owner on timegenie.%I for all using(
@@ -376,9 +426,18 @@ end $$;
 create or replace function timegenie.touch_workspace_change()
 returns trigger language plpgsql security definer set search_path = timegenie, extensions, pg_catalog
 as $$
+declare row_image jsonb;
 begin
+  row_image := to_jsonb(coalesce(new, old));
   insert into timegenie.workspace_changes(workspace_id, entity_type, entity_id, operation, entity_version, changed_at)
-  values (coalesce(new.workspace_id, old.workspace_id), tg_table_name, coalesce(new.id, old.id), lower(tg_op), coalesce(new.version, old.version), now());
+  values (
+    (row_image->>'workspace_id')::uuid,
+    tg_table_name,
+    coalesce(nullif(row_image->>'id', '')::uuid, nullif(row_image->>'task_id', '')::uuid),
+    lower(tg_op),
+    coalesce((row_image->>'version')::bigint, 1),
+    now()
+  );
   return coalesce(new, old);
 end $$;
 
@@ -445,7 +504,7 @@ end $$;
 do $$
 declare table_name text;
 begin
-  foreach table_name in array array['subjects','tasks','time_entries','time_allocations','unassigned_sessions','report_templates','reports'] loop
+  foreach table_name in array array['subjects','tasks','task_daily_estimates','task_recurrence_rules','task_occurrences','time_entries','time_allocations','unassigned_sessions','report_templates','reports'] loop
     execute format('drop trigger if exists workspace_change_trigger on timegenie.%I', table_name);
     execute format('create trigger workspace_change_trigger after insert or update or delete on timegenie.%I for each row execute function timegenie.touch_workspace_change()', table_name);
   end loop;
@@ -835,6 +894,9 @@ begin
     'external_bindings', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.external_bindings where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
     'tasks', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.tasks where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
     'task_status_events', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.task_status_events where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
+    'task_daily_estimates', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.task_daily_estimates where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
+    'task_recurrence_rules', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.task_recurrence_rules where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
+    'task_occurrences', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.task_occurrences where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
     'time_entries', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.time_entries where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
     'time_segments', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.time_segments where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
     'time_allocations', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.time_allocations where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
@@ -865,6 +927,9 @@ begin
     raise exception 'DEVICE_NOT_REGISTERED';
   end if;
   if exists(select 1 from timegenie.tasks where workspace_id = p_workspace_id)
+     or exists(select 1 from timegenie.task_daily_estimates where workspace_id = p_workspace_id)
+     or exists(select 1 from timegenie.task_recurrence_rules where workspace_id = p_workspace_id)
+     or exists(select 1 from timegenie.task_occurrences where workspace_id = p_workspace_id)
      or exists(select 1 from timegenie.time_entries where workspace_id = p_workspace_id)
      or exists(select 1 from timegenie.reports where workspace_id = p_workspace_id) then
     raise exception 'MIGRATION_TARGET_NOT_EMPTY';
@@ -913,6 +978,21 @@ begin
     insert into timegenie.task_status_events(id, workspace_id, task_id, status, occurred_at, source_type, created_at)
     values((row_data->>'id')::uuid, p_workspace_id, (row_data->>'task_id')::uuid, row_data->>'status', to_timestamp((row_data->>'occurred_at')::double precision / 1000), row_data->>'source_type', to_timestamp((row_data->>'created_at')::double precision / 1000))
     on conflict(id) do nothing;
+  end loop;
+  for row_data in select value from jsonb_array_elements(coalesce(p_snapshot->'task_daily_estimates', '[]'::jsonb)) loop
+    insert into timegenie.task_daily_estimates(workspace_id, task_id, work_date, estimate_minutes, created_at, updated_at, version)
+    values(p_workspace_id, (row_data->>'task_id')::uuid, (row_data->>'work_date')::date, (row_data->>'estimate_minutes')::integer, to_timestamp((row_data->>'created_at')::double precision / 1000), to_timestamp((row_data->>'updated_at')::double precision / 1000), coalesce((row_data->>'version')::bigint,1))
+    on conflict(task_id, work_date) do update set estimate_minutes = excluded.estimate_minutes, updated_at = excluded.updated_at, version = greatest(timegenie.task_daily_estimates.version, excluded.version);
+  end loop;
+  for row_data in select value from jsonb_array_elements(coalesce(p_snapshot->'task_recurrence_rules', '[]'::jsonb)) loop
+    insert into timegenie.task_recurrence_rules(id, workspace_id, task_id, frequency, weekdays_mask, effective_start, effective_end, created_at, updated_at, version)
+    values((row_data->>'id')::uuid, p_workspace_id, (row_data->>'task_id')::uuid, row_data->>'frequency', nullif(row_data->>'weekdays_mask','')::integer, (row_data->>'effective_start')::date, nullif(row_data->>'effective_end','')::date, to_timestamp((row_data->>'created_at')::double precision / 1000), to_timestamp((row_data->>'updated_at')::double precision / 1000), coalesce((row_data->>'version')::bigint,1))
+    on conflict(id) do update set frequency = excluded.frequency, weekdays_mask = excluded.weekdays_mask, effective_start = excluded.effective_start, effective_end = excluded.effective_end, updated_at = excluded.updated_at, version = greatest(timegenie.task_recurrence_rules.version, excluded.version);
+  end loop;
+  for row_data in select value from jsonb_array_elements(coalesce(p_snapshot->'task_occurrences', '[]'::jsonb)) loop
+    insert into timegenie.task_occurrences(workspace_id, task_id, occurrence_date, origin, status, completed_at, created_at, updated_at, version)
+    values(p_workspace_id, (row_data->>'task_id')::uuid, (row_data->>'occurrence_date')::date, row_data->>'origin', row_data->>'status', case when row_data->>'completed_at' is null then null else to_timestamp((row_data->>'completed_at')::double precision / 1000) end, to_timestamp((row_data->>'created_at')::double precision / 1000), to_timestamp((row_data->>'updated_at')::double precision / 1000), coalesce((row_data->>'version')::bigint,1))
+    on conflict(task_id, occurrence_date) do update set origin = excluded.origin, status = excluded.status, completed_at = excluded.completed_at, updated_at = excluded.updated_at, version = greatest(timegenie.task_occurrences.version, excluded.version);
   end loop;
   for row_data in select value from jsonb_array_elements(coalesce(p_snapshot->'time_entries', '[]'::jsonb)) loop
     insert into timegenie.time_entries(id, workspace_id, work_date, kind, source_type, state, default_task_id, label_snapshot, started_at, ended_at, duration_seconds, note, origin_unassigned_session_id, created_at, updated_at, version, created_by_device_id, updated_by_device_id, deleted_at)

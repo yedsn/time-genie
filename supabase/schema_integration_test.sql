@@ -262,6 +262,32 @@ select timegenie.migration_import_snapshot(
         'version', 1
       )
     ),
+    'task_daily_estimates', jsonb_build_array(jsonb_build_object(
+      'task_id', '60000000-0000-0000-0000-000000000002',
+      'work_date', '2026-09-24',
+      'estimate_minutes', 45,
+      'created_at', 1789689600000,
+      'updated_at', 1789689600000,
+      'version', 1
+    )),
+    'task_recurrence_rules', jsonb_build_array(jsonb_build_object(
+      'id', '90000000-0000-0000-0000-000000000001',
+      'task_id', '60000000-0000-0000-0000-000000000002',
+      'frequency', 'daily',
+      'effective_start', '2026-09-24',
+      'created_at', 1789689600000,
+      'updated_at', 1789689600000,
+      'version', 1
+    )),
+    'task_occurrences', jsonb_build_array(jsonb_build_object(
+      'task_id', '60000000-0000-0000-0000-000000000002',
+      'occurrence_date', '2026-09-24',
+      'origin', 'scheduled',
+      'status', 'open',
+      'created_at', 1789689600000,
+      'updated_at', 1789689600000,
+      'version', 1
+    )),
     'time_entries', jsonb_build_array(jsonb_build_object(
       'id', '70000000-0000-0000-0000-000000000001',
       'work_date', '2026-09-24',
@@ -340,6 +366,35 @@ begin
     where entry->>'id' = '70000000-0000-0000-0000-000000000001'
   ) then
     raise exception 'migration did not import the time entry';
+  end if;
+  if jsonb_array_length(snapshot->'task_daily_estimates') <> 1
+     or jsonb_array_length(snapshot->'task_recurrence_rules') <> 1
+     or jsonb_array_length(snapshot->'task_occurrences') <> 1 then
+    raise exception 'migration did not preserve recurring task data';
+  end if;
+  if not exists(
+    select 1
+    from jsonb_array_elements(snapshot->'task_daily_estimates') estimate
+    where estimate->>'task_id' = '60000000-0000-0000-0000-000000000002'
+      and (estimate->>'estimate_minutes')::integer = 45
+  ) then
+    raise exception 'migration did not import the daily estimate';
+  end if;
+  if not exists(
+    select 1
+    from jsonb_array_elements(snapshot->'task_recurrence_rules') rule
+    where rule->>'id' = '90000000-0000-0000-0000-000000000001'
+      and rule->>'frequency' = 'daily'
+  ) then
+    raise exception 'migration did not import the recurrence rule';
+  end if;
+  if not exists(
+    select 1
+    from jsonb_array_elements(snapshot->'task_occurrences') occurrence
+    where occurrence->>'task_id' = '60000000-0000-0000-0000-000000000002'
+      and occurrence->>'occurrence_date' = '2026-09-24'
+  ) then
+    raise exception 'migration did not import the task occurrence';
   end if;
   if not exists(
     select 1

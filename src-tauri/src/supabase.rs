@@ -626,25 +626,6 @@ pub fn migration_preview(
                 .map_err(|error| error.to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let has_unsupported_recurring_data = request.direction == "local_to_cloud"
-        && local_counts.iter().any(|count| {
-            matches!(
-                count.entity.as_str(),
-                "task_daily_estimates" | "task_recurrence_rules" | "task_occurrences"
-            ) && count.local_count > 0
-        });
-    if has_unsupported_recurring_data {
-        return Ok(MigrationPreview {
-            direction: request.direction,
-            source_workspace_id,
-            target_workspace_id: None,
-            entities: local_counts,
-            conflicts: vec![
-                "本地存在按日预估、重复规则或按日轮次，云端模式暂不支持，无法迁移".to_string(),
-            ],
-            can_execute: false,
-        });
-    }
     let workspace = workspace_bootstrap(database)?;
     let session = current_session(database)?;
     let snapshot = client(database)?.rpc(
@@ -658,6 +639,9 @@ pub fn migration_preview(
         "time_entries",
         "time_allocations",
         "reports",
+        "task_daily_estimates",
+        "task_recurrence_rules",
+        "task_occurrences",
     ]
     .into_iter()
     .map(|entity| {
@@ -1167,6 +1151,9 @@ fn local_snapshot(database: &Database, workspace_id: &str) -> Result<Value, Stri
         ("subjects", "SELECT * FROM subjects WHERE workspace_id = ?1"),
         ("tasks", "SELECT * FROM tasks WHERE workspace_id = ?1 ORDER BY parent_id IS NOT NULL, created_at"),
         ("task_status_events", "SELECT * FROM task_status_events WHERE workspace_id = ?1"),
+        ("task_daily_estimates", "SELECT * FROM task_daily_estimates WHERE workspace_id = ?1"),
+        ("task_recurrence_rules", "SELECT * FROM task_recurrence_rules WHERE workspace_id = ?1"),
+        ("task_occurrences", "SELECT * FROM task_occurrences WHERE workspace_id = ?1"),
         ("work_days", "SELECT * FROM work_days WHERE workspace_id = ?1"),
         ("time_entries", "SELECT * FROM time_entries WHERE workspace_id = ?1"),
         ("time_segments", "SELECT * FROM time_segments WHERE workspace_id = ?1"),
@@ -1609,11 +1596,14 @@ mod tests {
     }
 
     #[test]
-    fn local_recurring_data_blocks_cloud_migration_before_network_access() {
+    fn local_snapshot_includes_recurring_and_daily_estimate_data() {
         let directory = tempdir().unwrap();
         let database =
             Database::initialize_at(directory.path().join("recurring-migration.sqlite3")).unwrap();
         let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
         let subject_id: String = connection
             .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
             .unwrap();
@@ -1632,10 +1622,20 @@ mod tests {
             },
         )
         .unwrap();
+        let task_id = task.id.clone();
+        set_task_daily_estimate(
+            &database,
+            TaskDailyEstimateSetRequest {
+                task_id: task_id.clone(),
+                work_date: "2026-09-29".to_string(),
+                estimate_minutes: Some(60),
+            },
+        )
+        .unwrap();
         save_rule(
             &database,
             RecurrenceSaveRequest {
-                task_id: task.id,
+                task_id: task_id.clone(),
                 task_expected_version: task.version,
                 frequency: "daily".to_string(),
                 weekdays_mask: None,
@@ -1644,70 +1644,31 @@ mod tests {
             },
         )
         .unwrap();
-        let preview = migration_preview(
-            &database,
-            MigrationPreviewRequest {
-                direction: "local_to_cloud".to_string(),
-            },
-        )
-        .unwrap();
-        assert!(!preview.can_execute);
-        assert!(preview.target_workspace_id.is_none());
-        assert!(preview
-            .conflicts
-            .iter()
-            .any(|message| message.contains("重复规则")));
-    }
-
-    #[test]
-    fn local_daily_estimates_block_cloud_migration_before_network_access() {
-        let directory = tempdir().unwrap();
-        let database =
-            Database::initialize_at(directory.path().join("daily-estimate-migration.sqlite3"))
-                .unwrap();
         let connection = database.open().unwrap();
-        let subject_id: String = connection
-            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+        let now = now_seconds() * 1000;
+        connection
+            .execute(
+                "INSERT INTO task_occurrences(workspace_id,task_id,occurrence_date,origin,status,created_at,updated_at,version)
+                 VALUES (?1,?2,'2026-09-29','scheduled','open',?3,?3,1)",
+                params![workspace_id, task_id, now],
+            )
             .unwrap();
         drop(connection);
-        let task = create_task(
-            &database,
-            TaskCreateRequest {
-                subject_id,
-                parent_id: None,
-                title: "不支持迁移的按日预估".to_string(),
-                planned_date: None,
-                estimate_minutes: None,
-                note: None,
-                project_name: None,
-                solution_name: None,
-            },
-        )
-        .unwrap();
-        set_task_daily_estimate(
-            &database,
-            TaskDailyEstimateSetRequest {
-                task_id: task.id,
-                work_date: "2026-09-29".to_string(),
-                estimate_minutes: Some(60),
-            },
-        )
-        .unwrap();
 
-        let preview = migration_preview(
-            &database,
-            MigrationPreviewRequest {
-                direction: "local_to_cloud".to_string(),
-            },
-        )
-        .unwrap();
-
-        assert!(!preview.can_execute);
-        assert!(preview.target_workspace_id.is_none());
-        assert!(preview
-            .conflicts
-            .iter()
-            .any(|message| message.contains("按日预估")));
+        let snapshot = local_snapshot(&database, &workspace_id).unwrap();
+        assert_eq!(
+            snapshot["task_daily_estimates"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            snapshot["task_recurrence_rules"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(snapshot["task_occurrences"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            snapshot["task_daily_estimates"][0]["estimate_minutes"],
+            json!(60)
+        );
     }
 
     #[test]

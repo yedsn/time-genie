@@ -1426,6 +1426,24 @@ fn apply_snapshot(
         "task_status_events",
         &local_workspace_id,
     )?;
+    replace_snapshot_table(
+        &transaction,
+        snapshot,
+        "task_daily_estimates",
+        &local_workspace_id,
+    )?;
+    replace_snapshot_table(
+        &transaction,
+        snapshot,
+        "task_recurrence_rules",
+        &local_workspace_id,
+    )?;
+    replace_snapshot_table(
+        &transaction,
+        snapshot,
+        "task_occurrences",
+        &local_workspace_id,
+    )?;
     replace_snapshot_table(&transaction, snapshot, "work_days", &local_workspace_id)?;
     replace_snapshot_table(&transaction, snapshot, "time_entries", &local_workspace_id)?;
     replace_snapshot_table(&transaction, snapshot, "time_segments", &local_workspace_id)?;
@@ -1522,6 +1540,21 @@ fn replace_snapshot_table(
         "task_status_events" => {
             replace_simple_rows(transaction, table, workspace_id, rows, |tx, row, ws| {
                 tx.execute("INSERT INTO task_status_events(id,workspace_id,task_id,status,occurred_at,source_type,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![text(row,"id"),ws,text(row,"task_id"),text(row,"status"),millis(row,"occurred_at"),text(row,"source_type"),millis(row,"created_at")])
+            })?
+        }
+        "task_daily_estimates" => {
+            replace_simple_rows(transaction, table, workspace_id, rows, |tx, row, ws| {
+                tx.execute("INSERT INTO task_daily_estimates(workspace_id,task_id,work_date,estimate_minutes,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![ws,text(row,"task_id"),text(row,"work_date"),integer(row,"estimate_minutes"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version")])
+            })?
+        }
+        "task_recurrence_rules" => {
+            replace_simple_rows(transaction, table, workspace_id, rows, |tx, row, ws| {
+                tx.execute("INSERT INTO task_recurrence_rules(id,workspace_id,task_id,frequency,weekdays_mask,effective_start,effective_end,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![text(row,"id"),ws,text(row,"task_id"),text(row,"frequency"),optional_integer(row,"weekdays_mask"),text(row,"effective_start"),optional_text(row,"effective_end"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version")])
+            })?
+        }
+        "task_occurrences" => {
+            replace_simple_rows(transaction, table, workspace_id, rows, |tx, row, ws| {
+                tx.execute("INSERT INTO task_occurrences(workspace_id,task_id,occurrence_date,origin,status,completed_at,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![ws,text(row,"task_id"),text(row,"occurrence_date"),text(row,"origin"),text(row,"status"),optional_millis(row,"completed_at"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version")])
             })?
         }
         "work_days" => {
@@ -1639,6 +1672,8 @@ fn clear_snapshot_cache(transaction: &Transaction<'_>, workspace_id: &str) -> Re
         "external_bindings",
         "integration_configs",
         "report_tasks",
+        "task_occurrences",
+        "task_recurrence_rules",
         "task_daily_estimates",
         "time_allocations",
         "time_segments",
@@ -2292,6 +2327,58 @@ mod tests {
             )
             .unwrap();
         assert_eq!(saved, ("云端主体".to_string(), 7, 42));
+    }
+
+    #[test]
+    fn snapshot_import_restores_daily_estimates_and_recurring_data() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("cloud-snapshot-recurring.sqlite3"))
+                .unwrap();
+        let connection = database.open().unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+
+        let task_id = Uuid::now_v7().to_string();
+        let rule_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        let snapshot = json!({
+            "subjects": [{"id": subject_id, "name": "默认", "sort_order": 10, "created_at": now, "updated_at": now, "version": 1, "deleted_at": null}],
+            "tasks": [{"id": task_id, "subject_id": subject_id, "parent_id": null, "title": "每日复盘", "status": "open", "source_type": "manual", "sort_order": 10, "created_at": now, "updated_at": now, "version": 1}],
+            "task_daily_estimates": [{"task_id": task_id, "work_date": "2026-09-29", "estimate_minutes": 40, "created_at": now, "updated_at": now, "version": 2}],
+            "task_recurrence_rules": [{"id": rule_id, "task_id": task_id, "frequency": "daily", "weekdays_mask": null, "effective_start": "2026-09-29", "effective_end": null, "created_at": now, "updated_at": now, "version": 3}],
+            "task_occurrences": [{"task_id": task_id, "occurrence_date": "2026-09-29", "origin": "scheduled", "status": "open", "completed_at": null, "created_at": now, "updated_at": now, "version": 4}]
+        });
+
+        apply_snapshot(&database, &snapshot, None, None, None).unwrap();
+
+        let connection = database.open().unwrap();
+        let daily_estimate: i64 = connection
+            .query_row(
+                "SELECT estimate_minutes FROM task_daily_estimates WHERE task_id = ?1 AND work_date = '2026-09-29'",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let frequency: String = connection
+            .query_row(
+                "SELECT frequency FROM task_recurrence_rules WHERE id = ?1",
+                [&rule_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let occurrence_status: String = connection
+            .query_row(
+                "SELECT status FROM task_occurrences WHERE task_id = ?1 AND occurrence_date = '2026-09-29'",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(daily_estimate, 40);
+        assert_eq!(frequency, "daily");
+        assert_eq!(occurrence_status, "open");
     }
 
     #[test]
