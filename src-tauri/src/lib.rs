@@ -848,13 +848,21 @@ fn run_tray_timer_action(
         refresh_tray_timer_menu(&database, &menu);
         match result {
             Ok(timer) => {
+                if matches!(action, TrayTimerAction::Stop) {
+                    show(&app, "main");
+                }
+                let timer_stopped_entry_id = matches!(action, TrayTimerAction::Stop)
+                    .then(|| timer.get("id").and_then(serde_json::Value::as_str))
+                    .flatten()
+                    .map(str::to_string);
                 let _ = app.emit("timer-state-changed", timer);
                 let _ = app.emit(
                     "work-data-changed",
                     serde_json::json!({
                         "revision": 0,
                         "domains": ["tasks", "time", "unassigned"],
-                        "source": "tray"
+                        "source": "tray",
+                        "timerStoppedEntryId": timer_stopped_entry_id
                     }),
                 );
             }
@@ -872,13 +880,21 @@ fn run_native_tray_timer_action(app: &AppHandle, action: TrayTimerAction) {
     tauri::async_runtime::spawn_blocking(move || {
         match execute_tray_timer_action(&database, action) {
             Ok(timer) => {
+                if matches!(action, TrayTimerAction::Stop) {
+                    show(&app, "main");
+                }
+                let timer_stopped_entry_id = matches!(action, TrayTimerAction::Stop)
+                    .then(|| timer.get("id").and_then(serde_json::Value::as_str))
+                    .flatten()
+                    .map(str::to_string);
                 let _ = app.emit("timer-state-changed", timer);
                 let _ = app.emit(
                     "work-data-changed",
                     serde_json::json!({
                         "revision": 0,
                         "domains": ["tasks", "time", "unassigned"],
-                        "source": "native-tray"
+                        "source": "native-tray",
+                        "timerStoppedEntryId": timer_stopped_entry_id
                     }),
                 );
             }
@@ -945,7 +961,7 @@ fn execute_local_tray_timer_action(
                 time_tracking::TimerStopRequest {
                     entry_id: entry.id,
                     expected_version: entry.version,
-                    create_default_allocation: true,
+                    create_default_allocation: false,
                 },
             )?
         }
@@ -1394,6 +1410,7 @@ mod tests {
 
         let stopped = execute_tray_timer_action(&database, TrayTimerAction::Stop).unwrap();
         assert_eq!(stopped["state"], "ended");
+        assert_eq!(stopped["allocatedMinutes"], 0);
         assert!(time_tracking::get_timer_state(&database).unwrap().is_none());
     }
 }

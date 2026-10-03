@@ -1,3 +1,4 @@
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -16,6 +17,7 @@ const REALTIME_HEARTBEAT_SECONDS: u64 = 25;
 const REALTIME_RECONNECT_SECONDS: u64 = 5;
 const OUTBOX_SENDING_STALE_AFTER_MILLIS: i64 = 5 * 60 * 1000;
 const OUTBOX_RETRY_MAX_BACKOFF_MILLIS: i64 = 60 * 1000;
+static TRACKING_LEASE_TOKEN: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 pub fn spawn_background_services(database: Database, app: AppHandle) {
     spawn_background_lease(database.clone(), app.clone());
@@ -24,15 +26,14 @@ pub fn spawn_background_services(database: Database, app: AppHandle) {
 
 fn spawn_background_lease(database: Database, app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let mut lease_token: Option<String> = None;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             let Ok(state) = storage_mode(&database) else {
-                lease_token = None;
+                clear_tracking_lease_token();
                 continue;
             };
             if state.mode != "cloud" || !state.online {
-                lease_token = None;
+                clear_tracking_lease_token();
                 continue;
             }
             if let Ok(push) = push_outbox(&database) {
@@ -55,32 +56,65 @@ fn spawn_background_lease(database: Database, app: AppHandle) {
                     }
                 }
             }
-            let result = if let Some(token) = lease_token.clone() {
-                renew_lease(
-                    &database,
-                    TrackingLeaseRequest {
-                        lease_token: Some(token),
-                    },
-                )
-            } else {
-                acquire_lease(&database)
-            };
-            match result {
-                Ok(value) => {
-                    lease_token = value
-                        .get("leaseToken")
-                        .or_else(|| value.get("lease_token"))
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
-                        .or(lease_token);
-                    if value.get("acquired").and_then(Value::as_bool) == Some(false) {
-                        lease_token = None;
-                    }
-                }
-                Err(_) => lease_token = None,
-            }
+            let _ = acquire_or_renew_tracking_lease(&database);
         }
     });
+}
+
+fn acquire_or_renew_tracking_lease(database: &Database) -> Result<Value, String> {
+    let token = current_tracking_lease_token();
+    let result = if let Some(token) = token {
+        match renew_lease(
+            database,
+            TrackingLeaseRequest {
+                lease_token: Some(token),
+            },
+        ) {
+            Ok(value) => Ok(value),
+            Err(_) => {
+                clear_tracking_lease_token();
+                acquire_lease(database)
+            }
+        }
+    } else {
+        acquire_lease(database)
+    };
+    match &result {
+        Ok(value) => update_tracking_lease_token(value),
+        Err(_) => clear_tracking_lease_token(),
+    }
+    result
+}
+
+fn current_tracking_lease_token() -> Option<String> {
+    TRACKING_LEASE_TOKEN
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|token| token.clone())
+}
+
+fn update_tracking_lease_token(value: &Value) {
+    let next_token = value
+        .get("leaseToken")
+        .or_else(|| value.get("lease_token"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    if value.get("acquired").and_then(Value::as_bool) == Some(false) {
+        clear_tracking_lease_token();
+        return;
+    }
+    if let Some(next_token) = next_token {
+        if let Ok(mut token) = TRACKING_LEASE_TOKEN.get_or_init(|| Mutex::new(None)).lock() {
+            *token = Some(next_token);
+        }
+    }
+}
+
+fn clear_tracking_lease_token() {
+    if let Ok(mut token) = TRACKING_LEASE_TOKEN.get_or_init(|| Mutex::new(None)).lock() {
+        *token = None;
+    }
 }
 
 fn spawn_realtime_listener(database: Database, app: AppHandle) {
@@ -487,7 +521,6 @@ pub fn enqueue_entity(
     Ok(())
 }
 
-#[cfg(test)]
 pub fn enqueue_entity_deferred(
     database: &Database,
     operation_type: &str,
@@ -566,12 +599,28 @@ pub(crate) fn enqueue_entity_in_transaction(
 pub fn flush_if_online(database: &Database) -> Result<(), String> {
     let state = storage_mode(database)?;
     if state.mode == "cloud" && state.online {
-        let result = push_outbox(database)?;
-        if result.conflicts > 0 {
-            return Err("SYNC_CONFLICT: 云端数据已变化，本地修改已保留在冲突队列".to_string());
+        match push_outbox(database) {
+            Ok(result) if result.conflicts > 0 => {
+                return Err("SYNC_CONFLICT: 云端数据已变化，本地修改已保留在冲突队列".to_string());
+            }
+            Ok(_) => {}
+            Err(error) if is_cloud_unavailable_error(&error) => {
+                update_sync_state(
+                    database,
+                    &state.workspace_id,
+                    &state.device_id,
+                    state.last_change_seq,
+                    Some(&error),
+                )?;
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok(())
+}
+
+fn is_cloud_unavailable_error(error: &str) -> bool {
+    error.starts_with("NETWORK_ERROR:") || error.starts_with("AUTH_REQUIRED:")
 }
 
 pub fn push_outbox(database: &Database) -> Result<CloudSyncPushResult, String> {
@@ -935,14 +984,17 @@ pub fn timer_get_state(database: &Database) -> Result<Option<Value>, String> {
         )?
         .json()
         .map_err(|error| format!("NETWORK_ERROR: 读取云端计时状态失败: {error}"))?;
-    Ok(rows.into_iter().next())
+    rows.into_iter()
+        .next()
+        .map(|entry| hydrate_cloud_timer_duration(&api, &session, entry))
+        .transpose()
 }
 
 pub fn time_entry_list(database: &Database, work_date: &str) -> Result<Vec<Value>, String> {
     let state = require_cloud(database)?;
     let session = current_session(database)?;
     let api = client(database)?;
-    api.request(
+    let rows: Vec<Value> = api.request(
         api.get(format!(
             "{}/rest/v1/time_entries?workspace_id=eq.{}&work_date=eq.{}&deleted_at=is.null&select=*&order=started_at.desc",
             api.project_url, state.workspace_id, work_date
@@ -950,7 +1002,46 @@ pub fn time_entry_list(database: &Database, work_date: &str) -> Result<Vec<Value
         &session,
     )?
     .json()
-    .map_err(|error| format!("NETWORK_ERROR: 读取云端时间记录失败: {error}"))
+    .map_err(|error| format!("NETWORK_ERROR: 读取云端时间记录失败: {error}"))?;
+    rows.into_iter()
+        .map(|entry| hydrate_cloud_timer_duration(&api, &session, entry))
+        .collect()
+}
+
+fn hydrate_cloud_timer_duration(
+    api: &crate::supabase::SupabaseClient,
+    session: &crate::supabase::CloudSession,
+    mut entry: Value,
+) -> Result<Value, String> {
+    if entry.get("state").and_then(Value::as_str) != Some("running") {
+        return Ok(entry);
+    }
+    let Some(entry_id) = entry.get("id").and_then(Value::as_str) else {
+        return Ok(entry);
+    };
+    let rows: Vec<Value> = api
+        .request(
+            api.get(format!(
+                "{}/rest/v1/time_segments?entry_id=eq.{}&ended_at=is.null&select=started_at&limit=1",
+                api.project_url, entry_id
+            )),
+            session,
+        )?
+        .json()
+        .map_err(|error| format!("NETWORK_ERROR: 读取云端计时片段失败: {error}"))?;
+    let Some(started_at) = rows
+        .first()
+        .and_then(|row| optional_millis(row, "started_at"))
+    else {
+        return Ok(entry);
+    };
+    let stored_seconds = entry
+        .get("duration_seconds")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    entry["duration_seconds"] =
+        json!(stored_seconds + ((now_millis() - started_at).max(0) / 1_000));
+    Ok(entry)
 }
 
 pub fn timer_action(
@@ -989,6 +1080,7 @@ pub fn timer_action(
 }
 
 pub fn unassigned_get_state(database: &Database) -> Result<Option<Value>, String> {
+    let _ = acquire_or_renew_tracking_lease(database);
     let state = require_cloud(database)?;
     let session = current_session(database)?;
     client(database)?
@@ -1035,7 +1127,6 @@ fn require_cloud(database: &Database) -> Result<crate::supabase::StorageModeSnap
     Ok(state)
 }
 
-#[cfg(test)]
 fn entity_payload(
     database: &Database,
     entity_type: &str,

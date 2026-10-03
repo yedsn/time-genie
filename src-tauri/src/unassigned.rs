@@ -824,8 +824,18 @@ pub fn unassigned_resolve_work(
     database: tauri::State<'_, Database>,
     request: ResolveWorkRequest,
 ) -> Result<UnassignedResolveResult, String> {
-    crate::supabase::ensure_local_mode(&database)?;
-    resolve_work_with_hooks(&database, request)
+    let expected_version = request.expected_version;
+    let operation_id = request.operation_id.clone();
+    let result = resolve_work_with_hooks(&database, request)?;
+    enqueue_unassigned_resolution_if_cloud(
+        &database,
+        &result,
+        expected_version,
+        "unassigned_resolve_work",
+        Some(&operation_id),
+    )?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -833,8 +843,18 @@ pub fn unassigned_resolve_break(
     database: tauri::State<'_, Database>,
     request: ResolveSessionRequest,
 ) -> Result<UnassignedResolveResult, String> {
-    crate::supabase::ensure_local_mode(&database)?;
-    resolve_break(&database, request)
+    let expected_version = request.expected_version;
+    let operation_id = request.operation_id.clone();
+    let result = resolve_break(&database, request)?;
+    enqueue_unassigned_resolution_if_cloud(
+        &database,
+        &result,
+        expected_version,
+        "unassigned_resolve_break",
+        Some(&operation_id),
+    )?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -842,14 +862,46 @@ pub fn unassigned_discard(
     database: tauri::State<'_, Database>,
     request: ResolveSessionRequest,
 ) -> Result<UnassignedResolveResult, String> {
-    crate::supabase::ensure_local_mode(&database)?;
-    discard(&database, request)
+    let expected_version = request.expected_version;
+    let operation_id = request.operation_id.clone();
+    let result = discard(&database, request)?;
+    enqueue_unassigned_resolution_if_cloud(
+        &database,
+        &result,
+        expected_version,
+        "unassigned_discard",
+        Some(&operation_id),
+    )?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
+}
+
+fn enqueue_unassigned_resolution_if_cloud(
+    database: &Database,
+    result: &UnassignedResolveResult,
+    base_version: i64,
+    operation_type: &str,
+    operation_id: Option<&str>,
+) -> Result<(), String> {
+    if let Some(entry_id) = result.generated_entry_id.as_deref() {
+        return crate::cloud_sync::enqueue_entity_deferred(
+            database,
+            operation_type,
+            "time_entry",
+            Some(entry_id),
+            Some(base_version),
+            operation_id,
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{self, SettingsScope, SettingsUpdate};
     use crate::tasks::{create_task, TaskCreateRequest};
+    use serde_json::json;
     use tempfile::tempdir;
 
     fn setup() -> (Database, String) {
@@ -988,5 +1040,84 @@ mod tests {
         .unwrap();
         assert_eq!(result.resolution_type, "discard");
         assert!(result.generated_entry_id.is_some());
+    }
+
+    #[test]
+    fn cloud_mode_unassigned_work_can_write_local_cache_when_cloud_is_unavailable() {
+        let (database, task_id) = setup();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id.clone()),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let initial = get_state(&database).unwrap().unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE unassigned_segments SET started_at = started_at - 120000 WHERE session_id = ?1 AND ended_at IS NULL",
+                [&initial.session_id],
+            )
+            .unwrap();
+        let due = get_state(&database).unwrap().unwrap();
+        let operation_id = Uuid::now_v7().to_string();
+        let result = resolve_work_with_hooks(
+            &database,
+            ResolveWorkRequest {
+                session_id: due.session_id,
+                allocations: vec![UnassignedAllocationInput {
+                    task_id,
+                    minutes: due.required_minutes,
+                    complete_task: false,
+                    task_expected_version: None,
+                }],
+                expected_version: due.version,
+                operation_id: operation_id.clone(),
+            },
+        )
+        .unwrap();
+        enqueue_unassigned_resolution_if_cloud(
+            &database,
+            &result,
+            due.version,
+            "unassigned_resolve_work",
+            Some(&operation_id),
+        )
+        .unwrap();
+        crate::cloud_sync::flush_if_online(&database).unwrap();
+
+        let entry_id = result.generated_entry_id.unwrap();
+        let outbox: (String, String, String, String) = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT operation_id, operation_type, entity_type, entity_id FROM sync_outbox WHERE workspace_id = ?1",
+                [cloud_workspace_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            outbox,
+            (
+                operation_id,
+                "unassigned_resolve_work".to_string(),
+                "time_entry".to_string(),
+                entry_id,
+            )
+        );
     }
 }

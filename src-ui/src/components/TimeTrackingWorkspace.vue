@@ -62,6 +62,17 @@ watch(() => store.runningEntry?.id, (currentId, previousId) => {
   if (!currentId && previousId) expandedEntryId.value = store.selectedEntryId;
 });
 
+watch(() => store.selectedEntryId, (entryId) => {
+  const entry = store.entries.find((item) => item.id === entryId);
+  if (!entry || entry.state !== "ended") return;
+  expandedEntryId.value = entry.id;
+  ensureDraft(entry);
+  ensureCorrectionDraft(entry);
+  void nextTick(() => {
+    document.querySelector<HTMLElement>(`[data-entry-id="${entry.id}"]`)?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  });
+});
+
 watch(manualOpen, (open) => {
   if (!open) return;
   manualTaskId.value = store.selectedTaskId;

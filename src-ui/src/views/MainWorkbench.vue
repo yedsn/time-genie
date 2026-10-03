@@ -12,6 +12,7 @@ import TimeTrackingWorkspace from "../components/TimeTrackingWorkspace.vue";
 import TodayOverviewWorkspace from "../components/TodayOverviewWorkspace.vue";
 import ReportWorkspace from "../components/ReportWorkspace.vue";
 import AutomationHooksSettings from "../components/AutomationHooksSettings.vue";
+import TimerStopConfirmationDialog from "../components/TimerStopConfirmationDialog.vue";
 import appIconUrl from "../../../src-tauri/icons/icon.svg";
 import { isCompletionFeedbackEnabled, playCompletionFeedback, setCompletionFeedbackEnabled, setCompletionFeedbackSoundEnabled } from "../services/completionFeedback";
 import { remainingOpenTaskCount } from "../services/completionFeedbackCore";
@@ -974,6 +975,7 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
       </div>
     </section>
     <UnassignedTimeDialog />
+    <TimerStopConfirmationDialog />
     <el-dialog v-model="cloudConflictDialogOpen" class="cloud-conflict-dialog" title="处理云端同步冲突" width="min(700px, 94vw)" append-to-body :close-on-click-modal="false">
       <div class="cloud-conflict-list">
         <div v-for="conflict in cloudConflicts" :key="conflict.operationId" class="cloud-conflict-item">

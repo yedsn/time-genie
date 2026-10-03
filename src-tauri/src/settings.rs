@@ -8,6 +8,7 @@ use serde_json::Value;
 use crate::database::Database;
 
 const KEYRING_SERVICE: &str = "timegenie";
+const SUPABASE_SESSION_ACCOUNT: &str = "supabase:session";
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -108,7 +109,8 @@ pub fn get_settings(database: &Database) -> Result<SettingsSnapshot, String> {
     let integrations = read_integration_configs(&connection, &workspace_id)?;
     let secrets = SecretPresence {
         seatable_token_set: secret_exists("seatable", &workspace_id),
-        supabase_session_set: secret_exists("supabase", &workspace_id),
+        supabase_session_set: secret_exists("supabase", &workspace_id)
+            || credential_account_exists(SUPABASE_SESSION_ACCOUNT),
     };
     Ok(SettingsSnapshot {
         storage_mode,
@@ -512,6 +514,13 @@ fn validate_setting_value(key: &str, value: &Value) -> Result<(), String> {
 fn credential_entry(provider: &str, workspace_id: &str) -> Result<Entry, String> {
     Entry::new(KEYRING_SERVICE, &format!("{provider}:{workspace_id}"))
         .map_err(|error| format!("无法访问系统凭据库: {error}"))
+}
+
+fn credential_account_exists(account: &str) -> bool {
+    let Ok(entry) = Entry::new(KEYRING_SERVICE, account) else {
+        return false;
+    };
+    entry.get_password().is_ok()
 }
 
 pub(crate) fn integration_secret(provider: &str, workspace_id: &str) -> Result<String, String> {

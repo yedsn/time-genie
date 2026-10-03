@@ -55,11 +55,15 @@ onMounted(() => {
     applyAppTheme(isAppTheme(theme) ? theme : "forest", true);
   }).catch(() => undefined);
   store.startClock(view.value === "main");
-  void onWorkDataChanged(() => {
+  void onWorkDataChanged((payload) => {
     const refresh = view.value === "main"
       ? Promise.all([store.loadWorkspaceData(), store.loadTimeData(), store.loadReports(), store.loadUnassignedState()]).then(() => store.loadTodayOverview())
       : Promise.all([store.loadWorkspaceData(), store.loadTimeData(), store.loadUnassignedState()]);
-    void refresh;
+    void refresh.then(() => {
+      if (view.value === "main" && payload.timerStoppedEntryId) {
+        void store.openTimerStopConfirmation(payload.timerStoppedEntryId);
+      }
+    });
   }).then((unlisten) => {
     if (unmounted) unlisten();
     else unlistenWorkDataChanged = unlisten;

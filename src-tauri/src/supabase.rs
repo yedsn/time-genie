@@ -13,9 +13,11 @@ use crate::database::Database;
 use crate::settings::{self, SettingsScope, SettingsUpdate};
 
 const SESSION_PROVIDER: &str = "supabase";
+const SESSION_ACCOUNT: &str = "supabase:session";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 12;
 pub(crate) const CLOUD_SCHEMA: &str = "timegenie";
 static SESSION_CACHE: OnceLock<Mutex<HashMap<String, CloudSession>>> = OnceLock::new();
+static SESSION_REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -338,9 +340,13 @@ pub fn sign_out(database: &Database) -> Result<(), String> {
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
-    let entry = keyring::Entry::new("timegenie", &format!("{SESSION_PROVIDER}:{workspace_id}"))
-        .map_err(|error| format!("无法访问系统凭据库: {error}"))?;
-    match entry.delete_credential() {
+    let stable_entry = session_entry(SESSION_ACCOUNT)?;
+    match stable_entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => {}
+        Err(error) => return Err(format!("删除 Supabase 会话失败: {error}")),
+    }
+    let legacy_entry = session_entry(&format!("{SESSION_PROVIDER}:{workspace_id}"))?;
+    match legacy_entry.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => {
             remove_cached_session(&workspace_id);
             Ok(())
@@ -440,12 +446,9 @@ fn send_auth_settings_request(
 pub fn session_snapshot_for_database(database: &Database) -> Result<CloudSessionSnapshot, String> {
     match current_session(database) {
         Ok(session) => Ok(session_snapshot(&session)),
-        Err(_) => Ok(CloudSessionSnapshot {
-            signed_in: false,
-            user_id: None,
-            email: None,
-            expires_at: None,
-        }),
+        Err(error) if error.starts_with("NETWORK_ERROR:") => saved_session_snapshot(database)
+            .map(|snapshot| snapshot.unwrap_or_else(signed_out_snapshot)),
+        Err(_) => Ok(signed_out_snapshot()),
     }
 }
 
@@ -953,6 +956,17 @@ pub(crate) fn current_session(database: &Database) -> Result<CloudSession, Strin
     {
         return Ok(existing);
     }
+    let _refresh_guard = SESSION_REFRESH_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "AUTH_REQUIRED: Supabase 会话刷新锁不可用".to_string())?;
+    let existing = session(&workspace_id)?;
+    if existing
+        .expires_at
+        .is_none_or(|expires_at| expires_at > now_seconds() + 60)
+    {
+        return Ok(existing);
+    }
     let api = client(database)?;
     let response = api.auth_token(
         "refresh_token",
@@ -964,6 +978,11 @@ pub(crate) fn current_session(database: &Database) -> Result<CloudSession, Strin
     let auth: AuthResponse = response
         .json()
         .map_err(|error| format!("AUTH_REQUIRED: Supabase 刷新响应无效: {error}"))?;
+    let refresh_token = if auth.refresh_token.is_empty() {
+        existing.refresh_token.clone()
+    } else {
+        auth.refresh_token
+    };
     let refreshed = CloudSession {
         user_id: auth
             .user
@@ -972,7 +991,7 @@ pub(crate) fn current_session(database: &Database) -> Result<CloudSession, Strin
             .unwrap_or(existing.user_id),
         email: auth.user.and_then(|user| user.email).or(existing.email),
         access_token: auth.access_token,
-        refresh_token: auth.refresh_token,
+        refresh_token,
         expires_at: auth.expires_in.map(|seconds| now_seconds() + seconds),
     };
     save_session(database, &refreshed)?;
@@ -983,11 +1002,24 @@ fn session(workspace_id: &str) -> Result<CloudSession, String> {
     if let Some(cached) = cached_session(workspace_id) {
         return Ok(cached);
     }
-    let entry = keyring::Entry::new("timegenie", &format!("{SESSION_PROVIDER}:{workspace_id}"))
-        .map_err(|error| format!("AUTH_REQUIRED: 无法访问系统凭据库: {error}"))?;
-    let serialized = entry.get_password().map_err(|error| {
-        format!("AUTH_REQUIRED: 尚未登录 Supabase（本机凭据读取失败: {error}）")
-    })?;
+    let accounts = session_account_candidates(workspace_id);
+    let serialized = read_session_credential(&accounts[0])
+        .or_else(|stable_error| {
+            read_session_credential(&accounts[1]).map_err(|legacy_error| {
+                if legacy_error == "NO_ENTRY" {
+                    stable_error
+                } else {
+                    legacy_error
+                }
+            })
+        })
+        .map_err(|error| {
+            if error == "NO_ENTRY" {
+                "AUTH_REQUIRED: 尚未登录 Supabase".to_string()
+            } else {
+                error
+            }
+        })?;
     let session: CloudSession = serde_json::from_str(&serialized)
         .map_err(|error| format!("AUTH_REQUIRED: Supabase 会话损坏: {error}"))?;
     cache_session(workspace_id, &session)?;
@@ -1003,13 +1035,36 @@ fn save_session(database: &Database, session: &CloudSession) -> Result<(), Strin
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
-    let entry = keyring::Entry::new("timegenie", &format!("{SESSION_PROVIDER}:{workspace_id}"))
-        .map_err(|error| format!("无法访问系统凭据库: {error}"))?;
     let serialized = serde_json::to_string(session).map_err(|error| error.to_string())?;
-    entry
+    session_entry(SESSION_ACCOUNT)?
+        .set_password(&serialized)
+        .map_err(|error| format!("保存 Supabase 会话失败: {error}"))?;
+    // Keep the legacy workspace-scoped entry so older settings views still report
+    // that a session exists and existing installations can migrate gradually.
+    session_entry(&format!("{SESSION_PROVIDER}:{workspace_id}"))?
         .set_password(&serialized)
         .map_err(|error| format!("保存 Supabase 会话失败: {error}"))?;
     cache_session(&workspace_id, session)
+}
+
+fn session_entry(account: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new("timegenie", account)
+        .map_err(|error| format!("无法访问系统凭据库: {error}"))
+}
+
+fn session_account_candidates(workspace_id: &str) -> [String; 2] {
+    [
+        SESSION_ACCOUNT.to_string(),
+        format!("{SESSION_PROVIDER}:{workspace_id}"),
+    ]
+}
+
+fn read_session_credential(account: &str) -> Result<String, String> {
+    let entry = session_entry(account)?;
+    entry.get_password().map_err(|error| match error {
+        keyring::Error::NoEntry => "NO_ENTRY".to_string(),
+        _ => format!("AUTH_REQUIRED: 尚未登录 Supabase（本机凭据读取失败: {error}）"),
+    })
 }
 
 fn cached_session(workspace_id: &str) -> Option<CloudSession> {
@@ -1042,6 +1097,30 @@ fn session_snapshot(session: &CloudSession) -> CloudSessionSnapshot {
         user_id: Some(session.user_id.clone()),
         email: session.email.clone(),
         expires_at: session.expires_at,
+    }
+}
+
+fn saved_session_snapshot(database: &Database) -> Result<Option<CloudSessionSnapshot>, String> {
+    let connection = database.open()?;
+    let workspace_id: String = connection
+        .query_row(
+            "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    match session(&workspace_id) {
+        Ok(session) => Ok(Some(session_snapshot(&session))),
+        Err(_) => Ok(None),
+    }
+}
+
+fn signed_out_snapshot() -> CloudSessionSnapshot {
+    CloudSessionSnapshot {
+        signed_in: false,
+        user_id: None,
+        email: None,
+        expires_at: None,
     }
 }
 
@@ -1378,6 +1457,14 @@ mod tests {
             "CLOUD_REQUEST_FAILED",
         );
         assert!(denied.starts_with("CLOUD_PERMISSION_DENIED:"));
+    }
+
+    #[test]
+    fn session_candidates_prefer_stable_account_before_workspace_legacy_key() {
+        let workspace_id = Uuid::now_v7().to_string();
+        let candidates = session_account_candidates(&workspace_id);
+        assert_eq!(candidates[0], SESSION_ACCOUNT);
+        assert_eq!(candidates[1], format!("{SESSION_PROVIDER}:{workspace_id}"));
     }
 
     #[test]

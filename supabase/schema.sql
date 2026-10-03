@@ -737,22 +737,6 @@ begin
   end if;
   update timegenie.time_entries set state = 'ended', ended_at = now(), duration_seconds = duration_seconds + coalesce(segment_seconds, 0), updated_at = now(), updated_by_device_id = p_device_id, version = version + 1
   where id = p_entry_id returning * into entry_row;
-  if entry_row.default_task_id is not null and entry_row.duration_seconds > 0 and exists(
-    select 1 from timegenie.tasks task
-    where task.id = entry_row.default_task_id
-      and task.workspace_id = p_workspace_id
-      and task.deleted_at is null
-      and not exists(
-        select 1 from timegenie.tasks child
-        where child.parent_id = task.id and child.deleted_at is null
-      )
-  ) then
-    insert into timegenie.time_allocations(workspace_id, entry_id, task_id, minutes)
-    values(p_workspace_id, entry_row.id, entry_row.default_task_id, greatest(1, ceil(entry_row.duration_seconds / 60.0)::integer))
-    on conflict(entry_id, task_id) do update set minutes = excluded.minutes, updated_at = now(), version = timegenie.time_allocations.version + 1;
-  elsif entry_row.default_task_id is not null then
-    update timegenie.time_entries set default_task_id = null where id = entry_row.id returning * into entry_row;
-  end if;
   perform timegenie.record_processed_operation(
     p_workspace_id,
     p_operation_id,

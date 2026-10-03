@@ -27,6 +27,11 @@ async function runTimerAction(action: () => Promise<unknown>, fallback: string) 
     busy.value = false;
   }
 }
+
+async function stopTimerFromHover() {
+  await store.stopTimer();
+  await openMainOverview();
+}
 </script>
 
 <template>
@@ -47,7 +52,7 @@ async function runTimerAction(action: () => Promise<unknown>, fallback: string) 
         <button v-if="!entry" class="primary-button" :disabled="busy" @click="runTimerAction(() => store.startTimer(selectedTaskId), '开始计时失败')"><Play :size="15" fill="currentColor" /> 开始计时</button>
         <button v-else-if="entry.state === 'running'" class="secondary-button" :disabled="busy" @click="runTimerAction(store.pauseTimer, '暂停计时失败')"><Pause :size="15" fill="currentColor" /> 暂停</button>
         <button v-else class="secondary-button" :disabled="busy" @click="runTimerAction(store.resumeTimer, '继续计时失败')"><Play :size="15" fill="currentColor" /> 继续</button>
-        <button v-if="entry" class="danger-button" :disabled="busy" @click="runTimerAction(store.stopTimer, '结束计时失败')"><Square :size="14" fill="currentColor" /> 结束本段</button>
+        <button v-if="entry" class="danger-button" :disabled="busy" @click="runTimerAction(stopTimerFromHover, '结束计时失败')"><Square :size="14" fill="currentColor" /> 结束本段</button>
       </div>
     </div>
   </section>

@@ -40,6 +40,7 @@ import {
   setTaskDailyEstimate,
   startTimerRecord,
   stopTimerRecord,
+  notifyTimerStopConfirmation,
   updateTask as updateTaskRecord,
   updateTimeEntry,
   updateTimeEntryDisposition,
@@ -175,6 +176,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   const unassignedFirstStartedAt = ref<number>();
   const unassignedLastEndedAt = ref<number>();
   const unassignedDialogOpen = ref(false);
+  const timerStopConfirmationEntryId = ref("");
   const unassignedSessionId = ref("");
   const unassignedVersion = ref(0);
   const unassignedThresholdSeconds = ref(5 * 60);
@@ -194,6 +196,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   const pendingMinutes = computed(() => Math.max(0, todayMinutes.value - allocatedMinutes.value));
   const runningEntry = computed(() => entries.find((entry) => entry.state === "running" || entry.state === "paused"));
   const selectedEntry = computed(() => entries.find((entry) => entry.id === selectedEntryId.value));
+  const timerStopConfirmationEntry = computed(() => entries.find((entry) => entry.id === timerStopConfirmationEntryId.value && entry.state === "ended"));
   const doneCount = computed(() => tasks.filter((task) => task.status === "done").length);
   const unassignedSeconds = computed(() => {
     const liveSeconds = unassignedStartedAt.value
@@ -377,6 +380,9 @@ export const useWorkdayStore = defineStore("workday", () => {
         else records.unshift(activeEntry);
       }
       entries.splice(0, entries.length, ...records.map(toUiTimeEntry));
+      if (timerStopConfirmationEntryId.value && !entries.some((entry) => entry.id === timerStopConfirmationEntryId.value)) {
+        timerStopConfirmationEntryId.value = "";
+      }
       if (!entries.some((entry) => entry.id === selectedEntryId.value)) {
         selectedEntryId.value = entries[0]?.id ?? "";
       }
@@ -901,12 +907,54 @@ export const useWorkdayStore = defineStore("workday", () => {
   async function stopTimer() {
     const entry = runningEntry.value;
     if (!entry) return;
-    const stopped = replaceTimeEntry(await stopTimerRecord(entry.id, entry.version, true));
+    const stopped = replaceTimeEntry(await stopTimerRecord(entry.id, entry.version, false));
     selectedEntryId.value = stopped.id;
+    timerStopConfirmationEntryId.value = stopped.id;
+    await notifyTimerStopConfirmation(stopped.id);
     await loadWorkspaceData();
     await loadUnassignedState();
     await loadTodayOverview();
     return stopped.id;
+  }
+
+  async function openTimerStopConfirmation(entryId: string) {
+    timerStopConfirmationEntryId.value = entryId;
+    selectedEntryId.value = entryId;
+    await loadTimeData();
+    await loadWorkspaceData();
+    await loadTodayOverview();
+  }
+
+  function dismissTimerStopConfirmation() {
+    timerStopConfirmationEntryId.value = "";
+  }
+
+  function adjustTimerStopAllocation(entryId = timerStopConfirmationEntryId.value) {
+    if (!entryId) return;
+    selectedEntryId.value = entryId;
+    activePage.value = "timer";
+    timerStopConfirmationEntryId.value = "";
+  }
+
+  async function confirmTimerStopAllocation(completeTask = false) {
+    const entry = timerStopConfirmationEntry.value;
+    if (!entry) return false;
+    if (!entry.defaultTask || entry.minutes <= 0) return false;
+    const result = await allocate(entry.id, [{
+      taskId: entry.defaultTask,
+      minutes: entry.minutes,
+      completeTask,
+    }]);
+    timerStopConfirmationEntryId.value = "";
+    return result ?? { completedCount: 0, completedTaskIds: [] };
+  }
+
+  async function resolveTimerStopDisposition(disposition: "break" | "discard") {
+    const entry = timerStopConfirmationEntry.value;
+    if (!entry) return false;
+    await setTimeEntryDisposition(entry.id, disposition);
+    timerStopConfirmationEntryId.value = "";
+    return true;
   }
 
   async function allocate(entryId: string, allocations: TimeAllocation[]): Promise<BatchCompletionResult | undefined> {
@@ -1131,11 +1179,11 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   return {
-    activePage, subjects, selectedSubjectId, selectedSubject, selectedSubjectTasks, tasks, todayTasks, visibleTasks, statusColors, entries, reports, todayOverview, todayOverviewLoading, todayOverviewSubjectId, todayOverviewSubject, selectedTaskId, selectedEntryId, selectedEntry, runningEntry,
+    activePage, subjects, selectedSubjectId, selectedSubject, selectedSubjectTasks, tasks, todayTasks, visibleTasks, statusColors, entries, reports, todayOverview, todayOverviewLoading, todayOverviewSubjectId, todayOverviewSubject, selectedTaskId, selectedEntryId, selectedEntry, runningEntry, timerStopConfirmationEntryId, timerStopConfirmationEntry,
     now, todayMinutes, allocatedMinutes, pendingMinutes, doneCount, unassignedSeconds, unassignedStartedAt,
     unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen,
     workspaceLoaded, workspaceLoading, loadWorkspaceData, loadTimeData, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addChildTask, saveTask, duplicateTask, deleteTask, moveTask, reorderTask,
-    indentTask, outdentTask, startTimer, pauseTimer, resumeTimer, stopTimer, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, publicReportText, previewObsidianReport, writeObsidianReport,
+    indentTask, outdentTask, startTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, adjustTimerStopAllocation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, publicReportText, previewObsidianReport, writeObsidianReport,
     beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, resolveUnassignedTime
   };
 });

@@ -1468,8 +1468,17 @@ pub fn timer_start(
     database: tauri::State<'_, Database>,
     request: TimerStartRequest,
 ) -> Result<TimeEntryDto, String> {
-    crate::supabase::ensure_local_mode(&database)?;
-    start_timer_with_hooks(&database, request)
+    let operation_id = request.client_request_id.clone();
+    let result = start_timer_with_hooks(&database, request)?;
+    enqueue_timer_entry_if_cloud(
+        &database,
+        &result.id,
+        None,
+        "timer_start",
+        Some(&operation_id),
+    )?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1477,8 +1486,17 @@ pub fn timer_pause(
     database: tauri::State<'_, Database>,
     request: TimerVersionRequest,
 ) -> Result<TimeEntryDto, String> {
-    crate::supabase::ensure_local_mode(&database)?;
-    pause_timer(&database, request)
+    let expected_version = request.expected_version;
+    let result = pause_timer(&database, request)?;
+    enqueue_timer_entry_if_cloud(
+        &database,
+        &result.id,
+        Some(expected_version),
+        "timer_pause",
+        None,
+    )?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1486,8 +1504,18 @@ pub fn timer_resume(
     database: tauri::State<'_, Database>,
     request: TimerResumeRequest,
 ) -> Result<TimeEntryDto, String> {
-    crate::supabase::ensure_local_mode(&database)?;
-    resume_timer(&database, request)
+    let expected_version = request.expected_version;
+    let operation_id = request.operation_id.clone();
+    let result = resume_timer(&database, request)?;
+    enqueue_timer_entry_if_cloud(
+        &database,
+        &result.id,
+        Some(expected_version),
+        "timer_resume",
+        Some(&operation_id),
+    )?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1495,8 +1523,34 @@ pub fn timer_stop(
     database: tauri::State<'_, Database>,
     request: TimerStopRequest,
 ) -> Result<TimeEntryDto, String> {
-    crate::supabase::ensure_local_mode(&database)?;
-    stop_timer_with_hooks(&database, request)
+    let expected_version = request.expected_version;
+    let result = stop_timer_with_hooks(&database, request)?;
+    enqueue_timer_entry_if_cloud(
+        &database,
+        &result.id,
+        Some(expected_version),
+        "timer_stop",
+        None,
+    )?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
+}
+
+fn enqueue_timer_entry_if_cloud(
+    database: &Database,
+    entry_id: &str,
+    base_version: Option<i64>,
+    operation_type: &str,
+    operation_id: Option<&str>,
+) -> Result<(), String> {
+    crate::cloud_sync::enqueue_entity_deferred(
+        database,
+        operation_type,
+        "time_entry",
+        Some(entry_id),
+        base_version,
+        operation_id,
+    )
 }
 
 #[tauri::command]
@@ -1762,6 +1816,70 @@ mod tests {
     }
 
     #[test]
+    fn cloud_mode_timer_can_write_local_cache_when_cloud_is_unavailable() {
+        let (database, _workspace_id, task_id) = setup();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id.clone()),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let operation_id = Uuid::now_v7().to_string();
+        let entry = start_timer_with_hooks(
+            &database,
+            TimerStartRequest {
+                task_id: Some(task_id),
+                note: Some("离线云端模式继续本地计时".to_string()),
+                client_request_id: operation_id.clone(),
+            },
+        )
+        .unwrap();
+        enqueue_timer_entry_if_cloud(
+            &database,
+            &entry.id,
+            None,
+            "timer_start",
+            Some(&operation_id),
+        )
+        .unwrap();
+
+        crate::cloud_sync::flush_if_online(&database).unwrap();
+        let active = get_timer_state(&database).unwrap().unwrap();
+        assert_eq!(active.id, entry.id);
+        assert_eq!(active.state, "running");
+
+        let connection = database.open().unwrap();
+        let outbox: (String, String, String) = connection
+            .query_row(
+                "SELECT operation_type, entity_type, entity_id FROM sync_outbox WHERE workspace_id = ?1",
+                [cloud_workspace_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            outbox,
+            (
+                "timer_start".to_string(),
+                "time_entry".to_string(),
+                entry.id
+            )
+        );
+    }
+
+    #[test]
     fn timer_pause_resume_stop_excludes_pause_duration() {
         let (database, _, task_id) = setup();
         let started = start_timer(
@@ -1811,6 +1929,63 @@ mod tests {
         assert_eq!(stopped.state, "ended");
         assert_eq!(stopped.allocations.len(), 1);
         assert_eq!(stopped.allocated_minutes, stopped.settlement_minutes);
+    }
+
+    #[test]
+    fn timer_stop_can_defer_default_allocation_until_confirmation() {
+        let (database, _, task_id) = setup();
+        let started = start_timer(
+            &database,
+            TimerStartRequest {
+                task_id: Some(task_id.clone()),
+                note: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE time_segments SET started_at = started_at - 120000 WHERE entry_id = ?1",
+                [&started.id],
+            )
+            .unwrap();
+
+        let stopped = stop_timer(
+            &database,
+            TimerStopRequest {
+                entry_id: started.id.clone(),
+                expected_version: started.version,
+                create_default_allocation: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(stopped.state, "ended");
+        assert_eq!(stopped.default_task_id.as_deref(), Some(task_id.as_str()));
+        assert_eq!(stopped.allocated_minutes, 0);
+        assert!(stopped.allocations.is_empty());
+
+        let allocated = replace_allocations(
+            &database,
+            AllocationReplaceRequest {
+                entry_id: stopped.id,
+                expected_version: stopped.version,
+                allocations: vec![AllocationInput {
+                    task_id: task_id.clone(),
+                    minutes: stopped.settlement_minutes,
+                    note: None,
+                    complete_task: false,
+                    task_expected_version: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(allocated.allocated_minutes, stopped.settlement_minutes);
+        assert_eq!(allocated.allocations.len(), 1);
+        assert_eq!(allocated.allocations[0].task_id, task_id);
     }
 
     #[test]

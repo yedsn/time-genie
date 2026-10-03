@@ -745,10 +745,43 @@ pre {
 .unassigned-primary-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
 .unassigned-secondary-actions .discard { color: #b8c3bd; }
 
+.timer-stop-confirm-dialog.el-dialog {
+  --el-dialog-bg-color: var(--panel);
+  --el-text-color-primary: var(--text);
+  --el-text-color-regular: var(--text-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 26px 80px rgba(0,0,0,0.52);
+}
+.timer-stop-confirm-dialog .el-dialog__header { display: none; }
+.timer-stop-confirm-dialog .el-dialog__body { padding: 20px; }
+.timer-stop-confirm-content { display: grid; gap: 14px; }
+.timer-stop-confirm-head { display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 12px; align-items: start; }
+.timer-stop-confirm-icon { width: 42px; height: 42px; display: grid; place-items: center; border: 1px solid rgba(201,239,143,0.2); border-radius: 8px; color: var(--accent); background: rgba(201,239,143,0.08); }
+.timer-stop-confirm-head h2 { margin: 0; color: var(--text); font-size: 17px; letter-spacing: 0; }
+.timer-stop-confirm-head p { margin: 5px 0 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.timer-stop-confirm-summary { min-height: 78px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 2px 14px; border: 1px solid var(--line-soft); border-radius: 7px; padding: 13px 15px; background: var(--surface-inset); }
+.timer-stop-confirm-summary span { color: var(--text-soft); font-size: 11px; }
+.timer-stop-confirm-summary strong { grid-column: 2; grid-row: 1 / span 2; color: var(--accent); font-size: 24px; line-height: 1; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.timer-stop-confirm-summary small { min-width: 0; color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.timer-stop-default-allocation { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; border: 1px solid var(--line); border-radius: 7px; padding: 12px; background: var(--surface-soft); }
+.timer-stop-default-allocation.disabled { opacity: 0.76; }
+.timer-stop-default-allocation div { min-width: 0; display: grid; gap: 3px; }
+.timer-stop-default-allocation span { color: var(--muted); font-size: 10px; }
+.timer-stop-default-allocation strong { min-width: 0; color: var(--text); font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.timer-stop-default-allocation small { color: var(--text-soft); font-size: 11px; }
+.timer-stop-confirm-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 4px; border-top: 1px solid var(--line-soft); }
+.timer-stop-secondary-actions, .timer-stop-primary-actions { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.timer-stop-secondary-actions .discard { color: #b8c3bd; }
+
 @media (max-width: 800px) {
   .unassigned-time-dialog.el-dialog { --unassigned-dialog-width: calc(100vw - 24px); }
   .unassigned-allocation-row { grid-template-columns: 108px minmax(84px, auto) 30px; }
   .unassigned-allocation-row .task-select-composite { grid-column: 1 / -1; }
+  .timer-stop-default-allocation { grid-template-columns: minmax(0, 1fr); }
+  .timer-stop-confirm-actions { align-items: stretch; flex-direction: column; }
+  .timer-stop-secondary-actions, .timer-stop-primary-actions { justify-content: flex-end; }
 }
 
 .dashboard-grid, .two-column, .report-layout, .settings-grid, .timer-layout {
