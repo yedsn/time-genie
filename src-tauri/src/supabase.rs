@@ -1,9 +1,11 @@
 use base64::Engine;
 use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::StatusCode;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use url::Url;
 use uuid::Uuid;
 
@@ -12,6 +14,8 @@ use crate::settings::{self, SettingsScope, SettingsUpdate};
 
 const SESSION_PROVIDER: &str = "supabase";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 12;
+pub(crate) const CLOUD_SCHEMA: &str = "timegenie";
+static SESSION_CACHE: OnceLock<Mutex<HashMap<String, CloudSession>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,6 +67,8 @@ pub struct StorageModeSnapshot {
     pub pending_operations: i64,
     pub conflict_count: i64,
     pub last_change_seq: i64,
+    pub last_synced_at: Option<i64>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -219,19 +225,19 @@ pub fn storage_mode(database: &Database) -> Result<StorageModeSnapshot, String> 
     let (pending, conflicts): (i64, i64) = connection
         .query_row(
             "SELECT
-                (SELECT COUNT(*) FROM sync_outbox WHERE workspace_id = ?1 AND state IN ('pending', 'sending')),
+                (SELECT COUNT(*) FROM sync_outbox WHERE workspace_id = ?1 AND state IN ('pending', 'sending', 'failed')),
                 (SELECT COUNT(*) FROM sync_outbox WHERE workspace_id = ?1 AND state = 'conflict')",
             [&sync_workspace_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|error| error.to_string())?;
-    let (last_change_seq, last_error): (i64, Option<String>) = connection
+    let (last_change_seq, last_synced_at, last_error): (i64, Option<i64>, Option<String>) = connection
         .query_row(
-            "SELECT last_change_seq, last_error FROM local_sync_state WHERE workspace_id = ?1",
+            "SELECT last_change_seq, last_full_sync_at, last_error FROM local_sync_state WHERE workspace_id = ?1",
             [&sync_workspace_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .unwrap_or((0, None));
+        .unwrap_or((0, None, None));
     Ok(StorageModeSnapshot {
         online: mode == "local" || current_session(database).is_ok(),
         sync_state: if last_error.is_some() {
@@ -247,6 +253,8 @@ pub fn storage_mode(database: &Database) -> Result<StorageModeSnapshot, String> 
         pending_operations: pending,
         conflict_count: conflicts,
         last_change_seq,
+        last_synced_at,
+        last_error,
     })
 }
 
@@ -259,15 +267,12 @@ pub fn configure(database: &Database, request: CloudConfigureRequest) -> Result<
     if is_service_role_key(anon_key) {
         return Err("SECURITY_ERROR: 不允许把 Supabase service_role key 放入桌面应用".to_string());
     }
+    ensure_can_replace_cloud_configuration(database, &project_url, anon_key)?;
     let http = Client::builder()
         .timeout(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECONDS))
         .build()
         .map_err(|error| format!("NETWORK_ERROR: 无法初始化 Supabase 客户端: {error}"))?;
-    let response = http
-        .get(format!("{project_url}/auth/v1/settings"))
-        .header("apikey", anon_key)
-        .send()
-        .map_err(|error| format!("NETWORK_ERROR: 无法连接 Supabase 项目: {error}"))?;
+    let response = send_auth_settings_request(&http, &project_url, anon_key)?;
     if !response.status().is_success() {
         return Err(map_http_error(response, "CLOUD_NOT_CONFIGURED"));
     }
@@ -298,17 +303,12 @@ pub fn sign_in_password(
         return Err("AUTH_FAILED: 邮箱和密码不能为空".to_string());
     }
     let client = client(database)?;
-    let response = client
-        .post(format!(
-            "{}/auth/v1/token?grant_type=password",
-            client.project_url
-        ))
-        .header("apikey", &client.anon_key)
-        .json(&json!({ "email": request.email.trim(), "password": request.password }))
-        .send()
-        .map_err(|error| format!("NETWORK_ERROR: Supabase 登录请求失败: {error}"))?;
+    let response = client.auth_token(
+        "password",
+        json!({ "email": request.email.trim(), "password": request.password }),
+    )?;
     if !response.status().is_success() {
-        return Err(map_http_error(response, "AUTH_FAILED"));
+        return Err(map_auth_error(response, "AUTH_FAILED"));
     }
     let auth: AuthResponse = response
         .json()
@@ -324,11 +324,12 @@ pub fn sign_in_password(
         expires_at: auth.expires_in.map(|seconds| now_seconds() + seconds),
     };
     save_session(database, &session)?;
-    let _ = workspace_bootstrap(database)?;
+    let _ = workspace_bootstrap_with_session(database, &client, &session)?;
     Ok(session_snapshot(&session))
 }
 
 pub fn sign_out(database: &Database) -> Result<(), String> {
+    ensure_no_pending_cloud_work(database)?;
     let connection = database.open()?;
     let workspace_id: String = connection
         .query_row(
@@ -340,9 +341,100 @@ pub fn sign_out(database: &Database) -> Result<(), String> {
     let entry = keyring::Entry::new("timegenie", &format!("{SESSION_PROVIDER}:{workspace_id}"))
         .map_err(|error| format!("无法访问系统凭据库: {error}"))?;
     match entry.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Ok(()) | Err(keyring::Error::NoEntry) => {
+            remove_cached_session(&workspace_id);
+            Ok(())
+        }
         Err(error) => Err(format!("删除 Supabase 会话失败: {error}")),
     }
+}
+
+fn ensure_no_pending_cloud_work(database: &Database) -> Result<(), String> {
+    let state = storage_mode(database)?;
+    if state.mode == "cloud" && (state.pending_operations > 0 || state.conflict_count > 0) {
+        return Err(
+            "OFFLINE_RESTRICTED: 请先同步或处理云端冲突，再退出账号或切换到本地模式".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn ensure_can_replace_cloud_configuration(
+    database: &Database,
+    project_url: &str,
+    anon_key: &str,
+) -> Result<(), String> {
+    let connection = database.open()?;
+    let mode: String = connection
+        .query_row(
+            "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'storage_mode'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| "local".to_string());
+    if mode != "cloud" {
+        return Ok(());
+    }
+    let current_project_url: Option<String> = connection
+        .query_row(
+            "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'supabase_project_url'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let current_anon_key: Option<String> = connection
+        .query_row(
+            "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'supabase_anon_key'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let is_changing = current_project_url
+        .as_deref()
+        .is_some_and(|current| current != project_url)
+        || current_anon_key
+            .as_deref()
+            .is_some_and(|current| current != anon_key);
+    drop(connection);
+
+    if is_changing {
+        ensure_no_pending_cloud_work(database).map_err(|error| {
+            if error.starts_with("OFFLINE_RESTRICTED:") {
+                "OFFLINE_RESTRICTED: 请先同步或处理云端冲突，再更换 Supabase 项目或公开 key"
+                    .to_string()
+            } else {
+                error
+            }
+        })?;
+    }
+    Ok(())
+}
+
+fn send_auth_settings_request(
+    http: &Client,
+    project_url: &str,
+    anon_key: &str,
+) -> Result<reqwest::blocking::Response, String> {
+    let url = format!("{project_url}/auth/v1/settings");
+    let response = http
+        .get(&url)
+        .header("apikey", anon_key)
+        .send()
+        .map_err(|error| format!("NETWORK_ERROR: 无法连接 Supabase 项目: {error}"))?;
+    if matches!(
+        response.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ) {
+        return http
+            .get(url)
+            .header("apikey", anon_key)
+            .bearer_auth(anon_key)
+            .send()
+            .map_err(|error| format!("NETWORK_ERROR: 无法连接 Supabase 项目: {error}"));
+    }
+    Ok(response)
 }
 
 pub fn session_snapshot_for_database(database: &Database) -> Result<CloudSessionSnapshot, String> {
@@ -360,6 +452,14 @@ pub fn session_snapshot_for_database(database: &Database) -> Result<CloudSession
 pub fn workspace_bootstrap(database: &Database) -> Result<CloudWorkspace, String> {
     let session = current_session(database)?;
     let client = client(database)?;
+    workspace_bootstrap_with_session(database, &client, &session)
+}
+
+fn workspace_bootstrap_with_session(
+    database: &Database,
+    client: &SupabaseClient,
+    session: &CloudSession,
+) -> Result<CloudWorkspace, String> {
     let mut workspaces: Vec<WorkspaceRow> = client
         .request(
             client
@@ -501,6 +601,10 @@ pub fn migration_preview(
             "SELECT COUNT(*) FROM reports WHERE workspace_id = ?1 AND deleted_at IS NULL",
         ),
         (
+            "task_daily_estimates",
+            "SELECT COUNT(*) FROM task_daily_estimates WHERE workspace_id = ?1",
+        ),
+        (
             "task_recurrence_rules",
             "SELECT COUNT(*) FROM task_recurrence_rules WHERE workspace_id = ?1",
         ),
@@ -526,7 +630,7 @@ pub fn migration_preview(
         && local_counts.iter().any(|count| {
             matches!(
                 count.entity.as_str(),
-                "task_recurrence_rules" | "task_occurrences"
+                "task_daily_estimates" | "task_recurrence_rules" | "task_occurrences"
             ) && count.local_count > 0
         });
     if has_unsupported_recurring_data {
@@ -535,7 +639,9 @@ pub fn migration_preview(
             source_workspace_id,
             target_workspace_id: None,
             entities: local_counts,
-            conflicts: vec!["本地存在重复规则或按日轮次，云端模式暂不支持，无法迁移".to_string()],
+            conflicts: vec![
+                "本地存在按日预估、重复规则或按日轮次，云端模式暂不支持，无法迁移".to_string(),
+            ],
             can_execute: false,
         });
     }
@@ -741,11 +847,48 @@ impl SupabaseClient {
     }
 
     pub(crate) fn get(&self, url: String) -> RequestBuilder {
-        self.http.get(url).header("apikey", &self.anon_key)
+        self.http
+            .get(url)
+            .header("apikey", &self.anon_key)
+            .header("Accept-Profile", CLOUD_SCHEMA)
+            .header("Content-Profile", CLOUD_SCHEMA)
     }
 
     pub(crate) fn post(&self, url: String) -> RequestBuilder {
-        self.http.post(url).header("apikey", &self.anon_key)
+        self.http
+            .post(url)
+            .header("apikey", &self.anon_key)
+            .header("Accept-Profile", CLOUD_SCHEMA)
+            .header("Content-Profile", CLOUD_SCHEMA)
+    }
+
+    fn auth_token(
+        &self,
+        grant_type: &str,
+        body: Value,
+    ) -> Result<reqwest::blocking::Response, String> {
+        let url = format!("{}/auth/v1/token?grant_type={grant_type}", self.project_url);
+        let response = self
+            .http
+            .post(&url)
+            .header("apikey", &self.anon_key)
+            .json(&body)
+            .send()
+            .map_err(|error| format!("NETWORK_ERROR: Supabase 登录请求失败: {error}"))?;
+        if matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) {
+            return self
+                .http
+                .post(url)
+                .header("apikey", &self.anon_key)
+                .bearer_auth(&self.anon_key)
+                .json(&body)
+                .send()
+                .map_err(|error| format!("NETWORK_ERROR: Supabase 登录请求失败: {error}"));
+        }
+        Ok(response)
     }
 
     pub(crate) fn request(
@@ -827,16 +970,12 @@ pub(crate) fn current_session(database: &Database) -> Result<CloudSession, Strin
         return Ok(existing);
     }
     let api = client(database)?;
-    let response = api
-        .post(format!(
-            "{}/auth/v1/token?grant_type=refresh_token",
-            api.project_url
-        ))
-        .json(&json!({ "refresh_token": existing.refresh_token }))
-        .send()
-        .map_err(|error| format!("NETWORK_ERROR: 刷新 Supabase 会话失败: {error}"))?;
+    let response = api.auth_token(
+        "refresh_token",
+        json!({ "refresh_token": existing.refresh_token }),
+    )?;
     if !response.status().is_success() {
-        return Err(map_http_error(response, "AUTH_REQUIRED"));
+        return Err(map_auth_error(response, "AUTH_REQUIRED"));
     }
     let auth: AuthResponse = response
         .json()
@@ -857,13 +996,18 @@ pub(crate) fn current_session(database: &Database) -> Result<CloudSession, Strin
 }
 
 fn session(workspace_id: &str) -> Result<CloudSession, String> {
+    if let Some(cached) = cached_session(workspace_id) {
+        return Ok(cached);
+    }
     let entry = keyring::Entry::new("timegenie", &format!("{SESSION_PROVIDER}:{workspace_id}"))
         .map_err(|error| format!("AUTH_REQUIRED: 无法访问系统凭据库: {error}"))?;
-    let serialized = entry
-        .get_password()
-        .map_err(|_| "AUTH_REQUIRED: 尚未登录 Supabase".to_string())?;
-    serde_json::from_str(&serialized)
-        .map_err(|error| format!("AUTH_REQUIRED: Supabase 会话损坏: {error}"))
+    let serialized = entry.get_password().map_err(|error| {
+        format!("AUTH_REQUIRED: 尚未登录 Supabase（本机凭据读取失败: {error}）")
+    })?;
+    let session: CloudSession = serde_json::from_str(&serialized)
+        .map_err(|error| format!("AUTH_REQUIRED: Supabase 会话损坏: {error}"))?;
+    cache_session(workspace_id, &session)?;
+    Ok(session)
 }
 
 fn save_session(database: &Database, session: &CloudSession) -> Result<(), String> {
@@ -880,7 +1024,32 @@ fn save_session(database: &Database, session: &CloudSession) -> Result<(), Strin
     let serialized = serde_json::to_string(session).map_err(|error| error.to_string())?;
     entry
         .set_password(&serialized)
-        .map_err(|error| format!("保存 Supabase 会话失败: {error}"))
+        .map_err(|error| format!("保存 Supabase 会话失败: {error}"))?;
+    cache_session(&workspace_id, session)
+}
+
+fn cached_session(workspace_id: &str) -> Option<CloudSession> {
+    SESSION_CACHE
+        .get()
+        .and_then(|cache| cache.lock().ok())
+        .and_then(|cache| cache.get(workspace_id).cloned())
+}
+
+fn cache_session(workspace_id: &str, session: &CloudSession) -> Result<(), String> {
+    SESSION_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| "AUTH_REQUIRED: Supabase 会话缓存不可用".to_string())?
+        .insert(workspace_id.to_string(), session.clone());
+    Ok(())
+}
+
+fn remove_cached_session(workspace_id: &str) {
+    if let Some(cache) = SESSION_CACHE.get() {
+        if let Ok(mut cache) = cache.lock() {
+            cache.remove(workspace_id);
+        }
+    }
 }
 
 fn session_snapshot(session: &CloudSession) -> CloudSessionSnapshot {
@@ -896,15 +1065,21 @@ fn validate_project_url(value: &str) -> Result<String, String> {
     let value = value.trim().trim_end_matches('/');
     let url =
         Url::parse(value).map_err(|_| "VALIDATION_ERROR: Supabase Project URL 无效".to_string())?;
-    let host = url
-        .host_str()
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("VALIDATION_ERROR: Supabase Project URL 不能包含用户名或密码".to_string());
+    }
+    url.host_str()
         .ok_or_else(|| "VALIDATION_ERROR: Supabase Project URL 无效".to_string())?;
-    let loopback_http = url.scheme() == "http" && matches!(host, "localhost" | "127.0.0.1" | "::1");
-    if url.scheme() != "https" && !loopback_http {
+    if !matches!(url.scheme(), "https" | "http") {
+        return Err("VALIDATION_ERROR: Supabase Project URL 只支持 HTTP 或 HTTPS 地址".to_string());
+    }
+    if url.path() != "" && url.path() != "/" {
         return Err(
-            "VALIDATION_ERROR: Supabase Project URL 必须是 HTTPS 地址；本地开发仅允许回环 HTTP 地址"
-                .to_string(),
+            "VALIDATION_ERROR: Supabase Project URL 必须填写项目根地址，不能包含路径".to_string(),
         );
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("VALIDATION_ERROR: Supabase Project URL 不能包含查询参数或片段".to_string());
     }
     Ok(value.to_string())
 }
@@ -932,6 +1107,25 @@ fn is_service_role_key(value: &str) -> bool {
 fn map_http_error(response: reqwest::blocking::Response, fallback: &str) -> String {
     let status = response.status();
     let body = response.text().unwrap_or_default();
+    classify_http_error(status, &body, fallback)
+}
+
+fn map_auth_error(response: reqwest::blocking::Response, fallback: &str) -> String {
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    let classified = classify_http_error(status, &body, fallback);
+    if (status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN)
+        && classified == format!("{fallback}: Unauthorized")
+    {
+        return format!(
+            "{fallback}: Supabase Auth 拒绝了登录请求，请确认 Project URL 是 API 根地址，anon/publishable key 属于同一个项目，且不是 Studio 地址或 service_role key"
+        );
+    }
+    classified
+}
+
+fn classify_http_error(status: StatusCode, body: &str, fallback: &str) -> String {
+    let parsed = serde_json::from_str::<Value>(body).ok();
     let message = serde_json::from_str::<Value>(&body)
         .ok()
         .and_then(|json| {
@@ -941,8 +1135,22 @@ fn map_http_error(response: reqwest::blocking::Response, fallback: &str) -> Stri
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
         })
-        .unwrap_or_else(|| body.chars().take(240).collect());
-    let code = if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        .unwrap_or_else(|| body.chars().take(240).collect::<String>());
+    let remote_code = parsed
+        .as_ref()
+        .and_then(|json| json.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let lower_message = message.to_ascii_lowercase();
+    let code = if matches!(remote_code, "PGRST202" | "PGRST205" | "42P01" | "42883")
+        || lower_message.contains("could not find the function")
+        || lower_message.contains("could not find the table")
+        || lower_message.contains("does not exist")
+    {
+        "CLOUD_SCHEMA_MISSING"
+    } else if remote_code == "42501" || lower_message.contains("permission denied") {
+        "CLOUD_PERMISSION_DENIED"
+    } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
         "AUTH_FAILED"
     } else if status == StatusCode::CONFLICT || status == StatusCode::PRECONDITION_FAILED {
         "VERSION_CONFLICT"
@@ -1037,6 +1245,7 @@ pub fn storage_mode_get(
 pub fn storage_mode_set_local(
     database: tauri::State<'_, Database>,
 ) -> Result<StorageModeSnapshot, String> {
+    ensure_no_pending_cloud_work(&database)?;
     settings::update_setting(
         &database,
         SettingsUpdate {
@@ -1121,12 +1330,26 @@ pub fn storage_migration_execute(
 mod tests {
     use super::*;
     use crate::recurring::{save_rule, RecurrenceSaveRequest};
-    use crate::tasks::{create_task, TaskCreateRequest};
+    use crate::tasks::{
+        create_task, set_task_daily_estimate, TaskCreateRequest, TaskDailyEstimateSetRequest,
+    };
     use tempfile::tempdir;
 
     #[test]
     fn rejects_non_https_and_service_role_key() {
-        assert!(validate_project_url("http://example.supabase.co").is_err());
+        assert!(validate_project_url("ftp://example.supabase.co").is_err());
+        assert!(validate_project_url("https://user:pass@example.supabase.co").is_err());
+        assert!(validate_project_url("https://example.supabase.co/rest/v1").is_err());
+        assert!(validate_project_url("https://example.supabase.co?apikey=abc").is_err());
+        assert!(validate_project_url("https://example.supabase.co#settings").is_err());
+        assert_eq!(
+            validate_project_url("https://example.supabase.co/").unwrap(),
+            "https://example.supabase.co"
+        );
+        assert_eq!(
+            validate_project_url("http://example.supabase.co").unwrap(),
+            "http://example.supabase.co"
+        );
         assert_eq!(
             validate_project_url("http://127.0.0.1:54321/").unwrap(),
             "http://127.0.0.1:54321"
@@ -1135,10 +1358,39 @@ mod tests {
             validate_project_url("http://localhost:54321").unwrap(),
             "http://localhost:54321"
         );
+        assert_eq!(
+            validate_project_url("http://192.168.1.20:54321/").unwrap(),
+            "http://192.168.1.20:54321"
+        );
+        assert_eq!(
+            validate_project_url("http://10.0.0.8:54321").unwrap(),
+            "http://10.0.0.8:54321"
+        );
+        assert_eq!(
+            validate_project_url("http://supabase.local:54321").unwrap(),
+            "http://supabase.local:54321"
+        );
         assert!(is_service_role_key("service_role-secret"));
         let payload =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"role":"service_role"}"#);
         assert!(is_service_role_key(&format!("header.{payload}.signature")));
+    }
+
+    #[test]
+    fn supabase_http_errors_distinguish_schema_and_permission_failures() {
+        let missing = classify_http_error(
+            StatusCode::NOT_FOUND,
+            r#"{"code":"PGRST202","message":"Could not find the function timegenie.cloud_snapshot_get"}"#,
+            "CLOUD_REQUEST_FAILED",
+        );
+        assert!(missing.starts_with("CLOUD_SCHEMA_MISSING:"));
+
+        let denied = classify_http_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"code":"42501","message":"permission denied for table workspaces"}"#,
+            "CLOUD_REQUEST_FAILED",
+        );
+        assert!(denied.starts_with("CLOUD_PERMISSION_DENIED:"));
     }
 
     #[test]
@@ -1149,6 +1401,211 @@ mod tests {
         assert_eq!(snapshot.mode, "local");
         assert_eq!(snapshot.pending_operations, 0);
         assert!(!snapshot.online || snapshot.sync_state == "synced");
+    }
+
+    #[test]
+    fn failed_outbox_rows_are_reported_as_pending_operations() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("failed-outbox.sqlite3")).unwrap();
+        let cloud_workspace_id = "cloud-workspace";
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let device_id = storage_mode(&database).unwrap().device_id;
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at, error_json)
+                 VALUES (?1, ?2, ?3, 'upsert', 'task', 'task-1', 1, '{}', 'failed', 1, 1, ?4)",
+                rusqlite::params![
+                    uuid::Uuid::now_v7().to_string(),
+                    cloud_workspace_id,
+                    device_id,
+                    json!({ "message": "temporary network failure" }).to_string()
+                ],
+            )
+            .unwrap();
+
+        let snapshot = storage_mode(&database).unwrap();
+        assert_eq!(snapshot.mode, "cloud");
+        assert_eq!(snapshot.pending_operations, 1);
+        assert_eq!(snapshot.sync_state, "pending");
+    }
+
+    #[test]
+    fn cloud_sync_state_exposes_last_success_and_error_details() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("sync-state-details.sqlite3")).unwrap();
+        let cloud_workspace_id = "cloud-workspace";
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "INSERT INTO local_sync_state(workspace_id, device_id, last_change_seq, last_full_sync_at, last_error)
+                 VALUES (?1, 'device-1', 42, 1700000000000, 'network timeout')",
+                [cloud_workspace_id],
+            )
+            .unwrap();
+
+        let snapshot = storage_mode(&database).unwrap();
+        assert_eq!(snapshot.sync_state, "error");
+        assert_eq!(snapshot.last_change_seq, 42);
+        assert_eq!(snapshot.last_synced_at, Some(1700000000000));
+        assert_eq!(snapshot.last_error.as_deref(), Some("network timeout"));
+    }
+
+    #[test]
+    fn local_mode_switch_is_blocked_until_cloud_outbox_is_clean() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("pending-cloud-switch.sqlite3")).unwrap();
+        let cloud_workspace_id = "cloud-workspace";
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let device_id = storage_mode(&database).unwrap().device_id;
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at)
+                 VALUES (?1, ?2, ?3, 'task_update', 'task', 'task-1', 1, '{}', 'pending', 0, 1)",
+                rusqlite::params![Uuid::now_v7().to_string(), cloud_workspace_id, device_id],
+            )
+            .unwrap();
+
+        let error = ensure_no_pending_cloud_work(&database).unwrap_err();
+        assert!(error.starts_with("OFFLINE_RESTRICTED:"));
+        let snapshot = storage_mode(&database).unwrap();
+        assert_eq!(snapshot.mode, "cloud");
+        assert_eq!(snapshot.pending_operations, 1);
+    }
+
+    #[test]
+    fn cloud_configuration_change_is_blocked_until_outbox_is_clean() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("pending-config-switch.sqlite3"))
+                .unwrap();
+        let cloud_workspace_id = "cloud-workspace";
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "supabase_project_url".to_string(),
+                value: json!("https://old-project.supabase.co"),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "supabase_anon_key".to_string(),
+                value: json!("old-anon-key"),
+            },
+        )
+        .unwrap();
+        let device_id = storage_mode(&database).unwrap().device_id;
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at)
+                 VALUES (?1, ?2, ?3, 'task_update', 'task', 'task-1', 1, '{}', 'pending', 0, 1)",
+                rusqlite::params![Uuid::now_v7().to_string(), cloud_workspace_id, device_id],
+            )
+            .unwrap();
+
+        ensure_can_replace_cloud_configuration(
+            &database,
+            "https://old-project.supabase.co",
+            "old-anon-key",
+        )
+        .unwrap();
+        let error = ensure_can_replace_cloud_configuration(
+            &database,
+            "https://new-project.supabase.co",
+            "old-anon-key",
+        )
+        .unwrap_err();
+        assert!(error.starts_with("OFFLINE_RESTRICTED:"));
+        let error = ensure_can_replace_cloud_configuration(
+            &database,
+            "https://old-project.supabase.co",
+            "new-anon-key",
+        )
+        .unwrap_err();
+        assert!(error.starts_with("OFFLINE_RESTRICTED:"));
     }
 
     #[test]
@@ -1200,6 +1657,57 @@ mod tests {
             .conflicts
             .iter()
             .any(|message| message.contains("重复规则")));
+    }
+
+    #[test]
+    fn local_daily_estimates_block_cloud_migration_before_network_access() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("daily-estimate-migration.sqlite3"))
+                .unwrap();
+        let connection = database.open().unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id,
+                parent_id: None,
+                title: "不支持迁移的按日预估".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        set_task_daily_estimate(
+            &database,
+            TaskDailyEstimateSetRequest {
+                task_id: task.id,
+                work_date: "2026-09-29".to_string(),
+                estimate_minutes: Some(60),
+            },
+        )
+        .unwrap();
+
+        let preview = migration_preview(
+            &database,
+            MigrationPreviewRequest {
+                direction: "local_to_cloud".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert!(!preview.can_execute);
+        assert!(preview.target_workspace_id.is_none());
+        assert!(preview
+            .conflicts
+            .iter()
+            .any(|message| message.contains("按日预估")));
     }
 
     #[test]

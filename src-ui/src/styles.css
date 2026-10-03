@@ -1828,6 +1828,7 @@ pre {
 .storage-mode-row strong,
 .cloud-account-row strong { color: var(--text); font-size: 12px; font-weight: 600; }
 .storage-mode-row small { margin-left: auto; color: #748179; font-size: 10px; }
+.cloud-sync-detail { margin: -3px 0 2px; color: var(--text-soft); font-size: 10px; line-height: 1.5; }
 .storage-state-dot.warning { background: #e7b75f; box-shadow: 0 0 0 3px rgba(231,183,95,0.12); }
 .cloud-sync-actions { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
 .storage-state-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #68736e; }

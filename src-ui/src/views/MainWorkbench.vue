@@ -92,10 +92,30 @@ let recentCompletedTimer: number | undefined;
 const cloudSyncLabel = computed(() => {
   if (storageState.value?.mode !== "cloud") return "本地模式";
   if (!storageState.value.online) return "云端离线";
+  if (storageState.value.lastError || storageState.value.syncState === "error") return "同步失败";
   if (storageState.value.conflictCount > 0) return `${storageState.value.conflictCount} 项冲突`;
   if (storageState.value.pendingOperations > 0) return `${storageState.value.pendingOperations} 项等待同步`;
   return "已同步";
 });
+
+const cloudSyncDetail = computed(() => {
+  const state = storageState.value;
+  if (!state || state.mode !== "cloud") return "";
+  if (state.lastError) return `同步失败：${state.lastError}`;
+  if (state.conflictCount > 0) return "本机修改已保存，需处理冲突后继续同步";
+  if (state.pendingOperations > 0) return "本机修改已保存，等待同步到云端";
+  if (state.lastSyncedAt) return `最近同步 ${formatSyncTime(state.lastSyncedAt)}`;
+  return "本机缓存已准备好，尚无云端同步记录";
+});
+
+function formatSyncTime(value: number) {
+  return new Date(value).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
 
 function cloudConflictTitle(conflict: CloudSyncConflict) {
   const payload = conflict.localPayload ?? {};
@@ -759,7 +779,7 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           <button :class="{ active: store.activePage === page.id }" @click="store.selectPage(page.id)">
             <component :is="page.icon" :size="17" />
             <span>{{ page.label }}</span>
-            <i v-if="page.id === 'settings' && storageState?.mode === 'cloud' && (storageState.pendingOperations || storageState.conflictCount)" :class="['nav-sync-indicator', { conflict: storageState.conflictCount }]" :title="cloudSyncLabel"></i>
+            <i v-if="page.id === 'settings' && storageState?.mode === 'cloud' && (storageState.pendingOperations || storageState.conflictCount || storageState.lastError)" :class="['nav-sync-indicator', { conflict: storageState.conflictCount || storageState.lastError }]" :title="cloudSyncLabel"></i>
           </button>
           <section v-if="page.id === 'plan'" class="subject-nav-list">
             <div
@@ -891,7 +911,8 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
 
         <div class="work-panel settings-panel">
           <div class="panel-title"><h2>数据存储</h2><span>{{ settingsDraft.storageMode === 'local' ? '本地 SQLite' : 'Supabase 云端' }}</span></div>
-          <div class="storage-mode-row"><span :class="['storage-state-dot', storageState?.online ? 'online' : '', { warning: storageState?.conflictCount || storageState?.pendingOperations }]"></span><strong>{{ storageState?.mode === 'cloud' ? '云端数据' : '本地数据' }}</strong><small>{{ storageState?.mode === 'cloud' ? `${cloudSyncLabel} · 变更序号 ${storageState.lastChangeSeq}` : '无需网络即可使用' }}</small></div>
+          <div class="storage-mode-row"><span :class="['storage-state-dot', storageState?.online ? 'online' : '', { warning: storageState?.conflictCount || storageState?.pendingOperations || storageState?.lastError }]"></span><strong>{{ storageState?.mode === 'cloud' ? '云端数据' : '本地数据' }}</strong><small>{{ storageState?.mode === 'cloud' ? `${cloudSyncLabel} · 变更序号 ${storageState.lastChangeSeq}` : '无需网络即可使用' }}</small></div>
+          <p v-if="cloudSyncDetail" class="cloud-sync-detail">{{ cloudSyncDetail }}</p>
           <div v-if="storageState?.mode === 'cloud'" class="cloud-sync-actions">
             <button class="secondary-button compact" type="button" :disabled="cloudSyncWorking" @click="refreshCloudSyncStatus">刷新状态</button>
             <button v-if="storageState.pendingOperations" class="secondary-button compact" type="button" :disabled="cloudSyncWorking || !storageState.online" @click="retryCloudSync">重试同步</button>

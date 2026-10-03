@@ -80,6 +80,8 @@ fn cleanup_owned_workspaces(database: &Database) -> Result<(), String> {
             api.project_url, session.user_id
         ))
         .header("apikey", api.anon_key())
+        .header("Accept-Profile", supabase::CLOUD_SCHEMA)
+        .header("Content-Profile", supabase::CLOUD_SCHEMA)
         .bearer_auth(&session.access_token)
         .send()
         .map_err(|error| error.to_string())?;
@@ -195,7 +197,10 @@ async fn subscribe_to_workspace_changes(
         .append_pair("apikey", api.anon_key())
         .append_pair("vsn", "1.0.0");
     let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
-    let topic = format!("realtime:workspace_changes:{workspace_id}");
+    let topic = format!(
+        "realtime:{}:workspace_changes:{workspace_id}",
+        supabase::CLOUD_SCHEMA
+    );
     socket
         .send(Message::Text(
             json!({
@@ -207,7 +212,7 @@ async fn subscribe_to_workspace_changes(
                         "presence": { "key": "" },
                         "postgres_changes": [{
                             "event": "*",
-                            "schema": "public",
+                            "schema": supabase::CLOUD_SCHEMA,
                             "table": "workspace_changes",
                             "filter": format!("workspace_id=eq.{workspace_id}")
                         }],

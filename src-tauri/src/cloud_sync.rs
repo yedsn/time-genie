@@ -10,10 +10,12 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::database::Database;
-use crate::supabase::{client, current_session, storage_mode};
+use crate::supabase::{client, current_session, storage_mode, CLOUD_SCHEMA};
 
 const REALTIME_HEARTBEAT_SECONDS: u64 = 25;
 const REALTIME_RECONNECT_SECONDS: u64 = 5;
+const OUTBOX_SENDING_STALE_AFTER_MILLIS: i64 = 5 * 60 * 1000;
+const OUTBOX_RETRY_MAX_BACKOFF_MILLIS: i64 = 60 * 1000;
 
 pub fn spawn_background_services(database: Database, app: AppHandle) {
     spawn_background_lease(database.clone(), app.clone());
@@ -137,7 +139,7 @@ async fn run_realtime_connection(
         .await
         .map_err(|error| format!("NETWORK_ERROR: Supabase Realtime 连接失败: {error}"))?;
     let (mut writer, mut reader) = socket.split();
-    let topic = format!("realtime:workspace_changes:{workspace_id}");
+    let topic = format!("realtime:{CLOUD_SCHEMA}:workspace_changes:{workspace_id}");
     writer
         .send(Message::Text(
             json!({
@@ -149,7 +151,7 @@ async fn run_realtime_connection(
                         "presence": { "key": "" },
                         "postgres_changes": [{
                             "event": "*",
-                            "schema": "public",
+                            "schema": CLOUD_SCHEMA,
                             "table": "workspace_changes",
                             "filter": format!("workspace_id=eq.{workspace_id}")
                         }],
@@ -267,9 +269,13 @@ fn emit_cloud_error(app: &AppHandle, database: &Database, error: &str) {
             "cloud-sync-state-changed",
             json!({
                 "mode": status.mode,
+                "workspaceId": status.workspace_id,
+                "deviceId": status.device_id,
                 "online": false,
                 "syncState": "error",
                 "lastChangeSeq": status.last_change_seq,
+                "lastSyncedAt": status.last_synced_at,
+                "lastError": error,
                 "pendingOperations": status.pending_operations,
                 "conflictCount": status.conflict_count,
                 "error": error
@@ -282,9 +288,13 @@ fn emit_cloud_error(app: &AppHandle, database: &Database, error: &str) {
 #[serde(rename_all = "camelCase")]
 pub struct CloudSyncStatus {
     pub mode: String,
+    pub workspace_id: String,
+    pub device_id: String,
     pub online: bool,
     pub sync_state: String,
     pub last_change_seq: i64,
+    pub last_synced_at: Option<i64>,
+    pub last_error: Option<String>,
     pub pending_operations: i64,
     pub conflict_count: i64,
 }
@@ -391,9 +401,13 @@ pub fn sync_status(database: &Database) -> Result<CloudSyncStatus, String> {
     let state = storage_mode(database)?;
     Ok(CloudSyncStatus {
         mode: state.mode,
+        workspace_id: state.workspace_id,
+        device_id: state.device_id,
         online: state.online,
         sync_state: state.sync_state,
         last_change_seq: state.last_change_seq,
+        last_synced_at: state.last_synced_at,
+        last_error: state.last_error,
         pending_operations: state.pending_operations,
         conflict_count: state.conflict_count,
     })
@@ -446,6 +460,7 @@ pub fn pull(
     })
 }
 
+#[cfg(test)]
 pub fn enqueue_entity(
     database: &Database,
     operation_type: &str,
@@ -472,6 +487,7 @@ pub fn enqueue_entity(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn enqueue_entity_deferred(
     database: &Database,
     operation_type: &str,
@@ -510,6 +526,43 @@ pub fn enqueue_entity_deferred(
     Ok(())
 }
 
+pub(crate) fn enqueue_entity_in_transaction(
+    transaction: &Transaction<'_>,
+    state: &crate::supabase::StorageModeSnapshot,
+    operation_type: &str,
+    entity_type: &str,
+    entity_id: Option<&str>,
+    base_version: Option<i64>,
+    operation_id: Option<&str>,
+) -> Result<(), String> {
+    if state.mode != "cloud" {
+        return Ok(());
+    }
+    let payload = entity_payload_from_connection(transaction, entity_type, entity_id)?;
+    let operation_id = operation_id
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| Uuid::now_v7().to_string());
+    transaction
+        .execute(
+            "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', 0, ?9)
+             ON CONFLICT(operation_id) DO NOTHING",
+            params![
+                operation_id,
+                state.workspace_id,
+                state.device_id,
+                operation_type,
+                entity_type,
+                entity_id,
+                base_version,
+                payload.to_string(),
+                now_millis()
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 pub fn flush_if_online(database: &Database) -> Result<(), String> {
     let state = storage_mode(database)?;
     if state.mode == "cloud" && state.online {
@@ -525,10 +578,9 @@ pub fn push_outbox(database: &Database) -> Result<CloudSyncPushResult, String> {
     let state = require_cloud(database)?;
     let session = current_session(database)?;
     let api = client(database)?;
-    let operations = load_pending_operations(database, &state.workspace_id)?;
+    let operations = claim_pending_operations(database, &state.workspace_id)?;
     let mut pushed = 0;
     for operation in operations {
-        mark_outbox_sending(database, &operation.operation_id)?;
         let response = api.rpc(
             "cloud_apply_patch",
             json!({
@@ -779,13 +831,7 @@ pub fn pull_snapshot(database: &Database) -> Result<i64, String> {
         &snapshot,
         Some(expected_local_revision),
         Some(&state.workspace_id),
-    )?;
-    update_sync_state(
-        database,
-        &state.workspace_id,
-        &state.device_id,
-        latest_change_seq,
-        None,
+        Some((&state.workspace_id, &state.device_id, latest_change_seq)),
     )?;
     Ok(latest_change_seq)
 }
@@ -989,12 +1035,21 @@ fn require_cloud(database: &Database) -> Result<crate::supabase::StorageModeSnap
     Ok(state)
 }
 
+#[cfg(test)]
 fn entity_payload(
     database: &Database,
     entity_type: &str,
     entity_id: Option<&str>,
 ) -> Result<Value, String> {
     let connection = database.open()?;
+    entity_payload_from_connection(&connection, entity_type, entity_id)
+}
+
+fn entity_payload_from_connection(
+    connection: &rusqlite::Connection,
+    entity_type: &str,
+    entity_id: Option<&str>,
+) -> Result<Value, String> {
     let local_workspace_id: String = connection
         .query_row(
             "SELECT id FROM workspaces WHERE storage_mode = 'local' AND deleted_at IS NULL ORDER BY created_at LIMIT 1",
@@ -1156,20 +1211,31 @@ fn sqlite_value_to_json(value: rusqlite::types::Value) -> Value {
     }
 }
 
-fn load_pending_operations(
+fn claim_pending_operations(
     database: &Database,
     workspace_id: &str,
 ) -> Result<Vec<OutboxOperation>, String> {
-    let connection = database.open()?;
-    let mut statement = connection
+    let mut connection = database.open()?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let now = now_millis();
+    let stale_sending_before = now.saturating_sub(OUTBOX_SENDING_STALE_AFTER_MILLIS);
+    let mut statement = transaction
         .prepare(
-            "SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json
-             FROM sync_outbox WHERE workspace_id = ?1 AND state IN ('pending','sending','failed') ORDER BY created_at, operation_id",
+            "SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, last_attempt_at
+             FROM sync_outbox
+             WHERE workspace_id = ?1
+               AND (state IN ('pending','failed') OR (state = 'sending' AND COALESCE(last_attempt_at, created_at) < ?2))
+             ORDER BY created_at, operation_id",
         )
         .map_err(|error| error.to_string())?;
-    let result = statement
-        .query_map([workspace_id], |row| {
+    let candidates = statement
+        .query_map(params![workspace_id, stale_sending_before], |row| {
             let payload: String = row.get(5)?;
+            let state: String = row.get(6)?;
+            let attempt_count: i64 = row.get(7)?;
+            let last_attempt_at: Option<i64> = row.get(8)?;
             Ok(OutboxOperation {
                 operation_id: row.get(0)?,
                 operation_type: row.get(1)?,
@@ -1178,22 +1244,46 @@ fn load_pending_operations(
                 base_version: row.get(4)?,
                 payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
             })
+            .map(|operation| (operation, state, attempt_count, last_attempt_at))
         })
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string());
-    result
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+
+    let result = candidates
+        .into_iter()
+        .filter_map(|(operation, state, attempt_count, last_attempt_at)| {
+            let retry_ready = state == "sending"
+                || retry_ready_at(last_attempt_at, attempt_count)
+                    .is_none_or(|ready_at| ready_at <= now);
+            retry_ready.then_some(operation)
+        })
+        .collect::<Vec<_>>();
+
+    for operation in &result {
+        transaction
+            .execute(
+                "UPDATE sync_outbox
+                 SET state = 'sending', attempt_count = attempt_count + 1, last_attempt_at = ?1, error_json = NULL
+                 WHERE workspace_id = ?2
+                   AND operation_id = ?3
+                   AND (state IN ('pending','failed') OR (state = 'sending' AND COALESCE(last_attempt_at, created_at) < ?4))",
+                params![now, workspace_id, operation.operation_id, stale_sending_before],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(result)
 }
 
-fn mark_outbox_sending(database: &Database, operation_id: &str) -> Result<(), String> {
-    database
-        .open()?
-        .execute(
-            "UPDATE sync_outbox SET state = 'sending', attempt_count = attempt_count + 1, last_attempt_at = ?1, error_json = NULL WHERE operation_id = ?2",
-            params![now_millis(), operation_id],
-        )
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+fn retry_ready_at(last_attempt_at: Option<i64>, attempt_count: i64) -> Option<i64> {
+    let last_attempt_at = last_attempt_at?;
+    let exponent = attempt_count.clamp(0, 6) as u32;
+    let backoff = (1_i64 << exponent)
+        .saturating_mul(1000)
+        .min(OUTBOX_RETRY_MAX_BACKOFF_MILLIS);
+    Some(last_attempt_at.saturating_add(backoff))
 }
 
 fn mark_outbox_error(
@@ -1290,6 +1380,7 @@ fn apply_snapshot(
     snapshot: &Value,
     expected_local_revision: Option<i64>,
     sync_workspace_id: Option<&str>,
+    sync_state_update: Option<(&str, &str, i64)>,
 ) -> Result<(), String> {
     let mut connection = database.open()?;
     let local_workspace_id: String = connection
@@ -1383,6 +1474,16 @@ fn apply_snapshot(
             [],
         )
         .map_err(|error| error.to_string())?;
+    if let Some((workspace_id, device_id, last_change_seq)) = sync_state_update {
+        transaction
+            .execute(
+                "INSERT INTO local_sync_state(workspace_id, device_id, last_change_seq, last_full_sync_at, last_error)
+                 VALUES (?1, ?2, ?3, ?4, NULL)
+                 ON CONFLICT(workspace_id) DO UPDATE SET device_id = excluded.device_id, last_change_seq = excluded.last_change_seq, last_full_sync_at = excluded.last_full_sync_at, last_error = excluded.last_error",
+                params![workspace_id, device_id, last_change_seq, now_millis()],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     transaction.commit().map_err(|error| error.to_string())
 }
 
@@ -1536,7 +1637,9 @@ fn clear_snapshot_cache(transaction: &Transaction<'_>, workspace_id: &str) -> Re
         .map_err(|error| error.to_string())?;
     for table in [
         "external_bindings",
+        "integration_configs",
         "report_tasks",
+        "task_daily_estimates",
         "time_allocations",
         "time_segments",
         "unassigned_segments",
@@ -1913,6 +2016,126 @@ mod tests {
     }
 
     #[test]
+    fn outbox_claim_skips_fresh_sending_and_retries_stale_sending() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("cloud-claim.sqlite3")).unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let pending_id = Uuid::now_v7().to_string();
+        let fresh_sending_id = Uuid::now_v7().to_string();
+        let stale_sending_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        let stale_attempt_at = now - OUTBOX_SENDING_STALE_AFTER_MILLIS - 1;
+        for (operation_id, state, attempt_count, last_attempt_at) in [
+            (&pending_id, "pending", 0_i64, None),
+            (&fresh_sending_id, "sending", 3_i64, Some(now)),
+            (&stale_sending_id, "sending", 2_i64, Some(stale_attempt_at)),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at, last_attempt_at)
+                     VALUES (?1, ?2, ?3, 'subject_create', 'subject', ?4, NULL, '{}', ?5, ?6, ?7, ?8)",
+                    params![operation_id, &workspace_id, &device_id, Uuid::now_v7().to_string(), state, attempt_count, now, last_attempt_at],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let claimed = claim_pending_operations(&database, &workspace_id).unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert!(claimed
+            .iter()
+            .any(|operation| operation.operation_id == pending_id));
+        assert!(claimed
+            .iter()
+            .any(|operation| operation.operation_id == stale_sending_id));
+
+        let connection = database.open().unwrap();
+        let pending_state: (String, i64) = connection
+            .query_row(
+                "SELECT state, attempt_count FROM sync_outbox WHERE operation_id = ?1",
+                [&pending_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let fresh_sending_state: (String, i64) = connection
+            .query_row(
+                "SELECT state, attempt_count FROM sync_outbox WHERE operation_id = ?1",
+                [&fresh_sending_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let stale_sending_state: (String, i64) = connection
+            .query_row(
+                "SELECT state, attempt_count FROM sync_outbox WHERE operation_id = ?1",
+                [&stale_sending_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pending_state, ("sending".to_string(), 1));
+        assert_eq!(fresh_sending_state, ("sending".to_string(), 3));
+        assert_eq!(stale_sending_state, ("sending".to_string(), 3));
+    }
+
+    #[test]
+    fn outbox_claim_respects_retry_backoff_for_recent_failures() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("cloud-backoff.sqlite3")).unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let fresh_failure_id = Uuid::now_v7().to_string();
+        let ready_failure_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        for (operation_id, attempt_count, last_attempt_at) in [
+            (&fresh_failure_id, 3_i64, now),
+            (&ready_failure_id, 3_i64, now - 10_000),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at, last_attempt_at)
+                     VALUES (?1, ?2, ?3, 'subject_create', 'subject', ?4, NULL, '{}', 'pending', ?5, ?6, ?7)",
+                    params![operation_id, &workspace_id, &device_id, Uuid::now_v7().to_string(), attempt_count, now, last_attempt_at],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let claimed = claim_pending_operations(&database, &workspace_id).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].operation_id, ready_failure_id);
+
+        let connection = database.open().unwrap();
+        let fresh_state: (String, i64) = connection
+            .query_row(
+                "SELECT state, attempt_count FROM sync_outbox WHERE operation_id = ?1",
+                [&fresh_failure_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let ready_state: (String, i64) = connection
+            .query_row(
+                "SELECT state, attempt_count FROM sync_outbox WHERE operation_id = ?1",
+                [&ready_failure_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(fresh_state, ("pending".to_string(), 3));
+        assert_eq!(ready_state, ("sending".to_string(), 4));
+    }
+
+    #[test]
     fn cloud_entity_version_reads_versioned_snapshot_entities() {
         let snapshot = json!({
             "tasks": [{"id": "task-a", "version": 4}],
@@ -2014,7 +2237,7 @@ mod tests {
                 {"id": parent_id, "subject_id": subject_id, "parent_id": null, "title": "父项", "status": "open", "source_type": "manual", "sort_order": 10, "created_at": now, "updated_at": now, "version": 1}
             ]
         });
-        apply_snapshot(&database, &snapshot, None, None).unwrap();
+        apply_snapshot(&database, &snapshot, None, None, None).unwrap();
         let restored_parent: String = database
             .open()
             .unwrap()
@@ -2025,6 +2248,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(restored_parent, parent_id);
+    }
+
+    #[test]
+    fn snapshot_import_advances_checkpoint_in_the_same_transaction() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("cloud-snapshot-checkpoint.sqlite3"))
+                .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+
+        let now = now_millis();
+        let snapshot = json!({
+            "subjects": [{"id": subject_id, "name": "云端主体", "sort_order": 10, "created_at": now, "updated_at": now, "version": 7, "deleted_at": null}]
+        });
+        apply_snapshot(
+            &database,
+            &snapshot,
+            None,
+            Some(&workspace_id),
+            Some((&workspace_id, &device_id, 42)),
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let saved: (String, i64, i64) = connection
+            .query_row(
+                "SELECT s.name, s.version, l.last_change_seq
+                 FROM subjects s CROSS JOIN local_sync_state l
+                 WHERE s.id = ?1 AND l.workspace_id = ?2",
+                params![subject_id, workspace_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(saved, ("云端主体".to_string(), 7, 42));
     }
 
     #[test]
@@ -2056,8 +2323,14 @@ mod tests {
             "subjects": [{"id": subject_id, "name": "云端旧名称", "sort_order": 10, "created_at": now, "updated_at": now, "version": 1, "deleted_at": null}]
         });
 
-        let error =
-            apply_snapshot(&database, &snapshot, Some(revision), Some(&workspace_id)).unwrap_err();
+        let error = apply_snapshot(
+            &database,
+            &snapshot,
+            Some(revision),
+            Some(&workspace_id),
+            None,
+        )
+        .unwrap_err();
         assert!(error.starts_with("SYNC_RETRY:"));
         let saved_name: String = database
             .open()
@@ -2069,6 +2342,41 @@ mod tests {
             )
             .unwrap();
         assert_eq!(saved_name, "本地新名称");
+    }
+
+    #[test]
+    fn snapshot_import_removes_stale_integration_configs() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("cloud-snapshot-integration-configs.sqlite3"),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let now = now_millis();
+        connection
+            .execute(
+                "INSERT INTO integration_configs(workspace_id,provider,enabled,config_json,secret_ref,updated_at,version)
+                 VALUES (?1,'seatable',1,?2,NULL,?3,1)",
+                params![workspace_id, json!({ "syncEnabled": true }).to_string(), now],
+            )
+            .unwrap();
+        drop(connection);
+
+        apply_snapshot(&database, &json!({}), None, None, None).unwrap();
+
+        let count: i64 = database
+            .open()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM integration_configs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]
@@ -2089,7 +2397,7 @@ mod tests {
         drop(connection);
         let snapshot = json!({});
 
-        apply_snapshot(&database, &snapshot, None, None).unwrap();
+        apply_snapshot(&database, &snapshot, None, None, None).unwrap();
 
         let connection = database.open().unwrap();
         let name: String = connection

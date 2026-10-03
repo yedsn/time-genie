@@ -511,24 +511,14 @@ fn preview_task_sync_with(
     Ok(preview)
 }
 
-pub fn execute_task_sync(
-    database: &Database,
-    request: SyncExecuteRequest,
-) -> Result<SyncExecutionResult, String> {
-    let connection = database.open()?;
-    let (workspace_id, config) = load_config(&connection)?;
-    let token = integration_secret("seatable", &workspace_id)?;
-    let client = SeaTableClient::connect(&config, &token)?;
-    execute_task_sync_with(database, request, &config, &client)
-}
-
 fn execute_task_sync_with(
     database: &Database,
     request: SyncExecuteRequest,
     config: &SeaTableConfig,
     client: &impl SeaTableApi,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<SyncExecutionResult, String> {
-    let connection = database.open()?;
+    let mut connection = database.open()?;
     let workspace_id: String = connection
         .query_row(
             "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
@@ -602,16 +592,31 @@ fn execute_task_sync_with(
             Ok(external_id) => {
                 success += 1;
                 let external_id = external_id.or(item.external_id).unwrap_or_default();
-                connection.execute(
+                let transaction = connection
+                    .transaction()
+                    .map_err(|error| error.to_string())?;
+                transaction.execute(
                     "UPDATE sync_items SET state = 'succeeded', external_id = ?1, error_code = NULL, error_message = NULL WHERE id = ?2",
                     params![external_id, item.item_id],
                 ).map_err(|error| error.to_string())?;
-                connection.execute(
+                transaction.execute(
                     "INSERT INTO external_bindings(id, workspace_id, provider, entity_type, entity_id, external_id, last_synced_at)
                      VALUES (?1, ?2, 'seatable', 'task', ?3, ?4, ?5)
                      ON CONFLICT(workspace_id, provider, entity_type, entity_id) DO UPDATE SET external_id = excluded.external_id, last_synced_at = excluded.last_synced_at",
                     params![Uuid::now_v7().to_string(), workspace_id, item.task_id, external_id, now],
                 ).map_err(|error| error.to_string())?;
+                if let Some((state, operation_type)) = cloud_operation {
+                    crate::cloud_sync::enqueue_entity_in_transaction(
+                        &transaction,
+                        state,
+                        operation_type,
+                        "external_binding",
+                        Some(&item.task_id),
+                        None,
+                        None,
+                    )?;
+                }
+                transaction.commit().map_err(|error| error.to_string())?;
             }
             Err(error) => {
                 failed += 1;
@@ -642,30 +647,12 @@ fn execute_task_sync_with(
     })
 }
 
-pub fn retry_failed(
-    database: &Database,
-    request: SyncExecuteRequest,
-) -> Result<SyncExecutionResult, String> {
-    let connection = database.open()?;
-    let (_, config) = load_config(&connection)?;
-    let workspace_id: String = connection
-        .query_row(
-            "SELECT workspace_id FROM sync_runs WHERE id = ?1",
-            [&request.run_id],
-            |row| row.get(0),
-        )
-        .map_err(|_| "NOT_FOUND: 原同步记录不存在".to_string())?;
-    let token = integration_secret("seatable", &workspace_id)?;
-    let client = SeaTableClient::connect(&config, &token)?;
-    drop(connection);
-    retry_failed_with(database, request, &config, &client)
-}
-
 fn retry_failed_with(
     database: &Database,
     request: SyncExecuteRequest,
     config: &SeaTableConfig,
     client: &impl SeaTableApi,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<SyncExecutionResult, String> {
     let connection = database.open()?;
     let preview_json: String = connection
@@ -730,6 +717,7 @@ fn retry_failed_with(
         SyncExecuteRequest { run_id: new_id },
         config,
         client,
+        cloud_operation,
     )
 }
 
@@ -1037,8 +1025,26 @@ pub fn seatable_task_sync_execute(
     database: tauri::State<'_, Database>,
     request: SyncExecuteRequest,
 ) -> Result<SyncExecutionResult, String> {
-    let result = execute_task_sync(&database, request)?;
-    enqueue_successful_bindings(&database, &result.run_id)?;
+    let state = crate::supabase::storage_mode(&database)?;
+    let connection = database.open()?;
+    let (_, config) = load_config(&connection)?;
+    let workspace_id: String = connection
+        .query_row(
+            "SELECT workspace_id FROM sync_runs WHERE id = ?1",
+            [&request.run_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| "NOT_FOUND: SeaTable 同步预览不存在".to_string())?;
+    let token = integration_secret("seatable", &workspace_id)?;
+    let client = SeaTableClient::connect(&config, &token)?;
+    drop(connection);
+    let result = execute_task_sync_with(
+        &database,
+        request,
+        &config,
+        &client,
+        Some((&state, "external_binding_upsert")),
+    )?;
     crate::cloud_sync::flush_if_online(&database)?;
     Ok(result)
 }
@@ -1048,35 +1054,28 @@ pub fn seatable_sync_retry_failed(
     database: tauri::State<'_, Database>,
     request: SyncExecuteRequest,
 ) -> Result<SyncExecutionResult, String> {
-    let result = retry_failed(&database, request)?;
-    enqueue_successful_bindings(&database, &result.run_id)?;
+    let state = crate::supabase::storage_mode(&database)?;
+    let connection = database.open()?;
+    let (_, config) = load_config(&connection)?;
+    let workspace_id: String = connection
+        .query_row(
+            "SELECT workspace_id FROM sync_runs WHERE id = ?1",
+            [&request.run_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| "NOT_FOUND: 原同步记录不存在".to_string())?;
+    let token = integration_secret("seatable", &workspace_id)?;
+    let client = SeaTableClient::connect(&config, &token)?;
+    drop(connection);
+    let result = retry_failed_with(
+        &database,
+        request,
+        &config,
+        &client,
+        Some((&state, "external_binding_upsert")),
+    )?;
     crate::cloud_sync::flush_if_online(&database)?;
     Ok(result)
-}
-
-fn enqueue_successful_bindings(database: &Database, run_id: &str) -> Result<(), String> {
-    let connection = database.open()?;
-    let mut statement = connection
-        .prepare("SELECT DISTINCT entity_id FROM sync_items WHERE run_id = ?1 AND entity_type = 'task' AND state = 'succeeded' AND external_id IS NOT NULL")
-        .map_err(|error| error.to_string())?;
-    let task_ids = statement
-        .query_map([run_id], |row| row.get::<_, String>(0))
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    drop(statement);
-    drop(connection);
-    for task_id in task_ids {
-        crate::cloud_sync::enqueue_entity_deferred(
-            database,
-            "external_binding_upsert",
-            "external_binding",
-            Some(&task_id),
-            None,
-            None,
-        )?;
-    }
-    Ok(())
 }
 
 #[tauri::command]
@@ -1093,6 +1092,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::settings::{self, SettingsScope, SettingsUpdate};
     use tempfile::tempdir;
 
     struct MockSeaTable {
@@ -1323,6 +1323,7 @@ mod tests {
             },
             &config(),
             &client,
+            None,
         )
         .unwrap();
         let repeated = execute_task_sync_with(
@@ -1332,6 +1333,7 @@ mod tests {
             },
             &config(),
             &client,
+            None,
         )
         .unwrap();
         assert_eq!(first.success_count, 1);
@@ -1354,6 +1356,78 @@ mod tests {
         .unwrap();
         assert_eq!(next.skip_count, 1);
         assert_eq!(next.create_count, 0);
+    }
+
+    #[test]
+    fn cloud_task_sync_persists_external_binding_outbox_transactionally() {
+        let (database, subject_id, task_ids) = database_and_tasks();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(Uuid::now_v7().to_string()),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let state = crate::supabase::storage_mode(&database).unwrap();
+        let client = MockSeaTable::new();
+        let preview = preview_task_sync_with(
+            &database,
+            TaskSyncPreviewRequest {
+                subject_id,
+                work_date: "2026-09-24".to_string(),
+                task_ids: vec![task_ids[0].clone()],
+            },
+            &config(),
+            &client,
+        )
+        .unwrap();
+
+        let result = execute_task_sync_with(
+            &database,
+            SyncExecuteRequest {
+                run_id: preview.run_id,
+            },
+            &config(),
+            &client,
+            Some((&state, "external_binding_upsert")),
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let external_id: String = connection
+            .query_row(
+                "SELECT external_id FROM external_bindings WHERE provider = 'seatable' AND entity_type = 'task' AND entity_id = ?1",
+                [&task_ids[0]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (operation_type, entity_type, payload_json): (String, String, String) = connection
+            .query_row(
+                "SELECT operation_type, entity_type, payload_json FROM sync_outbox WHERE entity_id = ?1",
+                [&task_ids[0]],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_str(&payload_json).unwrap();
+
+        assert_eq!(result.success_count, 1);
+        assert!(!external_id.is_empty());
+        assert_eq!(operation_type, "external_binding_upsert");
+        assert_eq!(entity_type, "external_binding");
+        assert_eq!(payload["provider"], "seatable");
+        assert_eq!(payload["entity_id"], task_ids[0]);
+        assert_eq!(payload["external_id"], external_id);
     }
 
     #[test]
@@ -1392,6 +1466,7 @@ mod tests {
             },
             &config(),
             &client,
+            None,
         )
         .unwrap();
         assert_eq!((first.success_count, first.failed_count), (1, 1));
@@ -1402,6 +1477,7 @@ mod tests {
             },
             &config(),
             &client,
+            None,
         )
         .unwrap();
         assert_eq!((retried.success_count, retried.failed_count), (1, 0));

@@ -234,8 +234,13 @@ pub fn run() {
                 stop: MenuItem::with_id(app, "stop_timer", "结束本段", false, None::<&str>)?,
             };
             let show_today = MenuItem::with_id(app, "show_today", "查看今日", true, None::<&str>)?;
-            let check_update =
-                MenuItem::with_id(app, "check_update", UPDATE_CHECK_MENU_LABEL, true, None::<&str>)?;
+            let check_update = MenuItem::with_id(
+                app,
+                "check_update",
+                UPDATE_CHECK_MENU_LABEL,
+                true,
+                None::<&str>,
+            )?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(
                 app,
@@ -681,7 +686,10 @@ fn ensure_updater_is_configured(app: &AppHandle) -> Result<(), String> {
     if endpoints_ready && pubkey_ready {
         Ok(())
     } else {
-        Err("更新功能尚未完成发布配置，请先填写 GitHub/Gitee Releases 地址和 updater 公钥。".to_string())
+        Err(
+            "更新功能尚未完成发布配置，请先填写 GitHub/Gitee Releases 地址和 updater 公钥。"
+                .to_string(),
+        )
     }
 }
 

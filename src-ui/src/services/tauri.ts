@@ -100,6 +100,8 @@ export type StorageModeSnapshot = {
   pendingOperations: number;
   conflictCount: number;
   lastChangeSeq: number;
+  lastSyncedAt?: number;
+  lastError?: string;
 };
 
 export type StorageMigrationPreview = {

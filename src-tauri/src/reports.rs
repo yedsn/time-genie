@@ -211,9 +211,18 @@ pub fn suggest_report_tasks(
         .collect())
 }
 
+#[cfg(test)]
 pub fn create_report(
     database: &Database,
     request: ReportCreateRequest,
+) -> Result<ReportDto, String> {
+    create_report_with_cloud_operation(database, request, None)
+}
+
+fn create_report_with_cloud_operation(
+    database: &Database,
+    request: ReportCreateRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
 ) -> Result<ReportDto, String> {
     validate_operation_id(&request.client_request_id)?;
     let (period_start, period_end) =
@@ -282,13 +291,25 @@ pub fn create_report(
         "report_create",
         &result,
     )?;
+    if let Some((state, operation_type, operation_id)) = cloud_operation {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "report",
+            Some(&id),
+            None,
+            operation_id,
+        )?;
+    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
 
-pub fn update_report_scope(
+fn update_report_scope_with_cloud_operation(
     database: &Database,
     request: ReportScopeUpdateRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<ReportDto, String> {
     let (period_start, period_end) =
         normalize_period(&request.report_type, &request.reference_date)?;
@@ -339,21 +360,44 @@ pub fn update_report_scope(
     )?;
     bump_revision(&transaction)?;
     let result = load_report(&transaction, &request.report_id)?;
+    if let Some((state, operation_type)) = cloud_operation {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "report",
+            Some(&request.report_id),
+            Some(request.expected_version),
+            None,
+        )?;
+    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
 
+#[cfg(test)]
 pub fn save_report_content(
     database: &Database,
     request: ReportContentSaveRequest,
 ) -> Result<ReportDto, String> {
+    save_report_content_with_cloud_operation(database, request, None)
+}
+
+fn save_report_content_with_cloud_operation(
+    database: &Database,
+    request: ReportContentSaveRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+) -> Result<ReportDto, String> {
     if request.markdown.trim().is_empty() {
         return Err("VALIDATION_ERROR: 报告内容不能为空".to_string());
     }
-    let connection = database.open()?;
+    let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     let now = now_millis();
-    let changed = connection
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let changed = transaction
         .execute(
             "UPDATE reports SET markdown_content = ?1, content_source = 'edited', updated_at = ?2, version = version + 1
              WHERE id = ?3 AND workspace_id = ?4 AND version = ?5 AND deleted_at IS NULL",
@@ -363,13 +407,35 @@ pub fn save_report_content(
     if changed == 0 {
         return Err("VERSION_CONFLICT: 报告内容已变化".to_string());
     }
-    bump_revision(&connection)?;
-    load_report(&connection, &request.report_id)
+    bump_revision(&transaction)?;
+    let result = load_report(&transaction, &request.report_id)?;
+    if let Some((state, operation_type)) = cloud_operation {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "report",
+            Some(&request.report_id),
+            Some(request.expected_version),
+            None,
+        )?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(result)
 }
 
+#[cfg(test)]
 pub fn regenerate_report(
     database: &Database,
     request: ReportVersionRequest,
+) -> Result<ReportDto, String> {
+    regenerate_report_with_cloud_operation(database, request, None)
+}
+
+fn regenerate_report_with_cloud_operation(
+    database: &Database,
+    request: ReportVersionRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<ReportDto, String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
@@ -403,15 +469,33 @@ pub fn regenerate_report(
     }
     bump_revision(&transaction)?;
     let result = load_report(&transaction, &request.report_id)?;
+    if let Some((state, operation_type)) = cloud_operation {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "report",
+            Some(&request.report_id),
+            Some(request.expected_version),
+            None,
+        )?;
+    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
 
-pub fn delete_report(database: &Database, request: ReportVersionRequest) -> Result<(), String> {
-    let connection = database.open()?;
+fn delete_report_with_cloud_operation(
+    database: &Database,
+    request: ReportVersionRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+) -> Result<(), String> {
+    let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     let now = now_millis();
-    let changed = connection
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let changed = transaction
         .execute(
             "UPDATE reports SET deleted_at = ?1, updated_at = ?1, version = version + 1
              WHERE id = ?2 AND workspace_id = ?3 AND version = ?4 AND deleted_at IS NULL",
@@ -426,7 +510,19 @@ pub fn delete_report(database: &Database, request: ReportVersionRequest) -> Resu
     if changed == 0 {
         return Err("VERSION_CONFLICT: 报告已变化或已删除".to_string());
     }
-    bump_revision(&connection)
+    bump_revision(&transaction)?;
+    if let Some((state, operation_type)) = cloud_operation {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "report",
+            Some(&request.report_id),
+            Some(request.expected_version),
+            None,
+        )?;
+    }
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 pub fn public_report(
@@ -469,13 +565,14 @@ pub fn get_template(
     )
 }
 
-pub fn save_template(
+fn save_template_with_cloud_operation(
     database: &Database,
     request: ReportTemplateSaveRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<ReportTemplateDto, String> {
     validate_report_type(&request.report_type)?;
     validate_template(&request.content)?;
-    let connection = database.open()?;
+    let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     if let Some(subject_id) = &request.subject_id {
         ensure_subject(&connection, &workspace_id, subject_id)?;
@@ -490,6 +587,9 @@ pub fn save_template(
         .optional()
         .map_err(|error| error.to_string())?;
     let now = now_millis();
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
     let id = if let Some((id, version)) = existing {
         if request
             .expected_version
@@ -497,7 +597,7 @@ pub fn save_template(
         {
             return Err("VERSION_CONFLICT: 报告模板已变化".to_string());
         }
-        connection
+        transaction
             .execute(
                 "UPDATE report_templates SET content = ?1, is_builtin = 0, updated_at = ?2, version = version + 1 WHERE id = ?3",
                 params![request.content, now, id],
@@ -506,7 +606,7 @@ pub fn save_template(
         id
     } else {
         let id = Uuid::now_v7().to_string();
-        connection
+        transaction
             .execute(
                 "INSERT INTO report_templates(id, workspace_id, report_type, subject_id, content, is_builtin, created_at, updated_at, version)
                  VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?6, 1)",
@@ -515,8 +615,21 @@ pub fn save_template(
             .map_err(|error| error.to_string())?;
         id
     };
-    bump_revision(&connection)?;
-    load_template_by_id(&connection, &id)
+    bump_revision(&transaction)?;
+    let result = load_template_by_id(&transaction, &id)?;
+    if let Some((state, operation_type)) = cloud_operation {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "report_template",
+            Some(&id),
+            request.expected_version,
+            None,
+        )?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(result)
 }
 
 fn load_report(connection: &rusqlite::Connection, report_id: &str) -> Result<ReportDto, String> {
@@ -1491,15 +1604,13 @@ pub fn report_create(
 ) -> Result<ReportDto, String> {
     crate::supabase::ensure_repository_write_mode(&database)?;
     let operation_id = request.client_request_id.clone();
-    let result = create_report(&database, request)?;
-    crate::cloud_sync::enqueue_entity(
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = create_report_with_cloud_operation(
         &database,
-        "report_create",
-        "report",
-        Some(&result.id),
-        None,
-        Some(&operation_id),
+        request,
+        Some((&state, "report_create", Some(operation_id.as_str()))),
     )?;
+    crate::cloud_sync::flush_if_online(&database)?;
     Ok(result)
 }
 #[tauri::command]
@@ -1508,16 +1619,13 @@ pub fn report_update_scope(
     request: ReportScopeUpdateRequest,
 ) -> Result<ReportDto, String> {
     crate::supabase::ensure_repository_write_mode(&database)?;
-    let base_version = request.expected_version;
-    let result = update_report_scope(&database, request)?;
-    crate::cloud_sync::enqueue_entity(
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = update_report_scope_with_cloud_operation(
         &database,
-        "report_update_scope",
-        "report",
-        Some(&result.id),
-        Some(base_version),
-        None,
+        request,
+        Some((&state, "report_update_scope")),
     )?;
+    crate::cloud_sync::flush_if_online(&database)?;
     Ok(result)
 }
 #[tauri::command]
@@ -1526,16 +1634,13 @@ pub fn report_save_content(
     request: ReportContentSaveRequest,
 ) -> Result<ReportDto, String> {
     crate::supabase::ensure_repository_write_mode(&database)?;
-    let base_version = request.expected_version;
-    let result = save_report_content(&database, request)?;
-    crate::cloud_sync::enqueue_entity(
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = save_report_content_with_cloud_operation(
         &database,
-        "report_save_content",
-        "report",
-        Some(&result.id),
-        Some(base_version),
-        None,
+        request,
+        Some((&state, "report_save_content")),
     )?;
+    crate::cloud_sync::flush_if_online(&database)?;
     Ok(result)
 }
 #[tauri::command]
@@ -1544,16 +1649,13 @@ pub fn report_regenerate(
     request: ReportVersionRequest,
 ) -> Result<ReportDto, String> {
     crate::supabase::ensure_repository_write_mode(&database)?;
-    let base_version = request.expected_version;
-    let result = regenerate_report(&database, request)?;
-    crate::cloud_sync::enqueue_entity(
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = regenerate_report_with_cloud_operation(
         &database,
-        "report_regenerate",
-        "report",
-        Some(&result.id),
-        Some(base_version),
-        None,
+        request,
+        Some((&state, "report_regenerate")),
     )?;
+    crate::cloud_sync::flush_if_online(&database)?;
     Ok(result)
 }
 #[tauri::command]
@@ -1562,17 +1664,9 @@ pub fn report_delete(
     request: ReportVersionRequest,
 ) -> Result<(), String> {
     crate::supabase::ensure_repository_write_mode(&database)?;
-    let report_id = request.report_id.clone();
-    let base_version = request.expected_version;
-    delete_report(&database, request)?;
-    crate::cloud_sync::enqueue_entity(
-        &database,
-        "report_delete",
-        "report",
-        Some(&report_id),
-        Some(base_version),
-        None,
-    )
+    let state = crate::supabase::storage_mode(&database)?;
+    delete_report_with_cloud_operation(&database, request, Some((&state, "report_delete")))?;
+    crate::cloud_sync::flush_if_online(&database)
 }
 #[tauri::command]
 pub fn report_public_text(
@@ -1594,16 +1688,13 @@ pub fn report_template_save(
     request: ReportTemplateSaveRequest,
 ) -> Result<ReportTemplateDto, String> {
     crate::supabase::ensure_repository_write_mode(&database)?;
-    let base_version = request.expected_version;
-    let result = save_template(&database, request)?;
-    crate::cloud_sync::enqueue_entity(
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = save_template_with_cloud_operation(
         &database,
-        "report_template_save",
-        "report_template",
-        Some(&result.id),
-        base_version,
-        None,
+        request,
+        Some((&state, "report_template_save")),
     )?;
+    crate::cloud_sync::flush_if_online(&database)?;
     Ok(result)
 }
 
@@ -1611,11 +1702,13 @@ pub fn report_template_save(
 mod tests {
     use super::*;
     use crate::recurring::{save_rule, RecurrenceSaveRequest};
+    use crate::settings::{self, SettingsScope, SettingsUpdate};
     use crate::tasks::{
         create_task, set_task_daily_estimate, set_task_status, TaskCreateRequest,
         TaskDailyEstimateSetRequest, TaskStatusRequest,
     };
     use crate::time_tracking::{create_manual_entry, ManualEntryRequest};
+    use serde_json::{json, Value};
     use tempfile::tempdir;
 
     fn setup() -> (Database, String, String) {
@@ -1720,6 +1813,140 @@ mod tests {
         assert_eq!(regenerated.content_source, "generated");
         assert!(!regenerated.markdown.contains("# 手工修改"));
         assert!(regenerated.markdown.contains("预计：20min 实际：30min"));
+    }
+
+    #[test]
+    fn cloud_report_writes_persist_outbox_in_the_same_transaction() {
+        let (database, subject_id, task_id) = setup();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let state = crate::supabase::storage_mode(&database).unwrap();
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let create_operation_id = Uuid::now_v7().to_string();
+
+        let created = create_report_with_cloud_operation(
+            &database,
+            ReportCreateRequest {
+                report_type: "daily".to_string(),
+                reference_date: date,
+                subject_id: subject_id.clone(),
+                task_ids: vec![task_id],
+                client_request_id: create_operation_id.clone(),
+            },
+            Some((&state, "report_create", Some(create_operation_id.as_str()))),
+        )
+        .unwrap();
+        let saved = save_report_content_with_cloud_operation(
+            &database,
+            ReportContentSaveRequest {
+                report_id: created.id.clone(),
+                markdown: "# 云端事务报告\n\n本地已保存。".to_string(),
+                expected_version: created.version,
+            },
+            Some((&state, "report_save_content")),
+        )
+        .unwrap();
+        let template = save_template_with_cloud_operation(
+            &database,
+            ReportTemplateSaveRequest {
+                report_type: "daily".to_string(),
+                subject_id: Some(subject_id),
+                content: "# {{日期}}\n{{今日事项}}".to_string(),
+                expected_version: None,
+            },
+            Some((&state, "report_template_save")),
+        )
+        .unwrap();
+        delete_report_with_cloud_operation(
+            &database,
+            ReportVersionRequest {
+                report_id: created.id.clone(),
+                expected_version: saved.version,
+            },
+            Some((&state, "report_delete")),
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let outbox = connection
+            .prepare(
+                "SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json FROM sync_outbox ORDER BY created_at, operation_type",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(outbox.iter().any(
+            |(operation_id, operation, entity_type, entity_id, base_version, payload)| {
+                let value: Value = serde_json::from_str(payload).unwrap();
+                operation_id == &create_operation_id
+                    && operation == "report_create"
+                    && entity_type == "report"
+                    && entity_id.as_deref() == Some(&created.id)
+                    && base_version.is_none()
+                    && value["report_tasks"]
+                        .as_array()
+                        .is_some_and(|tasks| tasks.len() == 1)
+            }
+        ));
+        assert!(outbox.iter().any(
+            |(_, operation, entity_type, entity_id, base_version, payload)| {
+                let value: Value = serde_json::from_str(payload).unwrap();
+                operation == "report_save_content"
+                    && entity_type == "report"
+                    && entity_id.as_deref() == Some(&created.id)
+                    && *base_version == Some(created.version)
+                    && value["markdown_content"] == "# 云端事务报告\n\n本地已保存。"
+            }
+        ));
+        assert!(outbox.iter().any(
+            |(_, operation, entity_type, entity_id, base_version, payload)| {
+                let value: Value = serde_json::from_str(payload).unwrap();
+                operation == "report_template_save"
+                    && entity_type == "report_template"
+                    && entity_id.as_deref() == Some(&template.id)
+                    && base_version.is_none()
+                    && value["content"] == "# {{日期}}\n{{今日事项}}"
+            }
+        ));
+        assert!(outbox.iter().any(
+            |(_, operation, entity_type, entity_id, base_version, payload)| {
+                let value: Value = serde_json::from_str(payload).unwrap();
+                operation == "report_delete"
+                    && entity_type == "report"
+                    && entity_id.as_deref() == Some(&created.id)
+                    && *base_version == Some(saved.version)
+                    && !value["deleted_at"].is_null()
+            }
+        ));
     }
 
     #[test]

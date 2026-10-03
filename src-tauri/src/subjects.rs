@@ -56,15 +56,24 @@ pub fn list_subjects(database: &Database) -> Result<Vec<SubjectDto>, String> {
     result
 }
 
+#[cfg(test)]
 pub fn create_subject(
     database: &Database,
     request: SubjectCreateRequest,
+) -> Result<SubjectCreateResult, String> {
+    create_subject_with_cloud_operation(database, request, None)
+}
+
+fn create_subject_with_cloud_operation(
+    database: &Database,
+    request: SubjectCreateRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<SubjectCreateResult, String> {
     let name = request.name.trim();
     if name.is_empty() {
         return Err("VALIDATION_ERROR: 主体名称不能为空".to_string());
     }
-    let connection = database.open()?;
+    let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     if let Some(subject) = find_subject_by_name(&connection, &workspace_id, name)? {
         return Ok(SubjectCreateResult {
@@ -81,36 +90,64 @@ pub fn create_subject(
         )
         .map_err(|error| error.to_string())?;
     let now = now_millis();
-    connection
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
         .execute(
             "INSERT INTO subjects(id, workspace_id, name, sort_order, created_at, updated_at, version)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1)",
             params![id, workspace_id, name, sort_order, now],
         )
         .map_err(|error| error.to_string())?;
-    bump_revision(&connection)?;
+    bump_revision(&transaction)?;
+    if let Some((state, operation_type)) = cloud_operation {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "subject",
+            Some(&id),
+            None,
+            None,
+        )?;
+    }
+    let subject = load_subject(&transaction, &id)?;
+    transaction.commit().map_err(|error| error.to_string())?;
     Ok(SubjectCreateResult {
-        subject: load_subject(&connection, &id)?,
+        subject,
         already_exists: false,
     })
 }
 
+#[cfg(test)]
 pub fn rename_subject(
     database: &Database,
     request: SubjectRenameRequest,
+) -> Result<SubjectDto, String> {
+    rename_subject_with_cloud_operation(database, request, None)
+}
+
+fn rename_subject_with_cloud_operation(
+    database: &Database,
+    request: SubjectRenameRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, i64)>,
 ) -> Result<SubjectDto, String> {
     let name = request.name.trim();
     if name.is_empty() {
         return Err("VALIDATION_ERROR: 主体名称不能为空".to_string());
     }
-    let connection = database.open()?;
+    let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     if let Some(existing) = find_subject_by_name(&connection, &workspace_id, name)? {
         if existing.id != request.subject_id {
             return Err("VALIDATION_ERROR: 主体名称已存在".to_string());
         }
     }
-    let changed = connection
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let changed = transaction
         .execute(
             "UPDATE subjects SET name = ?1, updated_at = ?2, version = version + 1
              WHERE id = ?3 AND workspace_id = ?4 AND version = ?5 AND deleted_at IS NULL",
@@ -126,8 +163,21 @@ pub fn rename_subject(
     if changed == 0 {
         return Err("VERSION_CONFLICT: 主体已被其他窗口或设备更新".to_string());
     }
-    bump_revision(&connection)?;
-    load_subject(&connection, &request.subject_id)
+    bump_revision(&transaction)?;
+    if let Some((state, operation_type, base_version)) = cloud_operation {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "subject",
+            Some(&request.subject_id),
+            Some(base_version),
+            None,
+        )?;
+    }
+    let result = load_subject(&transaction, &request.subject_id)?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(result)
 }
 
 fn subject_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubjectDto> {
@@ -212,16 +262,11 @@ pub fn subject_create(
     request: SubjectCreateRequest,
 ) -> Result<SubjectCreateResult, String> {
     crate::supabase::ensure_repository_write_mode(&database)?;
-    let result = create_subject(&database, request)?;
+    let state = crate::supabase::storage_mode(&database)?;
+    let result =
+        create_subject_with_cloud_operation(&database, request, Some((&state, "subject_create")))?;
     if !result.already_exists {
-        crate::cloud_sync::enqueue_entity(
-            &database,
-            "subject_create",
-            "subject",
-            Some(&result.subject.id),
-            None,
-            None,
-        )?;
+        crate::cloud_sync::flush_if_online(&database)?;
     }
     Ok(result)
 }
@@ -233,21 +278,21 @@ pub fn subject_rename(
 ) -> Result<SubjectDto, String> {
     crate::supabase::ensure_repository_write_mode(&database)?;
     let base_version = request.expected_version;
-    let result = rename_subject(&database, request)?;
-    crate::cloud_sync::enqueue_entity(
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = rename_subject_with_cloud_operation(
         &database,
-        "subject_rename",
-        "subject",
-        Some(&result.id),
-        Some(base_version),
-        None,
+        request,
+        Some((&state, "subject_rename", base_version)),
     )?;
+    crate::cloud_sync::flush_if_online(&database)?;
     Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{self, SettingsScope, SettingsUpdate};
+    use serde_json::{json, Value};
     use tempfile::tempdir;
 
     #[test]
@@ -280,5 +325,88 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[test]
+    fn cloud_subject_writes_persist_outbox_in_the_same_transaction() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("subjects-cloud.sqlite3")).unwrap();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let state = crate::supabase::storage_mode(&database).unwrap();
+
+        let created = create_subject_with_cloud_operation(
+            &database,
+            SubjectCreateRequest {
+                name: "云端主体".to_string(),
+            },
+            Some((&state, "subject_create")),
+        )
+        .unwrap();
+        let renamed = rename_subject_with_cloud_operation(
+            &database,
+            SubjectRenameRequest {
+                subject_id: created.subject.id.clone(),
+                name: "云端主体改名".to_string(),
+                expected_version: created.subject.version,
+            },
+            Some((&state, "subject_rename", created.subject.version)),
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT operation_type, base_version, payload_json FROM sync_outbox WHERE entity_id = ?1 ORDER BY created_at, operation_type",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([created.subject.id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(renamed.name, "云端主体改名");
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .any(|(operation_type, base_version, payload_json)| {
+                let payload: Value = serde_json::from_str(payload_json).unwrap();
+                operation_type == "subject_create"
+                    && base_version.is_none()
+                    && payload["name"] == "云端主体"
+            }));
+        assert!(rows
+            .iter()
+            .any(|(operation_type, base_version, payload_json)| {
+                let payload: Value = serde_json::from_str(payload_json).unwrap();
+                operation_type == "subject_rename"
+                    && *base_version == Some(created.subject.version)
+                    && payload["name"] == "云端主体改名"
+            }));
     }
 }

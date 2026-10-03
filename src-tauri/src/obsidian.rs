@@ -451,9 +451,18 @@ pub fn preview_plan_from_obsidian(
     })
 }
 
+#[cfg(test)]
 pub fn confirm_plan_import(
     database: &Database,
     request: PlanImportConfirmRequest,
+) -> Result<PlanImportConfirmResult, String> {
+    confirm_plan_import_with_cloud_operation(database, request, None)
+}
+
+fn confirm_plan_import_with_cloud_operation(
+    database: &Database,
+    request: PlanImportConfirmRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<PlanImportConfirmResult, String> {
     let mut connection = database.open()?;
     let batch: Option<(String, String, String, i64)> = connection
@@ -546,6 +555,19 @@ pub fn confirm_plan_import(
         )
         .map_err(|error| error.to_string())?;
     bump_revision(&transaction)?;
+    if let Some((state, operation_type)) = cloud_operation {
+        for task_id in &created_ids {
+            crate::cloud_sync::enqueue_entity_in_transaction(
+                &transaction,
+                state,
+                operation_type,
+                "task",
+                Some(task_id),
+                None,
+                None,
+            )?;
+        }
+    }
     transaction.commit().map_err(|error| error.to_string())?;
     let connection = database.open()?;
     let tasks = created_ids
@@ -800,17 +822,12 @@ pub fn obsidian_plan_import_confirm(
     request: PlanImportConfirmRequest,
 ) -> Result<PlanImportConfirmResult, String> {
     crate::supabase::ensure_repository_write_mode(&database)?;
-    let result = confirm_plan_import(&database, request)?;
-    for task in &result.tasks {
-        crate::cloud_sync::enqueue_entity_deferred(
-            &database,
-            "obsidian_plan_import",
-            "task",
-            Some(&task.id),
-            None,
-            None,
-        )?;
-    }
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = confirm_plan_import_with_cloud_operation(
+        &database,
+        request,
+        Some((&state, "obsidian_plan_import")),
+    )?;
     crate::cloud_sync::flush_if_online(&database)?;
     Ok(result)
 }
@@ -911,6 +928,115 @@ mod tests {
         .unwrap();
         assert!(repeated.already_confirmed);
         assert_eq!(repeated.tasks.len(), 2);
+    }
+
+    #[test]
+    fn cloud_obsidian_import_queues_created_tasks_in_the_same_transaction() {
+        let directory = tempdir().unwrap();
+        let vault = directory.path().join("vault");
+        fs::create_dir_all(vault.join("工作日报")).unwrap();
+        fs::write(
+            vault.join("工作日报/2026-10-02.md"),
+            "# 日报\n\n## 明日计划：\n\n1. 云端同步相关\n   - 补齐 Obsidian 导入同步 <预计：45min>\n",
+        )
+        .unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("obsidian-cloud.sqlite3")).unwrap();
+        update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "obsidian_root_path".to_string(),
+                value: serde_json::json!(vault.display().to_string()),
+            },
+        )
+        .unwrap();
+        update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: serde_json::json!(Uuid::now_v7().to_string()),
+            },
+        )
+        .unwrap();
+        update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: serde_json::json!("cloud"),
+            },
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let preview = preview_plan_from_obsidian(
+            &database,
+            PlanImportPreviewRequest {
+                source_date: "2026-10-02".to_string(),
+                target_date: "2026-10-03".to_string(),
+                subject_id,
+            },
+        )
+        .unwrap();
+        let selections = preview
+            .items
+            .iter()
+            .map(|item| PlanImportConfirmItem {
+                import_item_id: item.id.clone(),
+                selected: true,
+                title: item.title.clone(),
+                estimate_minutes: item.estimate_minutes,
+            })
+            .collect();
+        let state = crate::supabase::storage_mode(&database).unwrap();
+
+        let confirmed = confirm_plan_import_with_cloud_operation(
+            &database,
+            PlanImportConfirmRequest {
+                batch_id: preview.batch_id,
+                items: selections,
+                expected_version: 1,
+            },
+            Some((&state, "obsidian_plan_import")),
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let outbox = connection
+            .prepare(
+                "SELECT operation_type, entity_type, entity_id, payload_json FROM sync_outbox ORDER BY created_at, operation_type",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(confirmed.tasks.len(), 2);
+        assert!(confirmed.tasks.iter().all(|task| {
+            outbox
+                .iter()
+                .any(|(operation, entity_type, entity_id, payload)| {
+                    let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+                    operation == "obsidian_plan_import"
+                        && entity_type == "task"
+                        && entity_id.as_deref() == Some(&task.id)
+                        && value["source_type"] == "obsidian_import"
+                        && value["planned_date"] == "2026-10-03"
+                })
+        }));
     }
 
     #[test]

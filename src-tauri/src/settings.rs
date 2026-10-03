@@ -125,9 +125,17 @@ pub fn update_setting(
     database: &Database,
     request: SettingsUpdate,
 ) -> Result<SettingsSnapshot, String> {
+    update_setting_with_cloud_operation(database, request, None)
+}
+
+fn update_setting_with_cloud_operation(
+    database: &Database,
+    request: SettingsUpdate,
+    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+) -> Result<SettingsSnapshot, String> {
     validate_setting_key(&request.scope, &request.key)?;
     validate_setting_value(&request.key, &request.value)?;
-    let connection = database.open()?;
+    let mut connection = database.open()?;
     let workspace_id: String = connection
         .query_row(
             "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
@@ -137,9 +145,20 @@ pub fn update_setting(
         .map_err(|error| error.to_string())?;
     let serialized = serde_json::to_string(&request.value).map_err(|error| error.to_string())?;
     let now = now_millis();
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
     match request.scope {
         SettingsScope::Shared => {
-            connection
+            let base_version: Option<i64> = transaction
+                .query_row(
+                    "SELECT version FROM app_settings WHERE workspace_id = ?1 AND key = ?2",
+                    params![workspace_id, request.key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            transaction
                 .execute(
                     "INSERT INTO app_settings(workspace_id, key, value_json, updated_at, version)
                      VALUES (?1, ?2, ?3, ?4, 1)
@@ -147,9 +166,20 @@ pub fn update_setting(
                     params![workspace_id, request.key, serialized, now],
                 )
                 .map_err(|error| error.to_string())?;
+            if let Some(state) = cloud_state {
+                crate::cloud_sync::enqueue_entity_in_transaction(
+                    &transaction,
+                    state,
+                    "app_setting_update",
+                    "app_setting",
+                    Some(&request.key),
+                    base_version,
+                    None,
+                )?;
+            }
         }
         SettingsScope::Device => {
-            connection
+            transaction
                 .execute(
                     "INSERT INTO device_settings(key, value_json, updated_at)
                      VALUES (?1, ?2, ?3)
@@ -159,6 +189,7 @@ pub fn update_setting(
                 .map_err(|error| error.to_string())?;
         }
     }
+    transaction.commit().map_err(|error| error.to_string())?;
     get_settings(database)
 }
 
@@ -194,16 +225,25 @@ pub fn set_integration_secret(
     get_settings(database)
 }
 
+#[cfg(test)]
 pub fn update_integration_config(
     database: &Database,
     request: IntegrationConfigRequest,
+) -> Result<SettingsSnapshot, String> {
+    update_integration_config_with_cloud_operation(database, request, None)
+}
+
+fn update_integration_config_with_cloud_operation(
+    database: &Database,
+    request: IntegrationConfigRequest,
+    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
 ) -> Result<SettingsSnapshot, String> {
     if !matches!(request.provider.as_str(), "seatable") {
         return Err(format!("不支持的共享集成: {}", request.provider));
     }
     reject_sensitive_json(&request.config, "config")?;
     let serialized = serde_json::to_string(&request.config).map_err(|error| error.to_string())?;
-    let connection = database.open()?;
+    let mut connection = database.open()?;
     let workspace_id: String = connection
         .query_row(
             "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
@@ -211,8 +251,11 @@ pub fn update_integration_config(
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
     if let Some(expected_version) = request.expected_version {
-        let changed = connection
+        let changed = transaction
             .execute(
                 "UPDATE integration_configs
                  SET enabled = ?1, config_json = ?2, updated_at = ?3, version = version + 1
@@ -231,7 +274,7 @@ pub fn update_integration_config(
             return Err("VERSION_CONFLICT: 集成配置已在其他窗口或设备更新".to_string());
         }
     } else {
-        connection
+        transaction
             .execute(
                 "INSERT INTO integration_configs(workspace_id, provider, enabled, config_json, secret_ref, updated_at, version)
                  VALUES (?1, ?2, ?3, ?4, NULL, ?5, 1)
@@ -240,6 +283,18 @@ pub fn update_integration_config(
             )
             .map_err(|error| error.to_string())?;
     }
+    if let Some(state) = cloud_state {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            "integration_config_update",
+            "integration_config",
+            Some(&request.provider),
+            request.expected_version,
+            None,
+        )?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
     get_settings(database)
 }
 
@@ -495,29 +550,11 @@ pub fn settings_update(
     request: SettingsUpdate,
 ) -> Result<SettingsSnapshot, String> {
     crate::supabase::ensure_repository_write_mode(&database)?;
+    let state = crate::supabase::storage_mode(&database)?;
     let is_shared = matches!(&request.scope, SettingsScope::Shared);
-    let key = request.key.clone();
-    let result = update_setting(&database, request)?;
+    let result = update_setting_with_cloud_operation(&database, request, Some(&state))?;
     if is_shared {
-        let version = result.shared.get(&key).and_then(|_| {
-            database.open().ok().and_then(|connection| {
-                connection
-                    .query_row(
-                        "SELECT version FROM app_settings WHERE workspace_id = ?1 AND key = ?2",
-                        rusqlite::params![result.workspace_id, key],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .ok()
-            })
-        });
-        crate::cloud_sync::enqueue_entity(
-            &database,
-            "app_setting_update",
-            "app_setting",
-            Some(&key),
-            version.map(|value| value.saturating_sub(1)),
-            None,
-        )?;
+        crate::cloud_sync::flush_if_online(&database)?;
     }
     Ok(result)
 }
@@ -536,17 +573,9 @@ pub fn integration_config_update(
     request: IntegrationConfigRequest,
 ) -> Result<SettingsSnapshot, String> {
     crate::supabase::ensure_repository_write_mode(&database)?;
-    let provider = request.provider.clone();
-    let base_version = request.expected_version;
-    let result = update_integration_config(&database, request)?;
-    crate::cloud_sync::enqueue_entity(
-        &database,
-        "integration_config_update",
-        "integration_config",
-        Some(&provider),
-        base_version,
-        None,
-    )?;
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = update_integration_config_with_cloud_operation(&database, request, Some(&state))?;
+    crate::cloud_sync::flush_if_online(&database)?;
     Ok(result)
 }
 
@@ -562,6 +591,7 @@ pub fn integration_secret_clear(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use uuid::Uuid;
 
     #[test]
     fn shared_and_device_settings_persist_without_exposing_secrets() {
@@ -719,5 +749,107 @@ mod tests {
             },
         );
         assert!(conflict.is_err());
+    }
+
+    #[test]
+    fn cloud_shared_settings_and_integration_config_are_queued_transactionally() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("settings-cloud.sqlite3")).unwrap();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: serde_json::json!(cloud_workspace_id),
+            },
+        )
+        .unwrap();
+        update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: serde_json::json!("cloud"),
+            },
+        )
+        .unwrap();
+        let state = crate::supabase::storage_mode(&database).unwrap();
+
+        update_setting_with_cloud_operation(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Shared,
+                key: "salary_hourly_rate".to_string(),
+                value: serde_json::json!(120),
+            },
+            Some(&state),
+        )
+        .unwrap();
+        update_setting_with_cloud_operation(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "obsidian_root_path".to_string(),
+                value: serde_json::json!("D:/private-vault"),
+            },
+            Some(&state),
+        )
+        .unwrap();
+        update_integration_config_with_cloud_operation(
+            &database,
+            IntegrationConfigRequest {
+                provider: "seatable".to_string(),
+                enabled: true,
+                config: serde_json::json!({ "serverUrl": "https://example.invalid" }),
+                expected_version: None,
+            },
+            Some(&state),
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT operation_type, entity_type, entity_id, payload_json FROM sync_outbox ORDER BY created_at, operation_type",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .any(|(operation_type, entity_type, entity_id, payload_json)| {
+                let payload: Value = serde_json::from_str(payload_json).unwrap();
+                operation_type == "app_setting_update"
+                    && entity_type == "app_setting"
+                    && entity_id.as_deref() == Some("salary_hourly_rate")
+                    && payload["value_json"] == serde_json::json!(120)
+            }));
+        assert!(rows
+            .iter()
+            .any(|(operation_type, entity_type, entity_id, payload_json)| {
+                let payload: Value = serde_json::from_str(payload_json).unwrap();
+                operation_type == "integration_config_update"
+                    && entity_type == "integration_config"
+                    && entity_id.as_deref() == Some("seatable")
+                    && payload["config_json"]
+                        == serde_json::json!({ "serverUrl": "https://example.invalid" })
+            }));
+        assert!(!rows
+            .iter()
+            .any(|(_, _, entity_id, _)| entity_id.as_deref() == Some("obsidian_root_path")));
     }
 }

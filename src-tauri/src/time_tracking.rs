@@ -506,9 +506,18 @@ pub fn list_time_entries(
     })
 }
 
+#[cfg(test)]
 pub fn create_manual_entry(
     database: &Database,
     request: ManualEntryRequest,
+) -> Result<TimeEntryDto, String> {
+    create_manual_entry_with_cloud_operation(database, request, None)
+}
+
+fn create_manual_entry_with_cloud_operation(
+    database: &Database,
+    request: ManualEntryRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
 ) -> Result<TimeEntryDto, String> {
     validate_date(&request.work_date)?;
     validate_operation_id(&request.client_request_id)?;
@@ -528,6 +537,16 @@ pub fn create_manual_entry(
     };
     let id = Uuid::now_v7().to_string();
     let now = now_millis();
+    let completed_task_outbox = request
+        .complete_task
+        .then(|| {
+            request
+                .task_id
+                .as_ref()
+                .zip(request.task_expected_version)
+                .map(|(task_id, version)| (task_id.clone(), version))
+        })
+        .flatten();
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
@@ -596,13 +615,44 @@ pub fn create_manual_entry(
         "time_entry_create_manual",
         &result,
     )?;
+    if let Some((state, operation_type, operation_id)) = cloud_operation {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "time_entry",
+            Some(&id),
+            None,
+            operation_id,
+        )?;
+        if let Some((task_id, base_version)) = completed_task_outbox {
+            crate::cloud_sync::enqueue_entity_in_transaction(
+                &transaction,
+                state,
+                "task_set_completed_from_time_entry",
+                "task",
+                Some(&task_id),
+                Some(base_version),
+                None,
+            )?;
+        }
+    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
 
+#[cfg(test)]
 pub fn update_time_entry(
     database: &Database,
     request: TimeEntryUpdateRequest,
+) -> Result<TimeEntryDto, String> {
+    update_time_entry_with_cloud_operation(database, request, None)
+}
+
+fn update_time_entry_with_cloud_operation(
+    database: &Database,
+    request: TimeEntryUpdateRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<TimeEntryDto, String> {
     if request.ended_at <= request.started_at {
         return Err("VALIDATION_ERROR: 结束时间必须晚于开始时间".to_string());
@@ -669,13 +719,33 @@ pub fn update_time_entry(
     clear_workday_settlement(&transaction, &workspace_id, &request.entry_id)?;
     bump_revision(&transaction)?;
     let result = load_entry(&transaction, &request.entry_id, now)?;
+    if let Some((state, operation_type)) = cloud_operation {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "time_entry",
+            Some(&request.entry_id),
+            Some(request.expected_version),
+            None,
+        )?;
+    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
 
+#[cfg(test)]
 pub fn update_time_entry_disposition(
     database: &Database,
     request: TimeEntryDispositionRequest,
+) -> Result<TimeEntryDto, String> {
+    update_time_entry_disposition_with_cloud_operation(database, request, None)
+}
+
+fn update_time_entry_disposition_with_cloud_operation(
+    database: &Database,
+    request: TimeEntryDispositionRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<TimeEntryDto, String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
@@ -734,13 +804,33 @@ pub fn update_time_entry_disposition(
         result.note = Some("已标记为无效时间".to_string());
         result
     };
+    if let Some((state, operation_type)) = cloud_operation {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "time_entry",
+            Some(&request.entry_id),
+            Some(request.expected_version),
+            None,
+        )?;
+    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
 
+#[cfg(test)]
 pub fn replace_allocations(
     database: &Database,
     request: AllocationReplaceRequest,
+) -> Result<TimeEntryDto, String> {
+    replace_allocations_with_cloud_operation(database, request, None)
+}
+
+fn replace_allocations_with_cloud_operation(
+    database: &Database,
+    request: AllocationReplaceRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<TimeEntryDto, String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
@@ -789,6 +879,15 @@ pub fn replace_allocations(
             total - current.settlement_minutes
         ));
     }
+    let completed_task_outbox = merged
+        .iter()
+        .filter_map(|(task_id, (_, _, complete_task, expected_version))| {
+            complete_task
+                .then_some(*expected_version)
+                .flatten()
+                .map(|version| (task_id.clone(), version))
+        })
+        .collect::<Vec<_>>();
     let now = now_millis();
     let transaction = connection
         .transaction()
@@ -846,19 +945,47 @@ pub fn replace_allocations(
                  updated_at = ?1,
                  version = version + 1
              WHERE id = ?2 AND version = ?3 AND deleted_at IS NULL",
-            params![now, request.entry_id, request.expected_version, should_convert_to_work],
+            params![
+                now,
+                request.entry_id,
+                request.expected_version,
+                should_convert_to_work
+            ],
         )
         .map_err(|error| error.to_string())?;
     clear_workday_settlement(&transaction, &workspace_id, &request.entry_id)?;
     bump_revision(&transaction)?;
     let result = load_entry(&transaction, &request.entry_id, now)?;
+    if let Some((state, operation_type)) = cloud_operation {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "time_entry",
+            Some(&request.entry_id),
+            Some(request.expected_version),
+            None,
+        )?;
+        for (task_id, base_version) in completed_task_outbox {
+            crate::cloud_sync::enqueue_entity_in_transaction(
+                &transaction,
+                state,
+                "task_set_completed_from_allocation",
+                "task",
+                Some(&task_id),
+                Some(base_version),
+                None,
+            )?;
+        }
+    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
 
-pub fn replace_allocations_with_hooks(
+fn replace_allocations_with_hooks_and_cloud_operation(
     database: &Database,
     request: AllocationReplaceRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<TimeEntryDto, String> {
     let work_date = get_time_entry_by_id(database, &request.entry_id)?.work_date;
     let candidates = request
@@ -870,7 +997,7 @@ pub fn replace_allocations_with_hooks(
                 .map(|completed| (allocation.task_id.clone(), completed))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let result = replace_allocations(database, request)?;
+    let result = replace_allocations_with_cloud_operation(database, request, cloud_operation)?;
     for (task_id, was_completed) in candidates {
         if !was_completed && crate::tasks::task_is_completed(database, &task_id, Some(&work_date))?
         {
@@ -1387,15 +1514,17 @@ pub fn time_entry_create_manual(
 ) -> Result<TimeEntryDto, String> {
     crate::supabase::ensure_repository_write_mode(&database)?;
     let operation_id = request.client_request_id.clone();
-    let result = create_manual_entry(&database, request)?;
-    crate::cloud_sync::enqueue_entity(
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = create_manual_entry_with_cloud_operation(
         &database,
-        "time_entry_create_manual",
-        "time_entry",
-        Some(&result.id),
-        None,
-        Some(&operation_id),
+        request,
+        Some((
+            &state,
+            "time_entry_create_manual",
+            Some(operation_id.as_str()),
+        )),
     )?;
+    crate::cloud_sync::flush_if_online(&database)?;
     Ok(result)
 }
 
@@ -1405,16 +1534,13 @@ pub fn time_entry_update(
     request: TimeEntryUpdateRequest,
 ) -> Result<TimeEntryDto, String> {
     crate::supabase::ensure_repository_write_mode(&database)?;
-    let base_version = request.expected_version;
-    let result = update_time_entry(&database, request)?;
-    crate::cloud_sync::enqueue_entity(
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = update_time_entry_with_cloud_operation(
         &database,
-        "time_entry_update",
-        "time_entry",
-        Some(&result.id),
-        Some(base_version),
-        None,
+        request,
+        Some((&state, "time_entry_update")),
     )?;
+    crate::cloud_sync::flush_if_online(&database)?;
     Ok(result)
 }
 
@@ -1424,16 +1550,13 @@ pub fn time_entry_update_disposition(
     request: TimeEntryDispositionRequest,
 ) -> Result<TimeEntryDto, String> {
     crate::supabase::ensure_repository_write_mode(&database)?;
-    let base_version = request.expected_version;
-    let result = update_time_entry_disposition(&database, request)?;
-    crate::cloud_sync::enqueue_entity(
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = update_time_entry_disposition_with_cloud_operation(
         &database,
-        "time_entry_update_disposition",
-        "time_entry",
-        Some(&result.id),
-        Some(base_version),
-        None,
+        request,
+        Some((&state, "time_entry_update_disposition")),
     )?;
+    crate::cloud_sync::flush_if_online(&database)?;
     Ok(result)
 }
 
@@ -1443,36 +1566,12 @@ pub fn time_allocation_replace(
     request: AllocationReplaceRequest,
 ) -> Result<TimeEntryDto, String> {
     crate::supabase::ensure_repository_write_mode(&database)?;
-    let base_version = request.expected_version;
-    let completion_tasks = request
-        .allocations
-        .iter()
-        .filter(|allocation| allocation.complete_task)
-        .filter_map(|allocation| {
-            allocation
-                .task_expected_version
-                .map(|version| (allocation.task_id.clone(), version))
-        })
-        .collect::<HashMap<_, _>>();
-    let result = replace_allocations_with_hooks(&database, request)?;
-    crate::cloud_sync::enqueue_entity_deferred(
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = replace_allocations_with_hooks_and_cloud_operation(
         &database,
-        "time_allocation_replace",
-        "time_entry",
-        Some(&result.id),
-        Some(base_version),
-        None,
+        request,
+        Some((&state, "time_allocation_replace")),
     )?;
-    for (task_id, version) in completion_tasks {
-        crate::cloud_sync::enqueue_entity_deferred(
-            &database,
-            "task_set_completed_from_allocation",
-            "task",
-            Some(&task_id),
-            Some(version),
-            None,
-        )?;
-    }
     crate::cloud_sync::flush_if_online(&database)?;
     Ok(result)
 }
@@ -1481,7 +1580,9 @@ pub fn time_allocation_replace(
 mod tests {
     use super::*;
     use crate::recurring::{save_rule, RecurrenceSaveRequest};
+    use crate::settings::{self, SettingsScope, SettingsUpdate};
     use crate::tasks::{create_task, TaskCreateRequest};
+    use serde_json::{json, Value};
     use tempfile::tempdir;
 
     fn setup() -> (Database, String, String) {
@@ -1512,6 +1613,152 @@ mod tests {
         )
         .unwrap();
         (database, workspace_id, task.id)
+    }
+
+    #[test]
+    fn cloud_time_entry_writes_persist_outbox_in_the_same_transaction() {
+        let (database, _workspace_id, task_id) = setup();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let state = crate::supabase::storage_mode(&database).unwrap();
+        let operation_id = Uuid::now_v7().to_string();
+        let started_at = now_millis() - 3_600_000;
+        let ended_at = started_at + 1_800_000;
+
+        let created = create_manual_entry_with_cloud_operation(
+            &database,
+            ManualEntryRequest {
+                task_id: Some(task_id.clone()),
+                work_date: "2026-10-03".to_string(),
+                started_at: Some(started_at),
+                ended_at: Some(ended_at),
+                minutes: None,
+                note: Some("云端手动记录".to_string()),
+                complete_task: false,
+                task_expected_version: None,
+                client_request_id: operation_id.clone(),
+            },
+            Some((
+                &state,
+                "time_entry_create_manual",
+                Some(operation_id.as_str()),
+            )),
+        )
+        .unwrap();
+        let updated = update_time_entry_with_cloud_operation(
+            &database,
+            TimeEntryUpdateRequest {
+                entry_id: created.id.clone(),
+                started_at,
+                ended_at: started_at + 2_400_000,
+                note: Some("修正后的云端手动记录".to_string()),
+                expected_version: created.version,
+            },
+            Some((&state, "time_entry_update")),
+        )
+        .unwrap();
+        replace_allocations_with_cloud_operation(
+            &database,
+            AllocationReplaceRequest {
+                entry_id: created.id.clone(),
+                expected_version: updated.version,
+                allocations: vec![AllocationInput {
+                    task_id: task_id.clone(),
+                    minutes: 40,
+                    note: Some("全部归属并完成".to_string()),
+                    complete_task: true,
+                    task_expected_version: Some(1),
+                }],
+            },
+            Some((&state, "time_allocation_replace")),
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let outbox = connection
+            .prepare(
+                "SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json FROM sync_outbox ORDER BY created_at, operation_type",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(outbox.iter().any(
+            |(queued_operation_id, operation, entity_type, entity_id, base_version, payload)| {
+                let value: Value = serde_json::from_str(payload).unwrap();
+                queued_operation_id == &operation_id
+                    && operation == "time_entry_create_manual"
+                    && entity_type == "time_entry"
+                    && entity_id.as_deref() == Some(&created.id)
+                    && base_version.is_none()
+                    && value["allocations"]
+                        .as_array()
+                        .is_some_and(|items| items.len() == 1)
+            }
+        ));
+        assert!(outbox.iter().any(
+            |(_, operation, entity_type, entity_id, base_version, payload)| {
+                let value: Value = serde_json::from_str(payload).unwrap();
+                operation == "time_entry_update"
+                    && entity_type == "time_entry"
+                    && entity_id.as_deref() == Some(&created.id)
+                    && *base_version == Some(created.version)
+                    && value["note"] == "修正后的云端手动记录"
+                    && value["duration_seconds"] == 2_400
+            }
+        ));
+        assert!(outbox.iter().any(
+            |(_, operation, entity_type, entity_id, base_version, payload)| {
+                let value: Value = serde_json::from_str(payload).unwrap();
+                operation == "time_allocation_replace"
+                    && entity_type == "time_entry"
+                    && entity_id.as_deref() == Some(&created.id)
+                    && *base_version == Some(updated.version)
+                    && value["allocations"].as_array().is_some_and(|items| {
+                        items
+                            .iter()
+                            .any(|item| item["task_id"] == task_id && item["minutes"] == 40)
+                    })
+            }
+        ));
+        assert!(outbox.iter().any(
+            |(_, operation, entity_type, entity_id, base_version, payload)| {
+                let value: Value = serde_json::from_str(payload).unwrap();
+                operation == "task_set_completed_from_allocation"
+                    && entity_type == "task"
+                    && entity_id.as_deref() == Some(&task_id)
+                    && *base_version == Some(1)
+                    && value["status"] == "done"
+            }
+        ));
     }
 
     #[test]
@@ -1847,9 +2094,11 @@ mod tests {
         assert_eq!(manual.allocated_minutes, 25);
         let connection = database.open().unwrap();
         let status: String = connection
-            .query_row("SELECT status FROM tasks WHERE id = ?1", [&task_id], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                [&task_id],
+                |row| row.get(0),
+            )
             .unwrap();
         let done_events: i64 = connection
             .query_row(

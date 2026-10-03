@@ -47,7 +47,7 @@
 3. 选择报告时长格式，默认使用分钟，例如 `90min`；也可以切换为一位小数小时，例如 `1.5h`。
 4. 根据需要设置工资时薪。
 5. 如需连接 SeaTable，填写服务地址、事项表、事项视图、报销表和“本地事项 ID”字段，再填写 Base API Token。
-6. 如需多设备使用，先在 Supabase SQL Editor 执行 [`supabase/schema.sql`](supabase/schema.sql)，再在“数据存储”中填写 Project URL 和 anon key，用邮箱密码登录。
+6. 如需多设备使用，先确保 Supabase API 暴露 `timegenie` schema，再在 Supabase SQL Editor 执行 [`supabase/schema.sql`](supabase/schema.sql)，然后在“数据存储”中填写 Project URL 和 anon key，用邮箱密码登录。
 7. 登录后先查看本地数据迁移预览，确认后再执行迁移。
 
 SeaTable Token、Supabase 会话等敏感内容会保存到系统凭据库，不进入普通数据文件或报告。
@@ -92,11 +92,22 @@ SeaTable Token、Supabase 会话等敏感内容会保存到系统凭据库，不
 - Supabase PostgreSQL 是云端模式的权威数据源，SQLite 只保留本机缓存、同步状态和离线队列。
 - 桌面端只允许配置 anon key，拒绝 service role key；用户会话保存到系统凭据库。
 - 已提供 Auth、工作空间、设备注册、RLS、变更序列、迁移入口、全局单计时器 RPC 和 15 秒续租/45 秒过期的后台采集租约。
-- `schema.sql` 会显式撤销匿名角色对业务表和保护 RPC 的访问，只向 `authenticated` 授予 API 所需权限；RLS 再按账号限制工作空间范围。
-- Realtime 订阅 `workspace_changes`，客户端按 `change_seq` 增量补拉。
+- `schema.sql` 会在 `timegenie` schema 下创建业务表和 RPC，不在 `public` 下创建 TimeGenie 业务表；它会显式撤销匿名角色对业务表和保护 RPC 的访问，只向 `authenticated` 授予 API 所需权限；RLS 再按账号限制工作空间范围。
+- Supabase/PostgREST 需要暴露 `timegenie` schema。本地 CLI 已在 [`supabase/config.toml`](supabase/config.toml) 配置；自托管环境请把 `timegenie` 加入 `PGRST_DB_SCHEMAS` 后重启 REST/PostgREST 服务。
+- Realtime 订阅 `timegenie.workspace_changes`，客户端按 `change_seq` 增量补拉。
 - 当前未接入云端事务的业务写操作会明确提示不可用，不会回退写入本地 SQLite。
 
 正式启用前，建议在两台设备上完成登录、迁移、冲突和计时互斥验证。
+
+### Schema 集成验证
+
+本地可以先运行一次 PostgreSQL 隔离验证，检查 [`supabase/schema.sql`](supabase/schema.sql) 的表结构、RLS、显式授权、RPC 幂等、迁移导入和 Realtime publication 配置。该命令会在仓库临时目录启动一次性 PostgreSQL 实例，执行 [`supabase/schema_integration_test.sql`](supabase/schema_integration_test.sql)，结束后自动停止并清理。
+
+```powershell
+npm run test:supabase:schema
+```
+
+如果 PostgreSQL 工具不在 PATH 中，可设置 `PG_BIN_DIR` 指向 PostgreSQL 的 `bin` 目录。该验证不连接真实 Supabase 项目，不能替代下面的双设备端到端验证。
 
 ### 双设备端到端验证
 
@@ -113,7 +124,7 @@ $env:TG_SUPABASE_E2E_ALLOW_RESET="1"
 npm run test:supabase:e2e
 ```
 
-运行前需要先在目标项目执行 [`supabase/schema.sql`](supabase/schema.sql)，并确保测试账号已经创建且可以使用邮箱密码登录。
+运行前需要先确保目标项目的 Supabase API 暴露 `timegenie` schema，再执行 [`supabase/schema.sql`](supabase/schema.sql)，并确保测试账号已经创建且可以使用邮箱密码登录。
 
 也可以使用仓库内的 [`supabase/config.toml`](supabase/config.toml) 启动一次性本地 Supabase 环境。需要先确保 Docker Desktop 的 Linux 引擎可用：
 
@@ -124,7 +135,7 @@ npx --yes supabase@2.117.0 status -o env
 
 随后在本地 SQL Editor 执行 [`supabase/schema.sql`](supabase/schema.sql)，通过本地 Auth 创建专用测试账号，并将上方变量中的 URL、anon key、邮箱和密码替换为本地环境值。
 
-应用仅允许 `localhost`、`127.0.0.1` 和 `[::1]` 使用 HTTP/WS；其他 Supabase 地址仍强制使用 HTTPS/WSS。
+应用支持 HTTP/WS 和 HTTPS/WSS 的 Supabase 根地址，适配本机、内网和自托管部署；公网项目建议继续使用 HTTPS/WSS。
 
 ## 开发
 

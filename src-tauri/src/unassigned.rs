@@ -305,7 +305,11 @@ fn resolve_without_allocations(
             &id,
             &state,
             "break",
-            if resolution_type == "break" { "休息时间" } else { "无效时间" },
+            if resolution_type == "break" {
+                "休息时间"
+            } else {
+                "无效时间"
+            },
             now,
         )?;
         Some(id)

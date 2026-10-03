@@ -14,23 +14,79 @@ begin
   end if;
 end $$;
 
+create schema if not exists auth;
+create table if not exists auth.users(id uuid primary key);
+create or replace function auth.uid()
+returns uuid language sql stable as $$
+  select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid;
+$$;
+
+do $$
+begin
+  if not exists(select 1 from pg_publication where pubname = 'supabase_realtime') then
+    create publication supabase_realtime;
+  end if;
+end $$;
+
 -- Reapply the idempotent schema after creating the Data API roles so this test
 -- exercises the same explicit grants and revokes used by a real Supabase project.
 \ir schema.sql
 
 do $$
 begin
-  if has_table_privilege('anon', 'public.workspaces', 'select') then
+  if has_table_privilege('anon', 'timegenie.workspaces', 'select') then
     raise exception 'anon can read business tables';
   end if;
-  if has_function_privilege('anon', 'public.cloud_snapshot_get(uuid)', 'execute') then
+  if has_function_privilege('anon', 'timegenie.cloud_snapshot_get(uuid)', 'execute') then
     raise exception 'anon can execute protected RPCs';
   end if;
-  if not has_table_privilege('authenticated', 'public.workspaces', 'select,insert,update,delete') then
-    raise exception 'authenticated is missing business table privileges';
+  if has_function_privilege('anon', 'timegenie.record_processed_operation(uuid, uuid, uuid, text, jsonb, jsonb)', 'execute') then
+    raise exception 'anon can execute internal idempotency helper';
   end if;
-  if not has_function_privilege('authenticated', 'public.cloud_snapshot_get(uuid)', 'execute') then
+  if not has_table_privilege('authenticated', 'timegenie.workspaces', 'select,insert') then
+    raise exception 'authenticated is missing workspace bootstrap privileges';
+  end if;
+  if has_table_privilege('authenticated', 'timegenie.tasks', 'insert,update,delete') then
+    raise exception 'authenticated can directly write synced business tables';
+  end if;
+  if has_table_privilege('authenticated', 'timegenie.tasks', 'select') then
+    raise exception 'authenticated can directly read synced business tables instead of using snapshot RPC';
+  end if;
+  if not has_table_privilege('authenticated', 'timegenie.workspace_changes', 'select') then
+    raise exception 'authenticated is missing change feed read access';
+  end if;
+  if not has_table_privilege('authenticated', 'timegenie.tracking_leases', 'select') then
+    raise exception 'authenticated is missing tracking lease read access';
+  end if;
+  if not has_table_privilege('authenticated', 'timegenie.time_entries', 'select') then
+    raise exception 'authenticated is missing timer read access';
+  end if;
+  if not has_function_privilege('authenticated', 'timegenie.cloud_snapshot_get(uuid)', 'execute') then
     raise exception 'authenticated is missing RPC execute privilege';
+  end if;
+  if not has_function_privilege('authenticated', 'timegenie.cloud_apply_patch(uuid, uuid, uuid, text, text, text, bigint, jsonb)', 'execute') then
+    raise exception 'authenticated is missing cloud apply RPC execute privilege';
+  end if;
+  if has_function_privilege('authenticated', 'timegenie.is_workspace_owner(uuid)', 'execute') then
+    raise exception 'authenticated can execute internal ownership helper';
+  end if;
+  if has_function_privilege('authenticated', 'timegenie.is_registered_device(uuid, uuid)', 'execute') then
+    raise exception 'authenticated can execute internal device helper';
+  end if;
+  if has_function_privilege('authenticated', 'timegenie.touch_workspace_change()', 'execute') then
+    raise exception 'authenticated can execute internal trigger helper';
+  end if;
+  if has_function_privilege('authenticated', 'timegenie.operation_request_hash(text, jsonb)', 'execute') then
+    raise exception 'authenticated can execute internal idempotency hash helper';
+  end if;
+  if has_function_privilege('authenticated', 'timegenie.processed_operation_result(uuid, uuid, text, jsonb)', 'execute') then
+    raise exception 'authenticated can execute internal idempotency read helper';
+  end if;
+  if has_function_privilege('authenticated', 'timegenie.record_processed_operation(uuid, uuid, uuid, text, jsonb, jsonb)', 'execute') then
+    raise exception 'authenticated can execute internal idempotency helper';
+  end if;
+  if has_function_privilege('authenticated', 'timegenie.unassigned_resolve_non_work(uuid, uuid, uuid, bigint, uuid, text)', 'execute') then
+    raise exception 'authenticated can execute internal unassigned helper';
   end if;
 end $$;
 
@@ -43,45 +99,40 @@ insert into auth.users(id) values
 set local role authenticated;
 select set_config('request.jwt.claim.sub', '10000000-0000-0000-0000-000000000001', true);
 
-insert into public.workspaces(id, owner_user_id, name) values
+insert into timegenie.workspaces(id, owner_user_id, name) values
   ('20000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000001', '账号 A 工作空间');
 
-select public.workspace_initialize_defaults('20000000-0000-0000-0000-000000000001');
-select public.workspace_initialize_defaults('20000000-0000-0000-0000-000000000001');
+select timegenie.workspace_initialize_defaults('20000000-0000-0000-0000-000000000001');
+select timegenie.workspace_initialize_defaults('20000000-0000-0000-0000-000000000001');
 
 do $$
+declare snapshot jsonb;
 begin
-  if (select count(*) from public.subjects where workspace_id = '20000000-0000-0000-0000-000000000001') <> 1 then
+  snapshot := timegenie.cloud_snapshot_get('20000000-0000-0000-0000-000000000001');
+  if jsonb_array_length(snapshot->'subjects') <> 1 then
     raise exception 'workspace defaults created duplicate subjects';
   end if;
-  if (select count(*) from public.app_settings where workspace_id = '20000000-0000-0000-0000-000000000001') <> 5 then
+  if jsonb_array_length(snapshot->'app_settings') <> 5 then
     raise exception 'workspace defaults created duplicate settings';
   end if;
-  if (select count(*) from public.report_templates where workspace_id = '20000000-0000-0000-0000-000000000001') <> 3 then
+  if jsonb_array_length(snapshot->'report_templates') <> 3 then
     raise exception 'workspace defaults created duplicate templates';
   end if;
 end $$;
 
-insert into public.devices(id, workspace_id, device_name, platform, app_version) values
+insert into timegenie.devices(id, workspace_id, device_name, platform, app_version) values
   ('30000000-0000-0000-0000-000000000001', '20000000-0000-0000-0000-000000000001', '设备 A', 'windows', '0.1.0'),
   ('30000000-0000-0000-0000-000000000002', '20000000-0000-0000-0000-000000000001', '设备 B', 'windows', '0.1.0');
 
 -- Security-definer RPCs must reject unknown or revoked device identities even
 -- when the authenticated user owns the workspace.
-insert into public.devices(id, workspace_id, device_name, platform, app_version, revoked_at) values
+insert into timegenie.devices(id, workspace_id, device_name, platform, app_version, revoked_at) values
   ('30000000-0000-0000-0000-000000000098', '20000000-0000-0000-0000-000000000001', '已撤销设备', 'windows', '0.1.0', now());
 
 do $$
 begin
-  if public.is_registered_device(
-    '20000000-0000-0000-0000-000000000001',
-    '30000000-0000-0000-0000-000000000098'
-  ) then
-    raise exception 'revoked device was considered registered';
-  end if;
-
   begin
-    perform public.tracking_lease_acquire(
+    perform timegenie.tracking_lease_acquire(
       '20000000-0000-0000-0000-000000000001',
       '30000000-0000-0000-0000-000000000098',
       '90000000-0000-0000-0000-000000000098'
@@ -93,7 +144,7 @@ begin
   end;
 
   begin
-    perform public.timer_start(
+    perform timegenie.timer_start(
       '20000000-0000-0000-0000-000000000001',
       null,
       '30000000-0000-0000-0000-000000000098',
@@ -107,7 +158,7 @@ begin
   end;
 
   begin
-    perform public.unassigned_resolve_work(
+    perform timegenie.unassigned_resolve_work(
       '20000000-0000-0000-0000-000000000001',
       '91000000-0000-0000-0000-000000000098',
       '30000000-0000-0000-0000-000000000098',
@@ -126,14 +177,18 @@ end $$;
 select set_config('request.jwt.claim.sub', '10000000-0000-0000-0000-000000000002', true);
 do $$
 begin
-  if (select count(*) from public.workspaces where id = '20000000-0000-0000-0000-000000000001') <> 0 then
+  if (select count(*) from timegenie.workspaces where id = '20000000-0000-0000-0000-000000000001') <> 0 then
     raise exception 'RLS exposed another user workspace';
   end if;
-  if (select count(*) from public.subjects where workspace_id = '20000000-0000-0000-0000-000000000001') <> 0 then
-    raise exception 'RLS exposed another user subjects';
-  end if;
   begin
-    insert into public.devices(id, workspace_id, device_name, platform, app_version) values
+    perform timegenie.cloud_snapshot_get('20000000-0000-0000-0000-000000000001');
+    raise exception 'RLS exposed another user snapshot';
+  exception
+    when others then
+      if sqlerrm not like '%AUTH_REQUIRED%' then raise; end if;
+  end;
+  begin
+    insert into timegenie.devices(id, workspace_id, device_name, platform, app_version) values
       ('30000000-0000-0000-0000-000000000099', '20000000-0000-0000-0000-000000000001', '越权设备', 'windows', '0.1.0');
     raise exception 'RLS allowed a device in another user workspace';
   exception
@@ -145,7 +200,7 @@ select set_config('request.jwt.claim.sub', '10000000-0000-0000-0000-000000000001
 
 -- Replace generated defaults with a complete local snapshot containing a task
 -- tree, one time entry, one report, and their relationships.
-select public.migration_import_snapshot(
+select timegenie.migration_import_snapshot(
   '20000000-0000-0000-0000-000000000001',
   '40000000-0000-0000-0000-000000000001',
   '30000000-0000-0000-0000-000000000001',
@@ -246,40 +301,79 @@ select public.migration_import_snapshot(
   )
 );
 
--- Retrying the same operation is idempotent even though the target is no
--- longer empty. A new migration operation must be rejected.
-select public.migration_import_snapshot(
-  '20000000-0000-0000-0000-000000000001',
-  '40000000-0000-0000-0000-000000000001',
-  '30000000-0000-0000-0000-000000000001',
-  '{}'::jsonb
-);
-
+-- Reusing an operation id with different content must be rejected. A new
+-- migration operation must also be rejected because the target is no longer empty.
 do $$
 begin
-  if (select count(*) from public.tasks where workspace_id = '20000000-0000-0000-0000-000000000001') <> 2 then
+  begin
+    perform timegenie.migration_import_snapshot(
+      '20000000-0000-0000-0000-000000000001',
+      '40000000-0000-0000-0000-000000000001',
+      '30000000-0000-0000-0000-000000000001',
+      '{}'::jsonb
+    );
+    raise exception 'migration accepted a reused operation id with different content';
+  exception
+    when others then
+      if sqlerrm not like '%IDEMPOTENCY_CONFLICT%' then raise; end if;
+  end;
+end $$;
+
+do $$
+declare snapshot jsonb;
+begin
+  snapshot := timegenie.cloud_snapshot_get('20000000-0000-0000-0000-000000000001');
+  if jsonb_array_length(snapshot->'tasks') <> 2 then
     raise exception 'migration did not preserve the task tree';
   end if;
-  if (select parent_id from public.tasks where id = '60000000-0000-0000-0000-000000000002') <> '60000000-0000-0000-0000-000000000001' then
+  if not exists(
+    select 1
+    from jsonb_array_elements(snapshot->'tasks') task
+    where task->>'id' = '60000000-0000-0000-0000-000000000002'
+      and task->>'parent_id' = '60000000-0000-0000-0000-000000000001'
+  ) then
     raise exception 'migration did not restore the task parent';
   end if;
-  if (select count(*) from public.time_entries where id = '70000000-0000-0000-0000-000000000001') <> 1 then
+  if not exists(
+    select 1
+    from jsonb_array_elements(snapshot->'time_entries') entry
+    where entry->>'id' = '70000000-0000-0000-0000-000000000001'
+  ) then
     raise exception 'migration did not import the time entry';
   end if;
-  if (select count(*) from public.reports where id = '80000000-0000-0000-0000-000000000001') <> 1 then
+  if not exists(
+    select 1
+    from jsonb_array_elements(snapshot->'reports') report
+    where report->>'id' = '80000000-0000-0000-0000-000000000001'
+  ) then
     raise exception 'migration did not import the report';
   end if;
-  if jsonb_typeof((select value_json from public.app_settings where workspace_id = '20000000-0000-0000-0000-000000000001' and key = 'salary_hourly_rate')) <> 'number' then
+  if not exists(
+    select 1
+    from jsonb_array_elements(snapshot->'app_settings') setting
+    where setting->>'key' = 'salary_hourly_rate'
+      and jsonb_typeof(setting->'value_json') = 'number'
+  ) then
     raise exception 'migration changed numeric setting type';
   end if;
-  if (select value_json #>> '{}' from public.app_settings where workspace_id = '20000000-0000-0000-0000-000000000001' and key = 'timezone') <> 'Asia/Shanghai' then
+  if not exists(
+    select 1
+    from jsonb_array_elements(snapshot->'app_settings') setting
+    where setting->>'key' = 'timezone'
+      and setting->>'value_json' = 'Asia/Shanghai'
+  ) then
     raise exception 'migration changed string setting value';
   end if;
-  if jsonb_typeof((select config_json from public.integration_configs where workspace_id = '20000000-0000-0000-0000-000000000001' and provider = 'seatable')) <> 'object' then
+  if not exists(
+    select 1
+    from jsonb_array_elements(snapshot->'integration_configs') config
+    where config->>'provider' = 'seatable'
+      and jsonb_typeof(config->'config_json') = 'object'
+  ) then
     raise exception 'migration changed integration config type';
   end if;
   begin
-    perform public.migration_import_snapshot(
+    perform timegenie.migration_import_snapshot(
       '20000000-0000-0000-0000-000000000001',
       '40000000-0000-0000-0000-000000000002',
       '30000000-0000-0000-0000-000000000001',
@@ -296,10 +390,10 @@ end $$;
 do $$
 declare before_seq bigint;
 begin
-  select max(change_seq) into before_seq from public.workspace_changes
+  select max(change_seq) into before_seq from timegenie.workspace_changes
   where workspace_id = '20000000-0000-0000-0000-000000000001';
 
-  perform public.cloud_apply_patch(
+  perform timegenie.cloud_apply_patch(
     '20000000-0000-0000-0000-000000000001',
     '30000000-0000-0000-0000-000000000001',
     '40000000-0000-0000-0000-000000000010',
@@ -323,12 +417,66 @@ begin
     )
   );
 
-  if (select max(change_seq) from public.workspace_changes where workspace_id = '20000000-0000-0000-0000-000000000001') <= before_seq then
+  if (select max(change_seq) from timegenie.workspace_changes where workspace_id = '20000000-0000-0000-0000-000000000001') <= before_seq then
     raise exception 'workspace change sequence did not advance';
   end if;
 
+  perform timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000010',
+    'task.update',
+    'task',
+    '60000000-0000-0000-0000-000000000002',
+    1,
+    jsonb_build_object(
+      'id', '60000000-0000-0000-0000-000000000002',
+      'subject_id', '50000000-0000-0000-0000-000000000001',
+      'parent_id', '60000000-0000-0000-0000-000000000001',
+      'title', '验证云端同步（设备 A）',
+      'status', 'open',
+      'planned_date', '2026-09-24',
+      'estimate_minutes', 30,
+      'source_type', 'manual',
+      'sort_order', 20,
+      'created_at', 1789689600000,
+      'updated_at', 1789696800000,
+      'version', 2
+    )
+  );
+
   begin
-    perform public.cloud_apply_patch(
+    perform timegenie.cloud_apply_patch(
+      '20000000-0000-0000-0000-000000000001',
+      '30000000-0000-0000-0000-000000000001',
+      '40000000-0000-0000-0000-000000000010',
+      'task.update',
+      'task',
+      '60000000-0000-0000-0000-000000000002',
+      1,
+      jsonb_build_object(
+        'id', '60000000-0000-0000-0000-000000000002',
+        'subject_id', '50000000-0000-0000-0000-000000000001',
+        'parent_id', '60000000-0000-0000-0000-000000000001',
+        'title', '同 ID 不同内容不应当被当作重试',
+        'status', 'open',
+        'planned_date', '2026-09-24',
+        'estimate_minutes', 30,
+        'source_type', 'manual',
+        'sort_order', 20,
+        'created_at', 1789689600000,
+        'updated_at', 1789696800000,
+        'version', 2
+      )
+    );
+    raise exception 'operation id accepted different payload';
+  exception
+    when others then
+      if sqlerrm not like '%IDEMPOTENCY_CONFLICT%' then raise; end if;
+  end;
+
+  begin
+    perform timegenie.cloud_apply_patch(
       '20000000-0000-0000-0000-000000000001',
       '30000000-0000-0000-0000-000000000002',
       '40000000-0000-0000-0000-000000000011',
@@ -350,7 +498,7 @@ end $$;
 do $$
 declare timer_row jsonb;
 begin
-  timer_row := public.timer_start(
+  timer_row := timegenie.timer_start(
     '20000000-0000-0000-0000-000000000001',
     '60000000-0000-0000-0000-000000000002',
     '30000000-0000-0000-0000-000000000001',
@@ -359,7 +507,7 @@ begin
   );
 
   begin
-    perform public.timer_start(
+    perform timegenie.timer_start(
       '20000000-0000-0000-0000-000000000001',
       '60000000-0000-0000-0000-000000000002',
       '30000000-0000-0000-0000-000000000002',
@@ -373,7 +521,7 @@ begin
   end;
 
   begin
-    perform public.timer_pause(
+    perform timegenie.timer_pause(
       '20000000-0000-0000-0000-000000000001',
       (timer_row->>'id')::uuid,
       '30000000-0000-0000-0000-000000000002',
@@ -386,21 +534,21 @@ begin
       if sqlerrm not like '%VERSION_CONFLICT%' then raise; end if;
   end;
 
-  timer_row := public.timer_pause(
+  timer_row := timegenie.timer_pause(
     '20000000-0000-0000-0000-000000000001',
     (timer_row->>'id')::uuid,
     '30000000-0000-0000-0000-000000000002',
     (timer_row->>'version')::bigint,
     '40000000-0000-0000-0000-000000000023'
   );
-  timer_row := public.timer_resume(
+  timer_row := timegenie.timer_resume(
     '20000000-0000-0000-0000-000000000001',
     (timer_row->>'id')::uuid,
     '30000000-0000-0000-0000-000000000002',
     (timer_row->>'version')::bigint,
     '40000000-0000-0000-0000-000000000024'
   );
-  timer_row := public.timer_stop(
+  timer_row := timegenie.timer_stop(
     '20000000-0000-0000-0000-000000000001',
     (timer_row->>'id')::uuid,
     '30000000-0000-0000-0000-000000000001',
@@ -418,14 +566,14 @@ end $$;
 do $$
 declare lease_result jsonb;
 begin
-  lease_result := public.tracking_lease_acquire(
+  lease_result := timegenie.tracking_lease_acquire(
     '20000000-0000-0000-0000-000000000001',
     '30000000-0000-0000-0000-000000000001',
     '90000000-0000-0000-0000-000000000001'
   );
   if not (lease_result->>'acquired')::boolean then raise exception 'device A did not acquire lease'; end if;
 
-  lease_result := public.tracking_lease_acquire(
+  lease_result := timegenie.tracking_lease_acquire(
     '20000000-0000-0000-0000-000000000001',
     '30000000-0000-0000-0000-000000000002',
     '90000000-0000-0000-0000-000000000002'
@@ -433,7 +581,7 @@ begin
   if (lease_result->>'acquired')::boolean then raise exception 'device B stole a live lease'; end if;
 
   begin
-    perform public.tracking_lease_renew(
+    perform timegenie.tracking_lease_renew(
       '20000000-0000-0000-0000-000000000001',
       '30000000-0000-0000-0000-000000000001',
       '90000000-0000-0000-0000-000000000099'
@@ -444,10 +592,19 @@ begin
       if sqlerrm not like '%LEASE_EXPIRED%' then raise; end if;
   end;
 
-  update public.tracking_leases set expires_at = now() - interval '1 second'
-  where workspace_id = '20000000-0000-0000-0000-000000000001';
+end $$;
 
-  lease_result := public.tracking_lease_acquire(
+reset role;
+update timegenie.tracking_leases set expires_at = now() - interval '1 second'
+where workspace_id = '20000000-0000-0000-0000-000000000001';
+
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '10000000-0000-0000-0000-000000000001', true);
+
+do $$
+declare lease_result jsonb;
+begin
+  lease_result := timegenie.tracking_lease_acquire(
     '20000000-0000-0000-0000-000000000001',
     '30000000-0000-0000-0000-000000000002',
     '90000000-0000-0000-0000-000000000002'
@@ -455,7 +612,7 @@ begin
   if not (lease_result->>'acquired')::boolean then raise exception 'device B did not acquire expired lease'; end if;
 
   begin
-    perform public.unassigned_tick(
+    perform timegenie.unassigned_tick(
       '20000000-0000-0000-0000-000000000001',
       '30000000-0000-0000-0000-000000000001',
       '90000000-0000-0000-0000-000000000001'
@@ -466,16 +623,21 @@ begin
       if sqlerrm not like '%LEASE_EXPIRED%' then raise; end if;
   end;
 
-  perform public.unassigned_tick(
+  perform timegenie.unassigned_tick(
     '20000000-0000-0000-0000-000000000001',
     '30000000-0000-0000-0000-000000000002',
     '90000000-0000-0000-0000-000000000002'
   );
+end $$;
 
+reset role;
+
+do $$
+begin
   if (
     select count(*)
-    from public.unassigned_segments segment
-    join public.unassigned_sessions session on session.id = segment.session_id
+    from timegenie.unassigned_segments segment
+    join timegenie.unassigned_sessions session on session.id = segment.session_id
     where session.workspace_id = '20000000-0000-0000-0000-000000000001'
       and segment.ended_at is null
   ) <> 1 then
@@ -483,15 +645,13 @@ begin
   end if;
 end $$;
 
-reset role;
-
 do $$
 begin
   if not exists(
     select 1
     from pg_publication_tables
     where pubname = 'supabase_realtime'
-      and schemaname = 'public'
+      and schemaname = 'timegenie'
       and tablename = 'workspace_changes'
   ) then
     raise exception 'workspace_changes is not in the realtime publication';
