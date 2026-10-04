@@ -47,7 +47,7 @@
 3. 选择报告时长格式，默认使用分钟，例如 `90min`；也可以切换为一位小数小时，例如 `1.5h`。
 4. 根据需要设置工资时薪。
 5. 如需连接 SeaTable，填写服务地址、事项表、事项视图、报销表和“本地事项 ID”字段，再填写 Base API Token。
-6. 如需多设备使用，先确保 Supabase API 暴露 `timegenie` schema，再在 Supabase SQL Editor 执行 [`supabase/schema.sql`](supabase/schema.sql)，然后在“数据存储”中填写 Project URL 和 anon key，用邮箱密码登录。
+6. 如需多设备使用，先确保 Supabase API 暴露 `timegenie` schema。新项目在 Supabase SQL Editor 执行 [`supabase/schema.sql`](supabase/schema.sql)；已部署过旧版本 SQL 的项目按顺序执行 [`supabase/20261003_timegenie_recurring_migration_patch.sql`](supabase/20261003_timegenie_recurring_migration_patch.sql)、[`supabase/20261004_timegenie_cloud_sync_patch.sql`](supabase/20261004_timegenie_cloud_sync_patch.sql)、[`supabase/20261004b_timegenie_migration_target_guard_patch.sql`](supabase/20261004b_timegenie_migration_target_guard_patch.sql)、[`supabase/20261004c_timegenie_work_day_version_guard_patch.sql`](supabase/20261004c_timegenie_work_day_version_guard_patch.sql) 和 [`supabase/20261004d_timegenie_session_revocation_patch.sql`](supabase/20261004d_timegenie_session_revocation_patch.sql)。随后在“数据存储”中填写 Project URL 和 anon key，用邮箱密码登录。
 7. 登录后先查看本地数据迁移预览，确认后再执行迁移。
 
 SeaTable Token、Supabase 会话等敏感内容会保存到系统凭据库，不进入普通数据文件或报告。
@@ -89,15 +89,16 @@ SeaTable Token、Supabase 会话等敏感内容会保存到系统凭据库，不
 
 云端模式适合需要在多台设备之间同步同一份工作数据的场景。
 
-- Supabase PostgreSQL 是云端模式的权威数据源，SQLite 只保留本机缓存、同步状态和离线队列。
+- Supabase PostgreSQL 是云端模式的最终权威数据源；桌面端业务写入先在本机 SQLite 事务中保存并进入同步队列，成功推送后再由云端快照确认，避免网络抖动导致本地修改丢失。
 - 桌面端只允许配置 anon key，拒绝 service role key；用户会话保存到系统凭据库。
 - 已提供 Auth、工作空间、设备注册、RLS、变更序列、迁移入口、全局单计时器 RPC 和 15 秒续租/45 秒过期的后台采集租约。
 - `schema.sql` 会在 `timegenie` schema 下创建业务表和 RPC，不在 `public` 下创建 TimeGenie 业务表；它会显式撤销匿名角色对业务表和保护 RPC 的访问，只向 `authenticated` 授予 API 所需权限；RLS 再按账号限制工作空间范围。
 - Supabase/PostgREST 需要暴露 `timegenie` schema。本地 CLI 已在 [`supabase/config.toml`](supabase/config.toml) 配置；自托管环境请把 `timegenie` 加入 `PGRST_DB_SCHEMAS` 后重启 REST/PostgREST 服务。
+- 旧 Supabase 项目升级时不需要重跑完整 schema；按发布时间顺序执行 [`supabase/20261003_timegenie_recurring_migration_patch.sql`](supabase/20261003_timegenie_recurring_migration_patch.sql)、[`supabase/20261004_timegenie_cloud_sync_patch.sql`](supabase/20261004_timegenie_cloud_sync_patch.sql)、[`supabase/20261004b_timegenie_migration_target_guard_patch.sql`](supabase/20261004b_timegenie_migration_target_guard_patch.sql)、[`supabase/20261004c_timegenie_work_day_version_guard_patch.sql`](supabase/20261004c_timegenie_work_day_version_guard_patch.sql) 和 [`supabase/20261004d_timegenie_session_revocation_patch.sql`](supabase/20261004d_timegenie_session_revocation_patch.sql)，用于补齐周期事项、同步实体身份、未归属会话同步、迁移目标保护、工作日版本冲突保护以及长期登录与设备撤销。
 - Realtime 订阅 `timegenie.workspace_changes`，客户端按 `change_seq` 增量补拉。
-- 当前未接入云端事务的业务写操作会明确提示不可用，不会回退写入本地 SQLite。
+- 当前仍未纳入同步模型的业务写操作会明确提示不可用，不会伪装成已同步；已有业务写入会在界面显示待同步、失败或冲突状态。
 
-正式启用前，建议在两台设备上完成登录、迁移、冲突和计时互斥验证。
+正式启用前，建议在两台设备上完成登录、迁移、冲突和计时互斥验证。已执行旧项目增量补丁后，可在 Supabase SQL Editor 中运行只读脚本 [`supabase/20261004_verify_timegenie_cloud_guards.sql`](supabase/20261004_verify_timegenie_cloud_guards.sql)，确认迁移目标保护、未归属会话同步和工作日版本保护函数已经部署生效。
 
 ### Schema 集成验证
 
@@ -114,6 +115,7 @@ npm run test:supabase:schema
 仓库提供一个默认跳过的真实 Supabase 验证。它使用两个独立 SQLite 数据库模拟两台设备，并依次验证邮箱密码登录、工作空间和设备注册、本地数据迁移、Realtime 通知与增量拉取、离线 outbox、版本冲突、全局单计时器和后台采集租约。
 
 该验证会删除测试账号名下现有工作空间，并在完成后再次清理。请使用专门的可丢弃测试账号，不要使用正式账号。
+运行入口会先检查下列环境变量；缺少变量或未设置 `TG_SUPABASE_E2E_ALLOW_RESET=1` 时会直接拒绝执行，不会连接或清理 Supabase 数据。
 
 ```powershell
 $env:TG_SUPABASE_URL="https://your-project.supabase.co"

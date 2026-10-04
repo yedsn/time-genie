@@ -611,6 +611,12 @@ fn set_task_status_with_cloud_operation(
             )?
             .is_some()
         {
+            let previous_occurrence = crate::recurring::occurrence_for_date(
+                &transaction,
+                &workspace_id,
+                &request.id,
+                occurrence_date,
+            )?;
             crate::recurring::set_occurrence_status(
                 &transaction,
                 &workspace_id,
@@ -621,6 +627,32 @@ fn set_task_status_with_cloud_operation(
                 now,
             )?;
             bump_revision(&transaction)?;
+            if let Some((state, operation_type)) = cloud_operation {
+                let entity_id =
+                    crate::recurring::occurrence_entity_id(&request.id, occurrence_date);
+                let base_version = previous_occurrence.as_ref().map(|item| item.version);
+                let current_occurrence = crate::recurring::occurrence_for_date(
+                    &transaction,
+                    &workspace_id,
+                    &request.id,
+                    occurrence_date,
+                )?;
+                if current_occurrence.as_ref().is_some_and(|item| {
+                    previous_occurrence
+                        .as_ref()
+                        .is_none_or(|previous| item.version > previous.version)
+                }) {
+                    crate::cloud_sync::enqueue_entity_in_transaction(
+                        &transaction,
+                        state,
+                        operation_type,
+                        "task_occurrence",
+                        Some(&entity_id),
+                        base_version,
+                        None,
+                    )?;
+                }
+            }
             transaction.commit().map_err(|error| error.to_string())?;
             let connection = database.open()?;
             let mut task = load_task(&connection, &current.id)?;
@@ -1744,6 +1776,7 @@ mod tests {
     use super::*;
     use crate::database::Database;
     use crate::settings::{self, SettingsScope, SettingsUpdate};
+    use chrono::Local;
     use serde_json::{json, Value};
     use tempfile::tempdir;
 
@@ -1860,6 +1893,7 @@ mod tests {
     #[test]
     fn cloud_task_mutations_queue_outbox_in_the_same_transaction() {
         let database = database();
+        let occurrence_date = Local::now().format("%Y-%m-%d").to_string();
         let cloud_workspace_id = Uuid::now_v7().to_string();
         settings::update_setting(
             &database,
@@ -1946,6 +1980,44 @@ mod tests {
             Some((&state, "task_delete")),
         )
         .unwrap();
+        let recurring_task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: done.subject_id.clone(),
+                parent_id: None,
+                title: "云端事务重复事项".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let rule = crate::recurring::save_rule(
+            &database,
+            crate::recurring::RecurrenceSaveRequest {
+                task_id: recurring_task.id.clone(),
+                task_expected_version: recurring_task.version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: occurrence_date.clone(),
+                rule_expected_version: None,
+            },
+        )
+        .unwrap();
+        set_task_status_with_cloud_operation(
+            &database,
+            TaskStatusRequest {
+                id: recurring_task.id.clone(),
+                expected_version: recurring_task.version + 1,
+                done: true,
+                occurrence_date: Some(occurrence_date.clone()),
+                occurrence_expected_version: None,
+            },
+            Some((&state, "task_set_completed")),
+        )
+        .unwrap();
 
         let connection = database.open().unwrap();
         let outbox = connection
@@ -2005,6 +2077,23 @@ mod tests {
                     && *base_version == Some(done.version)
                     && !value["deleted_at"].is_null()
             }));
+        assert!(outbox
+            .iter()
+            .any(|(operation, entity_id, base_version, payload)| {
+                let value: Value = serde_json::from_str(payload).unwrap();
+                operation == "task_set_completed"
+                    && entity_id.as_deref()
+                        == Some(&crate::recurring::occurrence_entity_id(
+                            &recurring_task.id,
+                            &occurrence_date,
+                        ))
+                    && value["task_id"] == recurring_task.id
+                    && value["occurrence_date"] == occurrence_date
+                    && value["status"] == "done"
+                    && value["version"] == 2
+                    && base_version.is_none()
+            }));
+        assert_eq!(rule.version, 1);
     }
 
     #[test]

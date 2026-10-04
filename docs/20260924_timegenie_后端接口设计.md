@@ -7,8 +7,8 @@
 ## 1. 设计结论
 
 - 后端支持 `local` 本地模式和 `cloud` Supabase 云端模式。前端始终通过 `invoke(command, payload)` 调用 Rust 服务层，不直接在 Vue 组件中区分存储模式。
-- 本地模式由 Rust 服务层执行 SQLite 事务；云端模式由 Rust 服务层调用 Supabase Auth、PostgREST、PostgreSQL RPC 和 Realtime，并维护本机 SQLite 缓存与离线队列。
-- 云端模式以 Supabase PostgreSQL 为权威数据源，SQLite 只作缓存，不允许形成双主。
+- 本地模式由 Rust 服务层执行 SQLite 事务；云端模式由 Rust 服务层先提交本机 SQLite 事务并写入同步队列，再通过 Supabase Auth、PostgREST、PostgreSQL RPC 和 Realtime 推送、拉取和解决冲突。
+- 云端模式以 Supabase PostgreSQL 为最终权威数据源，SQLite 保存本机缓存、待同步队列和同步状态；有待同步或冲突操作时不得用云端快照覆盖本地编辑，不允许形成双主。
 - 主窗口、托盘窗口和悬浮窗口使用同一套命令，不允许各自维护业务副本。
 - Rust 服务层每次本地或云端写入确认后广播领域事件。其他设备通过 Supabase Realtime 收到变更序号，再做增量拉取。
 - 前端每秒只更新显示时钟，不每秒写数据库。运行时长以服务端保存的开放分段开始时间计算。
@@ -96,8 +96,8 @@ Vue -> Tauri Command -> Domain Service
 ```
 
 - 查询优先读取本机缓存，以便界面快速启动；云端同步完成后广播刷新事件。
-- 在线云端写操作只有 Supabase 确认成功后才算完成，并回写本地缓存。
-- 离线允许的操作返回 `syncState='pending'`，不能伪装成已云端保存。
+- 云端模式的普通业务写操作先在本机 SQLite 事务中完成并写入 `sync_outbox`；即时推送失败、断网或遇到冲突时，本地结果保留，界面通过 `syncState`、待同步数量和冲突数量提示用户。
+- 只有当 outbox 清空且无冲突时，才允许用云端快照刷新本机缓存；待同步、失败或冲突状态不能伪装成已云端保存。
 - 云端 RPC 必须根据 JWT 内的 `auth.uid()` 校验工作空间所有权，不接受客户端传入任意用户 ID。
 
 ## 3. 账号、工作空间和设备
@@ -112,11 +112,13 @@ Vue -> Tauri Command -> Domain Service
 | `cloud_sign_in_password` | 邮箱密码登录 |
 | `cloud_sign_in_magic_link` | 发送 Magic Link，可作为后续登录方式 |
 | `cloud_sign_out` | 退出当前云端账号 |
+| `cloud_sign_out_all` | 退出当前账号的全部设备 |
 | `cloud_session_get` | 获取脱敏会话和账号状态 |
 | `cloud_workspace_bootstrap` | 创建或加载当前用户的工作空间 |
 | `cloud_device_register` | 注册当前安装实例 |
 | `cloud_device_list` | 查看已登录设备 |
 | `cloud_device_revoke` | 撤销其他设备 |
+| `cloud_sync_resume_after_reauth` | 重新登录后确认恢复此前暂停的待同步修改 |
 | `storage_migration_preview` | 预览本地上传云端或云端导出本地 |
 | `storage_migration_execute` | 确认执行一次性迁移 |
 
@@ -146,6 +148,8 @@ Vue -> Tauri Command -> Domain Service
 
 密码只用于本次 Supabase Auth 请求，不落盘、不写日志。access token 和 refresh token 写入 Windows Credential Manager。返回脱敏账号信息，不返回 refresh token。
 
+`cloud_session_get` 返回结构化状态：`authenticated` 表示在线校验成功；`offline_saved` 表示凭据仍安全保存在本机，但因断网、限流或 Supabase 临时故障无法校验；`reauth_required` 表示 refresh token、账号、Auth 会话或设备授权已明确失效。只有 `reauth_required` 才展示密码登录。单次业务请求的 `401/403` 不直接删除 refresh token；可安全重放的请求先刷新再重试，不可安全重放的请求只刷新认证并提示用户重试。Schema、RLS、版本冲突和普通业务错误不改变登录状态。
+
 ### 3.4 `cloud_workspace_bootstrap`
 
 登录后调用。没有活跃工作空间时创建一个，已有时直接返回：
@@ -173,6 +177,12 @@ Vue -> Tauri Command -> Domain Service
 ```
 
 `deviceId` 在首次安装时生成并保存到设备配置。重新登录同一安装实例更新原记录，不重复创建。
+
+设备授权通过 `device_authorize` 显式建立，并绑定当前 Supabase Auth `session_id`；该标识只用于区分新旧 Auth 会话，不是 access/refresh token。`device_authorization_get` 在启动、会话刷新和同步上传前检查授权。`device_revoke` 撤销指定设备并释放其采集租约；`device_revoke_all` 撤销账号下全部设备并释放全部租约。已撤销设备只有在新的密码登录产生不同 Auth 会话后才能重新授权，旧会话、普通心跳或直接表更新都不得静默清除撤销状态。
+
+普通退出按“撤销当前设备授权 → Supabase Auth local logout → 清除本机 token”执行；退出所有设备按“撤销全部设备授权 → Supabase Auth global logout → 清除当前设备 token”执行，并要求前端二次确认。退出或撤销不会删除 SQLite 业务数据和 `sync_outbox`；重新登录后必须通过 `cloud_sync_resume_after_reauth` 明确恢复上传。
+
+后台撤销指定设备时，数据库 owner/迁移管理员可在受控环境调用 `timegenie.device_revoke(workspace_id, device_id)`；撤销账号全部 Auth 会话应使用 Supabase Auth 管理后台或受保护的 Admin API。`service_role` 只能存在于受控服务端，禁止配置到桌面客户端。
 
 ### 3.6 存储模式迁移
 

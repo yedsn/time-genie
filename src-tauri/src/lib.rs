@@ -381,15 +381,20 @@ pub fn run() {
             supabase::cloud_configure,
             supabase::cloud_sign_in_password,
             supabase::cloud_sign_out,
+            supabase::cloud_sign_out_all,
             supabase::cloud_session_get,
             supabase::cloud_workspace_bootstrap,
             supabase::cloud_device_register,
+            supabase::cloud_device_list,
+            supabase::cloud_device_revoke,
+            supabase::cloud_sync_resume_after_reauth,
             supabase::storage_migration_preview,
             supabase::storage_migration_execute,
             cloud_sync::cloud_sync_status,
             cloud_sync::cloud_sync_pull,
             cloud_sync::cloud_sync_push,
             cloud_sync::cloud_sync_refresh,
+            cloud_sync::cloud_sync_reset_local_cache,
             cloud_sync::cloud_sync_conflicts,
             cloud_sync::cloud_sync_resolve_conflict,
             cloud_sync::tracking_lease_acquire,
@@ -909,20 +914,9 @@ fn execute_tray_timer_action(
     database: &Database,
     action: TrayTimerAction,
 ) -> Result<serde_json::Value, String> {
-    let storage = supabase::storage_mode(database)?;
-    if storage.mode == "cloud" {
-        return execute_cloud_tray_timer_action(database, action);
-    }
-    execute_local_tray_timer_action(database, action)
-}
-
-fn execute_local_tray_timer_action(
-    database: &Database,
-    action: TrayTimerAction,
-) -> Result<serde_json::Value, String> {
     let current = time_tracking::get_timer_state(database)?;
     let result = match action {
-        TrayTimerAction::Start => time_tracking::start_timer_with_hooks(
+        TrayTimerAction::Start => time_tracking::start_timer_with_hooks_for_sync(
             database,
             time_tracking::TimerStartRequest {
                 task_id: None,
@@ -933,7 +927,7 @@ fn execute_local_tray_timer_action(
         TrayTimerAction::Pause => {
             let entry =
                 current.ok_or_else(|| "TIMER_NOT_RUNNING: 当前没有正在运行的计时".to_string())?;
-            time_tracking::pause_timer(
+            time_tracking::pause_timer_for_sync(
                 database,
                 time_tracking::TimerVersionRequest {
                     entry_id: entry.id,
@@ -944,7 +938,7 @@ fn execute_local_tray_timer_action(
         TrayTimerAction::Resume => {
             let entry =
                 current.ok_or_else(|| "TIMER_NOT_PAUSED: 当前没有已暂停的计时".to_string())?;
-            time_tracking::resume_timer(
+            time_tracking::resume_timer_for_sync(
                 database,
                 time_tracking::TimerResumeRequest {
                     entry_id: entry.id,
@@ -956,7 +950,7 @@ fn execute_local_tray_timer_action(
         TrayTimerAction::Stop => {
             let entry =
                 current.ok_or_else(|| "TIMER_NOT_RUNNING: 当前没有可结束的计时".to_string())?;
-            time_tracking::stop_timer_with_hooks(
+            time_tracking::stop_timer_with_hooks_for_sync(
                 database,
                 time_tracking::TimerStopRequest {
                     entry_id: entry.id,
@@ -967,47 +961,6 @@ fn execute_local_tray_timer_action(
         }
     };
     serde_json::to_value(result).map_err(|error| error.to_string())
-}
-
-fn execute_cloud_tray_timer_action(
-    database: &Database,
-    action: TrayTimerAction,
-) -> Result<serde_json::Value, String> {
-    if matches!(action, TrayTimerAction::Start) {
-        return cloud_sync::timer_start(
-            database,
-            cloud_sync::CloudTimerStartRequest {
-                task_id: None,
-                note: None,
-                operation_id: Uuid::now_v7().to_string(),
-            },
-        );
-    }
-    let entry = cloud_sync::timer_get_state(database)?
-        .ok_or_else(|| "TIMER_NOT_RUNNING: 当前没有可操作的云端计时".to_string())?;
-    let entry_id = entry
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "CLOUD_REQUEST_FAILED: 云端计时缺少 ID".to_string())?;
-    let expected_version = entry
-        .get("version")
-        .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| "CLOUD_REQUEST_FAILED: 云端计时缺少版本号".to_string())?;
-    let rpc = match action {
-        TrayTimerAction::Pause => "timer_pause",
-        TrayTimerAction::Resume => "timer_resume",
-        TrayTimerAction::Stop => "timer_stop",
-        TrayTimerAction::Start => unreachable!(),
-    };
-    cloud_sync::timer_action(
-        database,
-        rpc,
-        cloud_sync::CloudTimerVersionRequest {
-            entry_id: entry_id.to_string(),
-            expected_version,
-            operation_id: Uuid::now_v7().to_string(),
-        },
-    )
 }
 
 fn show(app: &AppHandle, label: &str) {
@@ -1323,6 +1276,8 @@ fn cursor_position() -> Option<PhysicalPosition<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{self, SettingsScope, SettingsUpdate};
+    use serde_json::json;
 
     #[test]
     fn physical_bounds_use_exclusive_bottom_and_right_edges() {
@@ -1412,5 +1367,68 @@ mod tests {
         assert_eq!(stopped["state"], "ended");
         assert_eq!(stopped["allocatedMinutes"], 0);
         assert!(time_tracking::get_timer_state(&database).unwrap().is_none());
+    }
+
+    #[test]
+    fn cloud_tray_timer_actions_use_local_cache_and_queue_outbox() {
+        let directory = tempfile::tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("cloud-tray-timer.sqlite3")).unwrap();
+        let cloud_workspace_id = uuid::Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id.clone()),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+
+        let started = execute_tray_timer_action(&database, TrayTimerAction::Start).unwrap();
+        assert_eq!(started["state"], "running");
+        assert!(time_tracking::get_timer_state(&database).unwrap().is_some());
+
+        let stopped = execute_tray_timer_action(&database, TrayTimerAction::Stop).unwrap();
+        assert_eq!(stopped["state"], "ended");
+        assert_eq!(stopped["allocatedMinutes"], 0);
+        assert!(time_tracking::get_timer_state(&database).unwrap().is_none());
+
+        let connection = database.open().unwrap();
+        let queued = connection
+            .prepare(
+                "SELECT operation_type, entity_type, entity_id, base_version FROM sync_outbox WHERE workspace_id = ?1 ORDER BY created_at, rowid",
+            )
+            .unwrap()
+            .query_map([cloud_workspace_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0].0, "timer_start");
+        assert_eq!(queued[0].1, "time_entry");
+        assert_eq!(queued[0].2.as_deref(), started["id"].as_str());
+        assert_eq!(queued[0].3, None);
+        assert_eq!(queued[1].0, "timer_stop");
+        assert_eq!(queued[1].1, "time_entry");
+        assert_eq!(queued[1].2.as_deref(), stopped["id"].as_str());
+        assert_eq!(queued[1].3, started["version"].as_i64());
     }
 }

@@ -606,12 +606,13 @@ fn execute_task_sync_with(
                     params![Uuid::now_v7().to_string(), workspace_id, item.task_id, external_id, now],
                 ).map_err(|error| error.to_string())?;
                 if let Some((state, operation_type)) = cloud_operation {
+                    let binding_entity_id = format!("seatable|task|{}", item.task_id);
                     crate::cloud_sync::enqueue_entity_in_transaction(
                         &transaction,
                         state,
                         operation_type,
                         "external_binding",
-                        Some(&item.task_id),
+                        Some(&binding_entity_id),
                         None,
                         None,
                     )?;
@@ -1415,7 +1416,7 @@ mod tests {
         let (operation_type, entity_type, payload_json): (String, String, String) = connection
             .query_row(
                 "SELECT operation_type, entity_type, payload_json FROM sync_outbox WHERE entity_id = ?1",
-                [&task_ids[0]],
+                [format!("seatable|task|{}", task_ids[0])],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();

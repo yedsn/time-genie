@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -11,13 +12,17 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::database::Database;
-use crate::supabase::{client, current_session, storage_mode, CLOUD_SCHEMA};
+use crate::supabase::{
+    client, current_session, ensure_current_device_authorized, mark_auth_blocked, storage_mode,
+    CLOUD_SCHEMA,
+};
 
 const REALTIME_HEARTBEAT_SECONDS: u64 = 25;
 const REALTIME_RECONNECT_SECONDS: u64 = 5;
 const OUTBOX_SENDING_STALE_AFTER_MILLIS: i64 = 5 * 60 * 1000;
 const OUTBOX_RETRY_MAX_BACKOFF_MILLIS: i64 = 60 * 1000;
 static TRACKING_LEASE_TOKEN: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static CLOUD_SYNC_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub fn spawn_background_services(database: Database, app: AppHandle) {
     spawn_background_lease(database.clone(), app.clone());
@@ -36,25 +41,34 @@ fn spawn_background_lease(database: Database, app: AppHandle) {
                 clear_tracking_lease_token();
                 continue;
             }
-            if let Ok(push) = push_outbox(&database) {
-                if push.pending > 0 || push.conflicts > 0 {
-                    emit_cloud_refresh(&app, &database, "outbox-state");
-                }
-                if push.pending == 0 && push.conflicts == 0 {
-                    if push.pushed > 0 {
-                        emit_cloud_refresh(&app, &database, "outbox");
-                    } else if pull(
-                        &database,
-                        CloudSyncPullRequest {
-                            after_change_seq: None,
-                            limit: None,
-                        },
-                    )
-                    .is_ok_and(|result| !result.changes.is_empty())
-                    {
-                        emit_cloud_refresh(&app, &database, "poll");
+            match push_outbox(&database) {
+                Ok(push) => {
+                    if push.pending > 0 || push.conflicts > 0 {
+                        emit_cloud_refresh(&app, &database, "outbox-state");
+                    }
+                    if push.pending == 0 && push.conflicts == 0 {
+                        if push.pushed > 0 {
+                            emit_cloud_refresh(&app, &database, "outbox");
+                        } else {
+                            match pull(
+                                &database,
+                                CloudSyncPullRequest {
+                                    after_change_seq: None,
+                                    limit: None,
+                                },
+                            ) {
+                                Ok(result) if !result.changes.is_empty() => {
+                                    emit_cloud_refresh(&app, &database, "poll");
+                                }
+                                Ok(_) => {}
+                                Err(error)
+                                    if should_defer_snapshot_refresh_after_local_race(&error) => {}
+                                Err(error) => emit_cloud_error(&app, &database, &error),
+                            }
+                        }
                     }
                 }
+                Err(error) => emit_cloud_error(&app, &database, &error),
             }
             let _ = acquire_or_renew_tracking_lease(&database);
         }
@@ -241,8 +255,8 @@ async fn run_realtime_connection(
                             match pull(database, CloudSyncPullRequest { after_change_seq: None, limit: None }) {
                                 Ok(result) if !result.changes.is_empty() => emit_cloud_refresh(app, database, "realtime"),
                                 Ok(_) => {}
-                                Err(error) if !error.starts_with("SYNC_PENDING:") => emit_cloud_error(app, database, &error),
-                                Err(_) => {}
+                                Err(error) if should_defer_snapshot_refresh_after_local_race(&error) => {}
+                                Err(error) => emit_cloud_error(app, database, &error),
                             }
                         } else if event == "phx_error" || event == "phx_close" {
                             return Err("NETWORK_ERROR: Supabase Realtime 频道已断开".to_string());
@@ -299,6 +313,16 @@ fn emit_cloud_refresh(app: &AppHandle, database: &Database, source: &str) {
 
 fn emit_cloud_error(app: &AppHandle, database: &Database, error: &str) {
     if let Ok(status) = sync_status(database) {
+        if status.mode == "cloud" {
+            let _ = update_sync_state(
+                database,
+                &status.workspace_id,
+                &status.device_id,
+                status.last_change_seq,
+                Some(error),
+            );
+        }
+        let status = sync_status(database).unwrap_or(status);
         let _ = app.emit(
             "cloud-sync-state-changed",
             json!({
@@ -306,10 +330,10 @@ fn emit_cloud_error(app: &AppHandle, database: &Database, error: &str) {
                 "workspaceId": status.workspace_id,
                 "deviceId": status.device_id,
                 "online": false,
-                "syncState": "error",
+                "syncState": status.sync_state,
                 "lastChangeSeq": status.last_change_seq,
                 "lastSyncedAt": status.last_synced_at,
-                "lastError": error,
+                "lastError": status.last_error.as_deref().unwrap_or(error),
                 "pendingOperations": status.pending_operations,
                 "conflictCount": status.conflict_count,
                 "error": error
@@ -390,7 +414,7 @@ pub struct CloudConflictResolveRequest {
     pub strategy: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct OutboxOperation {
     operation_id: String,
     operation_type: String,
@@ -398,6 +422,67 @@ struct OutboxOperation {
     entity_id: Option<String>,
     base_version: Option<i64>,
     payload: Value,
+}
+
+struct ActiveTimerEntryOverlay {
+    entry_id: String,
+    work_date: String,
+    kind: String,
+    source_type: String,
+    state: String,
+    default_task_id: Option<String>,
+    label_snapshot: String,
+    started_at: i64,
+    ended_at: Option<i64>,
+    duration_seconds: i64,
+    note: Option<String>,
+    origin_unassigned_session_id: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    version: i64,
+    deleted_at: Option<i64>,
+}
+
+struct ActiveTimerSegmentOverlay {
+    entry_id: String,
+    segment_id: String,
+    sequence_no: i64,
+    started_at: i64,
+    duration_seconds: i64,
+}
+
+struct ActiveUnassignedSegmentOverlay {
+    session_id: String,
+    segment_id: String,
+    sequence_no: i64,
+    started_at: i64,
+    duration_seconds: i64,
+    lease_token: Option<String>,
+}
+
+struct ActiveUnassignedSessionOverlay {
+    session_id: String,
+    work_date: String,
+    state: String,
+    threshold_seconds: i64,
+    duration_seconds: i64,
+    first_started_at: i64,
+    last_ended_at: Option<i64>,
+    prompted_at: Option<i64>,
+    resolution_type: Option<String>,
+    generated_entry_id: Option<String>,
+    resolved_at: Option<i64>,
+    created_at: i64,
+    updated_at: i64,
+    version: i64,
+}
+
+#[derive(Default)]
+struct LocalTrackingOverlay {
+    active_timer_entries: Vec<ActiveTimerEntryOverlay>,
+    active_timer_segments: Vec<ActiveTimerSegmentOverlay>,
+    active_unassigned_sessions: Vec<ActiveUnassignedSessionOverlay>,
+    active_unassigned_segments: Vec<ActiveUnassignedSegmentOverlay>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -455,6 +540,7 @@ pub fn pull(
     if state.mode != "cloud" {
         return Err("OFFLINE_RESTRICTED: 只有云端模式可以拉取 Supabase 增量".to_string());
     }
+    ensure_no_dirty_outbox(database, &state.workspace_id)?;
     let session = current_session(database)?;
     let api = client(database)?;
     let after = request
@@ -462,7 +548,8 @@ pub fn pull(
         .unwrap_or(state.last_change_seq)
         .max(0);
     let limit = request.limit.unwrap_or(500).clamp(1, 1000);
-    let response = api.request(
+    let response = api.request_for_database(
+        database,
         api.get(format!(
             "{}/rest/v1/workspace_changes?workspace_id=eq.{}&change_seq=gt.{}&select=change_seq,workspace_id,entity_type,entity_id,operation,entity_version,changed_at&order=change_seq.asc&limit={}",
             api.project_url, state.workspace_id, after, limit
@@ -521,6 +608,7 @@ pub fn enqueue_entity(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn enqueue_entity_deferred(
     database: &Database,
     operation_type: &str,
@@ -533,6 +621,7 @@ pub fn enqueue_entity_deferred(
     if state.mode != "cloud" {
         return Ok(());
     }
+    ensure_supported_cloud_entity_type(entity_type)?;
     let payload = entity_payload(database, entity_type, entity_id)?;
     let operation_id = operation_id
         .map(ToOwned::to_owned)
@@ -571,6 +660,7 @@ pub(crate) fn enqueue_entity_in_transaction(
     if state.mode != "cloud" {
         return Ok(());
     }
+    ensure_supported_cloud_entity_type(entity_type)?;
     let payload = entity_payload_from_connection(transaction, entity_type, entity_id)?;
     let operation_id = operation_id
         .map(ToOwned::to_owned)
@@ -596,11 +686,33 @@ pub(crate) fn enqueue_entity_in_transaction(
     Ok(())
 }
 
+fn ensure_supported_cloud_entity_type(entity_type: &str) -> Result<(), String> {
+    if matches!(
+        entity_type,
+        "subject"
+            | "task"
+            | "time_entry"
+            | "unassigned_session"
+            | "report"
+            | "report_template"
+            | "app_setting"
+            | "integration_config"
+            | "task_occurrence"
+            | "external_binding"
+    ) {
+        Ok(())
+    } else {
+        Err(format!(
+            "VALIDATION_ERROR: 不支持同步实体 {entity_type}，请先扩展 Supabase cloud_apply_patch"
+        ))
+    }
+}
+
 pub fn flush_if_online(database: &Database) -> Result<(), String> {
     let state = storage_mode(database)?;
     if state.mode == "cloud" && state.online {
         match push_outbox(database) {
-            Ok(result) if result.conflicts > 0 => {
+            Ok(result) if automatic_flush_should_block_local_result(&result) => {
                 return Err("SYNC_CONFLICT: 云端数据已变化，本地修改已保留在冲突队列".to_string());
             }
             Ok(_) => {}
@@ -623,14 +735,33 @@ fn is_cloud_unavailable_error(error: &str) -> bool {
     error.starts_with("NETWORK_ERROR:") || error.starts_with("AUTH_REQUIRED:")
 }
 
+fn automatic_flush_should_block_local_result(_result: &CloudSyncPushResult) -> bool {
+    false
+}
+
 pub fn push_outbox(database: &Database) -> Result<CloudSyncPushResult, String> {
+    let _operation_guard = CLOUD_SYNC_OPERATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    push_outbox_locked(database)
+}
+
+fn push_outbox_locked(database: &Database) -> Result<CloudSyncPushResult, String> {
     let state = require_cloud(database)?;
+    ensure_current_device_authorized(database).map_err(|error| {
+        if error.starts_with("DEVICE_REVOKED:") {
+            let _ = mark_auth_blocked(database, "device_revoked");
+        }
+        error
+    })?;
     let session = current_session(database)?;
     let api = client(database)?;
     let operations = claim_pending_operations(database, &state.workspace_id)?;
     let mut pushed = 0;
     for operation in operations {
-        let response = api.rpc(
+        let response = api.rpc_for_database(
+            database,
             "cloud_apply_patch",
             json!({
                 "p_workspace_id": state.workspace_id,
@@ -666,9 +797,15 @@ pub fn push_outbox(database: &Database) -> Result<CloudSyncPushResult, String> {
             }
         }
     }
-    let (pending, conflicts) = outbox_counts(database, &state.workspace_id)?;
+    let (mut pending, mut conflicts) = outbox_counts(database, &state.workspace_id)?;
     if should_pull_snapshot_after_push(pushed, pending, conflicts) {
-        pull_snapshot(database)?;
+        match pull_snapshot(database) {
+            Ok(_) => {}
+            Err(error) if should_defer_snapshot_refresh_after_local_race(&error) => {
+                (pending, conflicts) = outbox_counts(database, &state.workspace_id)?;
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(CloudSyncPushResult {
         pushed,
@@ -679,6 +816,10 @@ pub fn push_outbox(database: &Database) -> Result<CloudSyncPushResult, String> {
 
 fn should_pull_snapshot_after_push(pushed: i64, pending: i64, conflicts: i64) -> bool {
     pushed > 0 && pending == 0 && conflicts == 0
+}
+
+fn should_defer_snapshot_refresh_after_local_race(error: &str) -> bool {
+    error.starts_with("SYNC_PENDING:") || error.starts_with("SYNC_RETRY:")
 }
 
 pub fn list_conflicts(database: &Database) -> Result<Vec<CloudSyncConflict>, String> {
@@ -737,20 +878,23 @@ pub fn resolve_conflict(
     let conflict = load_conflict(database, &state.workspace_id, &request.operation_id)?;
     match request.strategy.as_str() {
         "use_cloud" => {
-            delete_outbox(database, &conflict.operation_id)?;
+            delete_outbox_entity_chain(database, &state.workspace_id, &conflict)?;
         }
         "keep_local" => {
+            let latest_local =
+                latest_outbox_entity_operation(database, &state.workspace_id, &conflict)?;
             let session = current_session(database)?;
-            let snapshot = client(database)?.rpc(
+            let snapshot = client(database)?.rpc_for_database(
+                database,
                 "cloud_snapshot_get",
                 json!({ "p_workspace_id": state.workspace_id }),
                 &session,
             )?;
             let cloud_version = cloud_entity_version(
                 &snapshot,
-                &conflict.entity_type,
-                conflict.entity_id.as_deref(),
-                &conflict.payload,
+                &latest_local.entity_type,
+                latest_local.entity_id.as_deref(),
+                &latest_local.payload,
             );
             if cloud_version.is_none() && conflict.base_version.is_some() {
                 return Err(
@@ -758,7 +902,7 @@ pub fn resolve_conflict(
                         .to_string(),
                 );
             }
-            let mut payload = conflict.payload.clone();
+            let mut payload = latest_local.payload.clone();
             if let (Some(version), Some(object)) = (cloud_version, payload.as_object_mut()) {
                 object.insert("version".to_string(), json!(version + 1));
                 if object.contains_key("updated_at") {
@@ -779,6 +923,12 @@ pub fn resolve_conflict(
                     ],
                 )
                 .map_err(|error| error.to_string())?;
+            delete_following_outbox_entity_operations(
+                database,
+                &state.workspace_id,
+                &latest_local,
+                &conflict.operation_id,
+            )?;
         }
         _ => {
             return Err("VALIDATION_ERROR: 冲突处理策略只能是 use_cloud 或 keep_local".to_string())
@@ -787,9 +937,109 @@ pub fn resolve_conflict(
 
     let result = push_outbox(database)?;
     if result.pending == 0 && result.conflicts == 0 {
-        pull_snapshot(database)?;
+        match pull_snapshot(database) {
+            Ok(_) => {}
+            Err(error) if should_defer_snapshot_refresh_after_local_race(&error) => {}
+            Err(error) => return Err(error),
+        }
     }
     sync_status(database)
+}
+
+fn latest_outbox_entity_operation(
+    database: &Database,
+    workspace_id: &str,
+    conflict: &OutboxOperation,
+) -> Result<OutboxOperation, String> {
+    let Some(entity_id) = conflict.entity_id.as_deref() else {
+        return Ok(conflict.clone());
+    };
+    database
+        .open()?
+        .query_row(
+            "SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json
+             FROM sync_outbox
+             WHERE workspace_id = ?1
+               AND entity_type = ?2
+               AND entity_id = ?3
+               AND rowid >= (SELECT rowid FROM sync_outbox WHERE operation_id = ?4)
+             ORDER BY rowid DESC
+             LIMIT 1",
+            params![
+                workspace_id,
+                conflict.entity_type,
+                entity_id,
+                conflict.operation_id
+            ],
+            |row| {
+                let payload: String = row.get(5)?;
+                Ok(OutboxOperation {
+                    operation_id: row.get(0)?,
+                    operation_type: row.get(1)?,
+                    entity_type: row.get(2)?,
+                    entity_id: row.get(3)?,
+                    base_version: row.get(4)?,
+                    payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+                })
+            },
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn delete_following_outbox_entity_operations(
+    database: &Database,
+    workspace_id: &str,
+    operation: &OutboxOperation,
+    keep_operation_id: &str,
+) -> Result<(), String> {
+    let Some(entity_id) = operation.entity_id.as_deref() else {
+        return Ok(());
+    };
+    database
+        .open()?
+        .execute(
+            "DELETE FROM sync_outbox
+             WHERE workspace_id = ?1
+               AND entity_type = ?2
+               AND entity_id = ?3
+               AND operation_id <> ?4
+               AND rowid >= (SELECT rowid FROM sync_outbox WHERE operation_id = ?4)",
+            params![
+                workspace_id,
+                operation.entity_type,
+                entity_id,
+                keep_operation_id
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn delete_outbox_entity_chain(
+    database: &Database,
+    workspace_id: &str,
+    conflict: &OutboxOperation,
+) -> Result<(), String> {
+    let Some(entity_id) = conflict.entity_id.as_deref() else {
+        return delete_outbox(database, &conflict.operation_id);
+    };
+    database
+        .open()?
+        .execute(
+            "DELETE FROM sync_outbox
+             WHERE workspace_id = ?1
+               AND entity_type = ?2
+               AND entity_id = ?3
+               AND rowid >= (SELECT rowid FROM sync_outbox WHERE operation_id = ?4)",
+            params![
+                workspace_id,
+                conflict.entity_type,
+                entity_id,
+                conflict.operation_id
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn load_conflict(
@@ -831,6 +1081,7 @@ fn cloud_entity_version(
         "subject" => ("subjects", "id", entity_id?),
         "task" => ("tasks", "id", entity_id?),
         "time_entry" => ("time_entries", "id", entity_id?),
+        "unassigned_session" => ("unassigned_sessions", "id", entity_id?),
         "report" => ("reports", "id", entity_id?),
         "report_template" => ("report_templates", "id", entity_id?),
         "app_setting" => ("app_settings", "key", payload.get("key")?.as_str()?),
@@ -839,6 +1090,20 @@ fn cloud_entity_version(
             "provider",
             payload.get("provider")?.as_str()?,
         ),
+        "task_occurrence" => {
+            let expected_task_id = payload.get("task_id")?.as_str()?;
+            let expected_date = payload.get("occurrence_date")?.as_str()?;
+            return snapshot
+                .get("task_occurrences")?
+                .as_array()?
+                .iter()
+                .find(|row| {
+                    row.get("task_id").and_then(Value::as_str) == Some(expected_task_id)
+                        && row.get("occurrence_date").and_then(Value::as_str) == Some(expected_date)
+                })
+                .and_then(|row| row.get("version"))
+                .and_then(Value::as_i64);
+        }
         _ => return None,
     };
     snapshot
@@ -855,18 +1120,14 @@ pub fn pull_snapshot(database: &Database) -> Result<i64, String> {
     if state.mode != "cloud" {
         return Err("OFFLINE_RESTRICTED: 当前不是 Supabase 云端模式".to_string());
     }
-    let (pending, conflicts) = outbox_counts(database, &state.workspace_id)?;
-    if pending > 0 || conflicts > 0 {
-        return Err(
-            "SYNC_PENDING: 本机仍有待同步或冲突操作，不能用云端快照覆盖本地编辑".to_string(),
-        );
-    }
+    ensure_no_dirty_outbox(database, &state.workspace_id)?;
     if !state.online {
         return Err("AUTH_REQUIRED: 云端会话不可用".to_string());
     }
     let expected_local_revision = local_revision(database)?;
     let session = current_session(database)?;
-    let snapshot = client(database)?.rpc(
+    let snapshot = client(database)?.rpc_for_database(
+        database,
         "cloud_snapshot_get",
         json!({ "p_workspace_id": state.workspace_id }),
         &session,
@@ -885,11 +1146,47 @@ pub fn pull_snapshot(database: &Database) -> Result<i64, String> {
     Ok(latest_change_seq)
 }
 
+pub fn reset_local_cache_from_cloud(database: &Database) -> Result<CloudSyncStatus, String> {
+    let _operation_guard = CLOUD_SYNC_OPERATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = storage_mode(database)?;
+    if state.mode != "cloud" {
+        return Err("OFFLINE_RESTRICTED: 当前不是 Supabase 云端模式".to_string());
+    }
+    if !state.online {
+        return Err("AUTH_REQUIRED: 云端会话不可用".to_string());
+    }
+    let expected_local_revision = local_revision(database)?;
+    let session = current_session(database)?;
+    let snapshot = client(database)?.rpc_for_database(
+        database,
+        "cloud_snapshot_get",
+        json!({ "p_workspace_id": state.workspace_id }),
+        &session,
+    )?;
+    let latest_change_seq = snapshot
+        .get("latest_change_seq")
+        .and_then(Value::as_i64)
+        .unwrap_or(state.last_change_seq);
+    apply_snapshot_with_reset_options(
+        database,
+        &snapshot,
+        Some(expected_local_revision),
+        Some(&state.workspace_id),
+        Some((&state.workspace_id, &state.device_id, latest_change_seq)),
+        false,
+    )?;
+    sync_status(database)
+}
+
 pub fn acquire_lease(database: &Database) -> Result<Value, String> {
     let state = require_cloud(database)?;
     let session = current_session(database)?;
     let api = client(database)?;
-    api.rpc(
+    api.rpc_for_database(
+        database,
         "tracking_lease_acquire",
         json!({
             "p_workspace_id": state.workspace_id,
@@ -906,7 +1203,8 @@ pub fn renew_lease(database: &Database, request: TrackingLeaseRequest) -> Result
         .ok_or_else(|| "VALIDATION_ERROR: 缺少租约令牌".to_string())?;
     let state = require_cloud(database)?;
     let session = current_session(database)?;
-    client(database)?.rpc(
+    client(database)?.rpc_for_database(
+        database,
         "tracking_lease_renew",
         json!({ "p_workspace_id": state.workspace_id, "p_device_id": state.device_id, "p_lease_token": token }),
         &session,
@@ -919,7 +1217,8 @@ pub fn release_lease(database: &Database, request: TrackingLeaseRequest) -> Resu
         .ok_or_else(|| "VALIDATION_ERROR: 缺少租约令牌".to_string())?;
     let state = require_cloud(database)?;
     let session = current_session(database)?;
-    client(database)?.rpc(
+    client(database)?.rpc_for_database(
+        database,
         "tracking_lease_release",
         json!({ "p_workspace_id": state.workspace_id, "p_device_id": state.device_id, "p_lease_token": token }),
         &session,
@@ -931,7 +1230,8 @@ pub fn get_lease(database: &Database) -> Result<Value, String> {
     let session = current_session(database)?;
     let api = client(database)?;
     api
-        .request(
+        .request_for_database(
+            database,
             api.get(format!(
                 "{}/rest/v1/tracking_leases?workspace_id=eq.{}&select=workspace_id,holder_device_id,lease_token,expires_at,version",
                 api.project_url, state.workspace_id
@@ -942,178 +1242,59 @@ pub fn get_lease(database: &Database) -> Result<Value, String> {
         .map_err(|error| format!("NETWORK_ERROR: 读取采集租约失败: {error}"))
 }
 
-pub fn timer_start(database: &Database, request: CloudTimerStartRequest) -> Result<Value, String> {
-    let operation_id = request.operation_id.clone();
-    let state = require_cloud(database)?;
-    ensure_clean_outbox(database, &state.workspace_id)?;
-    let session = current_session(database)?;
-    let result = client(database)?.rpc(
-        "timer_start",
-        json!({
-            "p_workspace_id": state.workspace_id,
-            "p_task_id": request.task_id,
-            "p_device_id": state.device_id,
-            "p_operation_id": request.operation_id,
-            "p_note": request.note
-        }),
-        &session,
-    )?;
-    pull_snapshot(database)?;
-    if let Some(entry) = crate::time_tracking::get_timer_state(database)? {
-        crate::time_tracking::publish_timer_hook(
-            database,
-            "timer.started",
-            format!("timer.started:{operation_id}"),
-            &entry,
-        );
-    }
-    Ok(result)
-}
-
-pub fn timer_get_state(database: &Database) -> Result<Option<Value>, String> {
-    let state = require_cloud(database)?;
-    let session = current_session(database)?;
-    let api = client(database)?;
-    let rows: Vec<Value> = api
-        .request(
-            api.get(format!(
-                "{}/rest/v1/time_entries?workspace_id=eq.{}&state=in.(running,paused)&deleted_at=is.null&select=*&order=created_at.desc&limit=1",
-                api.project_url, state.workspace_id
-            )),
-            &session,
-        )?
-        .json()
-        .map_err(|error| format!("NETWORK_ERROR: 读取云端计时状态失败: {error}"))?;
-    rows.into_iter()
-        .next()
-        .map(|entry| hydrate_cloud_timer_duration(&api, &session, entry))
-        .transpose()
-}
-
-pub fn time_entry_list(database: &Database, work_date: &str) -> Result<Vec<Value>, String> {
-    let state = require_cloud(database)?;
-    let session = current_session(database)?;
-    let api = client(database)?;
-    let rows: Vec<Value> = api.request(
-        api.get(format!(
-            "{}/rest/v1/time_entries?workspace_id=eq.{}&work_date=eq.{}&deleted_at=is.null&select=*&order=started_at.desc",
-            api.project_url, state.workspace_id, work_date
-        )),
-        &session,
-    )?
-    .json()
-    .map_err(|error| format!("NETWORK_ERROR: 读取云端时间记录失败: {error}"))?;
-    rows.into_iter()
-        .map(|entry| hydrate_cloud_timer_duration(&api, &session, entry))
-        .collect()
-}
-
-fn hydrate_cloud_timer_duration(
-    api: &crate::supabase::SupabaseClient,
-    session: &crate::supabase::CloudSession,
-    mut entry: Value,
-) -> Result<Value, String> {
-    if entry.get("state").and_then(Value::as_str) != Some("running") {
-        return Ok(entry);
-    }
-    let Some(entry_id) = entry.get("id").and_then(Value::as_str) else {
-        return Ok(entry);
-    };
-    let rows: Vec<Value> = api
-        .request(
-            api.get(format!(
-                "{}/rest/v1/time_segments?entry_id=eq.{}&ended_at=is.null&select=started_at&limit=1",
-                api.project_url, entry_id
-            )),
-            session,
-        )?
-        .json()
-        .map_err(|error| format!("NETWORK_ERROR: 读取云端计时片段失败: {error}"))?;
-    let Some(started_at) = rows
-        .first()
-        .and_then(|row| optional_millis(row, "started_at"))
-    else {
-        return Ok(entry);
-    };
-    let stored_seconds = entry
-        .get("duration_seconds")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    entry["duration_seconds"] =
-        json!(stored_seconds + ((now_millis() - started_at).max(0) / 1_000));
-    Ok(entry)
-}
-
-pub fn timer_action(
+pub fn legacy_cloud_timer_start_local_first(
     database: &Database,
-    action: &str,
+    request: CloudTimerStartRequest,
+) -> Result<crate::time_tracking::TimeEntryDto, String> {
+    crate::time_tracking::start_timer_with_hooks_for_sync(
+        database,
+        crate::time_tracking::TimerStartRequest {
+            task_id: request.task_id,
+            note: request.note,
+            client_request_id: request.operation_id,
+        },
+    )
+}
+
+pub fn legacy_cloud_timer_pause_local_first(
+    database: &Database,
     request: CloudTimerVersionRequest,
-) -> Result<Value, String> {
-    let operation_id = request.operation_id.clone();
-    let entry_id = request.entry_id.clone();
-    let state = require_cloud(database)?;
-    ensure_clean_outbox(database, &state.workspace_id)?;
-    let session = current_session(database)?;
-    let result = client(database)?.rpc(
-        action,
-        json!({
-            "p_workspace_id": state.workspace_id,
-            "p_entry_id": request.entry_id,
-            "p_device_id": state.device_id,
-            "p_expected_version": request.expected_version,
-            "p_operation_id": request.operation_id
-        }),
-        &session,
-    )?;
-    pull_snapshot(database)?;
-    if action == "timer_stop" {
-        if let Ok(entry) = crate::time_tracking::get_time_entry_by_id(database, &entry_id) {
-            crate::time_tracking::publish_timer_hook(
-                database,
-                "timer.stopped",
-                format!("timer.stopped:{operation_id}"),
-                &entry,
-            );
-        }
-    }
-    Ok(result)
+) -> Result<crate::time_tracking::TimeEntryDto, String> {
+    crate::time_tracking::pause_timer_for_sync(
+        database,
+        crate::time_tracking::TimerVersionRequest {
+            entry_id: request.entry_id,
+            expected_version: request.expected_version,
+        },
+    )
 }
 
-pub fn unassigned_get_state(database: &Database) -> Result<Option<Value>, String> {
-    let _ = acquire_or_renew_tracking_lease(database);
-    let state = require_cloud(database)?;
-    let session = current_session(database)?;
-    client(database)?
-        .rpc(
-            "unassigned_get_state",
-            json!({ "p_workspace_id": state.workspace_id }),
-            &session,
-        )
-        .map(|value| if value.is_null() { None } else { Some(value) })
-}
-
-pub fn unassigned_resolve(
+pub fn legacy_cloud_timer_resume_local_first(
     database: &Database,
-    action: &str,
-    request: CloudUnassignedResolveRequest,
-) -> Result<Value, String> {
-    let state = require_cloud(database)?;
-    ensure_clean_outbox(database, &state.workspace_id)?;
-    let session = current_session(database)?;
-    let result = client(database)?.rpc(
-        action,
-        json!({
-            "p_workspace_id": state.workspace_id,
-            "p_session_id": request.session_id,
-            "p_device_id": state.device_id,
-            "p_expected_version": request.expected_version,
-            "p_allocations": request.allocations.unwrap_or_default(),
-            "p_operation_id": request.operation_id
-        }),
-        &session,
-    )?;
-    pull_snapshot(database)?;
-    Ok(result)
+    request: CloudTimerVersionRequest,
+) -> Result<crate::time_tracking::TimeEntryDto, String> {
+    crate::time_tracking::resume_timer_for_sync(
+        database,
+        crate::time_tracking::TimerResumeRequest {
+            entry_id: request.entry_id,
+            expected_version: request.expected_version,
+            operation_id: request.operation_id,
+        },
+    )
+}
+
+pub fn legacy_cloud_timer_stop_local_first(
+    database: &Database,
+    request: CloudTimerVersionRequest,
+) -> Result<crate::time_tracking::TimeEntryDto, String> {
+    crate::time_tracking::stop_timer_with_hooks_for_sync(
+        database,
+        crate::time_tracking::TimerStopRequest {
+            entry_id: request.entry_id,
+            expected_version: request.expected_version,
+            create_default_allocation: false,
+        },
+    )
 }
 
 fn require_cloud(database: &Database) -> Result<crate::supabase::StorageModeSnapshot, String> {
@@ -1127,6 +1308,7 @@ fn require_cloud(database: &Database) -> Result<crate::supabase::StorageModeSnap
     Ok(state)
 }
 
+#[cfg(test)]
 fn entity_payload(
     database: &Database,
     entity_type: &str,
@@ -1182,10 +1364,70 @@ fn entity_payload_from_connection(
             value.as_object_mut().ok_or_else(|| "CACHE_ERROR: 时间记录缓存不是对象".to_string())?.insert("work_day".to_string(), work_day.unwrap_or(Value::Null));
             return Ok(value);
         }
+        "unassigned_session" => {
+            let id = entity_id.ok_or_else(|| "VALIDATION_ERROR: 未归属会话同步缺少实体 ID".to_string())?;
+            let mut value = query_json_row(
+                &connection,
+                "SELECT * FROM unassigned_sessions WHERE workspace_id = ?1 AND id = ?2",
+                &local_workspace_id,
+                id,
+            )?;
+            let mut statement = connection
+                .prepare("SELECT * FROM unassigned_segments WHERE workspace_id = ?1 AND session_id = ?2 ORDER BY sequence_no")
+                .map_err(|error| error.to_string())?;
+            let column_names = statement
+                .column_names()
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            let rows = statement
+                .query_map(params![local_workspace_id, id], |row| {
+                    row_to_json(row, &column_names)
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            value
+                .as_object_mut()
+                .ok_or_else(|| "CACHE_ERROR: 未归属会话缓存不是对象".to_string())?
+                .insert("segments".to_string(), Value::Array(rows));
+            return Ok(value);
+        }
         "report_template" => ("SELECT * FROM report_templates WHERE workspace_id = ?1 AND id = ?2", entity_id),
         "app_setting" => ("SELECT * FROM app_settings WHERE workspace_id = ?1 AND key = ?2", entity_id),
         "integration_config" => ("SELECT workspace_id, provider, enabled, config_json, updated_at, version FROM integration_configs WHERE workspace_id = ?1 AND provider = ?2", entity_id),
-        "external_binding" => ("SELECT * FROM external_bindings WHERE workspace_id = ?1 AND entity_id = ?2", entity_id),
+        "external_binding" => {
+            let key = entity_id
+                .ok_or_else(|| "VALIDATION_ERROR: 外部绑定同步缺少实体 ID".to_string())?;
+            let (provider, remainder) = key
+                .split_once('|')
+                .ok_or_else(|| "VALIDATION_ERROR: 外部绑定同步实体 ID 无效".to_string())?;
+            let (entity_kind, bound_entity_id) = remainder
+                .split_once('|')
+                .ok_or_else(|| "VALIDATION_ERROR: 外部绑定同步实体 ID 无效".to_string())?;
+            if provider.is_empty() || entity_kind.is_empty() || bound_entity_id.is_empty() {
+                return Err("VALIDATION_ERROR: 外部绑定同步实体 ID 无效".to_string());
+            }
+            return query_json_row_with_params(
+                connection,
+                "SELECT * FROM external_bindings WHERE workspace_id = ?1 AND provider = ?2 AND entity_type = ?3 AND entity_id = ?4",
+                params![local_workspace_id, provider, entity_kind, bound_entity_id],
+                key,
+            );
+        }
+        "task_occurrence" => {
+            let key = entity_id
+                .ok_or_else(|| "VALIDATION_ERROR: 重复事项轮次同步缺少实体 ID".to_string())?;
+            let (task_id, occurrence_date) = key
+                .split_once('|')
+                .ok_or_else(|| "VALIDATION_ERROR: 重复事项轮次同步实体 ID 无效".to_string())?;
+            return query_json_row_with_params(
+                connection,
+                "SELECT * FROM task_occurrences WHERE workspace_id = ?1 AND task_id = ?2 AND occurrence_date = ?3",
+                params![local_workspace_id, task_id, occurrence_date],
+                key,
+            );
+        }
         "report" => {
             let id = entity_id.ok_or_else(|| "VALIDATION_ERROR: 报告同步缺少实体 ID".to_string())?;
             let mut value = query_json_row(
@@ -1268,6 +1510,18 @@ fn query_json_row(
     workspace_id: &str,
     id: &str,
 ) -> Result<Value, String> {
+    query_json_row_with_params(connection, sql, params![workspace_id, id], id)
+}
+
+fn query_json_row_with_params<P>(
+    connection: &rusqlite::Connection,
+    sql: &str,
+    params: P,
+    id_for_error: &str,
+) -> Result<Value, String>
+where
+    P: rusqlite::Params,
+{
     let mut statement = connection.prepare(sql).map_err(|error| error.to_string())?;
     let column_names = statement
         .column_names()
@@ -1275,12 +1529,10 @@ fn query_json_row(
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
     statement
-        .query_row(params![workspace_id, id], |row| {
-            row_to_json(row, &column_names)
-        })
+        .query_row(params, |row| row_to_json(row, &column_names))
         .optional()
         .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("NOT_FOUND: 待同步实体不存在 {id}"))
+        .ok_or_else(|| format!("NOT_FOUND: 待同步实体不存在 {id_for_error}"))
 }
 
 fn row_to_json(row: &rusqlite::Row<'_>, column_names: &[String]) -> rusqlite::Result<Value> {
@@ -1314,19 +1566,20 @@ fn claim_pending_operations(
     let stale_sending_before = now.saturating_sub(OUTBOX_SENDING_STALE_AFTER_MILLIS);
     let mut statement = transaction
         .prepare(
-            "SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, last_attempt_at
+            "SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, last_attempt_at, created_at
              FROM sync_outbox
              WHERE workspace_id = ?1
-               AND (state IN ('pending','failed') OR (state = 'sending' AND COALESCE(last_attempt_at, created_at) < ?2))
-             ORDER BY created_at, operation_id",
+               AND state IN ('pending','failed','sending','conflict')
+             ORDER BY created_at, rowid",
         )
         .map_err(|error| error.to_string())?;
     let candidates = statement
-        .query_map(params![workspace_id, stale_sending_before], |row| {
+        .query_map([workspace_id], |row| {
             let payload: String = row.get(5)?;
             let state: String = row.get(6)?;
             let attempt_count: i64 = row.get(7)?;
             let last_attempt_at: Option<i64> = row.get(8)?;
+            let created_at: i64 = row.get(9)?;
             Ok(OutboxOperation {
                 operation_id: row.get(0)?,
                 operation_type: row.get(1)?,
@@ -1335,22 +1588,38 @@ fn claim_pending_operations(
                 base_version: row.get(4)?,
                 payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
             })
-            .map(|operation| (operation, state, attempt_count, last_attempt_at))
+            .map(|operation| (operation, state, attempt_count, last_attempt_at, created_at))
         })
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
     drop(statement);
 
-    let result = candidates
-        .into_iter()
-        .filter_map(|(operation, state, attempt_count, last_attempt_at)| {
-            let retry_ready = state == "sending"
-                || retry_ready_at(last_attempt_at, attempt_count)
-                    .is_none_or(|ready_at| ready_at <= now);
-            retry_ready.then_some(operation)
-        })
-        .collect::<Vec<_>>();
+    let mut blocked_entities = HashSet::<String>::new();
+    let mut result = Vec::new();
+    for (operation, state, attempt_count, last_attempt_at, created_at) in candidates {
+        let entity_key = outbox_entity_key(&operation);
+        if entity_key
+            .as_ref()
+            .is_some_and(|key| blocked_entities.contains(key))
+        {
+            continue;
+        }
+        let retry_ready = match state.as_str() {
+            "conflict" => false,
+            "sending" => last_attempt_at.unwrap_or(created_at) < stale_sending_before,
+            _ => retry_ready_at(last_attempt_at, attempt_count)
+                .is_none_or(|ready_at| ready_at <= now),
+        };
+        if retry_ready {
+            if let Some(key) = entity_key {
+                blocked_entities.insert(key);
+            }
+            result.push(operation);
+        } else if let Some(key) = entity_key {
+            blocked_entities.insert(key);
+        }
+    }
 
     for operation in &result {
         transaction
@@ -1366,6 +1635,14 @@ fn claim_pending_operations(
     }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
+}
+
+fn outbox_entity_key(operation: &OutboxOperation) -> Option<String> {
+    Some(format!(
+        "{}:{}",
+        operation.entity_type,
+        operation.entity_id.as_deref()?
+    ))
 }
 
 fn retry_ready_at(last_attempt_at: Option<i64>, attempt_count: i64) -> Option<i64> {
@@ -1423,13 +1700,14 @@ fn outbox_counts(database: &Database, workspace_id: &str) -> Result<(i64, i64), 
         .map_err(|error| error.to_string())
 }
 
-fn ensure_clean_outbox(database: &Database, workspace_id: &str) -> Result<(), String> {
+fn ensure_no_dirty_outbox(database: &Database, workspace_id: &str) -> Result<(), String> {
     let (pending, conflicts) = outbox_counts(database, workspace_id)?;
     if pending > 0 || conflicts > 0 {
-        Err("OFFLINE_RESTRICTED: 请先同步或处理本机待同步操作，再执行全局计时操作".to_string())
-    } else {
-        Ok(())
+        return Err(
+            "SYNC_PENDING: 本机仍有待同步或冲突操作，不能用云端快照覆盖本地编辑".to_string(),
+        );
     }
+    Ok(())
 }
 
 fn is_conflict_error(error: &str) -> bool {
@@ -1473,6 +1751,63 @@ fn apply_snapshot(
     sync_workspace_id: Option<&str>,
     sync_state_update: Option<(&str, &str, i64)>,
 ) -> Result<(), String> {
+    apply_snapshot_with_options(
+        database,
+        snapshot,
+        expected_local_revision,
+        sync_workspace_id,
+        sync_state_update,
+        true,
+    )
+}
+
+fn apply_snapshot_with_options(
+    database: &Database,
+    snapshot: &Value,
+    expected_local_revision: Option<i64>,
+    sync_workspace_id: Option<&str>,
+    sync_state_update: Option<(&str, &str, i64)>,
+    preserve_local_tracking: bool,
+) -> Result<(), String> {
+    apply_snapshot_with_policy(
+        database,
+        snapshot,
+        expected_local_revision,
+        sync_workspace_id,
+        sync_state_update,
+        preserve_local_tracking,
+        false,
+    )
+}
+
+fn apply_snapshot_with_reset_options(
+    database: &Database,
+    snapshot: &Value,
+    expected_local_revision: Option<i64>,
+    sync_workspace_id: Option<&str>,
+    sync_state_update: Option<(&str, &str, i64)>,
+    preserve_local_tracking: bool,
+) -> Result<(), String> {
+    apply_snapshot_with_policy(
+        database,
+        snapshot,
+        expected_local_revision,
+        sync_workspace_id,
+        sync_state_update,
+        preserve_local_tracking,
+        true,
+    )
+}
+
+fn apply_snapshot_with_policy(
+    database: &Database,
+    snapshot: &Value,
+    expected_local_revision: Option<i64>,
+    sync_workspace_id: Option<&str>,
+    sync_state_update: Option<(&str, &str, i64)>,
+    preserve_local_tracking: bool,
+    discard_dirty_outbox: bool,
+) -> Result<(), String> {
     let mut connection = database.open()?;
     let local_workspace_id: String = connection
         .query_row(
@@ -1504,10 +1839,24 @@ fn apply_snapshot(
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
-        if pending > 0 {
+        if pending > 0 && !discard_dirty_outbox {
             return Err("SYNC_PENDING: 本机产生了新的待同步操作，已取消本次快照覆盖".to_string());
         }
+        if discard_dirty_outbox {
+            transaction
+                .execute(
+                    "DELETE FROM sync_outbox WHERE workspace_id = ?1",
+                    [workspace_id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
     }
+    let integration_secret_refs = integration_secret_refs(&transaction, &local_workspace_id)?;
+    let local_tracking_overlay = if preserve_local_tracking {
+        local_tracking_overlay(&transaction, &local_workspace_id, snapshot)?
+    } else {
+        LocalTrackingOverlay::default()
+    };
     clear_snapshot_cache(&transaction, &local_workspace_id)?;
     replace_snapshot_table(&transaction, snapshot, "subjects", &local_workspace_id)?;
     replace_snapshot_table(&transaction, snapshot, "tasks", &local_workspace_id)?;
@@ -1571,12 +1920,14 @@ fn apply_snapshot(
         "integration_configs",
         &local_workspace_id,
     )?;
+    restore_integration_secret_refs(&transaction, &local_workspace_id, &integration_secret_refs)?;
     replace_snapshot_table(
         &transaction,
         snapshot,
         "external_bindings",
         &local_workspace_id,
     )?;
+    restore_local_tracking_overlay(&transaction, &local_workspace_id, &local_tracking_overlay)?;
     transaction
         .execute(
             "UPDATE app_metadata SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'global_revision'",
@@ -1594,6 +1945,442 @@ fn apply_snapshot(
             .map_err(|error| error.to_string())?;
     }
     transaction.commit().map_err(|error| error.to_string())
+}
+
+fn integration_secret_refs(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+) -> Result<HashMap<String, String>, String> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT provider, secret_ref FROM integration_configs
+             WHERE workspace_id = ?1 AND secret_ref IS NOT NULL AND secret_ref != ''",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([workspace_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|error| error.to_string())?;
+    let mut refs = HashMap::new();
+    for row in rows {
+        let (provider, secret_ref): (String, String) = row.map_err(|error| error.to_string())?;
+        refs.insert(provider, secret_ref);
+    }
+    Ok(refs)
+}
+
+fn local_tracking_overlay(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    snapshot: &Value,
+) -> Result<LocalTrackingOverlay, String> {
+    let mut overlay = LocalTrackingOverlay::default();
+
+    let mut timer_entry_statement = transaction
+        .prepare(
+            "SELECT id, work_date, kind, source_type, state, default_task_id,
+                    label_snapshot, started_at, ended_at, duration_seconds, note,
+                    origin_unassigned_session_id, created_at, updated_at, version, deleted_at
+             FROM time_entries
+             WHERE workspace_id = ?1 AND state IN ('running', 'paused') AND deleted_at IS NULL",
+        )
+        .map_err(|error| error.to_string())?;
+    let timer_entry_rows = timer_entry_statement
+        .query_map([workspace_id], |row| {
+            Ok(ActiveTimerEntryOverlay {
+                entry_id: row.get(0)?,
+                work_date: row.get(1)?,
+                kind: row.get(2)?,
+                source_type: row.get(3)?,
+                state: row.get(4)?,
+                default_task_id: row.get(5)?,
+                label_snapshot: row.get(6)?,
+                started_at: row.get(7)?,
+                ended_at: row.get(8)?,
+                duration_seconds: row.get(9)?,
+                note: row.get(10)?,
+                origin_unassigned_session_id: row.get(11)?,
+                created_at: row.get(12)?,
+                updated_at: row.get(13)?,
+                version: row.get(14)?,
+                deleted_at: row.get(15)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    for row in timer_entry_rows {
+        let entry = row.map_err(|error| error.to_string())?;
+        let snapshot_entry = snapshot
+            .get("time_entries")
+            .and_then(Value::as_array)
+            .and_then(|rows| {
+                rows.iter().find(|item| {
+                    item.get("id").and_then(Value::as_str) == Some(entry.entry_id.as_str())
+                })
+            });
+        let snapshot_version = snapshot_entry.map(|item| integer(item, "version"));
+        let snapshot_has_equal_or_newer_running_entry = snapshot_entry.is_some_and(|item| {
+            matches!(
+                item.get("state").and_then(Value::as_str),
+                Some("running") | Some("paused")
+            ) && snapshot_version.unwrap_or_default() >= entry.version
+        });
+        let snapshot_has_newer_entry =
+            snapshot_version.is_some_and(|version| version > entry.version);
+        if !snapshot_has_equal_or_newer_running_entry && !snapshot_has_newer_entry {
+            overlay.active_timer_entries.push(entry);
+        }
+    }
+
+    let mut timer_statement = transaction
+        .prepare(
+            "SELECT s.entry_id, s.id, s.sequence_no, s.started_at, s.duration_seconds
+             FROM time_segments s
+             JOIN time_entries e ON e.id = s.entry_id
+             WHERE s.workspace_id = ?1 AND s.ended_at IS NULL
+               AND e.workspace_id = ?1 AND e.state = 'running' AND e.deleted_at IS NULL",
+        )
+        .map_err(|error| error.to_string())?;
+    let timer_rows = timer_statement
+        .query_map([workspace_id], |row| {
+            Ok(ActiveTimerSegmentOverlay {
+                entry_id: row.get(0)?,
+                segment_id: row.get(1)?,
+                sequence_no: row.get(2)?,
+                started_at: row.get(3)?,
+                duration_seconds: row.get(4)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    for row in timer_rows {
+        let segment = row.map_err(|error| error.to_string())?;
+        let local_entry_preserved = overlay
+            .active_timer_entries
+            .iter()
+            .any(|entry| entry.entry_id == segment.entry_id);
+        let snapshot_has_running_entry = snapshot
+            .get("time_entries")
+            .and_then(Value::as_array)
+            .is_some_and(|rows| {
+                rows.iter().any(|item| {
+                    item.get("id").and_then(Value::as_str) == Some(segment.entry_id.as_str())
+                        && matches!(
+                            item.get("state").and_then(Value::as_str),
+                            Some("running") | Some("paused")
+                        )
+                })
+            });
+        if !local_entry_preserved && !snapshot_has_running_entry {
+            continue;
+        }
+        let segment_in_snapshot = snapshot
+            .get("time_segments")
+            .and_then(Value::as_array)
+            .and_then(|rows| {
+                rows.iter().find(|item| {
+                    item.get("id").and_then(Value::as_str) == Some(segment.segment_id.as_str())
+                        && item.get("entry_id").and_then(Value::as_str)
+                            == Some(segment.entry_id.as_str())
+                        && item.get("ended_at").is_some_and(Value::is_null)
+                })
+            });
+        if segment_in_snapshot.is_none() {
+            overlay.active_timer_segments.push(segment);
+        }
+    }
+
+    let mut unassigned_statement = transaction
+        .prepare(
+            "SELECT s.session_id, s.id, s.sequence_no, s.started_at, s.duration_seconds, s.lease_token
+             FROM unassigned_segments s
+             JOIN unassigned_sessions u ON u.id = s.session_id
+             WHERE s.workspace_id = ?1 AND s.ended_at IS NULL
+               AND u.workspace_id = ?1 AND u.state IN ('collecting', 'awaiting_resolution')",
+        )
+        .map_err(|error| error.to_string())?;
+    let unassigned_rows = unassigned_statement
+        .query_map([workspace_id], |row| {
+            Ok(ActiveUnassignedSegmentOverlay {
+                session_id: row.get(0)?,
+                segment_id: row.get(1)?,
+                sequence_no: row.get(2)?,
+                started_at: row.get(3)?,
+                duration_seconds: row.get(4)?,
+                lease_token: row.get(5)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+
+    let mut session_statement = transaction
+        .prepare(
+            "SELECT id, work_date, state, threshold_seconds, duration_seconds,
+                    first_started_at, last_ended_at, prompted_at, resolution_type,
+                    generated_entry_id, resolved_at, created_at, updated_at, version
+             FROM unassigned_sessions
+             WHERE workspace_id = ?1 AND state IN ('collecting', 'awaiting_resolution')",
+        )
+        .map_err(|error| error.to_string())?;
+    let session_rows = session_statement
+        .query_map([workspace_id], |row| {
+            Ok(ActiveUnassignedSessionOverlay {
+                session_id: row.get(0)?,
+                work_date: row.get(1)?,
+                state: row.get(2)?,
+                threshold_seconds: row.get(3)?,
+                duration_seconds: row.get(4)?,
+                first_started_at: row.get(5)?,
+                last_ended_at: row.get(6)?,
+                prompted_at: row.get(7)?,
+                resolution_type: row.get(8)?,
+                generated_entry_id: row.get(9)?,
+                resolved_at: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
+                version: row.get(13)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    for row in session_rows {
+        let session = row.map_err(|error| error.to_string())?;
+        let session_in_snapshot = snapshot
+            .get("unassigned_sessions")
+            .and_then(Value::as_array)
+            .and_then(|rows| {
+                rows.iter().find(|item| {
+                    item.get("id").and_then(Value::as_str) == Some(session.session_id.as_str())
+                })
+            });
+        let snapshot_version = session_in_snapshot.map(|item| integer(item, "version"));
+        let snapshot_has_equal_or_newer_active_session = session_in_snapshot.is_some_and(|item| {
+            matches!(
+                item.get("state").and_then(Value::as_str),
+                Some("collecting") | Some("awaiting_resolution")
+            ) && snapshot_version.unwrap_or_default() >= session.version
+        });
+        let snapshot_has_newer_session =
+            snapshot_version.is_some_and(|version| version > session.version);
+        if !snapshot_has_equal_or_newer_active_session && !snapshot_has_newer_session {
+            overlay.active_unassigned_sessions.push(session);
+        }
+    }
+
+    for row in unassigned_rows {
+        let segment = row.map_err(|error| error.to_string())?;
+        let session_in_snapshot = snapshot
+            .get("unassigned_sessions")
+            .and_then(Value::as_array)
+            .and_then(|rows| {
+                rows.iter().find(|item| {
+                    item.get("id").and_then(Value::as_str) == Some(segment.session_id.as_str())
+                        && matches!(
+                            item.get("state").and_then(Value::as_str),
+                            Some("collecting") | Some("awaiting_resolution")
+                        )
+                })
+            });
+        let local_session_preserved = overlay
+            .active_unassigned_sessions
+            .iter()
+            .any(|session| session.session_id == segment.session_id);
+        if session_in_snapshot.is_none() && !local_session_preserved {
+            continue;
+        }
+        let segment_in_snapshot = snapshot
+            .get("unassigned_segments")
+            .and_then(Value::as_array)
+            .and_then(|rows| {
+                rows.iter().find(|item| {
+                    item.get("id").and_then(Value::as_str) == Some(segment.segment_id.as_str())
+                        && item.get("session_id").and_then(Value::as_str)
+                            == Some(segment.session_id.as_str())
+                        && item.get("ended_at").is_some_and(Value::is_null)
+                })
+            });
+        if segment_in_snapshot.is_none() {
+            overlay.active_unassigned_segments.push(segment);
+        }
+    }
+
+    Ok(overlay)
+}
+
+fn restore_local_tracking_overlay(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    overlay: &LocalTrackingOverlay,
+) -> Result<(), String> {
+    if let Some(session) = overlay.active_unassigned_sessions.first() {
+        transaction
+            .execute(
+                "DELETE FROM unassigned_segments
+                 WHERE session_id IN (
+                   SELECT id FROM unassigned_sessions
+                   WHERE workspace_id = ?1 AND id <> ?2
+                     AND state IN ('collecting', 'awaiting_resolution')
+                 )",
+                params![workspace_id, session.session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM unassigned_sessions
+                 WHERE workspace_id = ?1 AND id <> ?2
+                   AND state IN ('collecting', 'awaiting_resolution')",
+                params![workspace_id, session.session_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    for session in &overlay.active_unassigned_sessions {
+        transaction
+            .execute(
+                "INSERT INTO unassigned_sessions(
+                   id, workspace_id, work_date, state, threshold_seconds, duration_seconds,
+                   first_started_at, last_ended_at, prompted_at, resolution_type,
+                   generated_entry_id, resolved_at, created_at, updated_at, version
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                 ON CONFLICT(id) DO UPDATE SET
+                   work_date = excluded.work_date, state = excluded.state,
+                   threshold_seconds = excluded.threshold_seconds,
+                   duration_seconds = excluded.duration_seconds,
+                   first_started_at = excluded.first_started_at,
+                   last_ended_at = excluded.last_ended_at,
+                   prompted_at = excluded.prompted_at,
+                   resolution_type = excluded.resolution_type,
+                   generated_entry_id = excluded.generated_entry_id,
+                   resolved_at = excluded.resolved_at,
+                   created_at = excluded.created_at,
+                   updated_at = excluded.updated_at,
+                   version = excluded.version",
+                params![
+                    session.session_id,
+                    workspace_id,
+                    session.work_date,
+                    session.state,
+                    session.threshold_seconds,
+                    session.duration_seconds,
+                    session.first_started_at,
+                    session.last_ended_at,
+                    session.prompted_at,
+                    session.resolution_type,
+                    session.generated_entry_id,
+                    session.resolved_at,
+                    session.created_at,
+                    session.updated_at,
+                    session.version
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    for entry in &overlay.active_timer_entries {
+        transaction
+            .execute(
+                "DELETE FROM time_segments WHERE workspace_id = ?1 AND entry_id = ?2",
+                params![workspace_id, entry.entry_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM time_allocations WHERE workspace_id = ?1 AND entry_id = ?2",
+                params![workspace_id, entry.entry_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO time_entries(
+                   id, workspace_id, work_date, kind, source_type, state, default_task_id,
+                   label_snapshot, started_at, ended_at, duration_seconds, note,
+                   origin_unassigned_session_id, created_at, updated_at, version, deleted_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                 ON CONFLICT(id) DO UPDATE SET
+                   work_date = excluded.work_date,
+                   kind = excluded.kind,
+                   source_type = excluded.source_type,
+                   state = excluded.state,
+                   default_task_id = excluded.default_task_id,
+                   label_snapshot = excluded.label_snapshot,
+                   started_at = excluded.started_at,
+                   ended_at = excluded.ended_at,
+                   duration_seconds = excluded.duration_seconds,
+                   note = excluded.note,
+                   origin_unassigned_session_id = excluded.origin_unassigned_session_id,
+                   updated_at = excluded.updated_at,
+                   version = excluded.version,
+                   deleted_at = excluded.deleted_at",
+                params![
+                    entry.entry_id,
+                    workspace_id,
+                    entry.work_date,
+                    entry.kind,
+                    entry.source_type,
+                    entry.state,
+                    entry.default_task_id,
+                    entry.label_snapshot,
+                    entry.started_at,
+                    entry.ended_at,
+                    entry.duration_seconds,
+                    entry.note,
+                    entry.origin_unassigned_session_id,
+                    entry.created_at,
+                    entry.updated_at,
+                    entry.version,
+                    entry.deleted_at
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    for segment in &overlay.active_timer_segments {
+        transaction
+            .execute(
+                "INSERT INTO time_segments(id, workspace_id, entry_id, sequence_no, started_at, duration_seconds)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET ended_at = NULL, started_at = excluded.started_at,
+                   sequence_no = excluded.sequence_no, duration_seconds = excluded.duration_seconds",
+                params![
+                    segment.segment_id,
+                    workspace_id,
+                    segment.entry_id,
+                    segment.sequence_no,
+                    segment.started_at,
+                    segment.duration_seconds
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    for segment in &overlay.active_unassigned_segments {
+        transaction
+            .execute(
+                "INSERT INTO unassigned_segments(id, workspace_id, session_id, sequence_no, started_at, duration_seconds, lease_token)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET ended_at = NULL, started_at = excluded.started_at,
+                   sequence_no = excluded.sequence_no, duration_seconds = excluded.duration_seconds,
+                   lease_token = excluded.lease_token",
+                params![
+                    segment.segment_id,
+                    workspace_id,
+                    segment.session_id,
+                    segment.sequence_no,
+                    segment.started_at,
+                    segment.duration_seconds,
+                    segment.lease_token
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn restore_integration_secret_refs(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    secret_refs: &HashMap<String, String>,
+) -> Result<(), String> {
+    for (provider, secret_ref) in secret_refs {
+        transaction
+            .execute(
+                "UPDATE integration_configs SET secret_ref = ?1 WHERE workspace_id = ?2 AND provider = ?3",
+                params![secret_ref, workspace_id, provider],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn replace_snapshot_table(
@@ -1823,12 +2610,39 @@ fn optional_millis(value: &Value, key: &str) -> Option<i64> {
         return None;
     }
     candidate.as_i64().or_else(|| {
-        candidate.as_str().and_then(|value| {
-            chrono::DateTime::parse_from_rfc3339(value)
-                .ok()
-                .map(|time| time.timestamp_millis())
-        })
+        candidate
+            .as_str()
+            .and_then(|value| parse_timestamp_millis(value))
     })
+}
+
+fn parse_timestamp_millis(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|time| time.timestamp_millis())
+        .or_else(|| {
+            let normalized = normalize_postgrest_timestamp(value);
+            (normalized != value).then(|| {
+                chrono::DateTime::parse_from_rfc3339(&normalized)
+                    .ok()
+                    .map(|time| time.timestamp_millis())
+            })?
+        })
+}
+
+fn normalize_postgrest_timestamp(value: &str) -> String {
+    let mut normalized = value.replace(' ', "T");
+    if normalized.len() >= 3 {
+        let suffix = &normalized[normalized.len() - 3..];
+        if (suffix.starts_with('+') || suffix.starts_with('-'))
+            && suffix[1..]
+                .chars()
+                .all(|character| character.is_ascii_digit())
+        {
+            normalized.push_str(":00");
+        }
+    }
+    normalized
 }
 
 fn now_millis() -> i64 {
@@ -1860,8 +2674,53 @@ pub fn cloud_sync_push(
 
 #[tauri::command]
 pub fn cloud_sync_refresh(database: tauri::State<'_, Database>) -> Result<CloudSyncStatus, String> {
-    pull_snapshot(&database)?;
+    let push = push_outbox(&database)?;
+    if should_pull_snapshot_after_manual_refresh(push.pending, push.conflicts) {
+        match pull_snapshot(&database) {
+            Ok(_) => {}
+            Err(error) if should_defer_snapshot_refresh_after_local_race(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
     sync_status(&database)
+}
+
+#[tauri::command]
+pub fn cloud_sync_reset_local_cache(
+    database: tauri::State<'_, Database>,
+) -> Result<CloudSyncStatus, String> {
+    reset_local_cache_from_cloud(&database)
+}
+
+fn should_pull_snapshot_after_manual_refresh(pending: i64, conflicts: i64) -> bool {
+    pending == 0 && conflicts == 0
+}
+
+pub fn refresh_unassigned_state_for_cloud_mode(
+    database: &Database,
+) -> Result<Option<crate::unassigned::UnassignedStateDto>, String> {
+    let state = storage_mode(database)?;
+    if state.mode != "cloud" {
+        return crate::unassigned::get_state(database);
+    }
+    match acquire_or_renew_tracking_lease(database) {
+        Ok(_) => match pull_snapshot(database) {
+            Ok(_) => {}
+            Err(error) if should_use_local_unassigned_state_after_cloud_refresh_error(&error) => {}
+            Err(error) => return Err(error),
+        },
+        Err(error) if should_use_local_unassigned_state_after_cloud_refresh_error(&error) => {}
+        Err(error) => return Err(error),
+    }
+    crate::unassigned::get_state(database)
+}
+
+fn should_use_local_unassigned_state_after_cloud_refresh_error(error: &str) -> bool {
+    error.starts_with("NETWORK_ERROR:")
+        || error.starts_with("AUTH_REQUIRED:")
+        || error.starts_with("CLOUD_NOT_CONFIGURED:")
+        || error.starts_with("SYNC_PENDING:")
+        || error.starts_with("SYNC_RETRY:")
 }
 
 #[tauri::command]
@@ -1909,78 +2768,113 @@ pub fn tracking_lease_get(database: tauri::State<'_, Database>) -> Result<Value,
 pub fn cloud_timer_start(
     database: tauri::State<'_, Database>,
     request: CloudTimerStartRequest,
-) -> Result<Value, String> {
-    timer_start(&database, request)
+) -> Result<crate::time_tracking::TimeEntryDto, String> {
+    legacy_cloud_timer_start_local_first(&database, request)
 }
 
 #[tauri::command]
 pub fn cloud_timer_get_state(
     database: tauri::State<'_, Database>,
-) -> Result<Option<Value>, String> {
-    timer_get_state(&database)
+) -> Result<Option<crate::time_tracking::TimeEntryDto>, String> {
+    crate::time_tracking::get_timer_state(&database)
 }
 
 #[tauri::command]
 pub fn cloud_time_entry_list(
     database: tauri::State<'_, Database>,
     work_date: String,
-) -> Result<Vec<Value>, String> {
-    time_entry_list(&database, &work_date)
+) -> Result<crate::time_tracking::TimeEntryListResult, String> {
+    crate::time_tracking::list_time_entries(
+        &database,
+        crate::time_tracking::TimeEntryListRequest {
+            work_date,
+            include_breaks: true,
+        },
+    )
 }
 
 #[tauri::command]
 pub fn cloud_timer_pause(
     database: tauri::State<'_, Database>,
     request: CloudTimerVersionRequest,
-) -> Result<Value, String> {
-    timer_action(&database, "timer_pause", request)
+) -> Result<crate::time_tracking::TimeEntryDto, String> {
+    legacy_cloud_timer_pause_local_first(&database, request)
 }
 
 #[tauri::command]
 pub fn cloud_timer_resume(
     database: tauri::State<'_, Database>,
     request: CloudTimerVersionRequest,
-) -> Result<Value, String> {
-    timer_action(&database, "timer_resume", request)
+) -> Result<crate::time_tracking::TimeEntryDto, String> {
+    legacy_cloud_timer_resume_local_first(&database, request)
 }
 
 #[tauri::command]
 pub fn cloud_timer_stop(
     database: tauri::State<'_, Database>,
     request: CloudTimerVersionRequest,
-) -> Result<Value, String> {
-    timer_action(&database, "timer_stop", request)
+) -> Result<crate::time_tracking::TimeEntryDto, String> {
+    legacy_cloud_timer_stop_local_first(&database, request)
 }
 
 #[tauri::command]
 pub fn cloud_unassigned_get_state(
     database: tauri::State<'_, Database>,
-) -> Result<Option<Value>, String> {
-    unassigned_get_state(&database)
+) -> Result<Option<crate::unassigned::UnassignedStateDto>, String> {
+    refresh_unassigned_state_for_cloud_mode(&database)
 }
 
 #[tauri::command]
 pub fn cloud_unassigned_resolve_work(
     database: tauri::State<'_, Database>,
     request: CloudUnassignedResolveRequest,
-) -> Result<Value, String> {
-    unassigned_resolve(&database, "unassigned_resolve_work", request)
+) -> Result<crate::unassigned::UnassignedResolveResult, String> {
+    let allocations = request
+        .allocations
+        .unwrap_or_default()
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("VALIDATION_ERROR: 未归属时间分配格式无效: {error}"))?;
+    crate::unassigned::resolve_work_for_sync(
+        &database,
+        crate::unassigned::ResolveWorkRequest {
+            session_id: request.session_id,
+            expected_version: request.expected_version,
+            operation_id: request.operation_id,
+            allocations,
+        },
+    )
 }
 
 #[tauri::command]
 pub fn cloud_unassigned_resolve_break(
     database: tauri::State<'_, Database>,
     request: CloudUnassignedResolveRequest,
-) -> Result<Value, String> {
-    unassigned_resolve(&database, "unassigned_resolve_break", request)
+) -> Result<crate::unassigned::UnassignedResolveResult, String> {
+    crate::unassigned::resolve_break_for_sync(
+        &database,
+        crate::unassigned::ResolveSessionRequest {
+            session_id: request.session_id,
+            expected_version: request.expected_version,
+            operation_id: request.operation_id,
+        },
+    )
 }
 
 #[tauri::command]
 pub fn cloud_unassigned_discard(
     database: tauri::State<'_, Database>,
     request: CloudUnassignedResolveRequest,
-) -> Result<Value, String> {
-    unassigned_resolve(&database, "unassigned_discard", request)
+) -> Result<crate::unassigned::UnassignedResolveResult, String> {
+    crate::unassigned::discard_for_sync(
+        &database,
+        crate::unassigned::ResolveSessionRequest {
+            session_id: request.session_id,
+            expected_version: request.expected_version,
+            operation_id: request.operation_id,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1988,6 +2882,8 @@ mod tests {
     use super::*;
     use crate::settings::{self, SettingsScope, SettingsUpdate};
     use crate::subjects::{create_subject, SubjectCreateRequest};
+    use crate::tasks::{create_task, TaskCreateRequest};
+    use crate::time_tracking::{self, TimerStartRequest};
     use tempfile::tempdir;
 
     #[test]
@@ -2023,6 +2919,200 @@ mod tests {
         )
         .is_err());
         assert!(acquire_lease(&database).is_err());
+    }
+
+    #[test]
+    fn cloud_unassigned_refresh_falls_back_to_local_cache_without_session() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("cloud-unassigned-refresh-offline.sqlite3"),
+        )
+        .unwrap();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+
+        let state = refresh_unassigned_state_for_cloud_mode(&database)
+            .unwrap()
+            .expect("本地缓存应继续提供未归属状态");
+        assert_eq!(state.state, "collecting");
+    }
+
+    #[test]
+    fn cloud_unassigned_refresh_keeps_local_cache_while_snapshot_is_deferred() {
+        assert!(should_use_local_unassigned_state_after_cloud_refresh_error(
+            "SYNC_PENDING: 本机还有待同步操作"
+        ));
+        assert!(should_use_local_unassigned_state_after_cloud_refresh_error(
+            "SYNC_RETRY: 快照导入期间本机又发生修改"
+        ));
+        assert!(should_use_local_unassigned_state_after_cloud_refresh_error(
+            "NETWORK_ERROR: Supabase 暂时不可用"
+        ));
+        assert!(should_use_local_unassigned_state_after_cloud_refresh_error(
+            "AUTH_REQUIRED: 云端会话暂时不可用"
+        ));
+        assert!(
+            !should_use_local_unassigned_state_after_cloud_refresh_error(
+                "VERSION_CONFLICT: 未归属会话版本已变化"
+            )
+        );
+    }
+
+    #[test]
+    fn direct_snapshot_refresh_is_blocked_by_all_dirty_outbox_states() {
+        for dirty_state in ["pending", "failed", "sending", "conflict"] {
+            let (_directory, database, _) = cloud_database_with_outbox_state(
+                &format!("cloud-refresh-dirty-{dirty_state}.sqlite3"),
+                dirty_state,
+            );
+
+            let error = pull_snapshot(&database).unwrap_err();
+            assert!(
+                error.starts_with("SYNC_PENDING:"),
+                "dirty outbox state {dirty_state} should block direct snapshot refresh, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_pull_is_blocked_by_all_dirty_outbox_states_before_network() {
+        for dirty_state in ["pending", "failed", "sending", "conflict"] {
+            let (_directory, database, _) = cloud_database_with_outbox_state(
+                &format!("cloud-pull-dirty-{dirty_state}.sqlite3"),
+                dirty_state,
+            );
+
+            let error = pull(
+                &database,
+                CloudSyncPullRequest {
+                    after_change_seq: None,
+                    limit: None,
+                },
+            )
+            .unwrap_err();
+            assert!(
+                error.starts_with("SYNC_PENDING:"),
+                "dirty outbox state {dirty_state} should block incremental pull before network, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_snapshot_import_discards_all_dirty_outbox_states() {
+        for dirty_state in ["pending", "failed", "sending", "conflict"] {
+            let (_directory, database, workspace_id) = cloud_database_with_outbox_state(
+                &format!("cloud-reset-dirty-{dirty_state}.sqlite3"),
+                dirty_state,
+            );
+            let connection = database.open().unwrap();
+            let device_id: String = connection
+                .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+                .unwrap();
+            let subject_id: String = connection
+                .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+                .unwrap();
+            let now = now_millis();
+            drop(connection);
+
+            apply_snapshot_with_reset_options(
+                &database,
+                &json!({
+                    "subjects": [{
+                        "id": subject_id,
+                        "name": "云端名称",
+                        "sort_order": 10,
+                        "created_at": now,
+                        "updated_at": now,
+                        "version": 2,
+                        "deleted_at": null
+                    }]
+                }),
+                None,
+                Some(&workspace_id),
+                Some((&workspace_id, &device_id, 12)),
+                false,
+            )
+            .unwrap();
+
+            let connection = database.open().unwrap();
+            let outbox_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id = ?1",
+                    [&workspace_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let subject_name: String = connection
+                .query_row("SELECT name FROM subjects LIMIT 1", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                outbox_count, 0,
+                "dirty state {dirty_state} should be discarded"
+            );
+            assert_eq!(subject_name, "云端名称");
+        }
+    }
+
+    fn cloud_database_with_outbox_state(
+        file_name: &str,
+        outbox_state: &str,
+    ) -> (tempfile::TempDir, Database, String) {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(directory.path().join(file_name)).unwrap();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id.clone()),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let device_id = storage_mode(&database).unwrap().device_id;
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at, error_json)
+                 VALUES (?1, ?2, ?3, 'task_update', 'task', 'task-1', 1, '{}', ?4, 1, 1, '{}')",
+                params![
+                    Uuid::now_v7().to_string(),
+                    &cloud_workspace_id,
+                    device_id,
+                    outbox_state
+                ],
+            )
+            .unwrap();
+        (directory, database, cloud_workspace_id)
     }
 
     #[test]
@@ -2095,6 +3185,232 @@ mod tests {
     }
 
     #[test]
+    fn legacy_cloud_timer_commands_use_local_cache_and_outbox() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("legacy-cloud-timer-local-first.sqlite3"),
+        )
+        .unwrap();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id.clone()),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+
+        let start_operation_id = Uuid::now_v7().to_string();
+        let started = legacy_cloud_timer_start_local_first(
+            &database,
+            CloudTimerStartRequest {
+                task_id: None,
+                note: Some("兼容入口".to_string()),
+                operation_id: start_operation_id.clone(),
+            },
+        )
+        .unwrap();
+        let paused = legacy_cloud_timer_pause_local_first(
+            &database,
+            CloudTimerVersionRequest {
+                entry_id: started.id.clone(),
+                expected_version: started.version,
+                operation_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        let resume_operation_id = Uuid::now_v7().to_string();
+        let resumed = legacy_cloud_timer_resume_local_first(
+            &database,
+            CloudTimerVersionRequest {
+                entry_id: started.id.clone(),
+                expected_version: paused.version,
+                operation_id: resume_operation_id.clone(),
+            },
+        )
+        .unwrap();
+        let stopped = legacy_cloud_timer_stop_local_first(
+            &database,
+            CloudTimerVersionRequest {
+                entry_id: started.id.clone(),
+                expected_version: resumed.version,
+                operation_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(stopped.state, "ended");
+        assert!(stopped.allocations.is_empty());
+        let connection = database.open().unwrap();
+        let outbox = connection
+            .prepare(
+                "SELECT operation_id, operation_type, entity_type, entity_id, base_version FROM sync_outbox WHERE workspace_id = ?1 ORDER BY created_at, rowid",
+            )
+            .unwrap()
+            .query_map([cloud_workspace_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(outbox.len(), 4);
+        assert_eq!(outbox[0].0, start_operation_id);
+        assert_eq!(outbox[0].1, "timer_start");
+        assert_eq!(outbox[0].2, "time_entry");
+        assert_eq!(outbox[0].3.as_deref(), Some(started.id.as_str()));
+        assert_eq!(outbox[0].4, None);
+        assert_eq!(outbox[1].1, "timer_pause");
+        assert_eq!(outbox[1].4, Some(started.version));
+        assert_eq!(outbox[2].0, resume_operation_id);
+        assert_eq!(outbox[2].1, "timer_resume");
+        assert_eq!(outbox[2].4, Some(paused.version));
+        assert_eq!(outbox[3].1, "timer_stop");
+        assert_eq!(outbox[3].4, Some(resumed.version));
+    }
+
+    #[test]
+    fn legacy_cloud_unassigned_commands_use_local_cache_and_outbox() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("legacy-cloud-unassigned-local-first.sqlite3"),
+        )
+        .unwrap();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id.clone()),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+
+        let first = crate::unassigned::get_state(&database).unwrap().unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE unassigned_segments SET started_at = started_at - 60000 WHERE session_id = ?1 AND ended_at IS NULL",
+                [&first.session_id],
+            )
+            .unwrap();
+        let first = crate::unassigned::get_state(&database).unwrap().unwrap();
+        let break_operation_id = Uuid::now_v7().to_string();
+        let break_result = crate::unassigned::resolve_break_for_sync(
+            &database,
+            crate::unassigned::ResolveSessionRequest {
+                session_id: first.session_id,
+                expected_version: first.version,
+                operation_id: break_operation_id.clone(),
+            },
+        )
+        .unwrap();
+
+        let second = crate::unassigned::get_state(&database).unwrap().unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE unassigned_segments SET started_at = started_at - 60000 WHERE session_id = ?1 AND ended_at IS NULL",
+                [&second.session_id],
+            )
+            .unwrap();
+        let second = crate::unassigned::get_state(&database).unwrap().unwrap();
+        let discard_operation_id = Uuid::now_v7().to_string();
+        let discard_result = crate::unassigned::discard_for_sync(
+            &database,
+            crate::unassigned::ResolveSessionRequest {
+                session_id: second.session_id,
+                expected_version: second.version,
+                operation_id: discard_operation_id.clone(),
+            },
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let outbox = connection
+            .prepare(
+                "SELECT operation_id, operation_type, entity_type, entity_id, base_version FROM sync_outbox WHERE workspace_id = ?1 ORDER BY created_at, rowid",
+            )
+            .unwrap()
+            .query_map([cloud_workspace_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(outbox.len(), 4);
+        assert_eq!(outbox[0].0, break_operation_id);
+        assert_eq!(outbox[0].1, "unassigned_resolve_break");
+        assert_eq!(outbox[0].2, "time_entry");
+        assert_eq!(
+            outbox[0].3.as_deref(),
+            break_result.generated_entry_id.as_deref()
+        );
+        assert_eq!(outbox[0].4, None);
+        assert_eq!(outbox[1].1, "unassigned_session.update");
+        assert_eq!(outbox[1].2, "unassigned_session");
+        assert_eq!(
+            outbox[1].3.as_deref(),
+            Some(break_result.session_id.as_str())
+        );
+        assert_eq!(outbox[1].4, Some(first.version));
+        assert_eq!(outbox[2].0, discard_operation_id);
+        assert_eq!(outbox[2].1, "unassigned_discard");
+        assert_eq!(outbox[2].2, "time_entry");
+        assert_eq!(
+            outbox[2].3.as_deref(),
+            discard_result.generated_entry_id.as_deref()
+        );
+        assert_eq!(outbox[2].4, None);
+        assert_eq!(outbox[3].1, "unassigned_session.update");
+        assert_eq!(outbox[3].2, "unassigned_session");
+        assert_eq!(
+            outbox[3].3.as_deref(),
+            Some(discard_result.session_id.as_str())
+        );
+        assert_eq!(outbox[3].4, Some(second.version));
+    }
+
+    #[test]
     fn outbox_conflict_is_counted_separately() {
         let directory = tempdir().unwrap();
         let database =
@@ -2139,6 +3455,192 @@ mod tests {
         assert_eq!(conflicts[0].entity_type, "task");
         assert_eq!(conflicts[0].base_version, Some(1));
         assert_eq!(conflicts[0].local_payload, json!({}));
+    }
+
+    #[test]
+    fn use_cloud_conflict_resolution_deletes_following_operations_for_same_entity_only() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("cloud-use-cloud-clears-entity-chain.sqlite3"),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let task_id = Uuid::now_v7().to_string();
+        let other_task_id = Uuid::now_v7().to_string();
+        let conflict_id = Uuid::now_v7().to_string();
+        let following_same_entity_id = Uuid::now_v7().to_string();
+        let other_entity_id = Uuid::now_v7().to_string();
+        for (operation_id, entity_id, state, created_at) in [
+            (&conflict_id, &task_id, "conflict", 1_i64),
+            (&following_same_entity_id, &task_id, "pending", 2_i64),
+            (&other_entity_id, &other_task_id, "pending", 3_i64),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at, error_json)
+                     VALUES (?1, ?2, ?3, 'task_update', 'task', ?4, 1, '{}', ?5, 0, ?6, '{}')",
+                    params![
+                        operation_id,
+                        &workspace_id,
+                        &device_id,
+                        entity_id,
+                        state,
+                        created_at
+                    ],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let conflict = load_conflict(&database, &workspace_id, &conflict_id).unwrap();
+        delete_outbox_entity_chain(&database, &workspace_id, &conflict).unwrap();
+
+        let connection = database.open().unwrap();
+        let remaining = connection
+            .prepare("SELECT operation_id FROM sync_outbox ORDER BY created_at")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(remaining, vec![other_entity_id]);
+    }
+
+    #[test]
+    fn keep_local_conflict_resolution_uses_latest_following_payload_for_same_entity() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("cloud-keep-local-uses-latest-entity-chain.sqlite3"),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let task_id = Uuid::now_v7().to_string();
+        let conflict_id = Uuid::now_v7().to_string();
+        let middle_id = Uuid::now_v7().to_string();
+        let latest_id = Uuid::now_v7().to_string();
+        for (operation_id, state, title, created_at) in [
+            (&conflict_id, "conflict", "本地旧标题", 1_i64),
+            (&middle_id, "pending", "本地中间标题", 2_i64),
+            (&latest_id, "pending", "本地最终标题", 3_i64),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at, error_json)
+                     VALUES (?1, ?2, ?3, 'task_update', 'task', ?4, 1, ?5, ?6, 0, ?7, '{}')",
+                    params![
+                        operation_id,
+                        &workspace_id,
+                        &device_id,
+                        &task_id,
+                        json!({ "id": task_id, "title": title, "version": 2 }).to_string(),
+                        state,
+                        created_at
+                    ],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let conflict = load_conflict(&database, &workspace_id, &conflict_id).unwrap();
+        let latest = latest_outbox_entity_operation(&database, &workspace_id, &conflict).unwrap();
+        assert_eq!(latest.operation_id, latest_id);
+        assert_eq!(latest.payload["title"], "本地最终标题");
+
+        delete_following_outbox_entity_operations(&database, &workspace_id, &latest, &conflict_id)
+            .unwrap();
+        let connection = database.open().unwrap();
+        let remaining = connection
+            .prepare("SELECT operation_id FROM sync_outbox ORDER BY created_at")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(remaining, vec![conflict_id]);
+    }
+
+    #[test]
+    fn automatic_flush_never_turns_saved_local_work_into_a_conflict_error() {
+        assert!(!automatic_flush_should_block_local_result(
+            &CloudSyncPushResult {
+                pushed: 0,
+                pending: 1,
+                conflicts: 1,
+            }
+        ));
+        assert!(!automatic_flush_should_block_local_result(
+            &CloudSyncPushResult {
+                pushed: 1,
+                pending: 0,
+                conflicts: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn flush_if_online_does_not_fail_local_save_when_conflicts_are_already_queued() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("cloud-existing-conflict.sqlite3"))
+                .unwrap();
+        let connection = database.open().unwrap();
+        let local_workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at, error_json)
+                 VALUES (?1, ?2, ?3, 'task_update', 'task', ?4, 1, '{}', 'conflict', 1, ?5, '{}')",
+                params![
+                    Uuid::now_v7().to_string(),
+                    &local_workspace_id,
+                    &device_id,
+                    Uuid::now_v7().to_string(),
+                    now_millis()
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(local_workspace_id),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+
+        flush_if_online(&database).unwrap();
     }
 
     #[test]
@@ -2210,6 +3712,108 @@ mod tests {
     }
 
     #[test]
+    fn outbox_claim_preserves_insert_order_for_same_millisecond_operations() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("cloud-claim-stable-order.sqlite3"))
+                .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let first_id = Uuid::now_v7().to_string();
+        let second_id = Uuid::now_v7().to_string();
+        let created_at = now_millis();
+        for operation_id in [&second_id, &first_id] {
+            connection
+                .execute(
+                    "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at)
+                     VALUES (?1, ?2, ?3, 'task_update', 'task', ?4, 1, '{}', 'pending', 0, ?5)",
+                    params![
+                        operation_id,
+                        &workspace_id,
+                        &device_id,
+                        Uuid::now_v7().to_string(),
+                        created_at
+                    ],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let claimed = claim_pending_operations(&database, &workspace_id).unwrap();
+        let claimed_ids = claimed
+            .into_iter()
+            .map(|operation| operation.operation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(claimed_ids, vec![second_id, first_id]);
+    }
+
+    #[test]
+    fn outbox_claim_takes_only_the_oldest_ready_operation_per_entity() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("cloud-claim-one-ready-operation-per-entity.sqlite3"),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let task_id = Uuid::now_v7().to_string();
+        let other_task_id = Uuid::now_v7().to_string();
+        let first_same_entity_id = Uuid::now_v7().to_string();
+        let second_same_entity_id = Uuid::now_v7().to_string();
+        let other_entity_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        for (operation_id, entity_id, created_offset) in [
+            (&first_same_entity_id, &task_id, 0_i64),
+            (&second_same_entity_id, &task_id, 1_i64),
+            (&other_entity_id, &other_task_id, 2_i64),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at)
+                     VALUES (?1, ?2, ?3, 'task_update', 'task', ?4, 1, '{}', 'pending', 0, ?5)",
+                    params![
+                        operation_id,
+                        &workspace_id,
+                        &device_id,
+                        entity_id,
+                        now + created_offset,
+                    ],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let claimed = claim_pending_operations(&database, &workspace_id).unwrap();
+        let claimed_ids = claimed
+            .into_iter()
+            .map(|operation| operation.operation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(claimed_ids, vec![first_same_entity_id, other_entity_id]);
+
+        let connection = database.open().unwrap();
+        let second_state: (String, i64) = connection
+            .query_row(
+                "SELECT state, attempt_count FROM sync_outbox WHERE operation_id = ?1",
+                [&second_same_entity_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(second_state, ("pending".to_string(), 0));
+    }
+
+    #[test]
     fn outbox_claim_respects_retry_backoff_for_recent_failures() {
         let directory = tempdir().unwrap();
         let database =
@@ -2262,15 +3866,163 @@ mod tests {
     }
 
     #[test]
+    fn outbox_claim_does_not_skip_over_older_not_ready_operation_for_same_entity() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("cloud-backoff-entity-order.sqlite3"))
+                .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let task_id = Uuid::now_v7().to_string();
+        let other_task_id = Uuid::now_v7().to_string();
+        let older_not_ready_id = Uuid::now_v7().to_string();
+        let newer_same_entity_id = Uuid::now_v7().to_string();
+        let ready_other_entity_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        for (operation_id, entity_id, attempt_count, last_attempt_at, created_offset) in [
+            (&older_not_ready_id, &task_id, 3_i64, Some(now), 0_i64),
+            (&newer_same_entity_id, &task_id, 0_i64, None, 1_i64),
+            (&ready_other_entity_id, &other_task_id, 0_i64, None, 2_i64),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at, last_attempt_at)
+                     VALUES (?1, ?2, ?3, 'task_update', 'task', ?4, 1, '{}', 'pending', ?5, ?6, ?7)",
+                    params![
+                        operation_id,
+                        &workspace_id,
+                        &device_id,
+                        entity_id,
+                        attempt_count,
+                        now + created_offset,
+                        last_attempt_at
+                    ],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let claimed = claim_pending_operations(&database, &workspace_id).unwrap();
+        let claimed_ids = claimed
+            .into_iter()
+            .map(|operation| operation.operation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(claimed_ids, vec![ready_other_entity_id]);
+    }
+
+    #[test]
+    fn outbox_claim_does_not_skip_over_active_sending_operation_for_same_entity() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("cloud-active-sending-entity-order.sqlite3"),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let task_id = Uuid::now_v7().to_string();
+        let sending_id = Uuid::now_v7().to_string();
+        let pending_same_entity_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        for (operation_id, state, last_attempt_at, created_offset) in [
+            (&sending_id, "sending", Some(now), 0_i64),
+            (&pending_same_entity_id, "pending", None, 1_i64),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at, last_attempt_at)
+                     VALUES (?1, ?2, ?3, 'task_update', 'task', ?4, 1, '{}', ?5, 0, ?6, ?7)",
+                    params![
+                        operation_id,
+                        &workspace_id,
+                        &device_id,
+                        &task_id,
+                        state,
+                        now + created_offset,
+                        last_attempt_at
+                    ],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let claimed = claim_pending_operations(&database, &workspace_id).unwrap();
+        assert!(claimed.is_empty());
+    }
+
+    #[test]
+    fn outbox_claim_does_not_skip_over_conflict_for_same_entity() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("cloud-conflict-entity-order.sqlite3"))
+                .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let task_id = Uuid::now_v7().to_string();
+        let conflict_id = Uuid::now_v7().to_string();
+        let pending_same_entity_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        for (operation_id, state, created_offset) in [
+            (&conflict_id, "conflict", 0_i64),
+            (&pending_same_entity_id, "pending", 1_i64),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at)
+                     VALUES (?1, ?2, ?3, 'task_update', 'task', ?4, 1, '{}', ?5, 0, ?6)",
+                    params![
+                        operation_id,
+                        &workspace_id,
+                        &device_id,
+                        &task_id,
+                        state,
+                        now + created_offset,
+                    ],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let claimed = claim_pending_operations(&database, &workspace_id).unwrap();
+        assert!(claimed.is_empty());
+    }
+
+    #[test]
     fn cloud_entity_version_reads_versioned_snapshot_entities() {
         let snapshot = json!({
             "tasks": [{"id": "task-a", "version": 4}],
+            "task_occurrences": [{"task_id": "task-a", "occurrence_date": "2026-09-29", "version": 5}],
             "app_settings": [{"key": "salary_hourly_rate", "version": 3}],
             "integration_configs": [{"provider": "seatable", "version": 2}]
         });
         assert_eq!(
             cloud_entity_version(&snapshot, "task", Some("task-a"), &Value::Null),
             Some(4)
+        );
+        assert_eq!(
+            cloud_entity_version(
+                &snapshot,
+                "task_occurrence",
+                Some("task-a|2026-09-29"),
+                &json!({"task_id": "task-a", "occurrence_date": "2026-09-29"})
+            ),
+            Some(5)
         );
         assert_eq!(
             cloud_entity_version(
@@ -2302,6 +4054,33 @@ mod tests {
         assert!(!should_pull_snapshot_after_push(0, 0, 0));
         assert!(!should_pull_snapshot_after_push(1, 1, 0));
         assert!(!should_pull_snapshot_after_push(1, 0, 1));
+    }
+
+    #[test]
+    fn manual_refresh_only_pulls_snapshot_after_the_queue_is_clean() {
+        assert!(should_pull_snapshot_after_manual_refresh(0, 0));
+        assert!(!should_pull_snapshot_after_manual_refresh(1, 0));
+        assert!(!should_pull_snapshot_after_manual_refresh(0, 1));
+        assert!(!should_pull_snapshot_after_manual_refresh(2, 3));
+    }
+
+    #[test]
+    fn snapshot_refresh_races_are_deferred_without_becoming_sync_errors() {
+        assert!(should_defer_snapshot_refresh_after_local_race(
+            "SYNC_PENDING: 本机产生了新的待同步操作"
+        ));
+        assert!(should_defer_snapshot_refresh_after_local_race(
+            "SYNC_RETRY: 拉取期间本地数据发生变化"
+        ));
+        assert!(!should_defer_snapshot_refresh_after_local_race(
+            "NETWORK_ERROR: 云端不可用"
+        ));
+    }
+
+    #[test]
+    fn cloud_timestamp_parser_accepts_postgrest_timezone_without_colon() {
+        let value = json!({ "started_at": "2026-10-03 09:08:07.123456+00" });
+        assert_eq!(optional_millis(&value, "started_at"), Some(1791018487123));
     }
 
     #[test]
@@ -2341,6 +4120,60 @@ mod tests {
             json!({"serverUrl": "https://example.test", "syncEnabled": true})
         );
         assert!(integration["config_json"].is_object());
+    }
+
+    #[test]
+    fn outbox_rejects_entity_types_not_supported_by_cloud_apply_patch() {
+        assert!(ensure_supported_cloud_entity_type("task").is_ok());
+        assert!(ensure_supported_cloud_entity_type("time_entry").is_ok());
+        assert!(ensure_supported_cloud_entity_type("unassigned_session").is_ok());
+        let error = ensure_supported_cloud_entity_type("work_day").unwrap_err();
+        assert!(error.starts_with("VALIDATION_ERROR:"));
+        assert!(error.contains("cloud_apply_patch"));
+    }
+
+    #[test]
+    fn entity_payload_selects_external_binding_by_composite_identity() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("cloud-external-binding-payload.sqlite3"),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let task_id = Uuid::now_v7().to_string();
+        for (provider, external_id) in [("seatable", "sea-row-1"), ("notion", "notion-row-1")] {
+            connection
+                .execute(
+                    "INSERT INTO external_bindings(id, workspace_id, provider, entity_type, entity_id, external_id, last_synced_at)
+                     VALUES (?1, ?2, ?3, 'task', ?4, ?5, ?6)",
+                    params![
+                        Uuid::now_v7().to_string(),
+                        &workspace_id,
+                        provider,
+                        &task_id,
+                        external_id,
+                        now_millis()
+                    ],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let payload = entity_payload(
+            &database,
+            "external_binding",
+            Some(&format!("seatable|task|{task_id}")),
+        )
+        .unwrap();
+        assert_eq!(payload["provider"], "seatable");
+        assert_eq!(payload["entity_type"], "task");
+        assert_eq!(payload["entity_id"], task_id);
+        assert_eq!(payload["external_id"], "sea-row-1");
     }
 
     #[test]
@@ -2473,6 +4306,464 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_import_preserves_local_open_timer_segment() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("cloud-snapshot-open-timer-segment.sqlite3"),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                parent_id: None,
+                title: "同步中计时".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let started = time_tracking::start_timer(
+            &database,
+            TimerStartRequest {
+                task_id: Some(task.id.clone()),
+                note: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE time_segments SET started_at = started_at - 4000 WHERE entry_id = ?1 AND ended_at IS NULL",
+                [&started.id],
+            )
+            .unwrap();
+
+        let now = now_millis();
+        let snapshot = json!({
+            "subjects": [{"id": subject_id.clone(), "name": "默认", "sort_order": 10, "created_at": now, "updated_at": now, "version": 1, "deleted_at": null}],
+            "tasks": [{"id": task.id.clone(), "subject_id": subject_id.clone(), "parent_id": null, "title": task.title.clone(), "status": "open", "source_type": "manual", "sort_order": 10, "created_at": now, "updated_at": now, "version": task.version}],
+            "time_entries": [{"id": started.id.clone(), "work_date": started.work_date.clone(), "kind": "work", "source_type": "timer", "state": "running", "default_task_id": task.id.clone(), "label_snapshot": started.label.clone(), "started_at": started.started_at, "ended_at": null, "duration_seconds": 0, "note": null, "origin_unassigned_session_id": null, "created_at": now, "updated_at": now, "version": started.version, "deleted_at": null}],
+            "time_segments": []
+        });
+        apply_snapshot(&database, &snapshot, None, None, None).unwrap();
+
+        let restored = time_tracking::get_timer_state(&database).unwrap().unwrap();
+        assert_eq!(restored.id, started.id);
+        assert!(restored.duration_seconds >= 3);
+    }
+
+    #[test]
+    fn snapshot_import_preserves_local_running_timer_missing_from_cloud() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("cloud-snapshot-missing-running-timer.sqlite3"),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                parent_id: None,
+                title: "本机未推送计时".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let started = time_tracking::start_timer(
+            &database,
+            TimerStartRequest {
+                task_id: Some(task.id.clone()),
+                note: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE time_segments SET started_at = started_at - 4000 WHERE entry_id = ?1 AND ended_at IS NULL",
+                [&started.id],
+            )
+            .unwrap();
+
+        let now = now_millis();
+        let snapshot = json!({
+            "subjects": [{"id": subject_id.clone(), "name": "默认", "sort_order": 10, "created_at": now, "updated_at": now, "version": 1, "deleted_at": null}],
+            "tasks": [{"id": task.id.clone(), "subject_id": subject_id.clone(), "parent_id": null, "title": task.title.clone(), "status": "open", "source_type": "manual", "sort_order": 10, "created_at": now, "updated_at": now, "version": task.version}],
+            "time_entries": [],
+            "time_segments": []
+        });
+        apply_snapshot(&database, &snapshot, None, None, None).unwrap();
+
+        let restored = time_tracking::get_timer_state(&database).unwrap().unwrap();
+        assert_eq!(restored.id, started.id);
+        assert_eq!(restored.state, "running");
+        assert!(restored.duration_seconds >= 3);
+    }
+
+    #[test]
+    fn reset_snapshot_import_does_not_preserve_local_running_timer_missing_from_cloud() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("cloud-reset-missing-running-timer.sqlite3"),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                parent_id: None,
+                title: "本机缓存损坏计时".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let started = time_tracking::start_timer(
+            &database,
+            TimerStartRequest {
+                task_id: Some(task.id.clone()),
+                note: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+
+        let now = now_millis();
+        let snapshot = json!({
+            "subjects": [{"id": subject_id.clone(), "name": "默认", "sort_order": 10, "created_at": now, "updated_at": now, "version": 1, "deleted_at": null}],
+            "tasks": [{"id": task.id.clone(), "subject_id": subject_id.clone(), "parent_id": null, "title": task.title.clone(), "status": "open", "source_type": "manual", "sort_order": 10, "created_at": now, "updated_at": now, "version": task.version}],
+            "time_entries": [],
+            "time_segments": []
+        });
+        apply_snapshot_with_options(
+            &database,
+            &snapshot,
+            None,
+            Some(&workspace_id),
+            Some((&workspace_id, &device_id, 7)),
+            false,
+        )
+        .unwrap();
+
+        assert!(time_tracking::get_timer_state(&database).unwrap().is_none());
+        let entry_count: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM time_entries WHERE id = ?1",
+                [&started.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(entry_count, 0);
+        let last_change_seq: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT last_change_seq FROM local_sync_state WHERE workspace_id = ?1",
+                [&workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_change_seq, 7);
+    }
+
+    #[test]
+    fn snapshot_import_keeps_local_running_timer_over_stale_cloud_end_state() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("cloud-snapshot-stale-ended-running-timer.sqlite3"),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                parent_id: None,
+                title: "旧云端结束状态".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let started = time_tracking::start_timer(
+            &database,
+            TimerStartRequest {
+                task_id: Some(task.id.clone()),
+                note: Some("本机仍在计时".to_string()),
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE time_segments SET started_at = started_at - 4000 WHERE entry_id = ?1 AND ended_at IS NULL",
+                [&started.id],
+            )
+            .unwrap();
+
+        let now = now_millis();
+        let snapshot = json!({
+            "subjects": [{"id": subject_id.clone(), "name": "默认", "sort_order": 10, "created_at": now, "updated_at": now, "version": 1, "deleted_at": null}],
+            "tasks": [{"id": task.id.clone(), "subject_id": subject_id.clone(), "parent_id": null, "title": task.title.clone(), "status": "open", "source_type": "manual", "sort_order": 10, "created_at": now, "updated_at": now, "version": task.version}],
+            "time_entries": [{"id": started.id.clone(), "work_date": started.work_date.clone(), "kind": "work", "source_type": "timer", "state": "ended", "default_task_id": task.id.clone(), "label_snapshot": started.label.clone(), "started_at": started.started_at, "ended_at": now, "duration_seconds": 2, "note": "旧状态", "origin_unassigned_session_id": null, "created_at": now, "updated_at": now, "version": started.version, "deleted_at": null}],
+            "time_segments": [{"id": Uuid::now_v7().to_string(), "entry_id": started.id.clone(), "sequence_no": 1, "started_at": started.started_at, "ended_at": now, "duration_seconds": 2}]
+        });
+        apply_snapshot(&database, &snapshot, None, None, None).unwrap();
+
+        let restored = time_tracking::get_timer_state(&database).unwrap().unwrap();
+        assert_eq!(restored.id, started.id);
+        assert_eq!(restored.state, "running");
+        assert_eq!(restored.note.as_deref(), Some("本机仍在计时"));
+        assert!(restored.duration_seconds >= 3);
+    }
+
+    #[test]
+    fn snapshot_import_preserves_local_open_unassigned_segment() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("cloud-snapshot-open-unassigned-segment.sqlite3"),
+        )
+        .unwrap();
+        let state = crate::unassigned::get_state(&database).unwrap().unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE unassigned_segments SET started_at = started_at - 4000 WHERE session_id = ?1 AND ended_at IS NULL",
+                [&state.session_id],
+            )
+            .unwrap();
+
+        let now = now_millis();
+        let snapshot = json!({
+            "unassigned_sessions": [{"id": state.session_id, "work_date": "2026-10-04", "state": "collecting", "threshold_seconds": 300, "duration_seconds": 0, "first_started_at": state.first_started_at, "last_ended_at": null, "prompted_at": null, "resolution_type": null, "generated_entry_id": null, "resolved_at": null, "created_at": now, "updated_at": now, "version": state.version}],
+            "unassigned_segments": []
+        });
+        apply_snapshot(&database, &snapshot, None, None, None).unwrap();
+
+        let restored = crate::unassigned::get_state(&database).unwrap().unwrap();
+        assert_eq!(restored.session_id, state.session_id);
+        assert!(restored.elapsed_seconds >= 3);
+    }
+
+    #[test]
+    fn snapshot_import_preserves_local_unassigned_session_missing_from_cloud() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("cloud-snapshot-missing-unassigned-session.sqlite3"),
+        )
+        .unwrap();
+        let state = crate::unassigned::get_state(&database).unwrap().unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE unassigned_segments SET started_at = started_at - 4000 WHERE session_id = ?1 AND ended_at IS NULL",
+                [&state.session_id],
+            )
+            .unwrap();
+
+        let snapshot = json!({
+            "unassigned_sessions": [],
+            "unassigned_segments": []
+        });
+        apply_snapshot(&database, &snapshot, None, None, None).unwrap();
+
+        let restored = crate::unassigned::get_state(&database).unwrap().unwrap();
+        assert_eq!(restored.session_id, state.session_id);
+        assert!(restored.elapsed_seconds >= 3);
+        let restored_state: String = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM unassigned_sessions WHERE id = ?1",
+                [&state.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored_state, "collecting");
+    }
+
+    #[test]
+    fn snapshot_import_keeps_local_unassigned_session_over_stale_cloud_resolution() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("cloud-snapshot-stale-unassigned-resolution.sqlite3"),
+        )
+        .unwrap();
+        let state = crate::unassigned::get_state(&database).unwrap().unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE unassigned_segments SET started_at = started_at - 4000 WHERE session_id = ?1 AND ended_at IS NULL",
+                [&state.session_id],
+            )
+            .unwrap();
+
+        let now = now_millis();
+        let snapshot = json!({
+            "unassigned_sessions": [{
+                "id": state.session_id,
+                "work_date": "2026-10-04",
+                "state": "resolved",
+                "threshold_seconds": 300,
+                "duration_seconds": 1,
+                "first_started_at": state.first_started_at,
+                "last_ended_at": now,
+                "prompted_at": null,
+                "resolution_type": "work",
+                "generated_entry_id": null,
+                "resolved_at": now,
+                "created_at": now,
+                "updated_at": now,
+                "version": state.version
+            }],
+            "unassigned_segments": []
+        });
+        apply_snapshot(&database, &snapshot, None, None, None).unwrap();
+
+        let restored = crate::unassigned::get_state(&database).unwrap().unwrap();
+        assert_eq!(restored.session_id, state.session_id);
+        assert_eq!(restored.state, "collecting");
+        assert!(restored.elapsed_seconds >= 3);
+    }
+
+    #[test]
+    fn snapshot_import_keeps_local_unassigned_when_cloud_has_another_active_session() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("cloud-snapshot-other-active-unassigned-session.sqlite3"),
+        )
+        .unwrap();
+        let state = crate::unassigned::get_state(&database).unwrap().unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE unassigned_segments SET started_at = started_at - 4000 WHERE session_id = ?1 AND ended_at IS NULL",
+                [&state.session_id],
+            )
+            .unwrap();
+
+        let now = now_millis();
+        let cloud_session_id = Uuid::now_v7().to_string();
+        let cloud_segment_id = Uuid::now_v7().to_string();
+        let snapshot = json!({
+            "unassigned_sessions": [{
+                "id": cloud_session_id,
+                "work_date": "2026-10-04",
+                "state": "collecting",
+                "threshold_seconds": 300,
+                "duration_seconds": 0,
+                "first_started_at": now,
+                "last_ended_at": null,
+                "prompted_at": null,
+                "resolution_type": null,
+                "generated_entry_id": null,
+                "resolved_at": null,
+                "created_at": now,
+                "updated_at": now,
+                "version": 1
+            }],
+            "unassigned_segments": [{
+                "id": cloud_segment_id,
+                "session_id": cloud_session_id,
+                "sequence_no": 1,
+                "started_at": now,
+                "ended_at": null,
+                "duration_seconds": 0,
+                "lease_token": null
+            }]
+        });
+        apply_snapshot(&database, &snapshot, None, None, None).unwrap();
+
+        let restored = crate::unassigned::get_state(&database).unwrap().unwrap();
+        assert_eq!(restored.session_id, state.session_id);
+        assert!(restored.elapsed_seconds >= 3);
+        let connection = database.open().unwrap();
+        let active_sessions: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM unassigned_sessions WHERE state IN ('collecting', 'awaiting_resolution')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_sessions, 1);
+        let cloud_session_exists: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM unassigned_sessions WHERE id = ?1",
+                [&cloud_session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cloud_session_exists, 0);
+    }
+
+    #[test]
     fn snapshot_import_does_not_overwrite_a_new_local_edit() {
         let directory = tempdir().unwrap();
         let database =
@@ -2523,6 +4814,78 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_import_is_blocked_by_all_dirty_outbox_states() {
+        for dirty_state in ["pending", "failed", "sending", "conflict"] {
+            let directory = tempdir().unwrap();
+            let database = Database::initialize_at(
+                directory
+                    .path()
+                    .join(format!("cloud-snapshot-dirty-{dirty_state}.sqlite3")),
+            )
+            .unwrap();
+            let connection = database.open().unwrap();
+            let workspace_id: String = connection
+                .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+                .unwrap();
+            let subject_id: String = connection
+                .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+                .unwrap();
+            let device_id: String = connection
+                .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+                .unwrap();
+            let revision = local_revision(&database).unwrap();
+            connection
+                .execute(
+                    "UPDATE subjects SET name = '本地新名称', version = version + 1 WHERE id = ?1",
+                    [&subject_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at, error_json)
+                     VALUES (?1, ?2, ?3, 'subject_update', 'subject', ?4, 1, '{}', ?5, 1, ?6, '{}')",
+                    params![
+                        Uuid::now_v7().to_string(),
+                        workspace_id,
+                        device_id,
+                        subject_id,
+                        dirty_state,
+                        now_millis()
+                    ],
+                )
+                .unwrap();
+            drop(connection);
+
+            let now = now_millis();
+            let snapshot = json!({
+                "subjects": [{"id": subject_id, "name": "云端旧名称", "sort_order": 10, "created_at": now, "updated_at": now, "version": 1, "deleted_at": null}]
+            });
+            let error = apply_snapshot(
+                &database,
+                &snapshot,
+                Some(revision),
+                Some(&workspace_id),
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                error.starts_with("SYNC_PENDING:"),
+                "dirty outbox state {dirty_state} should block snapshot import, got {error}"
+            );
+            let saved_name: String = database
+                .open()
+                .unwrap()
+                .query_row(
+                    "SELECT name FROM subjects WHERE id = ?1",
+                    [&subject_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(saved_name, "本地新名称");
+        }
+    }
+
+    #[test]
     fn snapshot_import_removes_stale_integration_configs() {
         let directory = tempdir().unwrap();
         let database = Database::initialize_at(
@@ -2555,6 +4918,58 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn snapshot_import_preserves_matching_integration_secret_ref() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("cloud-snapshot-integration-secret-ref.sqlite3"),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let now = now_millis();
+        connection
+            .execute(
+                "INSERT INTO integration_configs(workspace_id,provider,enabled,config_json,secret_ref,updated_at,version)
+                 VALUES (?1,'seatable',1,?2,'keyring://seatable',?3,1)",
+                params![workspace_id, json!({ "syncEnabled": true }).to_string(), now],
+            )
+            .unwrap();
+        drop(connection);
+
+        let snapshot = json!({
+            "integration_configs": [{
+                "provider": "seatable",
+                "enabled": false,
+                "config_json": { "syncEnabled": false, "serverUrl": "https://cloud.example" },
+                "updated_at": now + 1_000,
+                "version": 2
+            }]
+        });
+        apply_snapshot(&database, &snapshot, None, None, None).unwrap();
+
+        let saved: (i64, String, String, i64) = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT enabled, config_json, secret_ref, version FROM integration_configs WHERE provider = 'seatable'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(saved.0, 0);
+        assert_eq!(
+            serde_json::from_str::<Value>(&saved.1).unwrap(),
+            json!({ "syncEnabled": false, "serverUrl": "https://cloud.example" })
+        );
+        assert_eq!(saved.2, "keyring://seatable");
+        assert_eq!(saved.3, 2);
     }
 
     #[test]

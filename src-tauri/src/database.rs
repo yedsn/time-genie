@@ -35,6 +35,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "automation_hooks",
         sql: include_str!("../migrations/0004_automation_hooks.sql"),
     },
+    Migration {
+        version: 5,
+        name: "cloud_session_lifecycle",
+        sql: include_str!("../migrations/0005_cloud_session_lifecycle.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -433,7 +438,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let database = Database::initialize_at(directory.path().join("test.sqlite3")).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 4);
+        assert_eq!(status.schema_version, 5);
         for table in REQUIRED_TABLES {
             assert!(
                 status.tables.iter().any(|value| value == table),
@@ -473,7 +478,7 @@ mod tests {
         let workspace_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migration_count, 4);
+        assert_eq!(migration_count, 5);
         assert_eq!(workspace_count, 1);
     }
 
@@ -634,7 +639,7 @@ mod tests {
 
         let database = Database::initialize_at(path).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 4);
+        assert_eq!(status.schema_version, 5);
         assert!(status.tables.iter().any(|table| table == "device_hooks"));
         assert!(status
             .tables

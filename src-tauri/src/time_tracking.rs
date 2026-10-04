@@ -165,12 +165,28 @@ pub(crate) fn get_time_entry_by_id(
     load_entry(&connection, entry_id, now_millis())
 }
 
-pub fn start_timer_with_hooks(
+pub fn start_timer_with_hooks_for_sync(
     database: &Database,
     request: TimerStartRequest,
 ) -> Result<TimeEntryDto, String> {
     let operation_id = request.client_request_id.clone();
-    let result = start_timer(database, request)?;
+    let state = crate::supabase::storage_mode(database)?;
+    let result = start_timer_with_hooks_and_cloud_operation(
+        database,
+        request,
+        Some((&state, "timer_start", Some(operation_id.as_str()))),
+    )?;
+    crate::cloud_sync::flush_if_online(database)?;
+    Ok(result)
+}
+
+fn start_timer_with_hooks_and_cloud_operation(
+    database: &Database,
+    request: TimerStartRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
+) -> Result<TimeEntryDto, String> {
+    let operation_id = request.client_request_id.clone();
+    let result = start_timer_with_cloud_operation(database, request, cloud_operation)?;
     publish_timer_hook(
         database,
         "timer.started",
@@ -180,11 +196,23 @@ pub fn start_timer_with_hooks(
     Ok(result)
 }
 
-pub fn stop_timer_with_hooks(
+pub fn stop_timer_with_hooks_for_sync(
     database: &Database,
     request: TimerStopRequest,
 ) -> Result<TimeEntryDto, String> {
-    let result = stop_timer(database, request)?;
+    let state = crate::supabase::storage_mode(database)?;
+    let result =
+        stop_timer_with_hooks_and_cloud_operation(database, request, Some((&state, "timer_stop")))?;
+    crate::cloud_sync::flush_if_online(database)?;
+    Ok(result)
+}
+
+fn stop_timer_with_hooks_and_cloud_operation(
+    database: &Database,
+    request: TimerStopRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+) -> Result<TimeEntryDto, String> {
+    let result = stop_timer_with_cloud_operation(database, request, cloud_operation)?;
     publish_timer_hook(
         database,
         "timer.stopped",
@@ -209,9 +237,18 @@ pub(crate) fn publish_timer_hook(
     }
 }
 
+#[cfg(test)]
 pub fn start_timer(
     database: &Database,
     request: TimerStartRequest,
+) -> Result<TimeEntryDto, String> {
+    start_timer_with_cloud_operation(database, request, None)
+}
+
+fn start_timer_with_cloud_operation(
+    database: &Database,
+    request: TimerStartRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
 ) -> Result<TimeEntryDto, String> {
     validate_operation_id(&request.client_request_id)?;
     let mut connection = database.open()?;
@@ -281,13 +318,36 @@ pub fn start_timer(
         "timer_start",
         &result,
     )?;
+    if let Some((state, operation_type, operation_id)) = cloud_operation {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "time_entry",
+            Some(&entry_id),
+            None,
+            operation_id,
+        )?;
+    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
 
-pub fn pause_timer(
+pub fn pause_timer_for_sync(
     database: &Database,
     request: TimerVersionRequest,
+) -> Result<TimeEntryDto, String> {
+    let state = crate::supabase::storage_mode(database)?;
+    let result =
+        pause_timer_with_cloud_operation(database, request, Some((&state, "timer_pause")))?;
+    crate::cloud_sync::flush_if_online(database)?;
+    Ok(result)
+}
+
+fn pause_timer_with_cloud_operation(
+    database: &Database,
+    request: TimerVersionRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<TimeEntryDto, String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
@@ -317,13 +377,40 @@ pub fn pause_timer(
     )?;
     bump_revision(&transaction)?;
     let result = load_entry(&transaction, &request.entry_id, now)?;
+    if let Some((state, operation_type)) = cloud_operation {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "time_entry",
+            Some(&request.entry_id),
+            Some(request.expected_version),
+            None,
+        )?;
+    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
 
-pub fn resume_timer(
+pub fn resume_timer_for_sync(
     database: &Database,
     request: TimerResumeRequest,
+) -> Result<TimeEntryDto, String> {
+    let operation_id = request.operation_id.clone();
+    let state = crate::supabase::storage_mode(database)?;
+    let result = resume_timer_with_cloud_operation(
+        database,
+        request,
+        Some((&state, "timer_resume", Some(operation_id.as_str()))),
+    )?;
+    crate::cloud_sync::flush_if_online(database)?;
+    Ok(result)
+}
+
+fn resume_timer_with_cloud_operation(
+    database: &Database,
+    request: TimerResumeRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
 ) -> Result<TimeEntryDto, String> {
     validate_operation_id(&request.operation_id)?;
     let mut connection = database.open()?;
@@ -381,11 +468,31 @@ pub fn resume_timer(
         "timer_resume",
         &result,
     )?;
+    if let Some((state, operation_type, operation_id)) = cloud_operation {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "time_entry",
+            Some(&request.entry_id),
+            Some(request.expected_version),
+            operation_id,
+        )?;
+    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
 
+#[cfg(test)]
 pub fn stop_timer(database: &Database, request: TimerStopRequest) -> Result<TimeEntryDto, String> {
+    stop_timer_with_cloud_operation(database, request, None)
+}
+
+fn stop_timer_with_cloud_operation(
+    database: &Database,
+    request: TimerStopRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+) -> Result<TimeEntryDto, String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     let now = now_millis();
@@ -452,6 +559,17 @@ pub fn stop_timer(database: &Database, request: TimerStopRequest) -> Result<Time
     crate::unassigned::resume_after_timer(&transaction, &workspace_id, now)?;
     bump_revision(&transaction)?;
     let result = load_entry(&transaction, &request.entry_id, now)?;
+    if let Some((state, operation_type)) = cloud_operation {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "time_entry",
+            Some(&request.entry_id),
+            Some(request.expected_version),
+            None,
+        )?;
+    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -547,6 +665,7 @@ fn create_manual_entry_with_cloud_operation(
                 .map(|(task_id, version)| (task_id.clone(), version))
         })
         .flatten();
+    let mut completed_occurrence_outbox = Vec::<(String, Option<i64>)>::new();
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
@@ -594,14 +713,16 @@ fn create_manual_entry_with_cloud_operation(
                 )
                 .map_err(|error| error.to_string())?;
             if request.complete_task {
-                complete_task_if_open(
+                if let Some(occurrence_outbox) = complete_task_if_open(
                     &transaction,
                     &workspace_id,
                     &task_id,
                     request.task_expected_version,
                     &request.work_date,
                     now,
-                )?;
+                )? {
+                    completed_occurrence_outbox.push(occurrence_outbox);
+                }
             }
         }
     }
@@ -633,6 +754,17 @@ fn create_manual_entry_with_cloud_operation(
                 "task",
                 Some(&task_id),
                 Some(base_version),
+                None,
+            )?;
+        }
+        for (entity_id, base_version) in completed_occurrence_outbox {
+            crate::cloud_sync::enqueue_entity_in_transaction(
+                &transaction,
+                state,
+                "task_occurrence_set_completed_from_time_entry",
+                "task_occurrence",
+                Some(&entity_id),
+                base_version,
                 None,
             )?;
         }
@@ -889,6 +1021,7 @@ fn replace_allocations_with_cloud_operation(
         })
         .collect::<Vec<_>>();
     let now = now_millis();
+    let mut completed_occurrence_outbox = Vec::<(String, Option<i64>)>::new();
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
@@ -925,14 +1058,16 @@ fn replace_allocations_with_cloud_operation(
             )
             .map_err(|error| error.to_string())?;
         if complete_task {
-            complete_task_if_open(
+            if let Some(occurrence_outbox) = complete_task_if_open(
                 &transaction,
                 &workspace_id,
                 &task_id,
                 expected_version,
                 &current.work_date,
                 now,
-            )?;
+            )? {
+                completed_occurrence_outbox.push(occurrence_outbox);
+            }
         }
     }
     let should_convert_to_work = current.kind == "break" && total > 0;
@@ -974,6 +1109,17 @@ fn replace_allocations_with_cloud_operation(
                 "task",
                 Some(&task_id),
                 Some(base_version),
+                None,
+            )?;
+        }
+        for (entity_id, base_version) in completed_occurrence_outbox {
+            crate::cloud_sync::enqueue_entity_in_transaction(
+                &transaction,
+                state,
+                "task_occurrence_set_completed_from_allocation",
+                "task_occurrence",
+                Some(&entity_id),
+                base_version,
                 None,
             )?;
         }
@@ -1265,12 +1411,14 @@ pub(crate) fn complete_task_if_open(
     expected_version: Option<i64>,
     work_date: &str,
     now: i64,
-) -> Result<(), String> {
+) -> Result<Option<(String, Option<i64>)>, String> {
     if crate::recurring::get_active_rule(transaction, workspace_id, task_id)?.is_some()
         || crate::recurring::get_rule_for_date(transaction, workspace_id, task_id, work_date)?
             .is_some()
     {
-        crate::recurring::set_occurrence_status(
+        let previous =
+            crate::recurring::occurrence_for_date(transaction, workspace_id, task_id, work_date)?;
+        let occurrence = crate::recurring::set_occurrence_status(
             transaction,
             workspace_id,
             task_id,
@@ -1279,7 +1427,16 @@ pub(crate) fn complete_task_if_open(
             None,
             now,
         )?;
-        return Ok(());
+        if previous
+            .as_ref()
+            .is_some_and(|item| item.status == occurrence.status)
+        {
+            return Ok(None);
+        }
+        return Ok(Some((
+            crate::recurring::occurrence_entity_id(task_id, work_date),
+            previous.map(|item| item.version),
+        )));
     }
     let status: String = transaction
         .query_row(
@@ -1289,7 +1446,7 @@ pub(crate) fn complete_task_if_open(
         )
         .map_err(|error| error.to_string())?;
     if status == "done" {
-        return Ok(());
+        return Ok(None);
     }
     let expected_version =
         expected_version.ok_or_else(|| "VALIDATION_ERROR: 完成事项时缺少事项版本".to_string())?;
@@ -1310,7 +1467,8 @@ pub(crate) fn complete_task_if_open(
             params![Uuid::now_v7().to_string(), workspace_id, task_id, now],
         )
         .map(|_| ())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(None)
 }
 
 fn manual_time_range(request: &ManualEntryRequest) -> Result<(i64, i64, i64), String> {
@@ -1469,13 +1627,11 @@ pub fn timer_start(
     request: TimerStartRequest,
 ) -> Result<TimeEntryDto, String> {
     let operation_id = request.client_request_id.clone();
-    let result = start_timer_with_hooks(&database, request)?;
-    enqueue_timer_entry_if_cloud(
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = start_timer_with_hooks_and_cloud_operation(
         &database,
-        &result.id,
-        None,
-        "timer_start",
-        Some(&operation_id),
+        request,
+        Some((&state, "timer_start", Some(operation_id.as_str()))),
     )?;
     crate::cloud_sync::flush_if_online(&database)?;
     Ok(result)
@@ -1487,15 +1643,11 @@ pub fn timer_pause(
     request: TimerVersionRequest,
 ) -> Result<TimeEntryDto, String> {
     let expected_version = request.expected_version;
-    let result = pause_timer(&database, request)?;
-    enqueue_timer_entry_if_cloud(
-        &database,
-        &result.id,
-        Some(expected_version),
-        "timer_pause",
-        None,
-    )?;
+    let state = crate::supabase::storage_mode(&database)?;
+    let result =
+        pause_timer_with_cloud_operation(&database, request, Some((&state, "timer_pause")))?;
     crate::cloud_sync::flush_if_online(&database)?;
+    let _ = expected_version;
     Ok(result)
 }
 
@@ -1506,15 +1658,14 @@ pub fn timer_resume(
 ) -> Result<TimeEntryDto, String> {
     let expected_version = request.expected_version;
     let operation_id = request.operation_id.clone();
-    let result = resume_timer(&database, request)?;
-    enqueue_timer_entry_if_cloud(
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = resume_timer_with_cloud_operation(
         &database,
-        &result.id,
-        Some(expected_version),
-        "timer_resume",
-        Some(&operation_id),
+        request,
+        Some((&state, "timer_resume", Some(operation_id.as_str()))),
     )?;
     crate::cloud_sync::flush_if_online(&database)?;
+    let _ = expected_version;
     Ok(result)
 }
 
@@ -1524,33 +1675,15 @@ pub fn timer_stop(
     request: TimerStopRequest,
 ) -> Result<TimeEntryDto, String> {
     let expected_version = request.expected_version;
-    let result = stop_timer_with_hooks(&database, request)?;
-    enqueue_timer_entry_if_cloud(
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = stop_timer_with_hooks_and_cloud_operation(
         &database,
-        &result.id,
-        Some(expected_version),
-        "timer_stop",
-        None,
+        request,
+        Some((&state, "timer_stop")),
     )?;
     crate::cloud_sync::flush_if_online(&database)?;
+    let _ = expected_version;
     Ok(result)
-}
-
-fn enqueue_timer_entry_if_cloud(
-    database: &Database,
-    entry_id: &str,
-    base_version: Option<i64>,
-    operation_type: &str,
-    operation_id: Option<&str>,
-) -> Result<(), String> {
-    crate::cloud_sync::enqueue_entity_deferred(
-        database,
-        operation_type,
-        "time_entry",
-        Some(entry_id),
-        base_version,
-        operation_id,
-    )
 }
 
 #[tauri::command]
@@ -1838,21 +1971,15 @@ mod tests {
         )
         .unwrap();
         let operation_id = Uuid::now_v7().to_string();
-        let entry = start_timer_with_hooks(
+        let state = crate::supabase::storage_mode(&database).unwrap();
+        let entry = start_timer_with_hooks_and_cloud_operation(
             &database,
             TimerStartRequest {
                 task_id: Some(task_id),
                 note: Some("离线云端模式继续本地计时".to_string()),
                 client_request_id: operation_id.clone(),
             },
-        )
-        .unwrap();
-        enqueue_timer_entry_if_cloud(
-            &database,
-            &entry.id,
-            None,
-            "timer_start",
-            Some(&operation_id),
+            Some((&state, "timer_start", Some(operation_id.as_str()))),
         )
         .unwrap();
 
@@ -1880,6 +2007,111 @@ mod tests {
     }
 
     #[test]
+    fn cloud_timer_lifecycle_persists_outbox_in_the_same_transaction() {
+        let (database, _workspace_id, task_id) = setup();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let state = crate::supabase::storage_mode(&database).unwrap();
+        let start_operation_id = Uuid::now_v7().to_string();
+        let resume_operation_id = Uuid::now_v7().to_string();
+
+        let started = start_timer_with_cloud_operation(
+            &database,
+            TimerStartRequest {
+                task_id: Some(task_id),
+                note: Some("云端计时事务队列".to_string()),
+                client_request_id: start_operation_id.clone(),
+            },
+            Some((&state, "timer_start", Some(start_operation_id.as_str()))),
+        )
+        .unwrap();
+        let paused = pause_timer_with_cloud_operation(
+            &database,
+            TimerVersionRequest {
+                entry_id: started.id.clone(),
+                expected_version: started.version,
+            },
+            Some((&state, "timer_pause")),
+        )
+        .unwrap();
+        let resumed = resume_timer_with_cloud_operation(
+            &database,
+            TimerResumeRequest {
+                entry_id: started.id.clone(),
+                expected_version: paused.version,
+                operation_id: resume_operation_id.clone(),
+            },
+            Some((&state, "timer_resume", Some(resume_operation_id.as_str()))),
+        )
+        .unwrap();
+        stop_timer_with_cloud_operation(
+            &database,
+            TimerStopRequest {
+                entry_id: started.id.clone(),
+                expected_version: resumed.version,
+                create_default_allocation: false,
+            },
+            Some((&state, "timer_stop")),
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let outbox = connection
+            .prepare(
+                "SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json FROM sync_outbox ORDER BY created_at, rowid",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(outbox.len(), 4);
+        assert_eq!(outbox[0].0, start_operation_id);
+        assert_eq!(outbox[0].1, "timer_start");
+        assert_eq!(outbox[0].4, None);
+        assert_eq!(outbox[1].1, "timer_pause");
+        assert_eq!(outbox[1].4, Some(started.version));
+        assert_eq!(outbox[2].0, resume_operation_id);
+        assert_eq!(outbox[2].1, "timer_resume");
+        assert_eq!(outbox[2].4, Some(paused.version));
+        assert_eq!(outbox[3].1, "timer_stop");
+        assert_eq!(outbox[3].4, Some(resumed.version));
+        for (_, _, entity_type, entity_id, _, payload) in outbox {
+            let value: Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(entity_type, "time_entry");
+            assert_eq!(entity_id.as_deref(), Some(started.id.as_str()));
+            assert_eq!(value["id"], started.id);
+        }
+    }
+
+    #[test]
     fn timer_pause_resume_stop_excludes_pause_duration() {
         let (database, _, task_id) = setup();
         let started = start_timer(
@@ -1899,22 +2131,24 @@ mod tests {
             )
             .unwrap();
         drop(connection);
-        let paused = pause_timer(
+        let paused = pause_timer_with_cloud_operation(
             &database,
             TimerVersionRequest {
                 entry_id: started.id.clone(),
                 expected_version: started.version,
             },
+            None,
         )
         .unwrap();
         assert!(paused.duration_seconds >= 120);
-        let resumed = resume_timer(
+        let resumed = resume_timer_with_cloud_operation(
             &database,
             TimerResumeRequest {
                 entry_id: started.id.clone(),
                 expected_version: paused.version,
                 operation_id: Uuid::now_v7().to_string(),
             },
+            None,
         )
         .unwrap();
         let stopped = stop_timer(
@@ -2119,6 +2353,32 @@ mod tests {
         assert_eq!(restored.id, started.id);
         assert_eq!(restored.state, "running");
         assert_eq!(restored.note.as_deref(), Some("需要恢复"));
+    }
+
+    #[test]
+    fn running_timer_state_includes_open_segment_duration() {
+        let (database, _, task_id) = setup();
+        let started = start_timer(
+            &database,
+            TimerStartRequest {
+                task_id: Some(task_id),
+                note: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE time_segments SET started_at = started_at - 4000 WHERE entry_id = ?1 AND ended_at IS NULL",
+                [&started.id],
+            )
+            .unwrap();
+
+        let refreshed = get_timer_state(&database).unwrap().unwrap();
+        assert!(refreshed.duration_seconds >= 3);
+        assert!(refreshed.settlement_minutes >= 1);
     }
 
     #[test]

@@ -18,6 +18,8 @@ use crate::supabase::{
     MigrationExecuteRequest,
 };
 use crate::tasks::{self, TaskCreateRequest, TaskListRequest, TaskUpdateRequest};
+use crate::time_tracking::{self, TimeEntryListRequest};
+use crate::unassigned::{self, ResolveWorkRequest, UnassignedAllocationInput};
 
 struct TestConfig {
     project_url: String,
@@ -182,6 +184,17 @@ fn list_tasks(database: &Database) -> Vec<tasks::TaskDto> {
     .tasks
 }
 
+fn today_entries(database: &Database) -> time_tracking::TimeEntryListResult {
+    time_tracking::list_time_entries(
+        database,
+        TimeEntryListRequest {
+            work_date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+            include_breaks: true,
+        },
+    )
+    .unwrap()
+}
+
 async fn subscribe_to_workspace_changes(
     database: &Database,
     workspace_id: &str,
@@ -281,6 +294,39 @@ fn real_supabase_two_device_flow() {
     let device_b = Database::initialize_at(directory.path().join("device-b.sqlite3")).unwrap();
 
     configure_and_sign_in(&device_a, &config);
+    supabase::clear_cached_session_for_test(&device_a);
+    assert!(
+        supabase::current_session(&device_a).is_ok(),
+        "应用重启模拟后没有从系统凭据恢复 Supabase 会话"
+    );
+    let access_before_refresh = supabase::current_session(&device_a).unwrap().access_token;
+    supabase::force_cached_session_expiry_for_test(&device_a).unwrap();
+    let access_after_refresh = supabase::current_session(&device_a).unwrap().access_token;
+    assert_ne!(
+        access_after_refresh, access_before_refresh,
+        "access token 到期后没有自动刷新会话"
+    );
+    {
+        let original_url = config.project_url.clone();
+        device_a
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE device_settings SET value_json = ?1 WHERE key = 'supabase_project_url'",
+                [json!("http://127.0.0.1:9").to_string()],
+            )
+            .unwrap();
+        let offline = supabase::session_snapshot_for_database(&device_a).unwrap();
+        assert_eq!(offline.status, "offline_saved", "断网时没有保留登录状态");
+        device_a
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE device_settings SET value_json = ?1 WHERE key = 'supabase_project_url'",
+                [json!(original_url).to_string()],
+            )
+            .unwrap();
+    }
     let _cleanup = CleanupGuard {
         database: device_a.clone(),
     };
@@ -295,19 +341,7 @@ fn real_supabase_two_device_flow() {
     register_device(&device_b, "Supabase E2E 设备 B");
     migrate(&device_b, "cloud_to_local_snapshot");
 
-    let api = supabase::client(&device_a).unwrap();
-    let session = supabase::current_session(&device_a).unwrap();
-    let devices: Vec<Value> = api
-        .request(
-            api.get(format!(
-                "{}/rest/v1/devices?workspace_id=eq.{}&revoked_at=is.null&select=id,device_name",
-                api.project_url, workspace.id
-            )),
-            &session,
-        )
-        .unwrap()
-        .json()
-        .unwrap();
+    let devices = supabase::list_devices(&device_a).unwrap();
     assert_eq!(devices.len(), 2, "云端没有注册两台独立设备");
 
     let subject_id = subjects::list_subjects(&device_a).unwrap()[0].id.clone();
@@ -441,7 +475,7 @@ fn real_supabase_two_device_flow() {
         "冲突选择云端版本后本地缓存没有恢复云端内容"
     );
 
-    let timer = cloud_sync::timer_start(
+    let timer = cloud_sync::legacy_cloud_timer_start_local_first(
         &device_a,
         CloudTimerStartRequest {
             task_id: Some(synced_task.id.clone()),
@@ -450,7 +484,15 @@ fn real_supabase_two_device_flow() {
         },
     )
     .unwrap();
-    let parallel = cloud_sync::timer_start(
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: None,
+        },
+    )
+    .unwrap();
+    let parallel = cloud_sync::legacy_cloud_timer_start_local_first(
         &device_b,
         CloudTimerStartRequest {
             task_id: Some(synced_task.id.clone()),
@@ -459,43 +501,133 @@ fn real_supabase_two_device_flow() {
         },
     )
     .unwrap_err();
-    assert!(parallel.contains("REMOTE_TIMER_ACTIVE"));
+    assert!(parallel.contains("ACTIVE_TIMER_EXISTS"));
 
-    let entry_id = timer["id"].as_str().unwrap().to_string();
-    let paused = cloud_sync::timer_action(
+    let entry_id = timer.id.clone();
+    let paused = cloud_sync::legacy_cloud_timer_pause_local_first(
         &device_b,
-        "timer_pause",
         CloudTimerVersionRequest {
             entry_id: entry_id.clone(),
-            expected_version: timer["version"].as_i64().unwrap(),
+            expected_version: timer.version,
             operation_id: Uuid::now_v7().to_string(),
         },
     )
     .unwrap();
-    let resumed = cloud_sync::timer_action(
+    cloud_sync::pull(
         &device_a,
-        "timer_resume",
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: None,
+        },
+    )
+    .unwrap();
+    let resumed = cloud_sync::legacy_cloud_timer_resume_local_first(
+        &device_a,
         CloudTimerVersionRequest {
             entry_id: entry_id.clone(),
-            expected_version: paused["version"].as_i64().unwrap(),
+            expected_version: paused.version,
             operation_id: Uuid::now_v7().to_string(),
         },
     )
     .unwrap();
-    let stopped = cloud_sync::timer_action(
+    cloud_sync::pull(
         &device_b,
-        "timer_stop",
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: None,
+        },
+    )
+    .unwrap();
+    let stopped = cloud_sync::legacy_cloud_timer_stop_local_first(
+        &device_b,
         CloudTimerVersionRequest {
             entry_id,
-            expected_version: resumed["version"].as_i64().unwrap(),
+            expected_version: resumed.version,
             operation_id: Uuid::now_v7().to_string(),
         },
     )
     .unwrap();
-    assert_eq!(stopped["state"], "ended");
+    assert_eq!(stopped.state, "ended");
+    cloud_sync::pull(
+        &device_a,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: None,
+        },
+    )
+    .unwrap();
     assert!(
-        cloud_sync::timer_get_state(&device_a).unwrap().is_none(),
+        crate::time_tracking::get_timer_state(&device_a)
+            .unwrap()
+            .is_none(),
         "全局计时器停止后仍然存在活动计时"
+    );
+
+    let unassigned_task = create_task(&device_a, &subject_id, "Supabase E2E 未归属事项");
+    cloud_sync::enqueue_entity(
+        &device_a,
+        "task_create",
+        "task",
+        Some(&unassigned_task.id),
+        None,
+        None,
+    )
+    .unwrap();
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: None,
+        },
+    )
+    .unwrap();
+    let unassigned_state = unassigned::get_state(&device_a).unwrap().unwrap();
+    device_a
+        .open()
+        .unwrap()
+        .execute(
+            "UPDATE unassigned_segments SET started_at = started_at - 120000 WHERE session_id = ?1 AND ended_at IS NULL",
+            [&unassigned_state.session_id],
+        )
+        .unwrap();
+    let unassigned_state = unassigned::get_state(&device_a).unwrap().unwrap();
+    let unassigned_result = unassigned::resolve_work_for_sync(
+        &device_a,
+        ResolveWorkRequest {
+            session_id: unassigned_state.session_id.clone(),
+            expected_version: unassigned_state.version,
+            operation_id: Uuid::now_v7().to_string(),
+            allocations: vec![UnassignedAllocationInput {
+                task_id: unassigned_task.id.clone(),
+                minutes: unassigned_state.required_minutes,
+                complete_task: false,
+                task_expected_version: None,
+            }],
+        },
+    )
+    .unwrap();
+    let generated_entry_id = unassigned_result
+        .generated_entry_id
+        .as_deref()
+        .expect("未归属处理没有生成时间记录");
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: None,
+        },
+    )
+    .unwrap();
+    let synced_unassigned_entry = today_entries(&device_b)
+        .entries
+        .into_iter()
+        .find(|entry| entry.id == generated_entry_id)
+        .expect("设备 B 没有同步到未归属处理生成的记录");
+    assert_eq!(synced_unassigned_entry.kind, "work");
+    assert_eq!(synced_unassigned_entry.source_type, "unassigned");
+    assert_eq!(
+        synced_unassigned_entry.allocated_minutes, unassigned_state.required_minutes,
+        "未归属时间同步后分配分钟不正确"
     );
 
     let lease_a = cloud_sync::acquire_lease(&device_a).unwrap();
@@ -530,6 +662,88 @@ fn real_supabase_two_device_flow() {
     )
     .unwrap();
 
+    let device_a_id = supabase::storage_mode(&device_a).unwrap().device_id;
+    let device_b_id = supabase::storage_mode(&device_b).unwrap().device_id;
+    let retained_task = create_task(&device_b, &subject_id, "撤销后保留的设备 B 本地事项");
+    cloud_sync::enqueue_entity_deferred(
+        &device_b,
+        "task_create",
+        "task",
+        Some(&retained_task.id),
+        None,
+        Some(&Uuid::now_v7().to_string()),
+    )
+    .unwrap();
+    supabase::revoke_device(&device_a, &device_b_id).unwrap();
+    assert!(
+        supabase::current_session(&device_a).is_ok(),
+        "撤销设备 B 不应影响设备 A 的登录状态"
+    );
+    let revoked_push = cloud_sync::push_outbox(&device_b).unwrap_err();
+    assert!(revoked_push.contains("DEVICE_REVOKED"));
+    assert!(
+        list_tasks(&device_b)
+            .iter()
+            .any(|task| task.id == retained_task.id),
+        "设备 B 被撤销后本地事项丢失"
+    );
+    assert!(
+        cloud_sync::sync_status(&device_b)
+            .unwrap()
+            .pending_operations
+            > 0,
+        "设备 B 被撤销后 outbox 被错误删除"
+    );
+    assert_eq!(
+        supabase::session_snapshot_for_database(&device_b)
+            .unwrap()
+            .status,
+        "reauth_required"
+    );
+
+    configure_and_sign_in(&device_b, &config);
+    register_device(&device_b, "Supabase E2E 设备 B");
+    let blocked_push = cloud_sync::push_outbox(&device_b).unwrap_err();
+    assert!(blocked_push.contains("AUTH_RESUME_REQUIRED"));
+    supabase::resume_pending_sync(&device_b).unwrap();
+    assert!(cloud_sync::push_outbox(&device_b).is_ok());
+
+    supabase::sign_out_all(&device_a).unwrap();
+    supabase::force_cached_session_expiry_for_test(&device_b).unwrap();
+    assert!(
+        supabase::current_session(&device_b).is_err(),
+        "退出所有设备后设备 B 的 refresh token 仍可用"
+    );
+
+    configure_and_sign_in(&device_a, &config);
+    register_device(&device_a, "Supabase E2E 设备 A");
+    configure_and_sign_in(&device_b, &config);
+    register_device(&device_b, "Supabase E2E 设备 B");
+    let externally_revoked_session = supabase::current_session(&device_b).unwrap();
+    let external_logout = reqwest::blocking::Client::new()
+        .post(format!(
+            "{}/auth/v1/logout?scope=global",
+            config.project_url
+        ))
+        .header("apikey", &config.anon_key)
+        .bearer_auth(&externally_revoked_session.access_token)
+        .send()
+        .unwrap();
+    assert!(
+        external_logout.status().is_success(),
+        "模拟后台 Auth 撤销失败"
+    );
+    supabase::force_cached_session_expiry_for_test(&device_b).unwrap();
+    assert!(
+        supabase::current_session(&device_b).is_err(),
+        "后台 Auth 撤销后客户端刷新仍被视为有效"
+    );
+    assert_eq!(
+        supabase::storage_mode(&device_a).unwrap().device_id,
+        device_a_id
+    );
+
+    configure_and_sign_in(&device_a, &config);
     reset_owned_workspaces(&device_a);
     let _ = supabase::sign_out(&device_a);
     let _ = supabase::sign_out(&device_b);

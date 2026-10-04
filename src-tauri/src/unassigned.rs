@@ -79,11 +79,21 @@ pub fn get_state(database: &Database) -> Result<Option<UnassignedStateDto>, Stri
     Ok(result)
 }
 
+#[cfg(test)]
 pub fn resolve_work(
     database: &Database,
     request: ResolveWorkRequest,
 ) -> Result<UnassignedResolveResult, String> {
+    resolve_work_with_cloud_operation(database, request, None)
+}
+
+fn resolve_work_with_cloud_operation(
+    database: &Database,
+    request: ResolveWorkRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
+) -> Result<UnassignedResolveResult, String> {
     validate_operation_id(&request.operation_id)?;
+    let session_base_version = request.expected_version;
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     let device_id = device_id(&connection, &workspace_id)?;
@@ -168,6 +178,7 @@ pub fn resolve_work(
             )?;
         }
     }
+    let mut completed_occurrence_outbox = Vec::<(String, Option<i64>)>::new();
     for (task_id, (minutes, complete_task, expected_version)) in merged {
         let work_date = local_date();
         crate::recurring::ensure_occurrence_if_recurring(
@@ -185,14 +196,16 @@ pub fn resolve_work(
             )
             .map_err(|error| error.to_string())?;
         if complete_task {
-            crate::time_tracking::complete_task_if_open(
+            if let Some(occurrence_outbox) = crate::time_tracking::complete_task_if_open(
                 &transaction,
                 &workspace_id,
                 &task_id,
                 expected_version,
                 &work_date,
                 now,
-            )?;
+            )? {
+                completed_occurrence_outbox.push(occurrence_outbox);
+            }
         }
     }
     finish_session(
@@ -221,13 +234,47 @@ pub fn resolve_work(
     )?;
     start_next_session_if_idle(&transaction, &workspace_id, now)?;
     bump_revision(&transaction)?;
+    if let Some((state, operation_type, operation_id)) = cloud_operation {
+        if let Some(entry_id) = result.generated_entry_id.as_deref() {
+            crate::cloud_sync::enqueue_entity_in_transaction(
+                &transaction,
+                state,
+                operation_type,
+                "time_entry",
+                Some(entry_id),
+                None,
+                operation_id,
+            )?;
+        }
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            "unassigned_session.update",
+            "unassigned_session",
+            Some(&result.session_id),
+            Some(session_base_version),
+            None,
+        )?;
+        for (entity_id, base_version) in completed_occurrence_outbox {
+            crate::cloud_sync::enqueue_entity_in_transaction(
+                &transaction,
+                state,
+                "task_occurrence_set_completed_from_unassigned",
+                "task_occurrence",
+                Some(&entity_id),
+                base_version,
+                None,
+            )?;
+        }
+    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
 
-pub fn resolve_work_with_hooks(
+fn resolve_work_with_hooks_and_cloud_operation(
     database: &Database,
     request: ResolveWorkRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
 ) -> Result<UnassignedResolveResult, String> {
     let work_date = local_date();
     let operation_id = request.operation_id.clone();
@@ -240,7 +287,7 @@ pub fn resolve_work_with_hooks(
                 .map(|completed| (allocation.task_id.clone(), completed))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let result = resolve_work(database, request)?;
+    let result = resolve_work_with_cloud_operation(database, request, cloud_operation)?;
     for (task_id, was_completed) in candidates {
         if !was_completed && crate::tasks::task_is_completed(database, &task_id, Some(&work_date))?
         {
@@ -255,26 +302,41 @@ pub fn resolve_work_with_hooks(
     Ok(result)
 }
 
-pub fn resolve_break(
+pub fn resolve_work_for_sync(
     database: &Database,
-    request: ResolveSessionRequest,
+    request: ResolveWorkRequest,
 ) -> Result<UnassignedResolveResult, String> {
-    resolve_without_allocations(database, request, "break")
+    let operation_id = request.operation_id.clone();
+    let state = crate::supabase::storage_mode(database)?;
+    let result = resolve_work_with_hooks_and_cloud_operation(
+        database,
+        request,
+        Some((
+            &state,
+            "unassigned_resolve_work",
+            Some(operation_id.as_str()),
+        )),
+    )?;
+    crate::cloud_sync::flush_if_online(database)?;
+    Ok(result)
 }
 
+#[cfg(test)]
 pub fn discard(
     database: &Database,
     request: ResolveSessionRequest,
 ) -> Result<UnassignedResolveResult, String> {
-    resolve_without_allocations(database, request, "discard")
+    resolve_without_allocations(database, request, "discard", None)
 }
 
 fn resolve_without_allocations(
     database: &Database,
     request: ResolveSessionRequest,
     resolution_type: &str,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
 ) -> Result<UnassignedResolveResult, String> {
     validate_operation_id(&request.operation_id)?;
+    let session_base_version = request.expected_version;
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     let device_id = device_id(&connection, &workspace_id)?;
@@ -351,7 +413,65 @@ fn resolve_without_allocations(
     )?;
     start_next_session_if_idle(&transaction, &workspace_id, now)?;
     bump_revision(&transaction)?;
+    if let Some((state, operation_type, operation_id)) = cloud_operation {
+        if let Some(entry_id) = result.generated_entry_id.as_deref() {
+            crate::cloud_sync::enqueue_entity_in_transaction(
+                &transaction,
+                state,
+                operation_type,
+                "time_entry",
+                Some(entry_id),
+                None,
+                operation_id,
+            )?;
+        }
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            "unassigned_session.update",
+            "unassigned_session",
+            Some(&result.session_id),
+            Some(session_base_version),
+            None,
+        )?;
+    }
     transaction.commit().map_err(|error| error.to_string())?;
+    Ok(result)
+}
+
+pub fn resolve_break_for_sync(
+    database: &Database,
+    request: ResolveSessionRequest,
+) -> Result<UnassignedResolveResult, String> {
+    let operation_id = request.operation_id.clone();
+    let state = crate::supabase::storage_mode(database)?;
+    let result = resolve_without_allocations(
+        database,
+        request,
+        "break",
+        Some((
+            &state,
+            "unassigned_resolve_break",
+            Some(operation_id.as_str()),
+        )),
+    )?;
+    crate::cloud_sync::flush_if_online(database)?;
+    Ok(result)
+}
+
+pub fn discard_for_sync(
+    database: &Database,
+    request: ResolveSessionRequest,
+) -> Result<UnassignedResolveResult, String> {
+    let operation_id = request.operation_id.clone();
+    let state = crate::supabase::storage_mode(database)?;
+    let result = resolve_without_allocations(
+        database,
+        request,
+        "discard",
+        Some((&state, "unassigned_discard", Some(operation_id.as_str()))),
+    )?;
+    crate::cloud_sync::flush_if_online(database)?;
     Ok(result)
 }
 
@@ -816,7 +936,12 @@ fn now_millis() -> i64 {
 pub fn unassigned_get_state(
     database: tauri::State<'_, Database>,
 ) -> Result<Option<UnassignedStateDto>, String> {
-    get_state(&database)
+    let state = crate::supabase::storage_mode(&database)?;
+    if state.mode == "cloud" {
+        crate::cloud_sync::refresh_unassigned_state_for_cloud_mode(&database)
+    } else {
+        get_state(&database)
+    }
 }
 
 #[tauri::command]
@@ -824,18 +949,7 @@ pub fn unassigned_resolve_work(
     database: tauri::State<'_, Database>,
     request: ResolveWorkRequest,
 ) -> Result<UnassignedResolveResult, String> {
-    let expected_version = request.expected_version;
-    let operation_id = request.operation_id.clone();
-    let result = resolve_work_with_hooks(&database, request)?;
-    enqueue_unassigned_resolution_if_cloud(
-        &database,
-        &result,
-        expected_version,
-        "unassigned_resolve_work",
-        Some(&operation_id),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+    resolve_work_for_sync(&database, request)
 }
 
 #[tauri::command]
@@ -843,18 +957,7 @@ pub fn unassigned_resolve_break(
     database: tauri::State<'_, Database>,
     request: ResolveSessionRequest,
 ) -> Result<UnassignedResolveResult, String> {
-    let expected_version = request.expected_version;
-    let operation_id = request.operation_id.clone();
-    let result = resolve_break(&database, request)?;
-    enqueue_unassigned_resolution_if_cloud(
-        &database,
-        &result,
-        expected_version,
-        "unassigned_resolve_break",
-        Some(&operation_id),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+    resolve_break_for_sync(&database, request)
 }
 
 #[tauri::command]
@@ -862,38 +965,7 @@ pub fn unassigned_discard(
     database: tauri::State<'_, Database>,
     request: ResolveSessionRequest,
 ) -> Result<UnassignedResolveResult, String> {
-    let expected_version = request.expected_version;
-    let operation_id = request.operation_id.clone();
-    let result = discard(&database, request)?;
-    enqueue_unassigned_resolution_if_cloud(
-        &database,
-        &result,
-        expected_version,
-        "unassigned_discard",
-        Some(&operation_id),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
-}
-
-fn enqueue_unassigned_resolution_if_cloud(
-    database: &Database,
-    result: &UnassignedResolveResult,
-    base_version: i64,
-    operation_type: &str,
-    operation_id: Option<&str>,
-) -> Result<(), String> {
-    if let Some(entry_id) = result.generated_entry_id.as_deref() {
-        return crate::cloud_sync::enqueue_entity_deferred(
-            database,
-            operation_type,
-            "time_entry",
-            Some(entry_id),
-            Some(base_version),
-            operation_id,
-        );
-    }
-    Ok(())
+    discard_for_sync(&database, request)
 }
 
 #[cfg(test)]
@@ -1075,7 +1147,8 @@ mod tests {
             .unwrap();
         let due = get_state(&database).unwrap().unwrap();
         let operation_id = Uuid::now_v7().to_string();
-        let result = resolve_work_with_hooks(
+        let state = crate::supabase::storage_mode(&database).unwrap();
+        let result = resolve_work_with_hooks_and_cloud_operation(
             &database,
             ResolveWorkRequest {
                 session_id: due.session_id,
@@ -1088,36 +1161,185 @@ mod tests {
                 expected_version: due.version,
                 operation_id: operation_id.clone(),
             },
-        )
-        .unwrap();
-        enqueue_unassigned_resolution_if_cloud(
-            &database,
-            &result,
-            due.version,
-            "unassigned_resolve_work",
-            Some(&operation_id),
+            Some((
+                &state,
+                "unassigned_resolve_work",
+                Some(operation_id.as_str()),
+            )),
         )
         .unwrap();
         crate::cloud_sync::flush_if_online(&database).unwrap();
 
         let entry_id = result.generated_entry_id.unwrap();
-        let outbox: (String, String, String, String) = database
+        let connection = database.open().unwrap();
+        let outbox = connection
+            .prepare(
+                "SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json FROM sync_outbox WHERE workspace_id = ?1 ORDER BY created_at, rowid",
+            )
+            .unwrap()
+            .query_map([cloud_workspace_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(outbox.len(), 2);
+        assert_eq!(outbox[0].0, operation_id);
+        assert_eq!(outbox[0].1, "unassigned_resolve_work");
+        assert_eq!(outbox[0].2, "time_entry");
+        assert_eq!(outbox[0].3, entry_id);
+        assert_eq!(outbox[0].4, None);
+        assert_eq!(outbox[1].1, "unassigned_session.update");
+        assert_eq!(outbox[1].2, "unassigned_session");
+        assert_eq!(outbox[1].3, result.session_id);
+        assert_eq!(outbox[1].4, Some(due.version));
+        let session_payload: serde_json::Value = serde_json::from_str(&outbox[1].5).unwrap();
+        assert_eq!(
+            session_payload
+                .get("generated_entry_id")
+                .and_then(serde_json::Value::as_str),
+            Some(entry_id.as_str())
+        );
+        assert!(session_payload
+            .get("segments")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|segments| !segments.is_empty()));
+    }
+
+    #[test]
+    fn cloud_mode_unassigned_break_and_discard_queue_generated_entries_transactionally() {
+        let (database, _) = setup();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let state = crate::supabase::storage_mode(&database).unwrap();
+
+        let first = get_state(&database).unwrap().unwrap();
+        database
             .open()
             .unwrap()
-            .query_row(
-                "SELECT operation_id, operation_type, entity_type, entity_id FROM sync_outbox WHERE workspace_id = ?1",
-                [cloud_workspace_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            .execute(
+                "UPDATE unassigned_segments SET started_at = started_at - 60000 WHERE session_id = ?1 AND ended_at IS NULL",
+                [&first.session_id],
             )
             .unwrap();
-        assert_eq!(
-            outbox,
-            (
-                operation_id,
-                "unassigned_resolve_work".to_string(),
-                "time_entry".to_string(),
-                entry_id,
+        let first = get_state(&database).unwrap().unwrap();
+        let break_operation_id = Uuid::now_v7().to_string();
+        let break_result = resolve_without_allocations(
+            &database,
+            ResolveSessionRequest {
+                session_id: first.session_id,
+                expected_version: first.version,
+                operation_id: break_operation_id.clone(),
+            },
+            "break",
+            Some((
+                &state,
+                "unassigned_resolve_break",
+                Some(break_operation_id.as_str()),
+            )),
+        )
+        .unwrap();
+
+        let second = get_state(&database).unwrap().unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE unassigned_segments SET started_at = started_at - 60000 WHERE session_id = ?1 AND ended_at IS NULL",
+                [&second.session_id],
             )
+            .unwrap();
+        let second = get_state(&database).unwrap().unwrap();
+        let discard_operation_id = Uuid::now_v7().to_string();
+        let discard_result = resolve_without_allocations(
+            &database,
+            ResolveSessionRequest {
+                session_id: second.session_id,
+                expected_version: second.version,
+                operation_id: discard_operation_id.clone(),
+            },
+            "discard",
+            Some((
+                &state,
+                "unassigned_discard",
+                Some(discard_operation_id.as_str()),
+            )),
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let outbox = connection
+            .prepare(
+                "SELECT operation_id, operation_type, entity_type, entity_id, base_version FROM sync_outbox ORDER BY created_at, rowid",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(outbox.len(), 4);
+        assert_eq!(outbox[0].0, break_operation_id);
+        assert_eq!(outbox[0].1, "unassigned_resolve_break");
+        assert_eq!(outbox[0].2, "time_entry");
+        assert_eq!(
+            outbox[0].3.as_deref(),
+            break_result.generated_entry_id.as_deref()
         );
+        assert_eq!(outbox[0].4, None);
+        assert_eq!(outbox[1].1, "unassigned_session.update");
+        assert_eq!(outbox[1].2, "unassigned_session");
+        assert_eq!(
+            outbox[1].3.as_deref(),
+            Some(break_result.session_id.as_str())
+        );
+        assert_eq!(outbox[1].4, Some(first.version));
+        assert_eq!(outbox[2].0, discard_operation_id);
+        assert_eq!(outbox[2].1, "unassigned_discard");
+        assert_eq!(outbox[2].2, "time_entry");
+        assert_eq!(
+            outbox[2].3.as_deref(),
+            discard_result.generated_entry_id.as_deref()
+        );
+        assert_eq!(outbox[2].4, None);
+        assert_eq!(outbox[3].1, "unassigned_session.update");
+        assert_eq!(outbox[3].2, "unassigned_session");
+        assert_eq!(
+            outbox[3].3.as_deref(),
+            Some(discard_result.session_id.as_str())
+        );
+        assert_eq!(outbox[3].4, Some(second.version));
     }
 }

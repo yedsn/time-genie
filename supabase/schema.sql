@@ -27,9 +27,15 @@ create table if not exists timegenie.devices (
   platform text not null,
   app_version text not null,
   last_seen_at timestamptz not null default now(),
+  authorized_at timestamptz not null default now(),
+  reauthorized_at timestamptz,
+  auth_session_id text,
   created_at timestamptz not null default now(),
   revoked_at timestamptz
 );
+alter table timegenie.devices add column if not exists authorized_at timestamptz not null default now();
+alter table timegenie.devices add column if not exists reauthorized_at timestamptz;
+alter table timegenie.devices add column if not exists auth_session_id text;
 create index if not exists idx_devices_workspace on timegenie.devices(workspace_id, revoked_at);
 
 create table if not exists timegenie.tracking_leases (
@@ -45,12 +51,13 @@ create table if not exists timegenie.workspace_changes (
   change_seq bigint generated always as identity primary key,
   workspace_id uuid not null references timegenie.workspaces(id) on delete cascade,
   entity_type text not null,
-  entity_id uuid not null,
+  entity_id text not null,
   operation text not null check (operation in ('insert', 'update', 'delete')),
   entity_version bigint not null,
   changed_by_device_id uuid references timegenie.devices(id),
   changed_at timestamptz not null default now()
 );
+alter table timegenie.workspace_changes alter column entity_id type text using entity_id::text;
 create index if not exists idx_workspace_changes_pull on timegenie.workspace_changes(workspace_id, change_seq);
 
 create table if not exists timegenie.processed_operations (
@@ -427,13 +434,19 @@ create or replace function timegenie.touch_workspace_change()
 returns trigger language plpgsql security definer set search_path = timegenie, extensions, pg_catalog
 as $$
 declare row_image jsonb;
+declare changed_entity_id text;
 begin
   row_image := to_jsonb(coalesce(new, old));
+  changed_entity_id := case tg_table_name
+    when 'task_daily_estimates' then (row_image->>'task_id') || '|' || (row_image->>'work_date')
+    when 'task_occurrences' then (row_image->>'task_id') || '|' || (row_image->>'occurrence_date')
+    else coalesce(row_image->>'id', row_image->>'task_id')
+  end;
   insert into timegenie.workspace_changes(workspace_id, entity_type, entity_id, operation, entity_version, changed_at)
   values (
     (row_image->>'workspace_id')::uuid,
     tg_table_name,
-    coalesce(nullif(row_image->>'id', '')::uuid, nullif(row_image->>'task_id', '')::uuid),
+    changed_entity_id,
     lower(tg_op),
     coalesce((row_image->>'version')::bigint, 1),
     now()
@@ -445,6 +458,109 @@ create or replace function timegenie.operation_request_hash(p_operation_type tex
 returns text language sql immutable as $$
   select encode(extensions.digest(jsonb_build_object('operationType', p_operation_type, 'request', coalesce(p_request, '{}'::jsonb))::text, 'sha256'), 'hex');
 $$;
+
+create or replace function timegenie.current_auth_session_id()
+returns text language sql stable security definer set search_path = timegenie, extensions, pg_catalog
+as $$
+  select coalesce(
+    (nullif(current_setting('request.jwt.claims', true), '')::jsonb)->>'session_id',
+    nullif(current_setting('request.jwt.claim.session_id', true), '')
+  );
+$$;
+
+create or replace function timegenie.device_authorize(
+  p_workspace_id uuid, p_device_id uuid, p_device_name text, p_platform text, p_app_version text
+) returns jsonb language plpgsql security definer set search_path = timegenie, extensions, pg_catalog
+as $$
+declare existing_device timegenie.devices; authorized_device timegenie.devices; current_session_id text;
+begin
+  if not timegenie.is_workspace_owner(p_workspace_id) then raise exception 'AUTH_REQUIRED'; end if;
+  current_session_id := timegenie.current_auth_session_id();
+  if current_session_id is null then raise exception 'AUTH_SESSION_REQUIRED'; end if;
+  select * into existing_device from timegenie.devices where id = p_device_id for update;
+  if found and existing_device.workspace_id <> p_workspace_id then raise exception 'AUTH_REQUIRED'; end if;
+  if found and existing_device.revoked_at is not null and existing_device.auth_session_id = current_session_id then
+    raise exception 'PASSWORD_REAUTH_REQUIRED';
+  end if;
+  insert into timegenie.devices(id, workspace_id, device_name, platform, app_version, last_seen_at, authorized_at, reauthorized_at, auth_session_id, revoked_at)
+  values(p_device_id, p_workspace_id, nullif(trim(p_device_name), ''), p_platform, p_app_version, now(), now(), null, current_session_id, null)
+  on conflict(id) do update set
+    device_name = excluded.device_name,
+    platform = excluded.platform,
+    app_version = excluded.app_version,
+    last_seen_at = now(),
+    reauthorized_at = case when timegenie.devices.revoked_at is not null then now() else timegenie.devices.reauthorized_at end,
+    auth_session_id = current_session_id,
+    revoked_at = null
+  returning * into authorized_device;
+  return jsonb_build_object(
+    'id', authorized_device.id, 'workspace_id', authorized_device.workspace_id,
+    'device_name', authorized_device.device_name, 'platform', authorized_device.platform,
+    'app_version', authorized_device.app_version, 'last_seen_at', authorized_device.last_seen_at,
+    'authorized_at', authorized_device.authorized_at, 'reauthorized_at', authorized_device.reauthorized_at,
+    'revoked_at', authorized_device.revoked_at
+  );
+end $$;
+
+create or replace function timegenie.device_authorization_get(p_workspace_id uuid, p_device_id uuid)
+returns jsonb language plpgsql security definer set search_path = timegenie, extensions, pg_catalog
+as $$
+declare device_row timegenie.devices;
+begin
+  if not timegenie.is_workspace_owner(p_workspace_id) then raise exception 'AUTH_REQUIRED'; end if;
+  select * into device_row from timegenie.devices where workspace_id = p_workspace_id and id = p_device_id;
+  if not found then return jsonb_build_object('authorized', false, 'reason', 'DEVICE_NOT_REGISTERED'); end if;
+  return jsonb_build_object(
+    'authorized', device_row.revoked_at is null,
+    'reason', case when device_row.revoked_at is null then null else 'DEVICE_REVOKED' end,
+    'revoked_at', device_row.revoked_at
+  );
+end $$;
+
+create or replace function timegenie.device_list(p_workspace_id uuid)
+returns jsonb language plpgsql security definer set search_path = timegenie, extensions, pg_catalog
+as $$
+begin
+  if not timegenie.is_workspace_owner(p_workspace_id) then raise exception 'AUTH_REQUIRED'; end if;
+  return coalesce((
+    select jsonb_agg(jsonb_build_object(
+      'id', d.id, 'workspace_id', d.workspace_id, 'device_name', d.device_name,
+      'platform', d.platform, 'app_version', d.app_version, 'last_seen_at', d.last_seen_at,
+      'authorized_at', d.authorized_at, 'reauthorized_at', d.reauthorized_at, 'revoked_at', d.revoked_at
+    ) order by d.revoked_at is not null, d.last_seen_at desc)
+    from timegenie.devices d where d.workspace_id = p_workspace_id
+  ), '[]'::jsonb);
+end $$;
+
+create or replace function timegenie.device_revoke(p_workspace_id uuid, p_device_id uuid)
+returns jsonb language plpgsql security definer set search_path = timegenie, extensions, pg_catalog
+as $$
+declare affected integer;
+begin
+  if not timegenie.is_workspace_owner(p_workspace_id) then raise exception 'AUTH_REQUIRED'; end if;
+  update timegenie.devices set revoked_at = coalesce(revoked_at, now())
+  where workspace_id = p_workspace_id and id = p_device_id;
+  get diagnostics affected = row_count;
+  if affected = 0 then raise exception 'DEVICE_NOT_FOUND'; end if;
+  update timegenie.tracking_leases
+  set holder_device_id = null, lease_token = null, expires_at = null, updated_at = now(), version = version + 1
+  where workspace_id = p_workspace_id and holder_device_id = p_device_id;
+  return jsonb_build_object('deviceId', p_device_id, 'revoked', true);
+end $$;
+
+create or replace function timegenie.device_revoke_all(p_workspace_id uuid)
+returns jsonb language plpgsql security definer set search_path = timegenie, extensions, pg_catalog
+as $$
+declare affected integer;
+begin
+  if not timegenie.is_workspace_owner(p_workspace_id) then raise exception 'AUTH_REQUIRED'; end if;
+  update timegenie.devices set revoked_at = coalesce(revoked_at, now()) where workspace_id = p_workspace_id;
+  get diagnostics affected = row_count;
+  update timegenie.tracking_leases
+  set holder_device_id = null, lease_token = null, expires_at = null, updated_at = now(), version = version + 1
+  where workspace_id = p_workspace_id;
+  return jsonb_build_object('revokedCount', affected);
+end $$;
 
 create or replace function timegenie.processed_operation_result(
   p_workspace_id uuid,
@@ -914,7 +1030,9 @@ begin
      or exists(select 1 from timegenie.task_daily_estimates where workspace_id = p_workspace_id)
      or exists(select 1 from timegenie.task_recurrence_rules where workspace_id = p_workspace_id)
      or exists(select 1 from timegenie.task_occurrences where workspace_id = p_workspace_id)
+     or exists(select 1 from timegenie.work_days where workspace_id = p_workspace_id)
      or exists(select 1 from timegenie.time_entries where workspace_id = p_workspace_id)
+     or exists(select 1 from timegenie.unassigned_sessions where workspace_id = p_workspace_id)
      or exists(select 1 from timegenie.reports where workspace_id = p_workspace_id) then
     raise exception 'MIGRATION_TARGET_NOT_EMPTY';
   end if;
@@ -980,7 +1098,7 @@ begin
   end loop;
   for row_data in select value from jsonb_array_elements(coalesce(p_snapshot->'time_entries', '[]'::jsonb)) loop
     insert into timegenie.time_entries(id, workspace_id, work_date, kind, source_type, state, default_task_id, label_snapshot, started_at, ended_at, duration_seconds, note, origin_unassigned_session_id, created_at, updated_at, version, created_by_device_id, updated_by_device_id, deleted_at)
-    values((row_data->>'id')::uuid, p_workspace_id, (row_data->>'work_date')::date, row_data->>'kind', row_data->>'source_type', row_data->>'state', nullif(row_data->>'default_task_id','')::uuid, row_data->>'label_snapshot', to_timestamp((row_data->>'started_at')::double precision / 1000), case when row_data->>'ended_at' is null then null else to_timestamp((row_data->>'ended_at')::double precision / 1000) end, coalesce((row_data->>'duration_seconds')::bigint,0), row_data->>'note', null, to_timestamp((row_data->>'created_at')::double precision / 1000), to_timestamp((row_data->>'updated_at')::double precision / 1000), coalesce((row_data->>'version')::bigint,1), p_device_id, p_device_id, case when row_data->>'deleted_at' is null then null else to_timestamp((row_data->>'deleted_at')::double precision / 1000) end)
+    values((row_data->>'id')::uuid, p_workspace_id, (row_data->>'work_date')::date, row_data->>'kind', row_data->>'source_type', row_data->>'state', nullif(row_data->>'default_task_id','')::uuid, row_data->>'label_snapshot', to_timestamp((row_data->>'started_at')::double precision / 1000), case when row_data->>'ended_at' is null then null else to_timestamp((row_data->>'ended_at')::double precision / 1000) end, coalesce((row_data->>'duration_seconds')::bigint,0), row_data->>'note', nullif(row_data->>'origin_unassigned_session_id','')::uuid, to_timestamp((row_data->>'created_at')::double precision / 1000), to_timestamp((row_data->>'updated_at')::double precision / 1000), coalesce((row_data->>'version')::bigint,1), p_device_id, p_device_id, case when row_data->>'deleted_at' is null then null else to_timestamp((row_data->>'deleted_at')::double precision / 1000) end)
     on conflict(id) do update set state = excluded.state, ended_at = excluded.ended_at, duration_seconds = excluded.duration_seconds, note = excluded.note, updated_at = excluded.updated_at, version = greatest(timegenie.time_entries.version, excluded.version), deleted_at = excluded.deleted_at;
     imported_entries := imported_entries + 1;
   end loop;
@@ -1045,7 +1163,7 @@ create or replace function timegenie.cloud_apply_patch(
   p_payload jsonb
 ) returns jsonb language plpgsql security definer set search_path = timegenie, extensions, pg_catalog
 as $$
-declare current_version bigint; cached jsonb; result_value jsonb; row_data jsonb;
+declare current_version bigint; cached jsonb; result_value jsonb; row_data jsonb; payload_version bigint;
 begin
   if not timegenie.is_workspace_owner(p_workspace_id) then raise exception 'AUTH_REQUIRED'; end if;
   if not exists(select 1 from timegenie.devices where id = p_device_id and workspace_id = p_workspace_id and revoked_at is null) then
@@ -1059,23 +1177,67 @@ begin
   );
   if cached is not null then return cached; end if;
 
-  if p_base_version is not null and (p_entity_id is not null or p_entity_type = 'app_setting') then
+  row_data := coalesce(p_payload, '{}'::jsonb);
+
+  if p_entity_type in ('subject','task','time_entry','unassigned_session','report','report_template') then
+    if p_entity_id is null or row_data->>'id' is distinct from p_entity_id then
+      raise exception 'VALIDATION_ERROR: entity id does not match payload id';
+    end if;
+  elsif p_entity_type = 'app_setting' then
+    if p_entity_id is null or row_data->>'key' is distinct from p_entity_id then
+      raise exception 'VALIDATION_ERROR: entity id does not match setting key';
+    end if;
+  elsif p_entity_type = 'integration_config' then
+    if p_entity_id is null or row_data->>'provider' is distinct from p_entity_id then
+      raise exception 'VALIDATION_ERROR: entity id does not match integration provider';
+    end if;
+  elsif p_entity_type = 'task_occurrence' then
+    if p_entity_id is null or p_entity_id is distinct from (row_data->>'task_id') || '|' || (row_data->>'occurrence_date') then
+      raise exception 'VALIDATION_ERROR: entity id does not match task occurrence';
+    end if;
+  elsif p_entity_type = 'external_binding' then
+    if p_entity_id is null or p_entity_id is distinct from (row_data->>'provider') || '|' || (row_data->>'entity_type') || '|' || (row_data->>'entity_id') then
+      raise exception 'VALIDATION_ERROR: entity id does not match external binding identity';
+    end if;
+  end if;
+
+  if p_entity_type in ('subject','task','time_entry','report','report_template','app_setting','integration_config','task_occurrence') then
     case p_entity_type
       when 'subject' then select version into current_version from timegenie.subjects where workspace_id = p_workspace_id and id = p_entity_id::uuid;
       when 'task' then select version into current_version from timegenie.tasks where workspace_id = p_workspace_id and id = p_entity_id::uuid;
       when 'time_entry' then select version into current_version from timegenie.time_entries where workspace_id = p_workspace_id and id = p_entity_id::uuid;
       when 'report' then select version into current_version from timegenie.reports where workspace_id = p_workspace_id and id = p_entity_id::uuid;
       when 'report_template' then select version into current_version from timegenie.report_templates where workspace_id = p_workspace_id and id = p_entity_id::uuid;
-      when 'app_setting' then select version into current_version from timegenie.app_settings where workspace_id = p_workspace_id and key = p_payload->>'key';
-      when 'integration_config' then select version into current_version from timegenie.integration_configs where workspace_id = p_workspace_id and provider = p_payload->>'provider';
+      when 'app_setting' then select version into current_version from timegenie.app_settings where workspace_id = p_workspace_id and key = row_data->>'key';
+      when 'integration_config' then select version into current_version from timegenie.integration_configs where workspace_id = p_workspace_id and provider = row_data->>'provider';
+      when 'task_occurrence' then select version into current_version from timegenie.task_occurrences where workspace_id = p_workspace_id and task_id = (row_data->>'task_id')::uuid and occurrence_date = (row_data->>'occurrence_date')::date;
       else current_version := p_base_version;
     end case;
-    if current_version is distinct from p_base_version then
+
+    payload_version := coalesce((row_data->>'version')::bigint, 1);
+    if p_base_version is null and current_version is not null then
+      raise exception 'SYNC_CONFLICT: expected new entity, current version %', current_version;
+    elsif p_base_version is not null and current_version is distinct from p_base_version then
       raise exception 'SYNC_CONFLICT: expected version %, current version %', p_base_version, current_version;
+    elsif p_base_version is not null and payload_version <> p_base_version + 1 then
+      raise exception 'VERSION_CONFLICT: payload version % must follow base version %', payload_version, p_base_version;
+    elsif p_base_version is null and p_entity_type <> 'task_occurrence' and payload_version <> 1 then
+      raise exception 'VERSION_CONFLICT: new entity payload version must be 1';
+    end if;
+  elsif p_entity_type = 'unassigned_session' then
+    select version into current_version from timegenie.unassigned_sessions where workspace_id = p_workspace_id and id = p_entity_id::uuid;
+    payload_version := coalesce((row_data->>'version')::bigint, 1);
+    if p_base_version is null and current_version is not null then
+      raise exception 'SYNC_CONFLICT: expected new unassigned session, current version %', current_version;
+    elsif p_base_version is not null and current_version is distinct from p_base_version then
+      raise exception 'SYNC_CONFLICT: expected unassigned session version %, current version %', p_base_version, current_version;
+    elsif p_base_version is not null and payload_version <= p_base_version then
+      raise exception 'VERSION_CONFLICT: unassigned session payload version % must be above base version %', payload_version, p_base_version;
+    elsif current_version is not null and payload_version <= current_version then
+      raise exception 'SYNC_CONFLICT: expected unassigned session version above %, payload version %', current_version, payload_version;
     end if;
   end if;
 
-  row_data := coalesce(p_payload, '{}'::jsonb);
   if p_entity_type = 'subject' then
     insert into timegenie.subjects(id, workspace_id, name, sort_order, created_at, updated_at, version, created_by_device_id, updated_by_device_id, deleted_at)
     values((row_data->>'id')::uuid, p_workspace_id, row_data->>'name', coalesce((row_data->>'sort_order')::integer,0), to_timestamp(coalesce((row_data->>'created_at')::double precision, extract(epoch from now()) * 1000) / 1000), to_timestamp(coalesce((row_data->>'updated_at')::double precision, extract(epoch from now()) * 1000) / 1000), coalesce((row_data->>'version')::bigint,1), p_device_id, p_device_id, case when row_data->>'deleted_at' is null then null else to_timestamp((row_data->>'deleted_at')::double precision / 1000) end)
@@ -1098,7 +1260,7 @@ begin
   elsif p_entity_type = 'time_entry' then
     insert into timegenie.time_entries(id, workspace_id, work_date, kind, source_type, state, default_task_id, label_snapshot, started_at, ended_at, duration_seconds, note, origin_unassigned_session_id, created_at, updated_at, version, created_by_device_id, updated_by_device_id, deleted_at)
     values((row_data->>'id')::uuid, p_workspace_id, (row_data->>'work_date')::date, row_data->>'kind', row_data->>'source_type', row_data->>'state', nullif(row_data->>'default_task_id','')::uuid, row_data->>'label_snapshot', to_timestamp((row_data->>'started_at')::double precision / 1000), case when row_data->>'ended_at' is null then null else to_timestamp((row_data->>'ended_at')::double precision / 1000) end, coalesce((row_data->>'duration_seconds')::bigint,0), row_data->>'note', nullif(row_data->>'origin_unassigned_session_id','')::uuid, to_timestamp(coalesce((row_data->>'created_at')::double precision, extract(epoch from now()) * 1000) / 1000), to_timestamp(coalesce((row_data->>'updated_at')::double precision, extract(epoch from now()) * 1000) / 1000), coalesce((row_data->>'version')::bigint,1), p_device_id, p_device_id, case when row_data->>'deleted_at' is null then null else to_timestamp((row_data->>'deleted_at')::double precision / 1000) end)
-    on conflict(id) do update set work_date = excluded.work_date, kind = excluded.kind, source_type = excluded.source_type, state = excluded.state, default_task_id = excluded.default_task_id, label_snapshot = excluded.label_snapshot, started_at = excluded.started_at, ended_at = excluded.ended_at, duration_seconds = excluded.duration_seconds, note = excluded.note, updated_at = excluded.updated_at, version = excluded.version, updated_by_device_id = p_device_id, deleted_at = excluded.deleted_at;
+    on conflict(id) do update set work_date = excluded.work_date, kind = excluded.kind, source_type = excluded.source_type, state = excluded.state, default_task_id = excluded.default_task_id, label_snapshot = excluded.label_snapshot, started_at = excluded.started_at, ended_at = excluded.ended_at, duration_seconds = excluded.duration_seconds, note = excluded.note, origin_unassigned_session_id = excluded.origin_unassigned_session_id, updated_at = excluded.updated_at, version = excluded.version, updated_by_device_id = p_device_id, deleted_at = excluded.deleted_at;
     delete from timegenie.time_segments where entry_id = p_entity_id::uuid;
     insert into timegenie.time_segments(id, workspace_id, entry_id, sequence_no, started_at, ended_at, duration_seconds)
     select (item->>'id')::uuid, p_workspace_id, p_entity_id::uuid, (item->>'sequence_no')::integer, to_timestamp((item->>'started_at')::double precision / 1000), case when item->>'ended_at' is null then null else to_timestamp((item->>'ended_at')::double precision / 1000) end, coalesce((item->>'duration_seconds')::bigint,0)
@@ -1110,9 +1272,19 @@ begin
     if row_data->'work_day' is not null and row_data->'work_day' <> 'null'::jsonb then
       insert into timegenie.work_days(workspace_id, work_date, timezone, work_period_text, note, settled_at, created_at, updated_at, version)
       values(p_workspace_id, (row_data->'work_day'->>'work_date')::date, row_data->'work_day'->>'timezone', row_data->'work_day'->>'work_period_text', row_data->'work_day'->>'note', case when row_data->'work_day'->>'settled_at' is null then null else to_timestamp((row_data->'work_day'->>'settled_at')::double precision / 1000) end, to_timestamp((row_data->'work_day'->>'created_at')::double precision / 1000), to_timestamp((row_data->'work_day'->>'updated_at')::double precision / 1000), coalesce((row_data->'work_day'->>'version')::bigint,1))
-      on conflict(workspace_id, work_date) do update set timezone = excluded.timezone, work_period_text = excluded.work_period_text, note = excluded.note, settled_at = excluded.settled_at, updated_at = excluded.updated_at, version = excluded.version;
+      on conflict(workspace_id, work_date) do update set timezone = excluded.timezone, work_period_text = excluded.work_period_text, note = excluded.note, settled_at = excluded.settled_at, updated_at = excluded.updated_at, version = excluded.version
+      where timegenie.work_days.version <= excluded.version;
     end if;
     result_value := jsonb_build_object('entityType','time_entry','entityId',p_entity_id,'version',(select version from timegenie.time_entries where id = p_entity_id::uuid));
+  elsif p_entity_type = 'unassigned_session' then
+    insert into timegenie.unassigned_sessions(id, workspace_id, work_date, state, threshold_seconds, duration_seconds, first_started_at, last_ended_at, prompted_at, resolution_type, generated_entry_id, resolved_at, created_at, updated_at, version)
+    values((row_data->>'id')::uuid, p_workspace_id, (row_data->>'work_date')::date, row_data->>'state', coalesce((row_data->>'threshold_seconds')::integer,300), coalesce((row_data->>'duration_seconds')::bigint,0), to_timestamp((row_data->>'first_started_at')::double precision / 1000), case when row_data->>'last_ended_at' is null then null else to_timestamp((row_data->>'last_ended_at')::double precision / 1000) end, case when row_data->>'prompted_at' is null then null else to_timestamp((row_data->>'prompted_at')::double precision / 1000) end, row_data->>'resolution_type', nullif(row_data->>'generated_entry_id','')::uuid, case when row_data->>'resolved_at' is null then null else to_timestamp((row_data->>'resolved_at')::double precision / 1000) end, to_timestamp(coalesce((row_data->>'created_at')::double precision, extract(epoch from now()) * 1000) / 1000), to_timestamp(coalesce((row_data->>'updated_at')::double precision, extract(epoch from now()) * 1000) / 1000), coalesce((row_data->>'version')::bigint,1))
+    on conflict(id) do update set work_date = excluded.work_date, state = excluded.state, threshold_seconds = excluded.threshold_seconds, duration_seconds = excluded.duration_seconds, first_started_at = excluded.first_started_at, last_ended_at = excluded.last_ended_at, prompted_at = excluded.prompted_at, resolution_type = excluded.resolution_type, generated_entry_id = excluded.generated_entry_id, resolved_at = excluded.resolved_at, updated_at = excluded.updated_at, version = excluded.version;
+    delete from timegenie.unassigned_segments where session_id = p_entity_id::uuid;
+    insert into timegenie.unassigned_segments(id, workspace_id, session_id, sequence_no, started_at, ended_at, duration_seconds, lease_token)
+    select (item->>'id')::uuid, p_workspace_id, p_entity_id::uuid, (item->>'sequence_no')::integer, to_timestamp((item->>'started_at')::double precision / 1000), case when item->>'ended_at' is null then null else to_timestamp((item->>'ended_at')::double precision / 1000) end, coalesce((item->>'duration_seconds')::bigint,0), nullif(item->>'lease_token','')::uuid
+    from jsonb_array_elements(coalesce(row_data->'segments','[]'::jsonb)) item;
+    result_value := jsonb_build_object('entityType','unassigned_session','entityId',p_entity_id,'version',(select version from timegenie.unassigned_sessions where id = p_entity_id::uuid));
   elsif p_entity_type = 'report' then
     insert into timegenie.reports(id, workspace_id, report_type, subject_id, period_start, period_end, reference_date, template_id, markdown_content, content_source, generation_count, input_revision_hash, generated_at, created_at, updated_at, version, created_by_device_id, updated_by_device_id, deleted_at)
     values((row_data->>'id')::uuid, p_workspace_id, row_data->>'report_type', (row_data->>'subject_id')::uuid, (row_data->>'period_start')::date, (row_data->>'period_end')::date, (row_data->>'reference_date')::date, nullif(row_data->>'template_id','')::uuid, row_data->>'markdown_content', row_data->>'content_source', coalesce((row_data->>'generation_count')::integer,1), row_data->>'input_revision_hash', case when row_data->>'generated_at' is null then null else to_timestamp((row_data->>'generated_at')::double precision / 1000) end, to_timestamp(coalesce((row_data->>'created_at')::double precision, extract(epoch from now()) * 1000) / 1000), to_timestamp(coalesce((row_data->>'updated_at')::double precision, extract(epoch from now()) * 1000) / 1000), coalesce((row_data->>'version')::bigint,1), p_device_id, p_device_id, case when row_data->>'deleted_at' is null then null else to_timestamp((row_data->>'deleted_at')::double precision / 1000) end)
@@ -1127,22 +1299,27 @@ begin
     values(p_workspace_id, row_data->>'key', coalesce(row_data->'value_json','null'::jsonb), to_timestamp(coalesce((row_data->>'updated_at')::double precision, extract(epoch from now()) * 1000) / 1000), coalesce((row_data->>'version')::bigint,1))
     on conflict(workspace_id,key) do update set value_json = excluded.value_json, updated_at = excluded.updated_at, version = excluded.version;
     insert into timegenie.workspace_changes(workspace_id, entity_type, entity_id, operation, entity_version, changed_by_device_id)
-    values(p_workspace_id, 'app_settings', p_operation_id, 'update', (select version from timegenie.app_settings where workspace_id = p_workspace_id and key = row_data->>'key'), p_device_id);
+    values(p_workspace_id, 'app_settings', row_data->>'key', 'update', (select version from timegenie.app_settings where workspace_id = p_workspace_id and key = row_data->>'key'), p_device_id);
     result_value := jsonb_build_object('entityType','app_setting','entityId',row_data->>'key','version',(select version from timegenie.app_settings where workspace_id = p_workspace_id and key = row_data->>'key'));
   elsif p_entity_type = 'integration_config' then
     insert into timegenie.integration_configs(workspace_id, provider, enabled, config_json, updated_at, version)
     values(p_workspace_id, row_data->>'provider', coalesce((row_data->>'enabled')::boolean,false), coalesce(row_data->'config_json','{}'::jsonb), to_timestamp(coalesce((row_data->>'updated_at')::double precision, extract(epoch from now()) * 1000) / 1000), coalesce((row_data->>'version')::bigint,1))
     on conflict(workspace_id,provider) do update set enabled = excluded.enabled, config_json = excluded.config_json, updated_at = excluded.updated_at, version = excluded.version;
     insert into timegenie.workspace_changes(workspace_id, entity_type, entity_id, operation, entity_version, changed_by_device_id)
-    values(p_workspace_id, 'integration_configs', p_operation_id, 'update', (select version from timegenie.integration_configs where workspace_id = p_workspace_id and provider = row_data->>'provider'), p_device_id);
+    values(p_workspace_id, 'integration_configs', row_data->>'provider', 'update', (select version from timegenie.integration_configs where workspace_id = p_workspace_id and provider = row_data->>'provider'), p_device_id);
     result_value := jsonb_build_object('entityType','integration_config','entityId',row_data->>'provider','version',(select version from timegenie.integration_configs where workspace_id = p_workspace_id and provider = row_data->>'provider'));
+  elsif p_entity_type = 'task_occurrence' then
+    insert into timegenie.task_occurrences(workspace_id, task_id, occurrence_date, origin, status, completed_at, created_at, updated_at, version)
+    values(p_workspace_id, (row_data->>'task_id')::uuid, (row_data->>'occurrence_date')::date, row_data->>'origin', row_data->>'status', case when row_data->>'completed_at' is null then null else to_timestamp((row_data->>'completed_at')::double precision / 1000) end, to_timestamp(coalesce((row_data->>'created_at')::double precision, extract(epoch from now()) * 1000) / 1000), to_timestamp(coalesce((row_data->>'updated_at')::double precision, extract(epoch from now()) * 1000) / 1000), coalesce((row_data->>'version')::bigint,1))
+    on conflict(task_id, occurrence_date) do update set origin = excluded.origin, status = excluded.status, completed_at = excluded.completed_at, updated_at = excluded.updated_at, version = excluded.version;
+    result_value := jsonb_build_object('entityType','task_occurrence','entityId',p_entity_id,'version',(select version from timegenie.task_occurrences where workspace_id = p_workspace_id and task_id = (row_data->>'task_id')::uuid and occurrence_date = (row_data->>'occurrence_date')::date));
   elsif p_entity_type = 'external_binding' then
     insert into timegenie.external_bindings(id, workspace_id, provider, entity_type, entity_id, external_id, external_revision, last_synced_hash, last_synced_at)
     values((row_data->>'id')::uuid, p_workspace_id, row_data->>'provider', row_data->>'entity_type', (row_data->>'entity_id')::uuid, row_data->>'external_id', row_data->>'external_revision', row_data->>'last_synced_hash', case when row_data->>'last_synced_at' is null then null else to_timestamp((row_data->>'last_synced_at')::double precision / 1000) end)
     on conflict(workspace_id, provider, entity_type, entity_id) do update set external_id = excluded.external_id, external_revision = excluded.external_revision, last_synced_hash = excluded.last_synced_hash, last_synced_at = excluded.last_synced_at;
     insert into timegenie.workspace_changes(workspace_id, entity_type, entity_id, operation, entity_version, changed_by_device_id)
-    values(p_workspace_id, 'external_bindings', p_operation_id, 'update', 1, p_device_id);
-    result_value := jsonb_build_object('entityType','external_binding','entityId',row_data->>'entity_id','version',1);
+    values(p_workspace_id, 'external_bindings', p_entity_id, 'update', 1, p_device_id);
+    result_value := jsonb_build_object('entityType','external_binding','entityId',p_entity_id,'version',1);
   else
     raise exception 'UNSUPPORTED_OPERATION: %', p_entity_type;
   end if;
@@ -1187,13 +1364,18 @@ begin
     grant usage on schema timegenie to authenticated;
     revoke all on all tables in schema timegenie from authenticated;
     grant select, insert on timegenie.workspaces to authenticated;
-    grant select, insert, update on timegenie.devices to authenticated;
+    revoke all on timegenie.devices from authenticated;
     grant select on timegenie.workspace_changes to authenticated;
     grant select on timegenie.tracking_leases to authenticated;
     grant select on timegenie.time_entries to authenticated;
     grant usage, select on all sequences in schema timegenie to authenticated;
     revoke execute on all functions in schema timegenie from authenticated;
     grant execute on function timegenie.workspace_initialize_defaults(uuid) to authenticated;
+    grant execute on function timegenie.device_authorize(uuid, uuid, text, text, text) to authenticated;
+    grant execute on function timegenie.device_authorization_get(uuid, uuid) to authenticated;
+    grant execute on function timegenie.device_list(uuid) to authenticated;
+    grant execute on function timegenie.device_revoke(uuid, uuid) to authenticated;
+    grant execute on function timegenie.device_revoke_all(uuid) to authenticated;
     grant execute on function timegenie.tracking_lease_acquire(uuid, uuid, uuid) to authenticated;
     grant execute on function timegenie.tracking_lease_renew(uuid, uuid, uuid) to authenticated;
     grant execute on function timegenie.tracking_lease_release(uuid, uuid, uuid) to authenticated;
@@ -1212,6 +1394,7 @@ begin
     revoke execute on function timegenie.operation_request_hash(text, jsonb) from authenticated;
     revoke execute on function timegenie.is_workspace_owner(uuid) from authenticated;
     revoke execute on function timegenie.is_registered_device(uuid, uuid) from authenticated;
+    revoke execute on function timegenie.current_auth_session_id() from authenticated;
     revoke execute on function timegenie.touch_workspace_change() from authenticated;
     revoke execute on function timegenie.processed_operation_result(uuid, uuid, text, jsonb) from authenticated;
     revoke execute on function timegenie.record_processed_operation(uuid, uuid, uuid, text, jsonb, jsonb) from authenticated;

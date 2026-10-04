@@ -160,14 +160,16 @@ site_url = "http://127.0.0.1:3000"
 # external_url = ""
 # A list of *exact* URLs that auth providers are permitted to redirect to post authentication.
 additional_redirect_urls = ["https://127.0.0.1:3000"]
-# How long tokens are valid for, in seconds. Defaults to 3600 (1 hour), maximum 604,800 (1 week).
-jwt_expiry = 3600
+# How long tokens are valid for, in seconds. Keep desktop sessions warm; the
+# app also stores and refreshes the session until the user signs out or the
+# Supabase Auth session/user is revoked server-side.
+jwt_expiry = 604800
 # JWT issuer URL. If not set, defaults to auth.external_url.
 # jwt_issuer = ""
 # Path to JWT signing key. DO NOT commit your signing keys file to git.
 # signing_keys_path = "./signing_keys.json"
-# If disabled, the refresh token will never expire.
-enable_refresh_token_rotation = true
+# If disabled, the refresh token will not expire locally.
+enable_refresh_token_rotation = false
 # Allows refresh tokens to be reused after expiry, up to the specified interval in seconds.
 # Requires enable_refresh_token_rotation = true.
 refresh_token_reuse_interval = 10

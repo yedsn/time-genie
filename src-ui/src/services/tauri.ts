@@ -86,6 +86,8 @@ export type AutomationHookRule = AutomationHookDraft & {
 
 export type CloudSessionSnapshot = {
   signedIn: boolean;
+  status: "authenticated" | "offline_saved" | "reauth_required";
+  reason?: string;
   userId?: string;
   email?: string;
   expiresAt?: number;
@@ -96,12 +98,27 @@ export type StorageModeSnapshot = {
   workspaceId: string;
   deviceId: string;
   online: boolean;
-  syncState: "synced" | "pending" | "error" | string;
+  syncState: "synced" | "pending" | "conflict" | "error" | string;
   pendingOperations: number;
   conflictCount: number;
   lastChangeSeq: number;
   lastSyncedAt?: number;
   lastError?: string;
+  authBlocked: boolean;
+  authBlockedReason?: string;
+};
+
+export type CloudDevice = {
+  id: string;
+  workspaceId: string;
+  deviceName: string;
+  platform: string;
+  appVersion: string;
+  lastSeenAt: string;
+  authorizedAt: string;
+  reauthorizedAt?: string;
+  revokedAt?: string;
+  current: boolean;
 };
 
 export type StorageMigrationPreview = {
@@ -556,56 +573,22 @@ export async function confirmObsidianPlan(
 }
 
 export async function getTimerState(): Promise<TimeEntryRecord | null> {
-  if ((await getStorageMode()).mode === "cloud") {
-    try {
-      return normalizeCloudTimerRecord(await invoke<Record<string, unknown> | null>("cloud_timer_get_state"));
-    } catch (error) {
-      if (!isCloudUnavailableError(error)) throw error;
-    }
-  }
   return await invoke<TimeEntryRecord | null>("timer_get_state");
 }
 
 export async function startTimerRecord(taskId?: string, note?: string): Promise<TimeEntryRecord> {
   const clientRequestId = crypto.randomUUID();
-  if ((await getStorageMode()).mode === "cloud") {
-    try {
-      return normalizeCloudTimerRecord(await invoke<Record<string, unknown>>("cloud_timer_start", {
-        request: { taskId, note, operationId: clientRequestId },
-      }))!;
-    } catch (error) {
-      if (!isCloudUnavailableError(error)) throw error;
-    }
-  }
   return await invoke<TimeEntryRecord>("timer_start", {
     request: { taskId, note, clientRequestId },
   });
 }
 
 export async function pauseTimerRecord(entryId: string, expectedVersion: number): Promise<TimeEntryRecord> {
-  if ((await getStorageMode()).mode === "cloud") {
-    try {
-      return normalizeCloudTimerRecord(await invoke<Record<string, unknown>>("cloud_timer_pause", {
-        request: { entryId, expectedVersion, operationId: crypto.randomUUID() },
-      }))!;
-    } catch (error) {
-      if (!isCloudUnavailableError(error)) throw error;
-    }
-  }
   return await invoke<TimeEntryRecord>("timer_pause", { request: { entryId, expectedVersion } });
 }
 
 export async function resumeTimerRecord(entryId: string, expectedVersion: number): Promise<TimeEntryRecord> {
   const operationId = crypto.randomUUID();
-  if ((await getStorageMode()).mode === "cloud") {
-    try {
-      return normalizeCloudTimerRecord(await invoke<Record<string, unknown>>("cloud_timer_resume", {
-        request: { entryId, expectedVersion, operationId },
-      }))!;
-    } catch (error) {
-      if (!isCloudUnavailableError(error)) throw error;
-    }
-  }
   return await invoke<TimeEntryRecord>("timer_resume", {
     request: { entryId, expectedVersion, operationId },
   });
@@ -616,64 +599,9 @@ export async function stopTimerRecord(
   expectedVersion: number,
   createDefaultAllocation = false,
 ): Promise<TimeEntryRecord> {
-  if ((await getStorageMode()).mode === "cloud") {
-    try {
-      return normalizeCloudTimerRecord(await invoke<Record<string, unknown>>("cloud_timer_stop", {
-        request: { entryId, expectedVersion, operationId: crypto.randomUUID() },
-      }))!;
-    } catch (error) {
-      if (!isCloudUnavailableError(error)) throw error;
-    }
-  }
   return await invoke<TimeEntryRecord>("timer_stop", {
     request: { entryId, expectedVersion, createDefaultAllocation },
   });
-}
-
-function isCloudUnavailableError(error: unknown) {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.startsWith("NETWORK_ERROR:") || message.startsWith("AUTH_REQUIRED:");
-}
-
-function normalizeCloudTimerRecord(value: Record<string, unknown> | null): TimeEntryRecord | null {
-  if (!value) return null;
-  const startedAt = typeof value.started_at === "string" ? Date.parse(value.started_at) : Number(value.started_at ?? 0);
-  const endedAt = typeof value.ended_at === "string" ? Date.parse(value.ended_at) : Number(value.ended_at ?? 0);
-  const durationSeconds = Number(value.duration_seconds ?? 0);
-  return {
-    id: String(value.id ?? ""),
-    workDate: String(value.work_date ?? ""),
-    label: String(value.label_snapshot ?? "未命名事项"),
-    startedAt,
-    endedAt: endedAt || undefined,
-    durationSeconds,
-    settlementMinutes: durationSeconds > 0 ? Math.max(1, Math.ceil(durationSeconds / 60)) : 0,
-    allocatedMinutes: 0,
-    defaultTaskId: value.default_task_id ? String(value.default_task_id) : undefined,
-    note: value.note ? String(value.note) : undefined,
-    kind: value.kind === "break" ? "break" : "work",
-    sourceType: String(value.source_type ?? "timer"),
-    state: value.state === "paused" ? "paused" : value.state === "ended" ? "ended" : "running",
-    version: Number(value.version ?? 1),
-    allocations: [],
-  };
-}
-
-function normalizeCloudUnassignedState(value: Record<string, unknown> | null): UnassignedStateRecord | null {
-  if (!value) return null;
-  const timestamp = (candidate: unknown) => typeof candidate === "string" ? Date.parse(candidate) : Number(candidate ?? 0);
-  return {
-    sessionId: String(value.session_id ?? value.sessionId ?? ""),
-    state: value.state === "awaiting_resolution" ? "awaiting_resolution" : "collecting",
-    firstStartedAt: timestamp(value.first_started_at ?? value.firstStartedAt),
-    lastEndedAt: value.last_ended_at || value.lastEndedAt ? timestamp(value.last_ended_at ?? value.lastEndedAt) : undefined,
-    currentSegmentStartedAt: value.current_segment_started_at || value.currentSegmentStartedAt ? timestamp(value.current_segment_started_at ?? value.currentSegmentStartedAt) : undefined,
-    elapsedSeconds: Number(value.elapsed_seconds ?? value.elapsedSeconds ?? value.duration_seconds ?? 0),
-    requiredMinutes: Number(value.required_minutes ?? value.requiredMinutes ?? 0),
-    thresholdSeconds: Number(value.threshold_seconds ?? value.thresholdSeconds ?? 300),
-    mustResolve: Boolean(value.must_resolve ?? value.mustResolve ?? value.state === "awaiting_resolution"),
-    version: Number(value.version ?? 1),
-  };
 }
 
 export async function listTimeEntries(workDate: string, includeBreaks = true): Promise<TimeEntryListResult> {
@@ -733,13 +661,6 @@ export async function replaceTimeAllocations(
 }
 
 export async function getUnassignedState(): Promise<UnassignedStateRecord | null> {
-  if ((await getStorageMode()).mode === "cloud") {
-    try {
-      return normalizeCloudUnassignedState(await invoke<Record<string, unknown> | null>("cloud_unassigned_get_state"));
-    } catch (error) {
-      if (!isCloudUnavailableError(error)) throw error;
-    }
-  }
   return await invoke<UnassignedStateRecord | null>("unassigned_get_state");
 }
 
@@ -749,13 +670,6 @@ export async function resolveUnassignedWork(
   allocations: Array<{ taskId: string; minutes: number; completeTask?: boolean; taskExpectedVersion?: number }>,
 ): Promise<UnassignedResolveResult> {
   const operationId = crypto.randomUUID();
-  if ((await getStorageMode()).mode === "cloud") {
-    try {
-      return await invoke("cloud_unassigned_resolve_work", { request: { sessionId, expectedVersion, allocations, operationId } });
-    } catch (error) {
-      if (!isCloudUnavailableError(error)) throw error;
-    }
-  }
   return await invoke<UnassignedResolveResult>("unassigned_resolve_work", {
     request: { sessionId, expectedVersion, allocations, operationId },
   });
@@ -766,13 +680,6 @@ export async function resolveUnassignedBreak(
   expectedVersion: number,
 ): Promise<UnassignedResolveResult> {
   const operationId = crypto.randomUUID();
-  if ((await getStorageMode()).mode === "cloud") {
-    try {
-      return await invoke("cloud_unassigned_resolve_break", { request: { sessionId, expectedVersion, operationId } });
-    } catch (error) {
-      if (!isCloudUnavailableError(error)) throw error;
-    }
-  }
   return await invoke<UnassignedResolveResult>("unassigned_resolve_break", {
     request: { sessionId, expectedVersion, operationId },
   });
@@ -783,13 +690,6 @@ export async function discardUnassignedTime(
   expectedVersion: number,
 ): Promise<UnassignedResolveResult> {
   const operationId = crypto.randomUUID();
-  if ((await getStorageMode()).mode === "cloud") {
-    try {
-      return await invoke("cloud_unassigned_discard", { request: { sessionId, expectedVersion, operationId } });
-    } catch (error) {
-      if (!isCloudUnavailableError(error)) throw error;
-    }
-  }
   return await invoke<UnassignedResolveResult>("unassigned_discard", {
     request: { sessionId, expectedVersion, operationId },
   });
@@ -980,6 +880,10 @@ export async function signOutCloud(): Promise<StorageModeSnapshot> {
   return await invoke("cloud_sign_out");
 }
 
+export async function signOutAllCloudDevices(): Promise<StorageModeSnapshot> {
+  return await invoke("cloud_sign_out_all");
+}
+
 export async function registerCloudDevice(deviceName: string): Promise<unknown> {
   return await invoke("cloud_device_register", {
     request: { deviceName, platform: "windows", appVersion: __APP_VERSION__ },
@@ -998,6 +902,26 @@ export async function executeStorageMigration(direction: StorageMigrationPreview
 
 export async function getCloudSyncStatus(): Promise<StorageModeSnapshot> {
   return await invoke("cloud_sync_status");
+}
+
+export async function listCloudDevices(): Promise<CloudDevice[]> {
+  return await invoke("cloud_device_list");
+}
+
+export async function revokeCloudDevice(deviceId: string): Promise<CloudDevice[]> {
+  return await invoke("cloud_device_revoke", { request: { deviceId } });
+}
+
+export async function resumeCloudSyncAfterReauth(): Promise<StorageModeSnapshot> {
+  return await invoke("cloud_sync_resume_after_reauth");
+}
+
+export async function refreshCloudSync(): Promise<StorageModeSnapshot> {
+  return await invoke("cloud_sync_refresh");
+}
+
+export async function resetLocalCacheFromCloud(): Promise<StorageModeSnapshot> {
+  return await invoke("cloud_sync_reset_local_cache");
 }
 
 export async function pushCloudSync(): Promise<{ pushed: number; pending: number; conflicts: number }> {

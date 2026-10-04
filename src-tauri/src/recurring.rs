@@ -135,6 +135,10 @@ pub fn occurrence_for_date(
         .map_err(|error| error.to_string())
 }
 
+pub fn occurrence_entity_id(task_id: &str, date: &str) -> String {
+    format!("{task_id}|{date}")
+}
+
 pub fn rule_matches_date(rule: &RecurrenceRuleDto, date: &str) -> Result<bool, String> {
     let date = parse_date(date)?;
     let start = parse_date(&rule.effective_start)?;
@@ -561,6 +565,15 @@ fn validate_date(value: &str) -> Result<(), String> {
     parse_date(value).map(|_| ())
 }
 
+fn ensure_recurring_supported_in_storage_mode(database: &Database) -> Result<(), String> {
+    if crate::supabase::storage_mode(database)?.mode == "cloud" {
+        return Err(
+            "OFFLINE_RESTRICTED: 云端模式暂不支持修改重复规则，请先切回本地模式".to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn workspace_id(connection: &Connection) -> Result<String, String> {
     connection
         .query_row(
@@ -594,7 +607,7 @@ pub fn task_recurrence_save(
     database: tauri::State<'_, Database>,
     request: RecurrenceSaveRequest,
 ) -> Result<RecurrenceRuleDto, String> {
-    crate::supabase::ensure_local_mode(&database)?;
+    ensure_recurring_supported_in_storage_mode(&database)?;
     save_rule(&database, request)
 }
 
@@ -603,18 +616,20 @@ pub fn task_recurrence_close(
     database: tauri::State<'_, Database>,
     request: RecurrenceCloseRequest,
 ) -> Result<(), String> {
-    crate::supabase::ensure_local_mode(&database)?;
+    ensure_recurring_supported_in_storage_mode(&database)?;
     close_rule(&database, request)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{self, SettingsScope, SettingsUpdate};
     use crate::tasks::{
         create_task, list_tasks, set_task_status, TaskCreateRequest, TaskListRequest,
         TaskStatusRequest,
     };
     use crate::time_tracking::{create_manual_entry, ManualEntryRequest};
+    use serde_json::json;
     use tempfile::tempdir;
 
     fn setup_task() -> (Database, String, String, i64) {
@@ -747,6 +762,48 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.starts_with("TASK_NOT_LEAF:"));
+    }
+
+    #[test]
+    fn cloud_mode_rejects_recurrence_rule_changes_until_supported_by_sync() {
+        let (database, _, task_id, task_version) = setup_task();
+        let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let rule = save_rule(
+            &database,
+            RecurrenceSaveRequest {
+                task_id: task_id.clone(),
+                task_expected_version: task_version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: today,
+                rule_expected_version: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(rule.task_id, task_id);
+
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+
+        let error = ensure_recurring_supported_in_storage_mode(&database).unwrap_err();
+        assert!(error.starts_with("OFFLINE_RESTRICTED:"));
     }
 
     #[test]

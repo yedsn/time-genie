@@ -51,6 +51,7 @@ import {
   type UnassignedStateRecord,
   type RecurrenceRuleRecord,
 } from "./services/tauri";
+import { transientMissingStateResult } from "./services/transientStateGuard";
 
 export type TaskStatus = "open" | "done";
 
@@ -182,12 +183,17 @@ export const useWorkdayStore = defineStore("workday", () => {
   const unassignedThresholdSeconds = ref(5 * 60);
   let clock: number | undefined;
   let timeRefreshClock: number | undefined;
+  let timeDataRequestSeq = 0;
+  let timeDataMutationSeq = 0;
+  let unassignedStateRequestSeq = 0;
+  let unassignedStateMutationSeq = 0;
+  let timerStateMissingRefreshes = 0;
+  let unassignedStateMissingRefreshes = 0;
   let todayOverviewRequestSeq = 0;
   let workspaceRequestSeq = 0;
   const savingTaskIds = new Set<string>();
   const workspaceLoaded = ref(false);
   const workspaceLoading = ref(false);
-
   const todayMinutes = computed(() => entries.reduce((sum, entry) => {
     if (entry.kind === "break") return sum;
     return sum + Math.ceil(entryDurationSeconds(entry) / 60);
@@ -314,14 +320,19 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   function toUiTimeEntry(entry: TimeEntryRecord): TimeEntry {
+    const existing = entries.find((item) => item.id === entry.id);
+    const syncedAt = Date.now();
+    const durationSeconds = existing?.state === "running" && entry.state === "running"
+      ? Math.max(entry.durationSeconds, entryDurationSecondsAt(existing, syncedAt))
+      : entry.durationSeconds;
     return {
       id: entry.id,
       label: entry.label,
       startedAt: entry.startedAt,
       endedAt: entry.endedAt,
       minutes: entry.settlementMinutes,
-      durationSeconds: entry.durationSeconds,
-      syncedAt: Date.now(),
+      durationSeconds,
+      syncedAt,
       allocated: entry.allocatedMinutes,
       defaultTask: entry.defaultTaskId,
       allocations: entry.allocations.map((allocation) => ({
@@ -339,8 +350,12 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   function entryDurationSeconds(entry: TimeEntry) {
+    return entryDurationSecondsAt(entry, now.value);
+  }
+
+  function entryDurationSecondsAt(entry: TimeEntry, timestamp: number) {
     const liveSeconds = entry.state === "running"
-      ? Math.max(0, Math.floor((now.value - entry.syncedAt) / 1_000))
+      ? Math.max(0, Math.floor((timestamp - entry.syncedAt) / 1_000))
       : 0;
     return entry.durationSeconds + liveSeconds;
   }
@@ -370,16 +385,34 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function loadTimeData() {
+    const requestSeq = ++timeDataRequestSeq;
+    const mutationSeq = timeDataMutationSeq;
     try {
+      const previousActiveEntry = runningEntry.value ? cloneTimeEntry(runningEntry.value) : undefined;
       const workDate = formatLocalDate(new Date());
       const [result, activeEntry] = await Promise.all([listTimeEntries(workDate), getTimerState()]);
+      if (requestSeq !== timeDataRequestSeq || mutationSeq !== timeDataMutationSeq) return;
       const records = result.entries.slice();
       if (activeEntry) {
         const activeIndex = records.findIndex((entry) => entry.id === activeEntry.id);
         if (activeIndex >= 0) records.splice(activeIndex, 1, activeEntry);
         else records.unshift(activeEntry);
       }
-      entries.splice(0, entries.length, ...records.map(toUiTimeEntry));
+      const nextEntries = records.map(toUiTimeEntry);
+      const previousActiveStillPresent = previousActiveEntry
+        ? nextEntries.some((entry) => entry.id === previousActiveEntry.id)
+        : false;
+      const activeStateStillPresent = Boolean(activeEntry) || previousActiveStillPresent;
+      if (!activeEntry && previousActiveEntry && !previousActiveStillPresent) {
+        const guard = transientMissingStateResult(true, false, timerStateMissingRefreshes);
+        timerStateMissingRefreshes = guard.missingRefreshes;
+        if (guard.preservePrevious) {
+          nextEntries.unshift(previousActiveEntry);
+        }
+      } else {
+        timerStateMissingRefreshes = transientMissingStateResult(Boolean(previousActiveEntry), activeStateStillPresent, timerStateMissingRefreshes).missingRefreshes;
+      }
+      entries.splice(0, entries.length, ...nextEntries);
       if (timerStopConfirmationEntryId.value && !entries.some((entry) => entry.id === timerStopConfirmationEntryId.value)) {
         timerStopConfirmationEntryId.value = "";
       }
@@ -445,29 +478,54 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function loadUnassignedState() {
+    const requestSeq = ++unassignedStateRequestSeq;
+    const mutationSeq = unassignedStateMutationSeq;
     try {
-      applyUnassignedState(await getUnassignedState());
+      const state = await getUnassignedState();
+      if (requestSeq !== unassignedStateRequestSeq || mutationSeq !== unassignedStateMutationSeq) return;
+      applyUnassignedState(state);
     } catch (error) {
       console.error("加载未归属时间失败", error);
     }
   }
 
+  function markTimeDataChanged() {
+    timeDataMutationSeq += 1;
+    timerStateMissingRefreshes = 0;
+  }
+
+  function markUnassignedStateChanged() {
+    unassignedStateMutationSeq += 1;
+    unassignedStateMissingRefreshes = 0;
+  }
+
   function applyUnassignedState(state: UnassignedStateRecord | null) {
+    const syncedAt = Date.now();
     if (!state) {
+      if (unassignedSessionId.value) {
+        const guard = transientMissingStateResult(true, false, unassignedStateMissingRefreshes);
+        unassignedStateMissingRefreshes = guard.missingRefreshes;
+        if (guard.preservePrevious) {
+          now.value = syncedAt;
+          return;
+        }
+      }
       resetUnassignedTracking();
       return;
     }
-    const syncedAt = Date.now();
+    unassignedStateMissingRefreshes = 0;
+    const previousSeconds = unassignedSessionId.value === state.sessionId ? unassignedSeconds.value : 0;
     const liveSeconds = state.currentSegmentStartedAt
       ? Math.max(0, Math.floor((syncedAt - state.currentSegmentStartedAt) / 1_000))
       : 0;
+    const elapsedSeconds = Math.max(state.elapsedSeconds, previousSeconds);
     unassignedSessionId.value = state.sessionId;
     unassignedVersion.value = state.version;
     unassignedThresholdSeconds.value = state.thresholdSeconds;
     unassignedFirstStartedAt.value = state.firstStartedAt;
     unassignedLastEndedAt.value = state.lastEndedAt;
     unassignedStartedAt.value = state.currentSegmentStartedAt;
-    unassignedAccumulatedSeconds.value = Math.max(0, state.elapsedSeconds - liveSeconds);
+    unassignedAccumulatedSeconds.value = Math.max(0, elapsedSeconds - liveSeconds);
   }
 
   function replaceTask(record: TaskRecord) {
@@ -538,12 +596,14 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   function resetUnassignedTracking() {
+    markUnassignedStateChanged();
     unassignedStartedAt.value = undefined;
     unassignedAccumulatedSeconds.value = 0;
     unassignedFirstStartedAt.value = undefined;
     unassignedLastEndedAt.value = undefined;
     unassignedSessionId.value = "";
     unassignedVersion.value = 0;
+    unassignedStateMissingRefreshes = 0;
   }
 
   async function commitTaskToggle(task: Task): Promise<TaskCompletionResult | undefined> {
@@ -878,6 +938,8 @@ export const useWorkdayStore = defineStore("workday", () => {
     const persistedTaskId = await persistTimerTask(taskId);
     if (taskId && !persistedTaskId) throw new Error("计时事项保存失败");
     const entry = toUiTimeEntry(await startTimerRecord(persistedTaskId, note.trim() || undefined));
+    markTimeDataChanged();
+    markUnassignedStateChanged();
     entries.unshift(entry);
     selectedTaskId.value = persistedTaskId ?? "";
     selectedEntryId.value = entry.id;
@@ -890,6 +952,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   async function pauseTimer() {
     const entry = runningEntry.value;
     if (!entry) return;
+    markTimeDataChanged();
     replaceTimeEntry(await pauseTimerRecord(entry.id, entry.version));
     await loadWorkspaceData();
     await loadTodayOverview();
@@ -898,6 +961,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   async function resumeTimer() {
     const entry = runningEntry.value;
     if (entry?.state === "paused") {
+      markTimeDataChanged();
       replaceTimeEntry(await resumeTimerRecord(entry.id, entry.version));
       await loadWorkspaceData();
       await loadTodayOverview();
@@ -907,7 +971,9 @@ export const useWorkdayStore = defineStore("workday", () => {
   async function stopTimer() {
     const entry = runningEntry.value;
     if (!entry) return;
+    markTimeDataChanged();
     const stopped = replaceTimeEntry(await stopTimerRecord(entry.id, entry.version, false));
+    markUnassignedStateChanged();
     selectedEntryId.value = stopped.id;
     timerStopConfirmationEntryId.value = stopped.id;
     await notifyTimerStopConfirmation(stopped.id);
@@ -978,6 +1044,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     const completionCandidates = new Set(normalized
       .filter((allocation) => allocation.completeTask && tasks.find((task) => task.id === allocation.taskId)?.status !== "done")
       .map((allocation) => allocation.taskId));
+    markTimeDataChanged();
     replaceTimeEntry(await replaceTimeAllocations(entry.id, entry.version, normalized));
     await loadWorkspaceData();
     await loadTodayOverview();
@@ -1000,6 +1067,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       completeTask,
       taskExpectedVersion: completeTask ? task?.version : undefined,
     }));
+    markTimeDataChanged();
     entries.unshift(entry);
     selectedEntryId.value = entry.id;
     await loadWorkspaceData();
@@ -1013,6 +1081,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   async function correctTimeEntry(entryId: string, startedAt: number, endedAt: number, note = "") {
     const entry = entries.find((item) => item.id === entryId);
     if (!entry) return;
+    markTimeDataChanged();
     replaceTimeEntry(await updateTimeEntry({
       entryId,
       startedAt,
@@ -1027,6 +1096,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   async function setTimeEntryDisposition(entryId: string, disposition: "break" | "discard") {
     const entry = entries.find((item) => item.id === entryId);
     if (!entry) return;
+    markTimeDataChanged();
     const updated = toUiTimeEntry(await updateTimeEntryDisposition({
       entryId,
       expectedVersion: entry.version,
@@ -1123,10 +1193,18 @@ export const useWorkdayStore = defineStore("workday", () => {
 
   function replaceTimeEntry(record: TimeEntryRecord) {
     const next = toUiTimeEntry(record);
+    if (next.state === "running" || next.state === "paused") timerStateMissingRefreshes = 0;
     const index = entries.findIndex((entry) => entry.id === record.id);
     if (index >= 0) entries.splice(index, 1, next);
     else entries.unshift(next);
     return next;
+  }
+
+  function cloneTimeEntry(entry: TimeEntry): TimeEntry {
+    return {
+      ...entry,
+      allocations: entry.allocations?.map((allocation) => ({ ...allocation })),
+    };
   }
 
   function formatLocalDate(date: Date) {
@@ -1172,6 +1250,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     }
 
     unassignedDialogOpen.value = false;
+    resetUnassignedTracking();
     await Promise.all([loadTimeData(), loadWorkspaceData(), loadUnassignedState()]);
     await loadTodayOverview();
     const completedTaskIds = [...completionCandidates].filter((taskId) => tasks.find((task) => task.id === taskId)?.status === "done");

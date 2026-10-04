@@ -7,7 +7,7 @@
 ## 1. 设计结论
 
 - 正式版本支持两种数据模式：`local` 本地模式和 `cloud` Supabase 云端模式。用户可以只使用本地模式，也可以登录 Supabase 在多台机器间共享同一份数据。
-- 本地模式以 SQLite 为唯一主数据源；云端模式以 Supabase PostgreSQL 为权威主数据源，SQLite 只作为本机缓存、离线读取和待同步操作队列。
+- 本地模式以 SQLite 为唯一主数据源；云端模式以 Supabase PostgreSQL 为最终权威主数据源，SQLite 作为本机缓存、离线读取、同步状态和待同步操作队列。
 - 同一个数据空间在任一时刻只能选择一种权威模式，不允许 SQLite 与 Supabase 同时各自接受无约束写入。
 - Vue 当前使用的 `localStorage`、页面内 mock 数组和 `BroadcastChannel` 仅用于 UI 阶段，正式实现后不得继续作为业务事实来源。
 - “主体”是普通可编辑实体。名称为“默认”的主体与其他主体数据结构相同，默认选择由设置项引用，不在 UI 中显示特殊标识。
@@ -98,8 +98,8 @@ SQLite 中 `created_at/updated_at/deleted_at` 使用 UTC 毫秒；Supabase 中�
 ### 4.3 双模式与离线规则
 
 - `storage_mode='local'`：全部业务读写直接进入 SQLite，不需要网络或账号。
-- `storage_mode='cloud'`：Supabase 是权威数据源。在线写操作优先提交 Supabase；断网时写入本机 `sync_outbox`，界面明确标识“等待同步”。
-- 云端模式的 SQLite 缓存可以被删除并从 Supabase 重新构建，不得保存云端不存在的隐藏业务事实。
+- `storage_mode='cloud'`：Supabase 是最终权威数据源。业务写操作先在本机 SQLite 事务中保存并写入 `sync_outbox`；在线时立即尝试推送，断网、失败或冲突时保留本机结果并在界面明确标识“等待同步”或“需处理冲突”。
+- 云端模式的 SQLite 缓存在 outbox 清空后可以从 Supabase 重新构建；有待同步、失败或冲突操作时不得用云端快照覆盖本机编辑。
 - 所有离线操作携带 `operation_id`、`device_id`、`base_version` 和完整业务参数。Supabase 以 `operation_id` 幂等，避免重试造成重复数据。
 - Realtime 只作为变更通知，不作为唯一数据传输渠道。客户端收到通知后按 `workspace_changes.change_seq` 增量拉取。
 - 云端删除使用软删除并写入变更日志，离线设备才能收到删除墓碑。
@@ -151,10 +151,13 @@ SQLite 中 `created_at/updated_at/deleted_at` 使用 UTC 毫秒；Supabase 中�
 | `platform` | text | NOT NULL | `windows`，预留其他平台 |
 | `app_version` | text | NOT NULL | 最近连接的应用版本 |
 | `last_seen_at` | timestamptz | NOT NULL | 最近心跳 |
+| `authorized_at` | timestamptz | NOT NULL | 首次设备授权时间 |
+| `reauthorized_at` | timestamptz | NULL | 被撤销后最近一次显式重新授权时间 |
+| `auth_session_id` | text | NULL | 最近授权所对应的 Supabase Auth 会话标识，不是 token |
 | `created_at` | timestamptz | NOT NULL | 注册时间 |
 | `revoked_at` | timestamptz | NULL | 设备撤销时间 |
 
-设备撤销后，关联会话失效，未同步离线数据需要在撤销前处理。
+设备授权记录保存当前 Supabase Auth `session_id`（不保存 token）。设备撤销后，同一个旧 Auth 会话不能调用 `device_authorize` 恢复授权，必须由新的密码登录产生新会话；`is_registered_device` 同时立即拒绝该设备参与受保护写入，并释放它持有的 `tracking_leases`。完全离线的设备可能暂时不知道已被撤销，因此恢复联网后的顺序必须是“校验 Auth → 校验设备授权 → 上传 outbox”。检测到撤销后保留本地数据和待同步队列，暂停新增云端待同步写入；重新登录并由用户明确确认后才恢复上传。
 
 #### `tracking_leases` 后台采集租约
 
@@ -661,6 +664,9 @@ SeaTable Token、Supabase refresh token 等敏感值应使用 Windows Credential
 | `last_change_seq` | INTEGER NOT NULL DEFAULT 0 | 已应用的最大云端变更序号 |
 | `last_full_sync_at` | INTEGER NULL | 最近全量同步时间 |
 | `last_error` | TEXT NULL | 最近同步错误摘要 |
+| `auth_blocked` | INTEGER NOT NULL DEFAULT 0 | 认证或设备授权是否阻止上传 |
+| `auth_blocked_reason` | TEXT NULL | 阻止原因，不包含 token |
+| `auth_blocked_at` | INTEGER NULL | 检测到阻止状态的 UTC 毫秒时间 |
 
 #### `sync_outbox`
 

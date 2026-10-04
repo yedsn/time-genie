@@ -195,14 +195,15 @@ fn update_setting_with_cloud_operation(
     get_settings(database)
 }
 
-pub fn set_integration_secret(
+fn set_integration_secret_with_cloud_operation(
     database: &Database,
     request: IntegrationSecretRequest,
+    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
 ) -> Result<SettingsSnapshot, String> {
     if request.value.trim().is_empty() {
         return Err("凭据不能为空".to_string());
     }
-    let connection = database.open()?;
+    let mut connection = database.open()?;
     let workspace_id: String = connection
         .query_row(
             "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
@@ -216,7 +217,18 @@ pub fn set_integration_secret(
         .set_password(request.value.trim())
         .map_err(|error| format!("保存 {provider} 凭据失败: {error}"))?;
     let now = now_millis();
-    connection
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let base_version: Option<i64> = transaction
+        .query_row(
+            "SELECT version FROM integration_configs WHERE workspace_id = ?1 AND provider = ?2",
+            params![workspace_id, provider],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    transaction
         .execute(
             "INSERT INTO integration_configs(workspace_id, provider, enabled, config_json, secret_ref, updated_at, version)
              VALUES (?1, ?2, 1, '{}', ?3, ?4, 1)
@@ -224,6 +236,18 @@ pub fn set_integration_secret(
             params![workspace_id, provider, format!("keyring://{provider}"), now],
         )
         .map_err(|error| error.to_string())?;
+    if let Some(state) = cloud_state {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            "integration_secret_set",
+            "integration_config",
+            Some(provider),
+            base_version,
+            None,
+        )?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
     get_settings(database)
 }
 
@@ -255,6 +279,14 @@ fn update_integration_config_with_cloud_operation(
         .map_err(|error| error.to_string())?;
     let transaction = connection
         .transaction()
+        .map_err(|error| error.to_string())?;
+    let base_version: Option<i64> = transaction
+        .query_row(
+            "SELECT version FROM integration_configs WHERE workspace_id = ?1 AND provider = ?2",
+            params![workspace_id, request.provider],
+            |row| row.get(0),
+        )
+        .optional()
         .map_err(|error| error.to_string())?;
     if let Some(expected_version) = request.expected_version {
         let changed = transaction
@@ -292,7 +324,7 @@ fn update_integration_config_with_cloud_operation(
             "integration_config_update",
             "integration_config",
             Some(&request.provider),
-            request.expected_version,
+            request.expected_version.or(base_version),
             None,
         )?;
     }
@@ -300,11 +332,12 @@ fn update_integration_config_with_cloud_operation(
     get_settings(database)
 }
 
-pub fn clear_integration_secret(
+fn clear_integration_secret_with_cloud_operation(
     database: &Database,
     provider: SecretProvider,
+    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
 ) -> Result<SettingsSnapshot, String> {
-    let connection = database.open()?;
+    let mut connection = database.open()?;
     let workspace_id: String = connection
         .query_row(
             "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
@@ -318,13 +351,38 @@ pub fn clear_integration_secret(
         Ok(()) | Err(keyring::Error::NoEntry) => {}
         Err(error) => return Err(format!("删除 {provider_name} 凭据失败: {error}")),
     }
-    connection
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let base_version: Option<i64> = transaction
+        .query_row(
+            "SELECT version FROM integration_configs WHERE workspace_id = ?1 AND provider = ?2",
+            params![workspace_id, provider_name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let changed = transaction
         .execute(
             "UPDATE integration_configs SET secret_ref = NULL, enabled = 0, updated_at = ?1, version = version + 1
              WHERE workspace_id = ?2 AND provider = ?3",
             params![now_millis(), workspace_id, provider_name],
         )
         .map_err(|error| error.to_string())?;
+    if changed > 0 {
+        if let Some(state) = cloud_state {
+            crate::cloud_sync::enqueue_entity_in_transaction(
+                &transaction,
+                state,
+                "integration_secret_clear",
+                "integration_config",
+                Some(provider_name),
+                base_version,
+                None,
+            )?;
+        }
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
     get_settings(database)
 }
 
@@ -478,6 +536,7 @@ fn validate_setting_key(scope: &SettingsScope, key: &str) -> Result<(), String> 
             "storage_mode",
             "supabase_project_url",
             "supabase_anon_key",
+            "supabase_session_metadata",
             "cloud_workspace_id",
         ]
         .as_slice(),
@@ -573,7 +632,11 @@ pub fn integration_secret_set(
     database: tauri::State<'_, Database>,
     request: IntegrationSecretRequest,
 ) -> Result<SettingsSnapshot, String> {
-    set_integration_secret(&database, request)
+    crate::supabase::ensure_repository_write_mode(&database)?;
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = set_integration_secret_with_cloud_operation(&database, request, Some(&state))?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -593,7 +656,11 @@ pub fn integration_secret_clear(
     database: tauri::State<'_, Database>,
     provider: SecretProvider,
 ) -> Result<SettingsSnapshot, String> {
-    clear_integration_secret(&database, provider)
+    crate::supabase::ensure_repository_write_mode(&database)?;
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = clear_integration_secret_with_cloud_operation(&database, provider, Some(&state))?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -860,5 +927,86 @@ mod tests {
         assert!(!rows
             .iter()
             .any(|(_, _, entity_id, _)| entity_id.as_deref() == Some("obsidian_root_path")));
+    }
+
+    #[test]
+    fn cloud_integration_secret_state_is_queued_without_secret_material() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("settings-cloud-secret.sqlite3"))
+                .unwrap();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: serde_json::json!(cloud_workspace_id),
+            },
+        )
+        .unwrap();
+        update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: serde_json::json!("cloud"),
+            },
+        )
+        .unwrap();
+        let state = crate::supabase::storage_mode(&database).unwrap();
+
+        set_integration_secret_with_cloud_operation(
+            &database,
+            IntegrationSecretRequest {
+                provider: SecretProvider::Seatable,
+                value: "secret-token-that-must-not-sync".to_string(),
+            },
+            Some(&state),
+        )
+        .unwrap();
+        clear_integration_secret_with_cloud_operation(
+            &database,
+            SecretProvider::Seatable,
+            Some(&state),
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let rows = connection
+            .prepare(
+                "SELECT operation_type, entity_type, entity_id, base_version, payload_json FROM sync_outbox ORDER BY created_at, rowid",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "integration_secret_set");
+        assert_eq!(rows[0].1, "integration_config");
+        assert_eq!(rows[0].2.as_deref(), Some("seatable"));
+        assert_eq!(rows[0].3, None);
+        assert_eq!(rows[1].0, "integration_secret_clear");
+        assert_eq!(rows[1].1, "integration_config");
+        assert_eq!(rows[1].2.as_deref(), Some("seatable"));
+        assert_eq!(rows[1].3, Some(1));
+
+        for (_, _, _, _, payload_json) in rows {
+            let payload: Value = serde_json::from_str(&payload_json).unwrap();
+            assert_eq!(payload["provider"], "seatable");
+            assert!(payload.get("secret_ref").is_none());
+            assert!(!payload_json.contains("secret-token-that-must-not-sync"));
+            assert!(!payload_json.contains("keyring://"));
+        }
     }
 }

@@ -586,6 +586,7 @@ fn save_template_with_cloud_operation(
         )
         .optional()
         .map_err(|error| error.to_string())?;
+    let base_version = existing.as_ref().map(|(_, version)| *version);
     let now = now_millis();
     let transaction = connection
         .transaction()
@@ -624,7 +625,7 @@ fn save_template_with_cloud_operation(
             operation_type,
             "report_template",
             Some(&id),
-            request.expected_version,
+            request.expected_version.or(base_version),
             None,
         )?;
     }
