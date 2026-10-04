@@ -850,15 +850,15 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
   const row = event.currentTarget instanceof HTMLElement
     ? event.currentTarget.closest<HTMLElement>(".reminder-row, .el-table__row")
     : undefined;
+  const completing = task.status !== "done";
+  if (completing && isCompletionFeedbackEnabled()) row?.classList.add("task-completion-confirmed");
   try {
     const result = await store.commitTaskToggle(task);
     if (!result) return;
     if (result.direction === "completed" && isCompletionFeedbackEnabled()) {
-      row?.classList.add("task-completion-confirmed");
-      await new Promise((resolve) => window.setTimeout(resolve, 330));
+      window.setTimeout(() => row?.classList.remove("task-completion-confirmed"), 380);
     }
-    await store.loadWorkspaceData();
-    await store.loadTodayOverview();
+    void Promise.all([store.loadWorkspaceData(), store.loadTodayOverview()]);
     if (result.completedCount > 0 && isCompletionFeedbackEnabled()) {
       recentCompletedTaskId.value = result.taskId;
       if (recentCompletedTimer) window.clearTimeout(recentCompletedTimer);
@@ -872,9 +872,10 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
       playCompletionFeedback({ completedCount: result.completedCount, openBefore, openAfter });
     }
   } catch (error) {
+    row?.classList.remove("task-completion-confirmed");
     ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "事项状态更新失败");
   } finally {
-    row?.classList.remove("task-completion-confirmed");
+    if (!isCompletionFeedbackEnabled()) row?.classList.remove("task-completion-confirmed");
     completingTaskIds.delete(task.id);
   }
 }
@@ -1048,45 +1049,67 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           <button class="secondary-button" type="button" :disabled="seaTableLoading || !settingsSnapshot?.secrets.seatableTokenSet" @click="checkSeaTableConnection">{{ seaTableLoading ? '检测中...' : '检测连接与表结构' }}</button>
         </div>
 
-        <div class="work-panel settings-panel">
+        <div class="work-panel settings-panel settings-storage-panel">
           <div class="panel-title"><h2>数据存储</h2><span>{{ settingsDraft.storageMode === 'local' ? '本地 SQLite' : 'Supabase 云端' }}</span></div>
-          <div class="storage-mode-row"><span :class="['storage-state-dot', storageState?.online ? 'online' : '', { warning: storageState?.conflictCount || storageState?.pendingOperations || storageState?.lastError }]"></span><strong>{{ storageState?.mode === 'cloud' ? '云端数据' : '本地数据' }}</strong><small>{{ storageState?.mode === 'cloud' ? `${cloudSyncLabel} · 变更序号 ${storageState.lastChangeSeq}` : '无需网络即可使用' }}</small></div>
+          <div class="storage-status-card">
+            <div class="storage-status-main"><span :class="['storage-state-dot', storageState?.online ? 'online' : '', { warning: storageState?.conflictCount || storageState?.pendingOperations || storageState?.lastError }]"></span><div><strong>{{ storageState?.mode === 'cloud' ? '云端数据' : '本地数据' }}</strong><small>{{ storageState?.mode === 'cloud' ? cloudSyncLabel : '无需网络即可使用' }}</small></div></div>
+            <div v-if="storageState?.mode === 'cloud'" class="storage-status-meta"><span>变更序号</span><strong>{{ storageState.lastChangeSeq }}</strong></div>
+          </div>
           <p v-if="cloudSyncDetail" class="cloud-sync-detail">{{ cloudSyncDetail }}</p>
-          <div v-if="storageState?.mode === 'cloud'" class="cloud-sync-actions">
+          <div v-if="storageState?.mode === 'cloud'" class="cloud-sync-actions storage-status-actions">
             <button class="secondary-button compact" type="button" :disabled="cloudSyncWorking" @click="refreshCloudSyncStatus">刷新状态</button>
             <button v-if="storageState.pendingOperations" class="secondary-button compact" type="button" :disabled="cloudSyncWorking || !storageState.online" @click="retryCloudSync">重试同步</button>
             <button v-if="storageState.conflictCount" class="danger-button compact" type="button" :disabled="cloudSyncWorking" @click="openCloudConflicts">处理冲突</button>
           </div>
-          <div v-if="storageState?.mode === 'cloud'" class="local-cache-reset-row">
-            <div><strong>本地数据缓存</strong><small>本机显示异常时，可清空本机业务缓存后重新下载云端数据。</small></div>
-            <button class="danger-button compact" type="button" :disabled="resetLocalCacheWorking" @click="openResetLocalCacheDialog"><LoaderCircle v-if="resetLocalCacheWorking" class="sync-spin" :size="13" />{{ resetLocalCacheWorking ? '重置中...' : '重置本地数据' }}</button>
+
+          <div class="storage-section storage-connection-section">
+            <div class="storage-section-heading"><div><strong>连接配置</strong><small>用于连接当前 Supabase 项目</small></div><span>公开配置</span></div>
+            <div class="storage-connection-grid">
+              <label>Supabase Project URL<input v-model="settingsDraft.supabaseProjectUrl" :disabled="!settingsLoaded || cloudWorking" placeholder="https://example.supabase.co" /></label>
+              <label>Supabase anon key<input v-model="settingsDraft.supabaseAnonKey" :disabled="!settingsLoaded || cloudWorking" type="password" placeholder="公开 anon key，不要填写 service_role" autocomplete="off" /></label>
+            </div>
+            <div class="settings-inline-actions"><button class="secondary-button" type="button" :disabled="cloudWorking" @click="configureSupabase">保存连接</button></div>
           </div>
-          <p v-if="storageState?.mode === 'cloud' && (storageState.pendingOperations || storageState.conflictCount)" class="settings-help">重置时会丢弃待同步修改和冲突记录，并重新以云端数据建立本机缓存。</p>
-          <label>Supabase Project URL<input v-model="settingsDraft.supabaseProjectUrl" :disabled="!settingsLoaded || cloudWorking" placeholder="https://example.supabase.co" /></label>
-          <label>Supabase anon key<input v-model="settingsDraft.supabaseAnonKey" :disabled="!settingsLoaded || cloudWorking" type="password" placeholder="公开 anon key，不要填写 service_role" autocomplete="off" /></label>
-          <div class="settings-inline-actions"><button class="secondary-button" type="button" :disabled="cloudWorking" @click="configureSupabase">保存连接</button></div>
+
           <p v-if="cloudSession?.status === 'offline_saved'" class="settings-help">账号已安全保存在本机，当前无法连接 Supabase；恢复网络后会自动续期，无需重新输入密码。</p>
           <div v-if="cloudAuthBlocked" class="cloud-sync-banner warning"><AlertTriangle :size="16" /><div><strong>待同步修改已暂停</strong><span>{{ cloudSession?.signedIn ? '重新登录后不会自动上传，请确认后恢复。' : '本地数据和待同步修改均已保留，重新登录后再确认是否恢复上传。' }}</span></div><button v-if="cloudSession?.signedIn" class="secondary-button compact" type="button" :disabled="cloudWorking" @click="resumeBlockedCloudSync">确认恢复</button></div>
+
+          <div v-if="storageState?.mode === 'cloud'" class="storage-section local-cache-section">
+            <div class="local-cache-reset-row">
+              <div><strong>本地数据缓存</strong><small>本机显示异常时，可清空本机业务缓存后重新下载云端数据。</small></div>
+              <button class="danger-button compact" type="button" :disabled="resetLocalCacheWorking" @click="openResetLocalCacheDialog"><LoaderCircle v-if="resetLocalCacheWorking" class="sync-spin" :size="13" />{{ resetLocalCacheWorking ? '重置中...' : '重置本地数据' }}</button>
+            </div>
+            <p v-if="storageState.pendingOperations || storageState.conflictCount" class="settings-help">重置时会丢弃待同步修改和冲突记录，并重新以云端数据建立本机缓存。</p>
+          </div>
+
           <template v-if="cloudNeedsReauth">
-            <label>登录邮箱<input v-model="settingsDraft.supabaseEmail" :disabled="cloudWorking" type="email" autocomplete="username" placeholder="user@example.com" /></label>
-            <label>登录密码<input v-model="settingsDraft.supabasePassword" :disabled="cloudWorking" type="password" autocomplete="current-password" /></label>
-            <button class="primary-button" type="button" :disabled="cloudWorking || !settingsDraft.supabaseEmail || !settingsDraft.supabasePassword" @click="loginSupabase">登录 Supabase</button>
+            <div class="storage-section storage-login-section">
+              <div class="storage-section-heading"><div><strong>登录 Supabase</strong><small>登录后会安全保存在本机，下次启动自动恢复</small></div><span>需要验证</span></div>
+              <div class="storage-login-grid"><label>登录邮箱<input v-model="settingsDraft.supabaseEmail" :disabled="cloudWorking" type="email" autocomplete="username" placeholder="user@example.com" /></label><label>登录密码<input v-model="settingsDraft.supabasePassword" :disabled="cloudWorking" type="password" autocomplete="current-password" /></label></div>
+              <div class="settings-inline-actions"><button class="primary-button" type="button" :disabled="cloudWorking || !settingsDraft.supabaseEmail || !settingsDraft.supabasePassword" @click="loginSupabase">登录 Supabase</button></div>
+            </div>
           </template>
           <template v-else>
-            <div class="cloud-account-row"><div><span>当前账号</span><strong>{{ cloudSession?.email || cloudSession?.userId || '已保存账号' }}</strong></div><div class="settings-inline-actions"><button class="secondary-button compact" type="button" :disabled="cloudWorking" @click="logoutSupabase">退出当前设备</button><button class="danger-button compact" type="button" :disabled="cloudWorking" @click="logoutAllSupabase">退出所有设备</button></div></div>
-            <div v-if="cloudDevices.length" class="device-session-list">
-              <div v-for="device in cloudDevices" :key="device.id" class="cloud-account-row">
-                <div><span>{{ cloudDeviceKind(device) }} · {{ device.appVersion }}</span><strong>{{ device.deviceName }}</strong><small>最近在线 {{ new Date(device.lastSeenAt).toLocaleString() }}{{ device.revokedAt ? ' · 已撤销' : '' }}</small></div>
-                <button class="secondary-button compact" type="button" :disabled="cloudDeviceActionDisabled(device, cloudWorking)" @click="revokeSupabaseDevice(device)">{{ cloudDeviceActionLabel(device) }}</button>
+            <div class="storage-section storage-account-section">
+              <div class="storage-section-heading"><div><strong>账号与设备</strong><small>管理当前账号的登录状态和授权设备</small></div><span>已登录</span></div>
+              <div class="cloud-account-row"><div><span>当前账号</span><strong>{{ cloudSession?.email || cloudSession?.userId || '已保存账号' }}</strong></div><div class="settings-inline-actions cloud-account-actions"><button class="secondary-button compact" type="button" :disabled="cloudWorking" @click="logoutSupabase">退出当前设备</button><button class="danger-button compact" type="button" :disabled="cloudWorking" @click="logoutAllSupabase">退出所有设备</button></div></div>
+              <div v-if="cloudDevices.length" class="device-session-list">
+                <div v-for="device in cloudDevices" :key="device.id" class="cloud-account-row">
+                  <div><span>{{ cloudDeviceKind(device) }} · {{ device.appVersion }}</span><strong>{{ device.deviceName }}</strong><small>最近在线 {{ new Date(device.lastSeenAt).toLocaleString() }}{{ device.revokedAt ? ' · 已撤销' : '' }}</small></div>
+                  <button class="secondary-button compact" type="button" :disabled="cloudDeviceActionDisabled(device, cloudWorking)" @click="revokeSupabaseDevice(device)">{{ cloudDeviceActionLabel(device) }}</button>
+                </div>
               </div>
             </div>
-            <button v-if="!migrationPreview" class="secondary-button" type="button" :disabled="cloudWorking" @click="previewCloudMigration">预览本地数据迁移</button>
-            <div v-else class="migration-preview-block">
-              <div class="migration-count-grid"><span v-for="item in migrationPreview.entities" :key="item.entity"><strong>{{ item.localCount }}</strong><small>{{ item.entity }}</small></span></div>
-              <p v-if="migrationPreview.conflicts.length">{{ migrationPreview.conflicts.join('；') }}</p>
-              <div class="settings-inline-actions">
-                <button class="primary-button" type="button" :disabled="cloudWorking || !migrationPreview.canExecute || storageState?.mode === 'cloud'" @click="migrateToCloud">{{ storageState?.mode === 'cloud' ? '当前已使用云端' : '迁移并切换到云端' }}</button>
-                <button v-if="cloudHasBusinessData" class="secondary-button" type="button" :disabled="cloudWorking || storageState?.mode === 'cloud'" @click="useExistingCloud">使用现有云端数据</button>
+            <div class="storage-section storage-migration-section">
+              <div class="storage-section-heading"><div><strong>迁移本地数据</strong><small>将本机 SQLite 数据安全迁移到云端</small></div><span>可选</span></div>
+              <button v-if="!migrationPreview" class="secondary-button" type="button" :disabled="cloudWorking" @click="previewCloudMigration">预览本地数据迁移</button>
+              <div v-else class="migration-preview-block">
+                <div class="migration-count-grid"><span v-for="item in migrationPreview.entities" :key="item.entity"><strong>{{ item.localCount }}</strong><small>{{ item.entity }}</small></span></div>
+                <p v-if="migrationPreview.conflicts.length">{{ migrationPreview.conflicts.join('；') }}</p>
+                <div class="settings-inline-actions">
+                  <button class="primary-button" type="button" :disabled="cloudWorking || !migrationPreview.canExecute || storageState?.mode === 'cloud'" @click="migrateToCloud">{{ storageState?.mode === 'cloud' ? '当前已使用云端' : '迁移并切换到云端' }}</button>
+                  <button v-if="cloudHasBusinessData" class="secondary-button" type="button" :disabled="cloudWorking || storageState?.mode === 'cloud'" @click="useExistingCloud">使用现有云端数据</button>
+                </div>
               </div>
             </div>
           </template>

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -7,6 +7,7 @@ use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
+use tokio::sync::Notify;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
 use uuid::Uuid;
@@ -23,16 +24,27 @@ const OUTBOX_SENDING_STALE_AFTER_MILLIS: i64 = 5 * 60 * 1000;
 const OUTBOX_RETRY_MAX_BACKOFF_MILLIS: i64 = 60 * 1000;
 static TRACKING_LEASE_TOKEN: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static CLOUD_SYNC_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static CLOUD_SYNC_WAKEUP: OnceLock<Arc<Notify>> = OnceLock::new();
 
 pub fn spawn_background_services(database: Database, app: AppHandle) {
     spawn_background_lease(database.clone(), app.clone());
     spawn_realtime_listener(database, app);
 }
 
+fn cloud_sync_wakeup() -> Arc<Notify> {
+    CLOUD_SYNC_WAKEUP
+        .get_or_init(|| Arc::new(Notify::new()))
+        .clone()
+}
+
 fn spawn_background_lease(database: Database, app: AppHandle) {
+    let wakeup = cloud_sync_wakeup();
     tauri::async_runtime::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                _ = wakeup.notified() => {}
+            }
             let Ok(state) = storage_mode(&database) else {
                 clear_tracking_lease_token();
                 continue;
@@ -708,35 +720,9 @@ fn ensure_supported_cloud_entity_type(entity_type: &str) -> Result<(), String> {
     }
 }
 
-pub fn flush_if_online(database: &Database) -> Result<(), String> {
-    let state = storage_mode(database)?;
-    if state.mode == "cloud" && state.online {
-        match push_outbox(database) {
-            Ok(result) if automatic_flush_should_block_local_result(&result) => {
-                return Err("SYNC_CONFLICT: 云端数据已变化，本地修改已保留在冲突队列".to_string());
-            }
-            Ok(_) => {}
-            Err(error) if is_cloud_unavailable_error(&error) => {
-                update_sync_state(
-                    database,
-                    &state.workspace_id,
-                    &state.device_id,
-                    state.last_change_seq,
-                    Some(&error),
-                )?;
-            }
-            Err(error) => return Err(error),
-        }
-    }
+pub fn flush_if_online(_database: &Database) -> Result<(), String> {
+    cloud_sync_wakeup().notify_one();
     Ok(())
-}
-
-fn is_cloud_unavailable_error(error: &str) -> bool {
-    error.starts_with("NETWORK_ERROR:") || error.starts_with("AUTH_REQUIRED:")
-}
-
-fn automatic_flush_should_block_local_result(_result: &CloudSyncPushResult) -> bool {
-    false
 }
 
 pub fn push_outbox(database: &Database) -> Result<CloudSyncPushResult, String> {
@@ -3576,25 +3562,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_flush_never_turns_saved_local_work_into_a_conflict_error() {
-        assert!(!automatic_flush_should_block_local_result(
-            &CloudSyncPushResult {
-                pushed: 0,
-                pending: 1,
-                conflicts: 1,
-            }
-        ));
-        assert!(!automatic_flush_should_block_local_result(
-            &CloudSyncPushResult {
-                pushed: 1,
-                pending: 0,
-                conflicts: 1,
-            }
-        ));
-    }
-
-    #[test]
-    fn flush_if_online_does_not_fail_local_save_when_conflicts_are_already_queued() {
+    fn flush_if_online_preserves_queued_conflicts_for_background_sync() {
         let directory = tempdir().unwrap();
         let database =
             Database::initialize_at(directory.path().join("cloud-existing-conflict.sqlite3"))
@@ -3641,6 +3609,16 @@ mod tests {
         .unwrap();
 
         flush_if_online(&database).unwrap();
+        let queued: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE state = 'conflict'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(queued, 1);
     }
 
     #[test]

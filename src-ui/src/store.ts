@@ -533,7 +533,13 @@ export const useWorkdayStore = defineStore("workday", () => {
     const next = toUiTask(record);
     if (index >= 0) tasks.splice(index, 1, next);
     else tasks.push(next);
+    const todayIndex = todayTasks.findIndex((task) => task.id === record.id);
+    if (todayIndex >= 0) todayTasks.splice(todayIndex, 1, toUiTask(record));
     return next;
+  }
+
+  function applyTaskRecord(task: Task, record: TaskRecord) {
+    Object.assign(task, toUiTask(record));
   }
 
   function selectPage(page: string) {
@@ -609,24 +615,50 @@ export const useWorkdayStore = defineStore("workday", () => {
   async function commitTaskToggle(task: Task): Promise<TaskCompletionResult | undefined> {
     if (task.version <= 0) return;
     const direction = task.status === "done" ? "reopened" : "completed";
+    const optimisticStatus: TaskStatus = direction === "completed" ? "done" : "open";
     const todayTask = todayTasks.find((item) => item.id === task.id);
     const occurrenceDate = task.occurrenceDate
       ?? todayTask?.occurrenceDate
       ?? (task.recurrence ? formatLocalDate(new Date()) : undefined);
     const occurrenceVersion = task.occurrenceVersion ?? todayTask?.occurrenceVersion;
-    const updated = await setTaskCompleted(
-      task.id,
-      task.version,
-      direction === "completed",
-      occurrenceDate,
-      occurrenceVersion,
-    );
-    return {
-      taskId: task.id,
-      subjectId: task.subjectId,
-      direction,
-      completedCount: direction === "completed" && updated.status === "done" ? 1 : 0,
-    };
+    const optimisticTargets = occurrenceDate
+      ? [task, ...(todayTask && todayTask !== task ? [todayTask] : [])]
+      : [...tasks.filter((item) => item.id === task.id), ...todayTasks.filter((item) => item.id === task.id)];
+    const previousStates = [...new Set(optimisticTargets)].map((item) => ({
+      task: item,
+      status: item.status,
+      executionState: item.executionState,
+    }));
+    for (const item of optimisticTargets) {
+      item.status = optimisticStatus;
+      item.executionState = optimisticStatus === "done" ? "done" : item.actual > 0 ? "started" : "not_started";
+    }
+    try {
+      const updated = await setTaskCompleted(
+        task.id,
+        task.version,
+        direction === "completed",
+        occurrenceDate,
+        occurrenceVersion,
+      );
+      if (occurrenceDate) {
+        for (const item of new Set(optimisticTargets)) applyTaskRecord(item, updated);
+      } else {
+        replaceTask(updated);
+      }
+      return {
+        taskId: task.id,
+        subjectId: task.subjectId,
+        direction,
+        completedCount: direction === "completed" && updated.status === "done" ? 1 : 0,
+      };
+    } catch (error) {
+      for (const previous of previousStates) {
+        previous.task.status = previous.status;
+        previous.task.executionState = previous.executionState;
+      }
+      throw error;
+    }
   }
 
   async function toggleTask(task: Task) {
