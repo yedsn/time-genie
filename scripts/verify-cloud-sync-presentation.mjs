@@ -30,13 +30,13 @@ assert.deepEqual(cloudSyncPresentation({ ...cloud, mode: "local" }, formatSyncTi
 });
 
 const conflict = cloudSyncPresentation({ ...cloud, online: false, lastError: "网络失败", pendingOperations: 3, conflictCount: 2 }, formatSyncTime);
-assert.equal(conflict.label, "2 项冲突");
+assert.equal(conflict.label, "2 项冲突，3 项待处理");
 assert.equal(conflict.attentionLevel, "critical");
 assert.equal(conflict.needsAttention, true);
-assert.match(conflict.detail, /处理冲突/);
+assert.match(conflict.detail, /冲突阻塞了后续 3 项同步/);
 
 const pendingWithError = cloudSyncPresentation({ ...cloud, online: false, lastError: "网络失败", pendingOperations: 3 }, formatSyncTime);
-assert.equal(pendingWithError.label, "3 项等待同步");
+assert.equal(pendingWithError.label, "3 项等待连接");
 assert.equal(pendingWithError.attentionLevel, "pending");
 assert.match(pendingWithError.detail, /本机修改已保存/);
 assert.match(pendingWithError.detail, /网络失败/);
@@ -51,9 +51,9 @@ assert.equal(stateError.label, "同步失败");
 assert.equal(stateError.attentionLevel, "critical");
 
 const pending = cloudSyncPresentation({ ...cloud, online: false, pendingOperations: 3 }, formatSyncTime);
-assert.equal(pending.label, "3 项等待同步");
+assert.equal(pending.label, "3 项等待连接");
 assert.equal(pending.attentionLevel, "pending");
-assert.match(pending.detail, /等待同步/);
+assert.match(pending.detail, /等待网络或登录状态恢复/);
 
 const offline = cloudSyncPresentation({ ...cloud, online: false }, formatSyncTime);
 assert.equal(offline.label, "云端离线");

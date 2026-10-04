@@ -49,8 +49,21 @@ fn spawn_background_lease(database: Database, app: AppHandle) {
                 clear_tracking_lease_token();
                 continue;
             };
-            if state.mode != "cloud" || !state.online {
+            if state.mode != "cloud" {
                 clear_tracking_lease_token();
+                continue;
+            }
+            if let Err(error) =
+                recover_interrupted_sending_operations(&database, &state.workspace_id)
+            {
+                emit_cloud_error(&app, &database, &error);
+                continue;
+            }
+            if !state.online {
+                clear_tracking_lease_token();
+                if let Ok(status) = sync_status(&database) {
+                    let _ = app.emit("cloud-sync-state-changed", &status);
+                }
                 continue;
             }
             match push_outbox(&database) {
@@ -726,15 +739,30 @@ pub fn flush_if_online(_database: &Database) -> Result<(), String> {
 }
 
 pub fn push_outbox(database: &Database) -> Result<CloudSyncPushResult, String> {
+    push_outbox_with_retry_mode(database, false)
+}
+
+fn push_outbox_now(database: &Database) -> Result<CloudSyncPushResult, String> {
+    push_outbox_with_retry_mode(database, true)
+}
+
+fn push_outbox_with_retry_mode(
+    database: &Database,
+    retry_immediately: bool,
+) -> Result<CloudSyncPushResult, String> {
     let _operation_guard = CLOUD_SYNC_OPERATION_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    push_outbox_locked(database)
+    push_outbox_locked(database, retry_immediately)
 }
 
-fn push_outbox_locked(database: &Database) -> Result<CloudSyncPushResult, String> {
+fn push_outbox_locked(
+    database: &Database,
+    retry_immediately: bool,
+) -> Result<CloudSyncPushResult, String> {
     let state = require_cloud(database)?;
+    recover_interrupted_sending_operations(database, &state.workspace_id)?;
     ensure_current_device_authorized(database).map_err(|error| {
         if error.starts_with("DEVICE_REVOKED:") {
             let _ = mark_auth_blocked(database, "device_revoked");
@@ -743,9 +771,10 @@ fn push_outbox_locked(database: &Database) -> Result<CloudSyncPushResult, String
     })?;
     let session = current_session(database)?;
     let api = client(database)?;
-    let operations = claim_pending_operations(database, &state.workspace_id)?;
+    let operations =
+        claim_pending_operations_with_retry_mode(database, &state.workspace_id, retry_immediately)?;
     let mut pushed = 0;
-    for operation in operations {
+    for (index, operation) in operations.iter().enumerate() {
         let response = api.rpc_for_database(
             database,
             "cloud_apply_patch",
@@ -768,10 +797,12 @@ fn push_outbox_locked(database: &Database) -> Result<CloudSyncPushResult, String
             }
             Err(error) if is_conflict_error(&error) => {
                 mark_outbox_error(database, &operation.operation_id, "conflict", &error)?;
+                release_unprocessed_claims(database, &operations[index + 1..])?;
                 break;
             }
             Err(error) => {
                 mark_outbox_error(database, &operation.operation_id, "pending", &error)?;
+                release_unprocessed_claims(database, &operations[index + 1..])?;
                 update_sync_state(
                     database,
                     &state.workspace_id,
@@ -1540,9 +1571,18 @@ fn sqlite_value_to_json(value: rusqlite::types::Value) -> Value {
     }
 }
 
+#[cfg(test)]
 fn claim_pending_operations(
     database: &Database,
     workspace_id: &str,
+) -> Result<Vec<OutboxOperation>, String> {
+    claim_pending_operations_with_retry_mode(database, workspace_id, false)
+}
+
+fn claim_pending_operations_with_retry_mode(
+    database: &Database,
+    workspace_id: &str,
+    retry_immediately: bool,
 ) -> Result<Vec<OutboxOperation>, String> {
     let mut connection = database.open()?;
     let transaction = connection
@@ -1594,6 +1634,7 @@ fn claim_pending_operations(
         let retry_ready = match state.as_str() {
             "conflict" => false,
             "sending" => last_attempt_at.unwrap_or(created_at) < stale_sending_before,
+            _ if retry_immediately => true,
             _ => retry_ready_at(last_attempt_at, attempt_count)
                 .is_none_or(|ready_at| ready_at <= now),
         };
@@ -1621,6 +1662,22 @@ fn claim_pending_operations(
     }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
+}
+
+fn recover_interrupted_sending_operations(
+    database: &Database,
+    workspace_id: &str,
+) -> Result<(), String> {
+    database
+        .open()?
+        .execute(
+            "UPDATE sync_outbox
+             SET state = 'pending', last_attempt_at = NULL
+             WHERE workspace_id = ?1 AND state = 'sending'",
+            [workspace_id],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn outbox_entity_key(operation: &OutboxOperation) -> Option<String> {
@@ -1654,6 +1711,27 @@ fn mark_outbox_error(
         )
         .map(|_| ())
         .map_err(|database_error| database_error.to_string())
+}
+
+fn release_unprocessed_claims(
+    database: &Database,
+    operations: &[OutboxOperation],
+) -> Result<(), String> {
+    let mut connection = database.open()?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    for operation in operations {
+        transaction
+            .execute(
+                "UPDATE sync_outbox
+                 SET state = 'pending', last_attempt_at = NULL, error_json = NULL
+                 WHERE operation_id = ?1 AND state = 'sending'",
+                [operation.operation_id.as_str()],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 fn delete_outbox(database: &Database, operation_id: &str) -> Result<(), String> {
@@ -2655,12 +2733,12 @@ pub fn cloud_sync_pull(
 pub fn cloud_sync_push(
     database: tauri::State<'_, Database>,
 ) -> Result<CloudSyncPushResult, String> {
-    push_outbox(&database)
+    push_outbox_now(&database)
 }
 
 #[tauri::command]
 pub fn cloud_sync_refresh(database: tauri::State<'_, Database>) -> Result<CloudSyncStatus, String> {
-    let push = push_outbox(&database)?;
+    let push = push_outbox_now(&database)?;
     if should_pull_snapshot_after_manual_refresh(push.pending, push.conflicts) {
         match pull_snapshot(&database) {
             Ok(_) => {}
@@ -3687,6 +3765,122 @@ mod tests {
         assert_eq!(pending_state, ("sending".to_string(), 1));
         assert_eq!(fresh_sending_state, ("sending".to_string(), 3));
         assert_eq!(stale_sending_state, ("sending".to_string(), 3));
+    }
+
+    #[test]
+    fn release_unprocessed_claims_returns_queued_operations_to_pending() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("cloud-release-claims.sqlite3")).unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let first_id = Uuid::now_v7().to_string();
+        let second_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        for operation_id in [&first_id, &second_id] {
+            connection
+                .execute(
+                    "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at, last_attempt_at)
+                     VALUES (?1, ?2, ?3, 'task_update', 'task', ?4, 1, '{}', 'sending', 1, ?5, ?5)",
+                    params![operation_id, &workspace_id, &device_id, operation_id, now],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let operation = OutboxOperation {
+            operation_id: second_id.clone(),
+            operation_type: "task_update".to_string(),
+            entity_type: "task".to_string(),
+            entity_id: Some(second_id.clone()),
+            base_version: Some(1),
+            payload: Value::Object(Default::default()),
+        };
+        release_unprocessed_claims(&database, &[operation]).unwrap();
+
+        let state: String = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM sync_outbox WHERE operation_id = ?1",
+                [&second_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "pending");
+    }
+
+    #[test]
+    fn manual_claim_retries_recent_pending_operation_immediately() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("cloud-manual-retry.sqlite3")).unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let operation_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        connection
+            .execute(
+                "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at, last_attempt_at)
+                 VALUES (?1, ?2, ?3, 'task_update', 'task', ?4, 1, '{}', 'pending', 3, ?5, ?5)",
+                params![&operation_id, &workspace_id, &device_id, &operation_id, now],
+            )
+            .unwrap();
+        drop(connection);
+
+        let automatic = claim_pending_operations(&database, &workspace_id).unwrap();
+        assert!(automatic.is_empty());
+        let manual =
+            claim_pending_operations_with_retry_mode(&database, &workspace_id, true).unwrap();
+        assert_eq!(manual.len(), 1);
+        assert_eq!(manual[0].operation_id, operation_id);
+    }
+
+    #[test]
+    fn recover_interrupted_sending_operations_releases_all_workspace_claims() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("cloud-recover-sending.sqlite3"))
+                .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let operation_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        connection
+            .execute(
+                "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at, last_attempt_at)
+                 VALUES (?1, ?2, ?3, 'task_update', 'task', ?4, 1, '{}', 'sending', 1, ?5, ?5)",
+                params![&operation_id, &workspace_id, &device_id, &operation_id, now],
+            )
+            .unwrap();
+        drop(connection);
+
+        recover_interrupted_sending_operations(&database, &workspace_id).unwrap();
+        let state: (String, Option<i64>) = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT state, last_attempt_at FROM sync_outbox WHERE operation_id = ?1",
+                [&operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("pending".to_string(), None));
     }
 
     #[test]

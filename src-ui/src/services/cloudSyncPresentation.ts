@@ -43,8 +43,12 @@ export function cloudSyncPresentation(
 
   if (state.conflictCount > 0) {
     return {
-      label: `${state.conflictCount} 项冲突`,
-      detail: "本机修改已保存，需处理冲突后继续同步",
+      label: state.pendingOperations > 0
+        ? `${state.conflictCount} 项冲突，${state.pendingOperations} 项待处理`
+        : `${state.conflictCount} 项冲突`,
+      detail: state.pendingOperations > 0
+        ? `本机修改已保存；冲突阻塞了后续 ${state.pendingOperations} 项同步，请先处理冲突`
+        : "本机修改已保存，需处理冲突后继续同步",
       needsAttention: true,
       attentionLevel: "critical",
     };
@@ -52,10 +56,14 @@ export function cloudSyncPresentation(
 
   if (state.pendingOperations > 0) {
     return {
-      label: `${state.pendingOperations} 项等待同步`,
-      detail: state.lastError
-        ? `本机修改已保存，等待同步到云端；上次同步失败：${state.lastError}`
-        : "本机修改已保存，等待同步到云端",
+      label: state.online ? `${state.pendingOperations} 项等待同步` : `${state.pendingOperations} 项等待连接`,
+      detail: state.online
+        ? state.lastError
+          ? `本机修改已保存，等待同步到云端；上次同步失败：${state.lastError}`
+          : "本机修改已保存，等待同步到云端"
+        : state.lastError
+          ? `本机修改已保存，等待网络或登录状态恢复后自动同步；上次同步失败：${state.lastError}`
+          : "本机修改已保存，等待网络或登录状态恢复后自动同步",
       needsAttention: true,
       attentionLevel: "pending",
     };

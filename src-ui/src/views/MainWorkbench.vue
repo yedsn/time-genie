@@ -116,8 +116,10 @@ const cloudDockSyncDisabled = computed(() => storageState.value?.mode !== "cloud
 const cloudDockSyncTitle = computed(() => {
   if (storageState.value?.mode !== "cloud") return "本地模式无需同步";
   if (!cloudSession.value?.signedIn) return "登录后可同步";
+  if (storageState.value.conflictCount > 0) return "先处理同步冲突";
   return cloudSyncWorking.value ? "正在同步" : "手动同步云端数据";
 });
+const cloudDockSyncLabel = computed(() => storageState.value?.conflictCount ? "处理冲突" : "同步");
 const cloudBusinessEntities = new Set([
   "tasks",
   "task_daily_estimates",
@@ -365,6 +367,10 @@ async function refreshCloudSyncStatus() {
 
 async function retryCloudSync() {
   if (storageState.value?.mode !== "cloud" || cloudSyncWorking.value) return;
+  if (storageState.value.conflictCount > 0) {
+    await openCloudConflicts();
+    return;
+  }
   cloudSyncWorking.value = true;
   try {
     const result = await pushCloudSync();
@@ -385,8 +391,20 @@ async function retryCloudSync() {
 }
 
 async function openCloudConflicts() {
-  cloudConflicts.value = await listCloudSyncConflicts();
-  cloudConflictDialogOpen.value = true;
+  try {
+    cloudConflicts.value = await listCloudSyncConflicts();
+    cloudConflictDialogOpen.value = true;
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function handleCloudDockSync() {
+  if (storageState.value?.conflictCount) {
+    await openCloudConflicts();
+    return;
+  }
+  await refreshCloudSyncStatus();
 }
 
 async function resolveConflict(conflict: CloudSyncConflict, strategy: "use_cloud" | "keep_local") {
@@ -954,7 +972,7 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           <span>{{ cloudSyncDetail }}</span>
         </div>
         <button class="secondary-button compact" type="button" :disabled="cloudSyncWorking" @click="refreshCloudSyncStatus">刷新</button>
-        <button v-if="storageState?.pendingOperations" class="secondary-button compact" type="button" :disabled="cloudSyncWorking || !storageState.online" @click="retryCloudSync">重试</button>
+        <button v-if="storageState?.pendingOperations && !storageState?.conflictCount" class="secondary-button compact" type="button" :disabled="cloudSyncWorking || !storageState.online" @click="retryCloudSync">重试</button>
         <button v-if="storageState?.conflictCount" class="danger-button compact" type="button" :disabled="cloudSyncWorking" @click="openCloudConflicts">处理冲突</button>
       </section>
 
@@ -1058,7 +1076,7 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           <p v-if="cloudSyncDetail" class="cloud-sync-detail">{{ cloudSyncDetail }}</p>
           <div v-if="storageState?.mode === 'cloud'" class="cloud-sync-actions storage-status-actions">
             <button class="secondary-button compact" type="button" :disabled="cloudSyncWorking" @click="refreshCloudSyncStatus">刷新状态</button>
-            <button v-if="storageState.pendingOperations" class="secondary-button compact" type="button" :disabled="cloudSyncWorking || !storageState.online" @click="retryCloudSync">重试同步</button>
+            <button v-if="storageState.pendingOperations && !storageState.conflictCount" class="secondary-button compact" type="button" :disabled="cloudSyncWorking || !storageState.online" @click="retryCloudSync">重试同步</button>
             <button v-if="storageState.conflictCount" class="danger-button compact" type="button" :disabled="cloudSyncWorking" @click="openCloudConflicts">处理冲突</button>
           </div>
 
@@ -1158,11 +1176,11 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           </span>
           <small class="sync-status-detail" :title="cloudDockDetail">{{ cloudDockDetail }}</small>
         </div>
-        <button v-if="storageState?.conflictCount" class="sync-dock-conflict-button" type="button" :disabled="cloudSyncWorking" @click="openCloudConflicts">处理冲突</button>
-        <button class="sync-dock-button" :class="{ running: cloudSyncWorking }" type="button" :disabled="cloudDockSyncDisabled" :title="cloudDockSyncTitle" @click="refreshCloudSyncStatus">
+        <button class="sync-dock-button" :class="{ running: cloudSyncWorking, 'has-conflict': storageState?.conflictCount }" type="button" :disabled="cloudDockSyncDisabled" :title="cloudDockSyncTitle" @click="handleCloudDockSync">
           <LoaderCircle v-if="cloudSyncWorking" class="sync-spin" :size="14" />
+          <AlertTriangle v-else-if="storageState?.conflictCount" :size="14" />
           <RefreshCw v-else :size="14" />
-          <span>同步</span>
+          <span>{{ cloudSyncWorking ? '同步中' : cloudDockSyncLabel }}</span>
         </button>
       </footer>
     </section>
