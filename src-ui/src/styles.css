@@ -1987,6 +1987,9 @@ pre {
 .settings-hooks-panel {
   grid-column: 1 / -1;
 }
+.settings-update-panel {
+  grid-column: 1 / -1;
+}
 .settings-panel input,
 .settings-panel select {
   min-height: 38px;

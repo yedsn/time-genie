@@ -1123,11 +1123,19 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           <p class="settings-help">使用本地成功提示音与视觉特效同步播放；关闭后仅保留视觉反馈。</p>
         </div>
 
+        <div class="work-panel settings-panel">
+          <div class="panel-title"><h2>托盘行为</h2><span>当前设备独立设置</span></div>
+          <label class="switch-line"><input v-model="settingsDraft.trayHoverEnabled" :disabled="!settingsLoaded" type="checkbox" />鼠标停留后显示悬浮面板</label>
+          <label class="switch-line"><input v-model="settingsDraft.trayMenuSuppressHover" :disabled="!settingsLoaded" type="checkbox" />右键菜单打开时抑制悬浮面板</label>
+          <label class="switch-line"><input v-model="settingsDraft.startMinimized" :disabled="!settingsLoaded" type="checkbox" />开机后最小化启动</label>
+          <button class="primary-button settings-save-button" type="button" :disabled="!settingsLoaded || settingsSaving" @click="saveSettings">{{ settingsSaving ? '保存中...' : '保存设置' }}</button>
+        </div>
+
         <div class="work-panel settings-panel settings-hooks-panel">
           <AutomationHooksSettings />
         </div>
 
-        <div class="work-panel settings-panel">
+        <div class="work-panel settings-panel settings-update-panel">
           <div class="panel-title"><h2>应用更新</h2><span>v{{ appVersion }}</span></div>
           <div class="update-state-row">
             <div>
@@ -1136,14 +1144,6 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
             </div>
             <button class="secondary-button compact" type="button" :disabled="updateChecking || updateInstalling" @click="handleCheckUpdate">{{ updateChecking ? '检查中...' : updateInstalling ? '安装中...' : '检查更新' }}</button>
           </div>
-        </div>
-
-        <div class="work-panel settings-panel">
-          <div class="panel-title"><h2>托盘行为</h2><span>当前设备独立设置</span></div>
-          <label class="switch-line"><input v-model="settingsDraft.trayHoverEnabled" :disabled="!settingsLoaded" type="checkbox" />鼠标停留后显示悬浮面板</label>
-          <label class="switch-line"><input v-model="settingsDraft.trayMenuSuppressHover" :disabled="!settingsLoaded" type="checkbox" />右键菜单打开时抑制悬浮面板</label>
-          <label class="switch-line"><input v-model="settingsDraft.startMinimized" :disabled="!settingsLoaded" type="checkbox" />开机后最小化启动</label>
-          <button class="primary-button settings-save-button" type="button" :disabled="!settingsLoaded || settingsSaving" @click="saveSettings">{{ settingsSaving ? '保存中...' : '保存设置' }}</button>
         </div>
         </section>
       </div>
