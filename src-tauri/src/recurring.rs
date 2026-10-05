@@ -1,6 +1,7 @@
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::database::Database;
@@ -256,6 +257,14 @@ pub fn save_rule(
     database: &Database,
     request: RecurrenceSaveRequest,
 ) -> Result<RecurrenceRuleDto, String> {
+    save_rule_with_cloud_operation(database, request, None)
+}
+
+fn save_rule_with_cloud_operation(
+    database: &Database,
+    request: RecurrenceSaveRequest,
+    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+) -> Result<RecurrenceRuleDto, String> {
     validate_frequency(&request.frequency, request.weekdays_mask)?;
     let start = parse_date(&request.effective_start)?;
     if start < Local::now().date_naive() {
@@ -331,11 +340,61 @@ pub fn save_rule(
     )?;
     bump_revision(&transaction)?;
     let result = load_rule(&transaction, &rule_id)?;
+    if let Some(state) = cloud_state {
+        let task_version: i64 = transaction
+            .query_row(
+                "SELECT version FROM tasks WHERE workspace_id = ?1 AND id = ?2",
+                params![workspace_id, request.task_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let payload = json!({
+            "action": "save",
+            "task_id": request.task_id,
+            "task_expected_version": request.task_expected_version,
+            "task_version": task_version,
+            "rule_expected_version": request.rule_expected_version,
+            "rule_id": result.id,
+            "frequency": request.frequency,
+            "weekdays_mask": request.weekdays_mask,
+            "effective_start": request.effective_start,
+            "rules": recurrence_rules_payload(&transaction, &workspace_id, &request.task_id)?,
+            "version": result.version
+        });
+        crate::cloud_sync::enqueue_payload_in_transaction(
+            &transaction,
+            state,
+            "task_recurrence_save",
+            "task_recurrence_rule",
+            &request.task_id,
+            request.rule_expected_version,
+            &payload,
+            None,
+            None,
+        )?;
+    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
 
+#[cfg(test)]
+pub(crate) fn save_rule_for_cloud_test(
+    database: &Database,
+    request: RecurrenceSaveRequest,
+    cloud_state: &crate::supabase::StorageModeSnapshot,
+) -> Result<RecurrenceRuleDto, String> {
+    save_rule_with_cloud_operation(database, request, Some(cloud_state))
+}
+
 pub fn close_rule(database: &Database, request: RecurrenceCloseRequest) -> Result<(), String> {
+    close_rule_with_cloud_operation(database, request, None)
+}
+
+fn close_rule_with_cloud_operation(
+    database: &Database,
+    request: RecurrenceCloseRequest,
+    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+) -> Result<(), String> {
     validate_date(&request.effective_end)?;
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
@@ -366,28 +425,92 @@ pub fn close_rule(database: &Database, request: RecurrenceCloseRequest) -> Resul
             now,
         )?;
         bump_revision(&transaction)?;
-        return transaction.commit().map_err(|error| error.to_string());
+    } else {
+        let changed = transaction
+            .execute(
+                "UPDATE task_recurrence_rules
+                 SET effective_end = ?1, updated_at = ?2, version = version + 1
+                 WHERE id = ?3 AND version = ?4 AND effective_end IS NULL",
+                params![request.effective_end, now, current.id, current.version],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 0 {
+            return Err("VERSION_CONFLICT: 重复规则已变化".to_string());
+        }
+        touch_task(
+            &transaction,
+            &workspace_id,
+            &request.task_id,
+            request.task_expected_version,
+            now,
+        )?;
+        bump_revision(&transaction)?;
     }
-    let changed = transaction
-        .execute(
-            "UPDATE task_recurrence_rules
-             SET effective_end = ?1, updated_at = ?2, version = version + 1
-             WHERE id = ?3 AND version = ?4 AND effective_end IS NULL",
-            params![request.effective_end, now, current.id, current.version],
+    if let Some(state) = cloud_state {
+        let task_version: i64 = transaction
+            .query_row(
+                "SELECT version FROM tasks WHERE workspace_id = ?1 AND id = ?2",
+                params![workspace_id, request.task_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let rules = recurrence_rules_payload(&transaction, &workspace_id, &request.task_id)?;
+        let payload = json!({
+            "action": "close",
+            "task_id": request.task_id,
+            "task_expected_version": request.task_expected_version,
+            "task_version": task_version,
+            "rule_expected_version": request.rule_expected_version,
+            "rule_id": current.id,
+            "effective_end": request.effective_end,
+            "rules": rules,
+            "version": request.rule_expected_version + 1
+        });
+        crate::cloud_sync::enqueue_payload_in_transaction(
+            &transaction,
+            state,
+            "task_recurrence_close",
+            "task_recurrence_rule",
+            &request.task_id,
+            Some(request.rule_expected_version),
+            &payload,
+            None,
+            None,
+        )?;
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn recurrence_rules_payload(
+    connection: &Connection,
+    workspace_id: &str,
+    task_id: &str,
+) -> Result<Vec<Value>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, task_id, frequency, weekdays_mask, effective_start, effective_end, created_at, updated_at, version
+             FROM task_recurrence_rules WHERE workspace_id = ?1 AND task_id = ?2
+             ORDER BY effective_start, id",
         )
         .map_err(|error| error.to_string())?;
-    if changed == 0 {
-        return Err("VERSION_CONFLICT: 重复规则已变化".to_string());
-    }
-    touch_task(
-        &transaction,
-        &workspace_id,
-        &request.task_id,
-        request.task_expected_version,
-        now,
-    )?;
-    bump_revision(&transaction)?;
-    transaction.commit().map_err(|error| error.to_string())
+    let rows = statement
+        .query_map(params![workspace_id, task_id], |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "task_id": row.get::<_, String>(1)?,
+                "frequency": row.get::<_, String>(2)?,
+                "weekdays_mask": row.get::<_, Option<i64>>(3)?,
+                "effective_start": row.get::<_, String>(4)?,
+                "effective_end": row.get::<_, Option<String>>(5)?,
+                "created_at": row.get::<_, i64>(6)?,
+                "updated_at": row.get::<_, i64>(7)?,
+                "version": row.get::<_, i64>(8)?
+            }))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(rows)
 }
 
 pub fn task_has_active_rule(
@@ -565,15 +688,6 @@ fn validate_date(value: &str) -> Result<(), String> {
     parse_date(value).map(|_| ())
 }
 
-fn ensure_recurring_supported_in_storage_mode(database: &Database) -> Result<(), String> {
-    if crate::supabase::storage_mode(database)?.mode == "cloud" {
-        return Err(
-            "OFFLINE_RESTRICTED: 云端模式暂不支持修改重复规则，请先切回本地模式".to_string(),
-        );
-    }
-    Ok(())
-}
-
 fn workspace_id(connection: &Connection) -> Result<String, String> {
     connection
         .query_row(
@@ -607,8 +721,11 @@ pub fn task_recurrence_save(
     database: tauri::State<'_, Database>,
     request: RecurrenceSaveRequest,
 ) -> Result<RecurrenceRuleDto, String> {
-    ensure_recurring_supported_in_storage_mode(&database)?;
-    save_rule(&database, request)
+    crate::supabase::ensure_repository_write_mode(&database)?;
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = save_rule_with_cloud_operation(&database, request, Some(&state))?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -616,8 +733,10 @@ pub fn task_recurrence_close(
     database: tauri::State<'_, Database>,
     request: RecurrenceCloseRequest,
 ) -> Result<(), String> {
-    ensure_recurring_supported_in_storage_mode(&database)?;
-    close_rule(&database, request)
+    crate::supabase::ensure_repository_write_mode(&database)?;
+    let state = crate::supabase::storage_mode(&database)?;
+    close_rule_with_cloud_operation(&database, request, Some(&state))?;
+    crate::cloud_sync::flush_if_online(&database)
 }
 
 #[cfg(test)]
@@ -656,6 +775,40 @@ mod tests {
         )
         .unwrap();
         (database, subject_id, task.id, task.version)
+    }
+
+    fn configure_cloud_mode(database: &Database) -> crate::supabase::StorageModeSnapshot {
+        settings::update_setting(
+            database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(Uuid::now_v7().to_string()),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        crate::supabase::storage_mode(database).unwrap()
+    }
+
+    fn task_version(database: &Database, task_id: &str) -> i64 {
+        database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT version FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     #[test]
@@ -765,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_mode_rejects_recurrence_rule_changes_until_supported_by_sync() {
+    fn cloud_mode_queues_recurrence_rule_changes() {
         let (database, _, task_id, task_version) = setup_task();
         let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
         let rule = save_rule(
@@ -802,8 +955,317 @@ mod tests {
         )
         .unwrap();
 
-        let error = ensure_recurring_supported_in_storage_mode(&database).unwrap_err();
-        assert!(error.starts_with("OFFLINE_RESTRICTED:"));
+        let state = crate::supabase::storage_mode(&database).unwrap();
+        let current_task_version: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT version FROM tasks WHERE id = ?1",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let changed = save_rule_with_cloud_operation(
+            &database,
+            RecurrenceSaveRequest {
+                task_id: task_id.clone(),
+                task_expected_version: current_task_version,
+                frequency: "weekdays".to_string(),
+                weekdays_mask: None,
+                effective_start: Local::now().date_naive().format("%Y-%m-%d").to_string(),
+                rule_expected_version: Some(rule.version),
+            },
+            Some(&state),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let (operation_type, entity_type, entity_id, base_version, payload_json): (String, String, String, Option<i64>, String) = connection
+            .query_row(
+                "SELECT operation_type, entity_type, entity_id, base_version, payload_json FROM sync_outbox",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_str(&payload_json).unwrap();
+        assert_eq!(operation_type, "task_recurrence_save");
+        assert_eq!(entity_type, "task_recurrence_rule");
+        assert_eq!(entity_id, task_id);
+        assert_eq!(base_version, Some(rule.version));
+        assert_eq!(payload["action"], "save");
+        assert_eq!(payload["frequency"], "weekdays");
+        assert_eq!(payload["version"], changed.version);
+        assert!(payload["rules"]
+            .as_array()
+            .is_some_and(|rules| !rules.is_empty()));
+    }
+
+    #[test]
+    fn cloud_recurrence_save_preserves_ids_versions_and_rule_history() {
+        let (database, _, task_id, initial_task_version) = setup_task();
+        let state = configure_cloud_mode(&database);
+        let today = Local::now().date_naive();
+        let today_text = today.format("%Y-%m-%d").to_string();
+        let tomorrow_text = (today + Duration::days(1)).format("%Y-%m-%d").to_string();
+
+        let created = save_rule_with_cloud_operation(
+            &database,
+            RecurrenceSaveRequest {
+                task_id: task_id.clone(),
+                task_expected_version: initial_task_version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: today_text.clone(),
+                rule_expected_version: None,
+            },
+            Some(&state),
+        )
+        .unwrap();
+        assert_eq!(created.version, 1);
+
+        let same_day = save_rule_with_cloud_operation(
+            &database,
+            RecurrenceSaveRequest {
+                task_id: task_id.clone(),
+                task_expected_version: task_version(&database, &task_id),
+                frequency: "weekdays".to_string(),
+                weekdays_mask: None,
+                effective_start: today_text.clone(),
+                rule_expected_version: Some(created.version),
+            },
+            Some(&state),
+        )
+        .unwrap();
+        assert_eq!(same_day.id, created.id);
+        assert_eq!(same_day.version, 2);
+
+        let tomorrow_weekday = (today + Duration::days(1)).weekday().num_days_from_monday();
+        let next = save_rule_with_cloud_operation(
+            &database,
+            RecurrenceSaveRequest {
+                task_id: task_id.clone(),
+                task_expected_version: task_version(&database, &task_id),
+                frequency: "weekly".to_string(),
+                weekdays_mask: Some(1_i64 << tomorrow_weekday),
+                effective_start: tomorrow_text.clone(),
+                rule_expected_version: Some(same_day.version),
+            },
+            Some(&state),
+        )
+        .unwrap();
+        assert_ne!(next.id, same_day.id);
+        assert_eq!(next.version, 1);
+
+        let connection = database.open().unwrap();
+        let historical: (String, Option<String>, i64) = connection
+            .query_row(
+                "SELECT frequency, effective_end, version FROM task_recurrence_rules WHERE id = ?1",
+                [&same_day.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(historical, ("weekdays".to_string(), Some(today_text), 3));
+        let payload_json: String = connection
+            .query_row(
+                "SELECT payload_json FROM sync_outbox ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_str(&payload_json).unwrap();
+        assert_eq!(payload["action"], "save");
+        assert_eq!(payload["rule_id"], next.id);
+        assert_eq!(payload["rule_expected_version"], same_day.version);
+        assert_eq!(payload["frequency"], "weekly");
+        assert_eq!(payload["weekdays_mask"], 1_i64 << tomorrow_weekday);
+        assert_eq!(payload["rules"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cloud_recurrence_close_deletes_future_rule_and_keeps_history() {
+        let (database, _, task_id, initial_task_version) = setup_task();
+        let state = configure_cloud_mode(&database);
+        let today = Local::now().date_naive();
+        let today_text = today.format("%Y-%m-%d").to_string();
+        let tomorrow_text = (today + Duration::days(1)).format("%Y-%m-%d").to_string();
+        let rule = save_rule_with_cloud_operation(
+            &database,
+            RecurrenceSaveRequest {
+                task_id: task_id.clone(),
+                task_expected_version: initial_task_version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: tomorrow_text,
+                rule_expected_version: None,
+            },
+            Some(&state),
+        )
+        .unwrap();
+
+        close_rule_with_cloud_operation(
+            &database,
+            RecurrenceCloseRequest {
+                task_id: task_id.clone(),
+                task_expected_version: task_version(&database, &task_id),
+                effective_end: today_text,
+                rule_expected_version: rule.version,
+            },
+            Some(&state),
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let rule_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_recurrence_rules WHERE task_id = ?1",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rule_count, 0);
+        let payload_json: String = connection
+            .query_row(
+                "SELECT payload_json FROM sync_outbox ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_str(&payload_json).unwrap();
+        assert_eq!(payload["action"], "close");
+        assert_eq!(payload["rule_id"], rule.id);
+        assert!(payload["rules"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cloud_recurrence_close_keeps_effective_history_in_payload() {
+        let (database, _, task_id, initial_task_version) = setup_task();
+        let state = configure_cloud_mode(&database);
+        let today_text = Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let rule = save_rule_with_cloud_operation(
+            &database,
+            RecurrenceSaveRequest {
+                task_id: task_id.clone(),
+                task_expected_version: initial_task_version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: today_text.clone(),
+                rule_expected_version: None,
+            },
+            Some(&state),
+        )
+        .unwrap();
+        close_rule_with_cloud_operation(
+            &database,
+            RecurrenceCloseRequest {
+                task_id: task_id.clone(),
+                task_expected_version: task_version(&database, &task_id),
+                effective_end: today_text.clone(),
+                rule_expected_version: rule.version,
+            },
+            Some(&state),
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let stored: (Option<String>, i64) = connection
+            .query_row(
+                "SELECT effective_end, version FROM task_recurrence_rules WHERE id = ?1",
+                [&rule.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (Some(today_text.clone()), 2));
+        let payload_json: String = connection
+            .query_row(
+                "SELECT payload_json FROM sync_outbox ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_str(&payload_json).unwrap();
+        assert_eq!(payload["action"], "close");
+        assert_eq!(payload["effective_end"], today_text);
+        assert_eq!(payload["rules"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            payload["rules"][0]["effective_end"],
+            payload["effective_end"]
+        );
+    }
+
+    #[test]
+    fn recurrence_validation_rejects_invalid_masks_dates_and_task_state() {
+        let (database, _, task_id, task_version) = setup_task();
+        let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
+        for (frequency, mask) in [
+            ("weekly", None),
+            ("weekly", Some(0)),
+            ("weekly", Some(128)),
+            ("daily", Some(1)),
+            ("weekdays", Some(1)),
+        ] {
+            let error = save_rule(
+                &database,
+                RecurrenceSaveRequest {
+                    task_id: task_id.clone(),
+                    task_expected_version: task_version,
+                    frequency: frequency.to_string(),
+                    weekdays_mask: mask,
+                    effective_start: today.clone(),
+                    rule_expected_version: None,
+                },
+            )
+            .unwrap_err();
+            assert!(error.starts_with("VALIDATION_ERROR:"));
+        }
+
+        let bad_date = save_rule(
+            &database,
+            RecurrenceSaveRequest {
+                task_id: task_id.clone(),
+                task_expected_version: task_version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: "2026-99-99".to_string(),
+                rule_expected_version: None,
+            },
+        )
+        .unwrap_err();
+        assert!(bad_date.starts_with("VALIDATION_ERROR:"));
+
+        let stale = save_rule(
+            &database,
+            RecurrenceSaveRequest {
+                task_id: task_id.clone(),
+                task_expected_version: task_version + 99,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: today.clone(),
+                rule_expected_version: None,
+            },
+        )
+        .unwrap_err();
+        assert!(stale.starts_with("VERSION_CONFLICT:"));
+
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'done', completed_at = ?1 WHERE id = ?2",
+                params![now_millis(), task_id],
+            )
+            .unwrap();
+        let completed = save_rule(
+            &database,
+            RecurrenceSaveRequest {
+                task_id,
+                task_expected_version: task_version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: today,
+                rule_expected_version: None,
+            },
+        )
+        .unwrap_err();
+        assert!(completed.starts_with("TASK_COMPLETED:"));
     }
 
     #[test]

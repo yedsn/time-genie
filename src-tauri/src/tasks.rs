@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::NaiveDate;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::database::Database;
@@ -349,6 +350,14 @@ pub fn set_task_daily_estimate(
     database: &Database,
     request: TaskDailyEstimateSetRequest,
 ) -> Result<TaskDailyEstimateDto, String> {
+    set_task_daily_estimate_with_cloud_operation(database, request, None)
+}
+
+fn set_task_daily_estimate_with_cloud_operation(
+    database: &Database,
+    request: TaskDailyEstimateSetRequest,
+    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+) -> Result<TaskDailyEstimateDto, String> {
     validate_date(&request.work_date)?;
     validate_estimate(request.estimate_minutes)?;
     let mut connection = database.open()?;
@@ -369,13 +378,32 @@ pub fn set_task_daily_estimate(
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
-    crate::recurring::ensure_occurrence_if_recurring(
+    let previous_occurrence = crate::recurring::occurrence_for_date(
         &transaction,
         &workspace_id,
         &request.task_id,
         &request.work_date,
-        now,
     )?;
+    let occurrence = if request.estimate_minutes.is_some() {
+        crate::recurring::ensure_occurrence_if_recurring(
+            &transaction,
+            &workspace_id,
+            &request.task_id,
+            &request.work_date,
+            now,
+        )?
+    } else {
+        previous_occurrence.clone()
+    };
+    let previous_estimate: Option<(i64, i64)> = transaction
+        .query_row(
+            "SELECT version, created_at FROM task_daily_estimates
+             WHERE workspace_id = ?1 AND task_id = ?2 AND work_date = ?3",
+            params![workspace_id, request.task_id, request.work_date],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
     if let Some(minutes) = request.estimate_minutes {
         transaction
             .execute(
@@ -399,6 +427,78 @@ pub fn set_task_daily_estimate(
             .map_err(|error| error.to_string())?;
     }
     bump_revision(&transaction)?;
+    if let Some(state) = cloud_state {
+        let occurrence_operation_id = if previous_occurrence.is_none() {
+            if let Some(_occurrence) = occurrence.as_ref() {
+                crate::cloud_sync::enqueue_entity_in_transaction(
+                    &transaction,
+                    state,
+                    "task_occurrence_create_from_daily_estimate",
+                    "task_occurrence",
+                    Some(&crate::recurring::occurrence_entity_id(
+                        &request.task_id,
+                        &request.work_date,
+                    )),
+                    None,
+                    None,
+                )?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let entity_id = format!("{}|{}", request.task_id, request.work_date);
+        if let Some(minutes) = request.estimate_minutes {
+            let row: (i64, i64, i64) = transaction
+                .query_row(
+                    "SELECT estimate_minutes, created_at, version FROM task_daily_estimates
+                     WHERE workspace_id = ?1 AND task_id = ?2 AND work_date = ?3",
+                    params![workspace_id, request.task_id, request.work_date],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(|error| error.to_string())?;
+            let payload = json!({
+                "task_id": request.task_id,
+                "work_date": request.work_date,
+                "estimate_minutes": minutes,
+                "created_at": row.1,
+                "updated_at": now,
+                "version": row.2
+            });
+            crate::cloud_sync::enqueue_payload_in_transaction(
+                &transaction,
+                state,
+                "task_daily_estimate_set",
+                "task_daily_estimate",
+                &entity_id,
+                previous_estimate.map(|value| value.0),
+                &payload,
+                None,
+                occurrence_operation_id.as_deref(),
+            )?;
+        } else if let Some((previous_version, created_at)) = previous_estimate {
+            let payload = json!({
+                "task_id": request.task_id,
+                "work_date": request.work_date,
+                "deleted": true,
+                "created_at": created_at,
+                "updated_at": now,
+                "version": previous_version + 1
+            });
+            crate::cloud_sync::enqueue_payload_in_transaction(
+                &transaction,
+                state,
+                "task_daily_estimate_clear",
+                "task_daily_estimate",
+                &entity_id,
+                Some(previous_version),
+                &payload,
+                None,
+                occurrence_operation_id.as_deref(),
+            )?;
+        }
+    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(TaskDailyEstimateDto {
         task_id: request.task_id,
@@ -407,11 +507,13 @@ pub fn set_task_daily_estimate(
     })
 }
 
-fn ensure_daily_estimates_supported_in_storage_mode(database: &Database) -> Result<(), String> {
-    if crate::supabase::storage_mode(database)?.mode == "cloud" {
-        return Err("OFFLINE_RESTRICTED: 云端模式暂不支持按日预估，请先切回本地模式".to_string());
-    }
-    Ok(())
+#[cfg(test)]
+pub(crate) fn set_task_daily_estimate_for_cloud_test(
+    database: &Database,
+    request: TaskDailyEstimateSetRequest,
+    cloud_state: &crate::supabase::StorageModeSnapshot,
+) -> Result<TaskDailyEstimateDto, String> {
+    set_task_daily_estimate_with_cloud_operation(database, request, Some(cloud_state))
 }
 
 #[cfg(test)]
@@ -1640,8 +1742,10 @@ pub fn task_daily_estimate_set(
     request: TaskDailyEstimateSetRequest,
 ) -> Result<TaskDailyEstimateDto, String> {
     crate::supabase::ensure_repository_write_mode(&database)?;
-    ensure_daily_estimates_supported_in_storage_mode(&database)?;
-    set_task_daily_estimate(&database, request)
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = set_task_daily_estimate_with_cloud_operation(&database, request, Some(&state))?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1776,7 +1880,7 @@ mod tests {
     use super::*;
     use crate::database::Database;
     use crate::settings::{self, SettingsScope, SettingsUpdate};
-    use chrono::Local;
+    use chrono::{Datelike, Local};
     use serde_json::{json, Value};
     use tempfile::tempdir;
 
@@ -1786,6 +1890,50 @@ mod tests {
         let database = Database::initialize_at(path).unwrap();
         std::mem::forget(directory);
         database
+    }
+
+    fn configure_cloud_mode(database: &Database) -> crate::supabase::StorageModeSnapshot {
+        settings::update_setting(
+            database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(Uuid::now_v7().to_string()),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        crate::supabase::storage_mode(database).unwrap()
+    }
+
+    fn create_leaf_task(database: &Database, title: &str) -> TaskDto {
+        let subject_id: String = database
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        create_task(
+            database,
+            TaskCreateRequest {
+                subject_id,
+                parent_id: None,
+                title: title.to_string(),
+                planned_date: None,
+                estimate_minutes: Some(20),
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1863,7 +2011,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_mode_rejects_daily_estimates_until_supported_by_sync() {
+    fn cloud_mode_queues_daily_estimate_updates_and_clears() {
         let database = database();
         let cloud_workspace_id = Uuid::now_v7().to_string();
         settings::update_setting(
@@ -1885,9 +2033,273 @@ mod tests {
         )
         .unwrap();
 
-        let error = ensure_daily_estimates_supported_in_storage_mode(&database).unwrap_err();
+        let connection = database.open().unwrap();
+        let task_id: String = connection
+            .query_row("SELECT id FROM tasks LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let state = crate::supabase::storage_mode(&database).unwrap();
+        set_task_daily_estimate_with_cloud_operation(
+            &database,
+            TaskDailyEstimateSetRequest {
+                task_id: task_id.clone(),
+                work_date: "2026-10-05".to_string(),
+                estimate_minutes: Some(45),
+            },
+            Some(&state),
+        )
+        .unwrap();
+        set_task_daily_estimate_with_cloud_operation(
+            &database,
+            TaskDailyEstimateSetRequest {
+                task_id: task_id.clone(),
+                work_date: "2026-10-05".to_string(),
+                estimate_minutes: None,
+            },
+            Some(&state),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let rows = connection
+            .prepare("SELECT operation_type, entity_type, entity_id, base_version, payload_json FROM sync_outbox ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<i64>>(3)?, row.get::<_, String>(4)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "task_daily_estimate_set");
+        assert_eq!(rows[0].1, "task_daily_estimate");
+        assert_eq!(rows[0].2, format!("{task_id}|2026-10-05"));
+        assert_eq!(rows[0].3, None);
+        let cleared: Value = serde_json::from_str(&rows[1].4).unwrap();
+        assert_eq!(rows[1].0, "task_daily_estimate_clear");
+        assert_eq!(rows[1].3, Some(1));
+        assert_eq!(cleared["deleted"], true);
+        assert_eq!(cleared["version"], 2);
+    }
 
-        assert!(error.starts_with("OFFLINE_RESTRICTED:"));
+    #[test]
+    fn local_daily_estimate_does_not_queue_cloud_operation() {
+        let database = database();
+        let task = create_leaf_task(&database, "本地按日预估");
+        set_task_daily_estimate(
+            &database,
+            TaskDailyEstimateSetRequest {
+                task_id: task.id,
+                work_date: Local::now().format("%Y-%m-%d").to_string(),
+                estimate_minutes: Some(25),
+            },
+        )
+        .unwrap();
+
+        let count: i64 = database
+            .open()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn recurring_daily_estimate_queues_new_occurrence_before_estimate() {
+        let database = database();
+        let task = create_leaf_task(&database, "计划日预估");
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        crate::recurring::save_rule(
+            &database,
+            crate::recurring::RecurrenceSaveRequest {
+                task_id: task.id.clone(),
+                task_expected_version: task.version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: today.clone(),
+                rule_expected_version: None,
+            },
+        )
+        .unwrap();
+        let state = configure_cloud_mode(&database);
+
+        set_task_daily_estimate_with_cloud_operation(
+            &database,
+            TaskDailyEstimateSetRequest {
+                task_id: task.id.clone(),
+                work_date: today.clone(),
+                estimate_minutes: Some(35),
+            },
+            Some(&state),
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let occurrence: (String, String) = connection
+            .query_row(
+                "SELECT origin, status FROM task_occurrences WHERE task_id = ?1 AND occurrence_date = ?2",
+                params![task.id, today],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(occurrence, ("scheduled".to_string(), "open".to_string()));
+        let operations = connection
+            .prepare(
+                "SELECT operation_id, entity_type, depends_on_operation_id FROM sync_outbox ORDER BY rowid",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(operations.len(), 2);
+        assert_eq!(operations[0].1, "task_occurrence");
+        assert_eq!(operations[1].1, "task_daily_estimate");
+        assert_eq!(operations[1].2.as_deref(), Some(operations[0].0.as_str()));
+    }
+
+    #[test]
+    fn recurring_daily_estimate_on_non_plan_day_creates_manual_occurrence() {
+        let database = database();
+        let task = create_leaf_task(&database, "非计划日预估");
+        let today = Local::now().date_naive();
+        let today_text = today.format("%Y-%m-%d").to_string();
+        let another_weekday = (today.weekday().num_days_from_monday() + 1) % 7;
+        crate::recurring::save_rule(
+            &database,
+            crate::recurring::RecurrenceSaveRequest {
+                task_id: task.id.clone(),
+                task_expected_version: task.version,
+                frequency: "weekly".to_string(),
+                weekdays_mask: Some(1_i64 << another_weekday),
+                effective_start: today_text.clone(),
+                rule_expected_version: None,
+            },
+        )
+        .unwrap();
+        let state = configure_cloud_mode(&database);
+        set_task_daily_estimate_with_cloud_operation(
+            &database,
+            TaskDailyEstimateSetRequest {
+                task_id: task.id.clone(),
+                work_date: today_text.clone(),
+                estimate_minutes: Some(15),
+            },
+            Some(&state),
+        )
+        .unwrap();
+
+        let origin: String = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT origin FROM task_occurrences WHERE task_id = ?1 AND occurrence_date = ?2",
+                params![task.id, today_text],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(origin, "manual");
+    }
+
+    #[test]
+    fn daily_estimate_preserves_completed_occurrence_and_clear_does_not_materialize() {
+        let database = database();
+        let task = create_leaf_task(&database, "已完成轮次预估");
+        let today = Local::now().date_naive();
+        let today_text = today.format("%Y-%m-%d").to_string();
+        let tomorrow_text = today.succ_opt().unwrap().format("%Y-%m-%d").to_string();
+        crate::recurring::save_rule(
+            &database,
+            crate::recurring::RecurrenceSaveRequest {
+                task_id: task.id.clone(),
+                task_expected_version: task.version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: today_text.clone(),
+                rule_expected_version: None,
+            },
+        )
+        .unwrap();
+        {
+            let mut connection = database.open().unwrap();
+            let workspace_id: String = connection
+                .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+                .unwrap();
+            let transaction = connection.transaction().unwrap();
+            crate::recurring::ensure_occurrence(
+                &transaction,
+                &workspace_id,
+                &task.id,
+                &today_text,
+                1000,
+            )
+            .unwrap();
+            transaction
+                .execute(
+                    "UPDATE task_occurrences SET status = 'done', completed_at = 2000, version = 2 WHERE task_id = ?1 AND occurrence_date = ?2",
+                    params![task.id, today_text],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        let state = configure_cloud_mode(&database);
+        set_task_daily_estimate_with_cloud_operation(
+            &database,
+            TaskDailyEstimateSetRequest {
+                task_id: task.id.clone(),
+                work_date: today_text.clone(),
+                estimate_minutes: Some(40),
+            },
+            Some(&state),
+        )
+        .unwrap();
+        set_task_daily_estimate_with_cloud_operation(
+            &database,
+            TaskDailyEstimateSetRequest {
+                task_id: task.id.clone(),
+                work_date: tomorrow_text.clone(),
+                estimate_minutes: None,
+            },
+            Some(&state),
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let completed: (String, Option<i64>, i64) = connection
+            .query_row(
+                "SELECT status, completed_at, version FROM task_occurrences WHERE task_id = ?1 AND occurrence_date = ?2",
+                params![task.id, today_text],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(completed, ("done".to_string(), Some(2000), 2));
+        let tomorrow_occurrence_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_occurrences WHERE task_id = ?1 AND occurrence_date = ?2",
+                params![task.id, tomorrow_text],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tomorrow_occurrence_count, 0);
+        let occurrence_outbox_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE entity_type = 'task_occurrence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(occurrence_outbox_count, 0);
+        let estimate_outbox_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE entity_type = 'task_daily_estimate'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(estimate_outbox_count, 1);
     }
 
     #[test]

@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
-import { AlertTriangle, CalendarDays, CheckCircle2, Clock3, Copy, FileText, Folder, Home, LoaderCircle, Minus, Pencil, Plus, RefreshCw, Settings, Square, UserRound, X } from "lucide-vue-next";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
+import { AlertTriangle, CalendarDays, CheckCircle2, Clock3, Copy, Database, FileText, Home, LoaderCircle, Minus, Pencil, Plus, RefreshCw, Settings, Square, UserRound, X } from "lucide-vue-next";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useWorkdayStore, type Task } from "../store";
-import { checkAppUpdate, closeMainWindow, confirmObsidianPlan, configureCloud, downloadAndInstallUpdate, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listCloudSyncConflicts, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onTrayCheckUpdate, previewObsidianPlan, previewSeaTableTaskSync, previewStorageMigration, pushCloudSync, refreshCloudSync, registerCloudDevice, resetLocalCacheFromCloud, resolveCloudSyncConflict, restartApp, resumeCloudSyncAfterReauth, retryFailedSeaTableSync, revokeCloudDevice, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudSessionSnapshot, type CloudSyncConflict, type PlanImportPreviewResult, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
+import { checkAppUpdate, closeMainWindow, confirmObsidianPlan, configureCloud, downloadAndInstallUpdate, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listCloudSyncConflicts, listCloudSyncQueue, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onTrayCheckUpdate, previewObsidianPlan, previewSeaTableTaskSync, previewStorageMigration, pushCloudSync, refreshCloudSync, registerCloudDevice, resetLocalCacheFromCloud, resolveAllCloudSyncConflicts, restartApp, resumeCloudSyncAfterReauth, retryFailedSeaTableSync, revokeCloudDevice, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudSessionSnapshot, type CloudSyncConflict, type CloudSyncQueueItem, type PlanImportPreviewResult, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
 import PlanListEditor from "../components/PlanListEditor.vue";
 import GlobalTimerBar from "../components/GlobalTimerBar.vue";
 import UnassignedTimeIndicator from "../components/UnassignedTimeIndicator.vue";
@@ -30,6 +30,20 @@ const pages = [
   { id: "reports", label: "报告", icon: FileText },
   { id: "settings", label: "设置", icon: Settings }
 ];
+const settingsNavGroups = [
+  { label: "基础设置", items: [
+    { id: "appearance", label: "外观与本机", icon: Settings }
+  ] },
+  { label: "数据与集成", items: [
+    { id: "seatable", label: "SeaTable", icon: Database },
+    { id: "storage", label: "数据存储", icon: Database }
+  ] },
+  { label: "行为与自动化", items: [
+    { id: "feedback", label: "交互与托盘", icon: CheckCircle2 },
+    { id: "hooks", label: "自动化钩子", icon: RefreshCw }
+  ] },
+  { label: "系统", items: [{ id: "update", label: "应用更新", icon: RefreshCw }] }
+];
 
 const subjectDialogOpen = ref(false);
 const subjectNameDraft = ref("");
@@ -51,6 +65,9 @@ const migrationPreview = ref<StorageMigrationPreview>();
 const cloudSyncWorking = ref(false);
 const cloudConflictDialogOpen = ref(false);
 const cloudConflicts = ref<CloudSyncConflict[]>([]);
+const cloudQueueDialogOpen = ref(false);
+const cloudQueueLoading = ref(false);
+const cloudQueueItems = ref<CloudSyncQueueItem[]>([]);
 const resetLocalCacheDialogOpen = ref(false);
 const resetLocalCacheWorking = ref(false);
 const importDialogOpen = ref(false);
@@ -87,11 +104,50 @@ const settingsDraft = reactive({
   supabasePassword: "",
   seatableToken: ""
 });
+const activeSettingsSection = ref("appearance");
+
+function scrollToSettingsSection(sectionId: string) {
+  const target = document.querySelector<HTMLElement>(`[data-settings-section="${sectionId}"]`);
+  if (!target) return;
+  activeSettingsSection.value = sectionId;
+  target.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function openSettingsTarget(selector: string) {
+  store.activePage = "settings";
+  activeSettingsSection.value = "storage";
+  await nextTick();
+  const target = document.querySelector<HTMLElement>(selector)
+    ?? document.querySelector<HTMLElement>('[data-settings-section="storage"]');
+  target?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function openCloudAccountSettings() {
+  await openSettingsTarget(cloudNeedsReauth.value ? ".storage-login-section" : ".storage-account-section");
+}
+
+async function openCloudStorageSettings() {
+  cloudQueueDialogOpen.value = false;
+  await openSettingsTarget('[data-settings-section="storage"]');
+}
+
+function handleSettingsScroll(event: Event) {
+  if (store.activePage !== "settings") return;
+  const container = event.currentTarget as HTMLElement;
+  const sections = Array.from(container.querySelectorAll<HTMLElement>("[data-settings-section]"));
+  if (!sections.length) return;
+  const marker = container.getBoundingClientRect().top + 28;
+  const current = sections.reduce((closest, section) => Math.abs(section.getBoundingClientRect().top - marker) < Math.abs(closest.getBoundingClientRect().top - marker) ? section : closest);
+  activeSettingsSection.value = current.dataset.settingsSection || activeSettingsSection.value;
+}
 let unlistenWindowResize: (() => void) | undefined;
 let unlistenNavigatePage: (() => void) | undefined;
 let unlistenCloudSyncState: (() => void) | undefined;
 let unlistenTrayCheckUpdate: (() => void) | undefined;
 let unlistenAppUpdateEvent: (() => void) | undefined;
+let cloudSyncStatusClock: number | undefined;
+const cloudAutoSyncIntervalSeconds = 15;
+const cloudAutoSyncCountdown = ref(cloudAutoSyncIntervalSeconds);
 const completingTaskIds = new Set<string>();
 const recentCompletedTaskId = ref("");
 let recentCompletedTimer: number | undefined;
@@ -112,14 +168,36 @@ const cloudDockDetail = computed(() => {
   if (storageState.value?.mode === "cloud") return `变更序号 ${storageState.value.lastChangeSeq}`;
   return "数据只保存在本机";
 });
-const cloudDockSyncDisabled = computed(() => storageState.value?.mode !== "cloud" || cloudSyncWorking.value || !cloudSession.value?.signedIn);
+const cloudDockSyncDisabled = computed(() => cloudSyncWorking.value);
+const cloudDockRequiresStorageAttention = computed(() => (
+  storageState.value?.mode !== "cloud"
+  || !cloudSession.value?.signedIn
+  || !storageState.value.online
+  || Boolean(storageState.value.authBlocked)
+  || Boolean(storageState.value.conflictCount)
+  || Boolean(storageState.value.lastError)
+));
 const cloudDockSyncTitle = computed(() => {
   if (storageState.value?.mode !== "cloud") return "本地模式无需同步";
-  if (!cloudSession.value?.signedIn) return "登录后可同步";
-  if (storageState.value.conflictCount > 0) return "先处理同步冲突";
+  if (!cloudSession.value?.signedIn) return "前往数据存储设置登录";
+  if (storageState.value.conflictCount > 0) return "前往数据存储设置处理同步冲突";
+  if (!storageState.value.online || storageState.value.authBlocked || storageState.value.lastError) return "前往数据存储设置处理同步异常";
   return cloudSyncWorking.value ? "正在同步" : "手动同步云端数据";
 });
-const cloudDockSyncLabel = computed(() => storageState.value?.conflictCount ? "处理冲突" : "同步");
+const cloudDockSyncLabel = computed(() => {
+  if (storageState.value?.mode !== "cloud" || !cloudSession.value?.signedIn) return "设置";
+  if (storageState.value.conflictCount) return "处理冲突";
+  if (!storageState.value.online || storageState.value.authBlocked || storageState.value.lastError) return "处理异常";
+  return "同步";
+});
+const cloudAutoSyncVisible = computed(() => (
+  storageState.value?.mode === "cloud"
+  && storageState.value.online
+  && !cloudSyncWorking.value
+  && !storageState.value.authBlocked
+  && !storageState.value.conflictCount
+  && Boolean(cloudSession.value?.signedIn)
+));
 const cloudBusinessEntities = new Set([
   "tasks",
   "task_daily_estimates",
@@ -146,7 +224,115 @@ function formatSyncTime(value: number) {
 function cloudConflictTitle(conflict: CloudSyncConflict) {
   const payload = conflict.localPayload ?? {};
   const title = payload.title ?? payload.name ?? payload.report_type ?? payload.key ?? payload.provider;
-  return typeof title === "string" && title ? title : `${conflict.entityType} ${conflict.entityId ?? ""}`.trim();
+  if (conflict.entityType === "task_daily_estimate") return `按日预估 ${payload.work_date ?? conflict.entityId ?? ""}`.trim();
+  if (conflict.entityType === "task_recurrence_rule") return `重复规则 ${payload.task_id ?? conflict.entityId ?? ""}`.trim();
+  return typeof title === "string" && title ? title : `${cloudConflictEntityLabel(conflict.entityType)} ${conflict.entityId ?? ""}`.trim();
+}
+
+function cloudConflictEntityLabel(entityType: string) {
+  if (entityType === "time_entry") return "时间记录";
+  if (entityType === "task") return "普通事项";
+  if (entityType === "task_occurrence") return "周期事项";
+  if (entityType === "task_daily_estimate") return "按日预估";
+  if (entityType === "task_recurrence_rule") return "重复规则";
+  const labels: Record<string, string> = {
+    subject: "主体",
+    report: "报告",
+    setting: "设置",
+    integration_config: "集成配置",
+    unassigned_session: "未归属时间",
+    task_recurrence_rule: "周期规则",
+  };
+  return labels[entityType] ?? "同步数据";
+}
+
+function cloudConflictActionLabel(operationType: string) {
+  const labels: Record<string, string> = {
+    timer_start: "开始计时",
+    timer_pause: "暂停计时",
+    timer_resume: "继续计时",
+    timer_stop: "结束计时",
+    time_allocation_replace: "确认时间归属",
+    task_set_completed_from_allocation: "归属时同时完成普通事项",
+    task_occurrence_set_completed_from_allocation: "归属时同时完成周期事项",
+    task_daily_estimate_set: "设置按日预估",
+    task_daily_estimate_clear: "清空按日预估",
+    task_recurrence_save: "保存重复规则",
+    task_recurrence_close: "关闭重复规则",
+  };
+  return labels[operationType] ?? operationType;
+}
+
+function cloudQueueTitle(item: CloudSyncQueueItem) {
+  const payload = item.payload ?? {};
+  const title = payload.title ?? payload.name ?? payload.label_snapshot ?? payload.report_type ?? payload.key ?? payload.provider;
+  return typeof title === "string" && title ? title : `${cloudConflictEntityLabel(item.entityType)} ${item.entityId ?? ""}`.trim();
+}
+
+function cloudQueueStateLabel(state: string) {
+  const labels: Record<string, string> = { pending: "等待同步", sending: "正在同步", failed: "同步失败", conflict: "存在冲突" };
+  return labels[state] ?? state;
+}
+
+function formatQueueTime(value: number) {
+  return new Date(value).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+const conflictFieldLabels: Record<string, string> = {
+  version: "版本",
+  title: "标题",
+  name: "名称",
+  status: "状态",
+  state: "计时状态",
+  work_date: "工作日期",
+  estimate_minutes: "按日预估",
+  deleted: "清空预估",
+  action: "规则动作",
+  frequency: "重复频率",
+  weekdays_mask: "重复星期",
+  effective_start: "生效日期",
+  effective_end: "结束日期",
+  rules: "规则区间",
+  occurrence_date: "轮次日期",
+  label_snapshot: "计时事项",
+  started_at: "开始时间",
+  ended_at: "结束时间",
+  duration_seconds: "累计用时",
+  note: "备注",
+  default_task_id: "默认事项",
+  allocations: "时间归属",
+};
+
+const conflictFieldOrder = Object.keys(conflictFieldLabels);
+
+function conflictPayload(conflict: CloudSyncConflict, source: "local" | "cloud") {
+  return (source === "local" ? conflict.localPayload : conflict.cloudPayload) ?? null;
+}
+
+function conflictFields(conflict: CloudSyncConflict) {
+  const local = conflict.localPayload ?? {};
+  const cloud = conflict.cloudPayload ?? {};
+  return conflictFieldOrder.filter((key) => key in local || key in cloud);
+}
+
+function conflictValue(payload: Record<string, unknown> | null | undefined, key: string) {
+  if (!payload || !(key in payload) || payload[key] === null || payload[key] === undefined || payload[key] === "") return "无";
+  const value = payload[key];
+  if ((key === "started_at" || key === "ended_at") && typeof value === "number") return new Date(value).toLocaleString("zh-CN");
+  if (key === "duration_seconds" && typeof value === "number") return `${Math.floor(value / 60)} 分 ${value % 60} 秒`;
+  if (key === "allocations" && Array.isArray(value)) return value.length ? `${value.length} 项，共 ${value.reduce((sum, item) => sum + (typeof item === "object" && item && "minutes" in item && typeof item.minutes === "number" ? item.minutes : 0), 0)} 分钟` : "未归属";
+  if (typeof value === "boolean") return value ? "是" : "否";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function conflictFieldChanged(conflict: CloudSyncConflict, key: string) {
+  return JSON.stringify(conflict.localPayload?.[key]) !== JSON.stringify(conflict.cloudPayload?.[key]);
+}
+
+function formattedConflictPayload(conflict: CloudSyncConflict, source: "local" | "cloud") {
+  const payload = conflictPayload(conflict, source);
+  return payload ? JSON.stringify(payload, null, 2) : "无";
 }
 
 function settingString(scope: "shared" | "device", key: string, fallback = "") {
@@ -350,7 +536,7 @@ async function logoutSupabase() {
   }
 }
 
-async function refreshCloudSyncStatus() {
+async function runCloudSync(silent: boolean) {
   if (storageState.value?.mode !== "cloud" || cloudSyncWorking.value) return;
   cloudSyncWorking.value = true;
   try {
@@ -359,10 +545,15 @@ async function refreshCloudSyncStatus() {
       await Promise.all([store.loadWorkspaceData(), store.loadTimeData(), store.loadReports(), store.loadUnassignedState()]);
     }
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : String(error));
+    if (!silent) ElMessage.error(error instanceof Error ? error.message : String(error));
   } finally {
     cloudSyncWorking.value = false;
+    cloudAutoSyncCountdown.value = cloudAutoSyncIntervalSeconds;
   }
+}
+
+async function refreshCloudSyncStatus() {
+  await runCloudSync(false);
 }
 
 async function retryCloudSync() {
@@ -399,33 +590,88 @@ async function openCloudConflicts() {
   }
 }
 
+async function loadCloudSyncQueue() {
+  cloudQueueLoading.value = true;
+  try {
+    [storageState.value, cloudQueueItems.value] = await Promise.all([getCloudSyncStatus(), listCloudSyncQueue()]);
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    cloudQueueLoading.value = false;
+  }
+}
+
+async function refreshOpenCloudSyncQueue() {
+  if (!cloudQueueDialogOpen.value || cloudQueueLoading.value) return;
+  try {
+    cloudQueueItems.value = await listCloudSyncQueue();
+  } catch {
+    // 状态事件仍会继续刷新，弹窗保留上一次成功读取的本机队列。
+  }
+}
+
+async function openCloudSyncQueue() {
+  cloudQueueDialogOpen.value = true;
+  await loadCloudSyncQueue();
+}
+
+async function syncAllCloudQueue() {
+  if (cloudSyncWorking.value) return;
+  cloudSyncWorking.value = true;
+  try {
+    const result = await pushCloudSync();
+    storageState.value = await getCloudSyncStatus();
+    cloudQueueItems.value = await listCloudSyncQueue();
+    const feedback = cloudSyncRetryFeedback(result, storageState.value);
+    if (feedback.level === "warning") ElMessage.warning(feedback.message);
+    else ElMessage.success(feedback.message);
+    if (!storageState.value.pendingOperations && !storageState.value.conflictCount) {
+      await Promise.all([store.loadWorkspaceData(), store.loadTimeData(), store.loadReports(), store.loadUnassignedState()]);
+    }
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    cloudSyncWorking.value = false;
+  }
+}
+
+async function openConflictsFromQueue() {
+  cloudQueueDialogOpen.value = false;
+  await openCloudConflicts();
+}
+
 async function handleCloudDockSync() {
-  if (storageState.value?.conflictCount) {
-    await openCloudConflicts();
+  if (storageState.value?.conflictCount || storageState.value?.lastError || storageState.value?.authBlocked || !storageState.value?.online) {
+    await openCloudSyncQueue();
+    return;
+  }
+  if (storageState.value?.mode !== "cloud" || !cloudSession.value?.signedIn) {
+    await openCloudAccountSettings();
     return;
   }
   await refreshCloudSyncStatus();
 }
 
-async function resolveConflict(conflict: CloudSyncConflict, strategy: "use_cloud" | "keep_local") {
+async function resolveAllConflicts(strategy: "use_cloud" | "keep_local") {
   if (cloudSyncWorking.value) return;
   const keepLocal = strategy === "keep_local";
+  const conflictCount = cloudConflicts.value.length;
   try {
     await ElMessageBox.confirm(
       keepLocal
-        ? "本地内容将以云端最新版本为基础重新提交，并覆盖该实体当前的云端内容。"
-        : "本地这次修改将被放弃，并从云端重新加载当前内容。",
-      keepLocal ? "保留本地版本" : "使用云端版本",
-      { type: "warning", confirmButtonText: keepLocal ? "保留本地" : "使用云端", cancelButtonText: "取消", closeOnClickModal: false, customClass: "work-confirm-dialog" },
+        ? `将对当前 ${conflictCount} 个冲突以及随后暴露的待同步冲突统一保留本地版本，并基于云端最新版本重新提交。`
+        : `将对当前 ${conflictCount} 个冲突以及随后暴露的待同步冲突统一使用云端版本，本机对应修改会被放弃。`,
+      keepLocal ? "全部保留本地" : "全部使用云端",
+      { type: "warning", confirmButtonText: keepLocal ? "全部保留本地" : "全部使用云端", cancelButtonText: "取消", closeOnClickModal: false, customClass: "work-confirm-dialog" },
     );
   } catch { return; }
   cloudSyncWorking.value = true;
   try {
-    storageState.value = await resolveCloudSyncConflict(conflict.operationId, strategy);
+    storageState.value = await resolveAllCloudSyncConflicts(strategy);
     cloudConflicts.value = await listCloudSyncConflicts();
     await Promise.all([store.loadWorkspaceData(), store.loadTimeData(), store.loadReports(), store.loadUnassignedState()]);
     if (!cloudConflicts.value.length) cloudConflictDialogOpen.value = false;
-    ElMessage.success(keepLocal ? "已保留并重新提交本地版本" : "已使用云端版本");
+    ElMessage.success(keepLocal ? "冲突已统一保留本地版本" : "冲突已统一使用云端版本");
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : String(error));
   } finally {
@@ -640,7 +886,17 @@ onMounted(async () => {
   });
   unlistenCloudSyncState = await onCloudSyncStateChanged((state) => {
     storageState.value = state;
+    void refreshOpenCloudSyncQueue();
   });
+  cloudSyncStatusClock = window.setInterval(async () => {
+    if (!cloudAutoSyncVisible.value || cloudSyncWorking.value) {
+      cloudAutoSyncCountdown.value = cloudAutoSyncIntervalSeconds;
+      return;
+    }
+    cloudAutoSyncCountdown.value -= 1;
+    if (cloudAutoSyncCountdown.value > 0) return;
+    await runCloudSync(true);
+  }, 1_000);
   unlistenTrayCheckUpdate = await onTrayCheckUpdate(() => {
     void handleCheckUpdate();
   });
@@ -653,6 +909,7 @@ onUnmounted(() => {
   unlistenCloudSyncState?.();
   unlistenTrayCheckUpdate?.();
   unlistenAppUpdateEvent?.();
+  if (cloudSyncStatusClock) window.clearInterval(cloudSyncStatusClock);
   if (recentCompletedTimer) window.clearTimeout(recentCompletedTimer);
 });
 
@@ -965,18 +1222,7 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
         </div>
       </header>
 
-      <section v-if="cloudSyncNeedsAttention" :class="['cloud-sync-banner', cloudSyncAttentionLevel]">
-        <AlertTriangle :size="16" />
-        <div>
-          <strong>{{ cloudSyncLabel }}</strong>
-          <span>{{ cloudSyncDetail }}</span>
-        </div>
-        <button class="secondary-button compact" type="button" :disabled="cloudSyncWorking" @click="refreshCloudSyncStatus">刷新</button>
-        <button v-if="storageState?.pendingOperations && !storageState?.conflictCount" class="secondary-button compact" type="button" :disabled="cloudSyncWorking || !storageState.online" @click="retryCloudSync">重试</button>
-        <button v-if="storageState?.conflictCount" class="danger-button compact" type="button" :disabled="cloudSyncWorking" @click="openCloudConflicts">处理冲突</button>
-      </section>
-
-      <div class="content-scroll">
+      <div class="content-scroll" @scroll="handleSettingsScroll">
         <TodayOverviewWorkspace
           v-if="store.activePage === 'today'"
           @start-timer="startTimerForTask"
@@ -993,7 +1239,6 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           :recent-completed-id="recentCompletedTaskId"
           :running-task-id="store.runningEntry?.defaultTask"
           :format-minutes="formatMinutes"
-          :storage-mode="storageState?.mode ?? 'local'"
           @select="store.selectedTaskId = $event"
           @add="store.addTask('', store.selectedSubjectId)"
           @add-child="store.addChildTask"
@@ -1015,8 +1260,18 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
 
       <ReportWorkspace v-else-if="store.activePage === 'reports'" />
 
-      <section v-else class="settings-grid">
-        <div class="work-panel settings-panel settings-appearance-panel">
+      <section v-else class="settings-layout">
+        <aside class="settings-page-nav" aria-label="设置页导航">
+          <div class="settings-page-nav-head"><span class="settings-page-nav-mark"><Settings :size="16" /></span><div><strong>设置</strong><small>快速定位设置区域</small></div></div>
+          <nav class="settings-page-nav-list">
+            <section v-for="group in settingsNavGroups" :key="group.label" class="settings-page-nav-group">
+              <div class="settings-page-nav-group-title">{{ group.label }}</div>
+              <button v-for="item in group.items" :key="item.id" class="settings-page-nav-item" :class="{ active: activeSettingsSection === item.id }" type="button" @click="scrollToSettingsSection(item.id)"><component :is="item.icon" :size="14" /><span>{{ item.label }}</span></button>
+            </section>
+          </nav>
+        </aside>
+        <div class="settings-grid">
+        <div id="settings-appearance" data-settings-section="appearance" class="work-panel settings-panel settings-appearance-panel">
           <div class="panel-title"><h2>外观主题</h2><span>当前设备独立设置</span></div>
           <div class="theme-picker" role="radiogroup" aria-label="应用主题">
             <button
@@ -1040,7 +1295,7 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           <small class="settings-hint">选择后立即预览，点击“保存设置”后在下次启动时继续使用。</small>
         </div>
 
-        <div class="work-panel settings-panel">
+        <div id="settings-local" data-settings-section="local" class="work-panel settings-panel">
           <div class="panel-title"><h2>本机配置</h2><span>路径只保存在当前设备</span></div>
           <label>Obsidian 根目录<input v-model="settingsDraft.obsidianRootPath" :disabled="!settingsLoaded" placeholder="D:/Obsidian" /></label>
           <label>日报路径规则<input v-model="settingsDraft.obsidianDailyPathPattern" :disabled="!settingsLoaded" placeholder="工作日报/{date}.md" /></label>
@@ -1056,7 +1311,7 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           </div>
         </div>
 
-        <div class="work-panel settings-panel">
+        <div id="settings-seatable" data-settings-section="seatable" class="work-panel settings-panel">
           <div class="panel-title"><h2>SeaTable</h2><span>{{ settingsSnapshot?.secrets.seatableTokenSet ? 'Token 已安全保存' : '尚未配置 Token' }}</span></div>
           <label>服务地址<input v-model="settingsDraft.seatableServerUrl" :disabled="!settingsLoaded" placeholder="https://cloud.seatable.cn" /></label>
           <label>事项表<input v-model="settingsDraft.seatableTaskTable" :disabled="!settingsLoaded" placeholder="事项计划" /></label>
@@ -1067,7 +1322,7 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           <button class="secondary-button" type="button" :disabled="seaTableLoading || !settingsSnapshot?.secrets.seatableTokenSet" @click="checkSeaTableConnection">{{ seaTableLoading ? '检测中...' : '检测连接与表结构' }}</button>
         </div>
 
-        <div class="work-panel settings-panel settings-storage-panel">
+        <div id="settings-storage" data-settings-section="storage" class="work-panel settings-panel settings-storage-panel">
           <div class="panel-title"><h2>数据存储</h2><span>{{ settingsDraft.storageMode === 'local' ? '本地 SQLite' : 'Supabase 云端' }}</span></div>
           <div class="storage-status-card">
             <div class="storage-status-main"><span :class="['storage-state-dot', storageState?.online ? 'online' : '', { warning: storageState?.conflictCount || storageState?.pendingOperations || storageState?.lastError }]"></span><div><strong>{{ storageState?.mode === 'cloud' ? '云端数据' : '本地数据' }}</strong><small>{{ storageState?.mode === 'cloud' ? cloudSyncLabel : '无需网络即可使用' }}</small></div></div>
@@ -1133,7 +1388,7 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           </template>
         </div>
 
-        <div class="work-panel settings-panel">
+        <div id="settings-feedback" data-settings-section="feedback" class="work-panel settings-panel">
           <div class="panel-title"><h2>交互反馈</h2><span>当前设备独立设置</span></div>
           <label class="switch-line"><input v-model="settingsDraft.completionFeedbackEnabled" :disabled="!settingsLoaded" type="checkbox" @change="setCompletionFeedbackEnabled(settingsDraft.completionFeedbackEnabled)" />启用完成事项时的激励动画</label>
           <p class="settings-help">开启后显示彩带、完成提示和列表反馈；此选项不受 Windows 动画设置影响。</p>
@@ -1141,7 +1396,7 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           <p class="settings-help">使用本地成功提示音与视觉特效同步播放；关闭后仅保留视觉反馈。</p>
         </div>
 
-        <div class="work-panel settings-panel">
+        <div id="settings-tray" data-settings-section="tray" class="work-panel settings-panel">
           <div class="panel-title"><h2>托盘行为</h2><span>当前设备独立设置</span></div>
           <label class="switch-line"><input v-model="settingsDraft.trayHoverEnabled" :disabled="!settingsLoaded" type="checkbox" />鼠标停留后显示悬浮面板</label>
           <label class="switch-line"><input v-model="settingsDraft.trayMenuSuppressHover" :disabled="!settingsLoaded" type="checkbox" />右键菜单打开时抑制悬浮面板</label>
@@ -1149,11 +1404,11 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           <button class="primary-button settings-save-button" type="button" :disabled="!settingsLoaded || settingsSaving" @click="saveSettings">{{ settingsSaving ? '保存中...' : '保存设置' }}</button>
         </div>
 
-        <div class="work-panel settings-panel settings-hooks-panel">
+        <div id="settings-hooks" data-settings-section="hooks" class="work-panel settings-panel settings-hooks-panel">
           <AutomationHooksSettings />
         </div>
 
-        <div class="work-panel settings-panel settings-update-panel">
+        <div id="settings-update" data-settings-section="update" class="work-panel settings-panel settings-update-panel">
           <div class="panel-title"><h2>应用更新</h2><span>v{{ appVersion }}</span></div>
           <div class="update-state-row">
             <div>
@@ -1163,29 +1418,58 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
             <button class="secondary-button compact" type="button" :disabled="updateChecking || updateInstalling" @click="handleCheckUpdate">{{ updateChecking ? '检查中...' : updateInstalling ? '安装中...' : '检查更新' }}</button>
           </div>
         </div>
-        </section>
+        </div>
+      </section>
       </div>
       <footer class="sync-status-dock" aria-label="同步状态">
         <div class="sync-status-main" :class="[cloudSyncAttentionLevel, { working: cloudSyncWorking }]">
-          <span class="sync-user-pill" :title="cloudAccountLabel"><UserRound :size="14" /><strong>{{ cloudAccountLabel }}</strong></span>
-          <span class="sync-state-pill" :class="[cloudSyncAttentionLevel, { synced: storageState?.mode === 'cloud' && !cloudSyncNeedsAttention }]" :title="cloudSyncDetail || cloudSyncLabel">
+          <button class="sync-user-pill" type="button" :title="`${cloudAccountLabel}，点击管理账号`" @click="openCloudAccountSettings"><UserRound :size="14" /><strong>{{ cloudAccountLabel }}</strong></button>
+          <button class="sync-state-pill" :class="[cloudSyncAttentionLevel, { synced: storageState?.mode === 'cloud' && !cloudSyncNeedsAttention }]" type="button" :title="`${cloudSyncDetail || cloudSyncLabel}，点击查看待同步列表`" @click="openCloudSyncQueue">
             <LoaderCircle v-if="cloudSyncWorking" class="sync-spin" :size="14" />
             <AlertTriangle v-else-if="cloudSyncNeedsAttention" :size="14" />
             <CheckCircle2 v-else :size="14" />
             <span>{{ cloudSyncWorking ? '同步中' : cloudSyncLabel }}</span>
-          </span>
+          </button>
           <small class="sync-status-detail" :title="cloudDockDetail">{{ cloudDockDetail }}</small>
         </div>
         <button class="sync-dock-button" :class="{ running: cloudSyncWorking, 'has-conflict': storageState?.conflictCount }" type="button" :disabled="cloudDockSyncDisabled" :title="cloudDockSyncTitle" @click="handleCloudDockSync">
           <LoaderCircle v-if="cloudSyncWorking" class="sync-spin" :size="14" />
           <AlertTriangle v-else-if="storageState?.conflictCount" :size="14" />
           <RefreshCw v-else :size="14" />
-          <span>{{ cloudSyncWorking ? '同步中' : cloudDockSyncLabel }}</span>
+          <span class="sync-dock-label">{{ cloudSyncWorking ? '同步中' : cloudDockSyncLabel }}</span>
+          <span v-if="cloudAutoSyncVisible" class="sync-auto-countdown" :title="`将在 ${cloudAutoSyncCountdown} 秒后自动同步`" :aria-label="`将在 ${cloudAutoSyncCountdown} 秒后自动同步`">{{ cloudAutoSyncCountdown }}</span>
         </button>
       </footer>
     </section>
     <UnassignedTimeDialog />
     <TimerStopConfirmationDialog />
+    <el-dialog v-model="cloudQueueDialogOpen" class="cloud-sync-queue-dialog" title="同步队列" width="min(620px, 94vw)" append-to-body :close-on-click-modal="false">
+      <div class="cloud-sync-queue-summary">
+        <div><strong>{{ cloudQueueItems.length }}</strong><span>本机待处理</span></div>
+        <div><strong>{{ storageState?.pendingOperations ?? 0 }}</strong><span>等待同步</span></div>
+        <div :class="{ danger: storageState?.conflictCount }"><strong>{{ storageState?.conflictCount ?? 0 }}</strong><span>冲突</span></div>
+      </div>
+      <div v-if="cloudQueueLoading" class="cloud-sync-queue-empty"><LoaderCircle class="sync-spin" :size="22" /><span>正在读取本机同步队列</span></div>
+      <div v-else-if="cloudQueueItems.length" class="cloud-sync-queue-list">
+        <article v-for="item in cloudQueueItems" :key="item.operationId" :class="['cloud-sync-queue-item', item.state]">
+          <span class="cloud-sync-queue-state">{{ cloudQueueStateLabel(item.state) }}</span>
+          <div>
+            <strong>{{ cloudQueueTitle(item) }}</strong>
+            <span>{{ cloudConflictEntityLabel(item.entityType) }} · {{ cloudConflictActionLabel(item.operationType) }}<template v-if="item.coalescedCount > 1"> · 合并 {{ item.coalescedCount }} 次修改</template></span>
+            <small>{{ formatQueueTime(item.createdAt) }}<template v-if="item.attemptCount"> · 已尝试 {{ item.attemptCount }} 次</template><template v-if="item.dependsOnOperationId"> · 等待前置内容</template></small>
+            <p v-if="item.error">{{ item.error }}</p>
+          </div>
+        </article>
+      </div>
+      <div v-else class="cloud-sync-queue-empty"><CheckCircle2 :size="24" /><strong>当前没有待同步内容</strong><span>{{ storageState?.mode === 'cloud' ? '本机修改已全部处理。' : '当前使用本地存储模式。' }}</span></div>
+      <p v-if="storageState?.lastError" class="cloud-sync-queue-error">{{ storageState.lastError }}</p>
+      <template #footer>
+        <button class="secondary-button" type="button" @click="cloudQueueDialogOpen = false">关闭</button>
+        <button v-if="cloudDockRequiresStorageAttention && !storageState?.conflictCount" class="secondary-button" type="button" @click="openCloudStorageSettings">数据存储设置</button>
+        <button v-if="storageState?.conflictCount" class="danger-button" type="button" :disabled="cloudSyncWorking" @click="openConflictsFromQueue">处理冲突</button>
+        <button v-if="storageState?.pendingOperations" class="primary-button" type="button" :disabled="cloudSyncWorking || !storageState.online || !cloudSession?.signedIn || storageState.authBlocked || Boolean(storageState.conflictCount)" @click="syncAllCloudQueue"><LoaderCircle v-if="cloudSyncWorking" class="sync-spin" :size="14" />{{ cloudSyncWorking ? '同步中...' : '同步全部' }}</button>
+      </template>
+    </el-dialog>
     <el-dialog
       v-model="resetLocalCacheDialogOpen"
       class="reset-local-cache-dialog"
@@ -1218,17 +1502,32 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
         <div v-for="conflict in cloudConflicts" :key="conflict.operationId" class="cloud-conflict-item">
           <div class="cloud-conflict-copy">
             <strong>{{ cloudConflictTitle(conflict) }}</strong>
-            <span>{{ conflict.operationType }} · 本地基础版本 {{ conflict.baseVersion ?? '新建' }}</span>
+            <span>{{ cloudConflictEntityLabel(conflict.entityType) }} · {{ cloudConflictActionLabel(conflict.operationType) }} · 本地基础版本 {{ conflict.baseVersion ?? '新建' }}</span>
             <small>{{ conflict.error || '云端内容已在其他设备变化' }}</small>
           </div>
-          <div class="cloud-conflict-actions">
-            <button class="secondary-button compact" type="button" :disabled="cloudSyncWorking" @click="resolveConflict(conflict, 'use_cloud')">使用云端</button>
-            <button class="primary-button compact" type="button" :disabled="cloudSyncWorking" @click="resolveConflict(conflict, 'keep_local')">保留本地</button>
+          <div class="cloud-conflict-comparison">
+            <div class="cloud-conflict-side local"><strong>本机内容</strong><span>将要上传的修改</span></div>
+            <div class="cloud-conflict-side cloud"><strong>云端内容</strong><span>{{ conflict.cloudPayloadError ? '暂时无法读取' : conflict.cloudPayload ? '当前已保存版本' : '云端已不存在' }}</span></div>
+            <template v-for="field in conflictFields(conflict)" :key="field">
+              <div class="cloud-conflict-field-label">{{ conflictFieldLabels[field] }}</div>
+              <div :class="['cloud-conflict-value', { changed: conflictFieldChanged(conflict, field) }]">{{ conflictValue(conflict.localPayload, field) }}</div>
+              <div :class="['cloud-conflict-value', { changed: conflictFieldChanged(conflict, field) }]">{{ conflict.cloudPayloadError ? '读取失败' : conflictValue(conflict.cloudPayload, field) }}</div>
+            </template>
           </div>
+          <p v-if="conflict.cloudPayloadError" class="cloud-conflict-cloud-error">云端内容读取失败：{{ conflict.cloudPayloadError }}</p>
+          <details class="cloud-conflict-raw">
+            <summary>查看完整内容</summary>
+            <div><strong>本机</strong><pre>{{ formattedConflictPayload(conflict, 'local') }}</pre></div>
+            <div><strong>云端</strong><pre>{{ conflict.cloudPayloadError || formattedConflictPayload(conflict, 'cloud') }}</pre></div>
+          </details>
         </div>
         <p v-if="!cloudConflicts.length" class="cloud-conflict-empty">当前没有需要处理的冲突。</p>
       </div>
-      <template #footer><button class="secondary-button" type="button" :disabled="cloudSyncWorking" @click="cloudConflictDialogOpen = false">稍后处理</button></template>
+      <template #footer>
+        <button class="secondary-button" type="button" :disabled="cloudSyncWorking" @click="cloudConflictDialogOpen = false">稍后处理</button>
+        <button v-if="cloudConflicts.length" class="secondary-button" type="button" :disabled="cloudSyncWorking" @click="resolveAllConflicts('use_cloud')">全部使用云端</button>
+        <button v-if="cloudConflicts.length" class="primary-button" type="button" :disabled="cloudSyncWorking" @click="resolveAllConflicts('keep_local')"><LoaderCircle v-if="cloudSyncWorking" class="sync-spin" :size="14" />{{ cloudSyncWorking ? '处理中...' : '全部保留本地' }}</button>
+      </template>
     </el-dialog>
     <el-dialog v-model="seaTableDialogOpen" class="seatable-sync-dialog" title="同步到 SeaTable" width="min(720px, 94vw)" append-to-body destroy-on-close>
       <div v-if="seaTablePreview" class="seatable-sync-preview">

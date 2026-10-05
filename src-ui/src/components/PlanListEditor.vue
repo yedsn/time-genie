@@ -12,7 +12,6 @@ const props = defineProps<{
   recentCompletedId?: string;
   runningTaskId?: string;
   formatMinutes: (minutes: number) => string;
-  storageMode: "local" | "cloud";
 }>();
 
 const emit = defineEmits<{
@@ -283,10 +282,6 @@ function hasChildren(taskId: string) {
 }
 
 function openRecurrenceEditor(task: Task) {
-  if (props.storageMode === "cloud") {
-    ElMessage.warning("重复事项暂仅支持本地模式");
-    return;
-  }
   if (hasChildren(task.id)) return;
   recurrenceTaskId.value = task.id;
   recurrenceFrequency.value = task.recurrence?.frequency ?? "none";
@@ -485,9 +480,9 @@ onBeforeUnmount(() => {
               <button
                 v-if="!hasChildren(row.task.id)"
                 class="meta-picker recurrence-picker"
-                :class="{ filled: row.task.recurrence, disabled: storageMode === 'cloud' }"
+                :class="{ filled: row.task.recurrence }"
                 type="button"
-                :title="storageMode === 'cloud' ? '重复事项暂仅支持本地模式' : '设置重复规则'"
+                title="设置重复规则"
                 @click.stop="openRecurrenceEditor(row.task)"
               >
                 <Repeat2 :size="12" />{{ row.task.recurrence?.summary ?? '不重复' }}

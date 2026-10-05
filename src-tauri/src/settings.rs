@@ -873,6 +873,23 @@ mod tests {
             Some(&state),
         )
         .unwrap();
+        for (key, value) in [
+            ("tray_hover_enabled", serde_json::json!(false)),
+            ("tray_menu_suppress_hover", serde_json::json!(false)),
+            ("start_minimized", serde_json::json!(true)),
+            ("device_name", serde_json::json!("仅本机设备名")),
+        ] {
+            update_setting_with_cloud_operation(
+                &database,
+                SettingsUpdate {
+                    scope: SettingsScope::Device,
+                    key: key.to_string(),
+                    value,
+                },
+                Some(&state),
+            )
+            .unwrap();
+        }
         update_integration_config_with_cloud_operation(
             &database,
             IntegrationConfigRequest {
@@ -927,6 +944,16 @@ mod tests {
         assert!(!rows
             .iter()
             .any(|(_, _, entity_id, _)| entity_id.as_deref() == Some("obsidian_root_path")));
+        for local_key in [
+            "tray_hover_enabled",
+            "tray_menu_suppress_hover",
+            "start_minimized",
+            "device_name",
+        ] {
+            assert!(!rows
+                .iter()
+                .any(|(_, _, entity_id, _)| entity_id.as_deref() == Some(local_key)));
+        }
     }
 
     #[test]

@@ -40,6 +40,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "cloud_session_lifecycle",
         sql: include_str!("../migrations/0005_cloud_session_lifecycle.sql"),
     },
+    Migration {
+        version: 6,
+        name: "outbox_coordination",
+        sql: include_str!("../migrations/0006_outbox_coordination.sql"),
+    },
+    Migration {
+        version: 7,
+        name: "local_only_unassigned_sessions",
+        sql: include_str!("../migrations/0007_local_only_unassigned_sessions.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -438,7 +448,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let database = Database::initialize_at(directory.path().join("test.sqlite3")).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 5);
+        assert_eq!(status.schema_version, 7);
         for table in REQUIRED_TABLES {
             assert!(
                 status.tables.iter().any(|value| value == table),
@@ -478,8 +488,159 @@ mod tests {
         let workspace_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migration_count, 5);
+        assert_eq!(migration_count, 7);
         assert_eq!(workspace_count, 1);
+    }
+
+    #[test]
+    fn outbox_coordination_migration_preserves_legacy_rows() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("legacy-outbox.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                   version INTEGER PRIMARY KEY,
+                   name TEXT NOT NULL,
+                   applied_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        for migration in &MIGRATIONS[..5] {
+            let transaction = connection.transaction().unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?1, ?2, ?3)",
+                    params![migration.version, migration.name, now_millis()],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        for (index, state) in ["pending", "sending", "failed", "conflict"]
+            .into_iter()
+            .enumerate()
+        {
+            connection
+                .execute(
+                    "INSERT INTO sync_outbox(
+                       operation_id, workspace_id, device_id, operation_type, entity_type,
+                       entity_id, base_version, payload_json, state, attempt_count, created_at
+                     ) VALUES (?1, 'legacy-workspace', 'legacy-device', 'timer_update',
+                       'time_entry', ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        format!("legacy-{state}"),
+                        format!("entry-{index}"),
+                        index as i64,
+                        serde_json::json!({ "version": index as i64 + 1 }).to_string(),
+                        state,
+                        index as i64,
+                        now_millis() + index as i64,
+                    ],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let database = Database::initialize_at(path).unwrap();
+        let connection = database.open().unwrap();
+        let rows = connection
+            .prepare(
+                "SELECT state, payload_version, depends_on_operation_id, coalesced_count
+                 FROM sync_outbox WHERE workspace_id = 'legacy-workspace' ORDER BY created_at",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(rows.len(), 4);
+        for (index, (state, payload_version, dependency, coalesced_count)) in
+            rows.iter().enumerate()
+        {
+            assert_eq!(state, ["pending", "sending", "failed", "conflict"][index]);
+            assert_eq!(*payload_version, Some(index as i64 + 1));
+            assert_eq!(*dependency, None);
+            assert_eq!(*coalesced_count, 1);
+        }
+    }
+
+    #[test]
+    fn local_only_unassigned_migration_removes_old_session_operations_only() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("legacy-unassigned-outbox.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                   version INTEGER PRIMARY KEY,
+                   name TEXT NOT NULL,
+                   applied_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        for migration in &MIGRATIONS[..6] {
+            let transaction = connection.transaction().unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?1, ?2, ?3)",
+                    params![migration.version, migration.name, now_millis()],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        for (operation_id, entity_type, state, payload) in [
+            ("old-unassigned", "unassigned_session", "conflict", "{}"),
+            (
+                "keep-time-entry",
+                "time_entry",
+                "pending",
+                r#"{"origin_unassigned_session_id":"local-session","title":"保留"}"#,
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, payload_json, state, attempt_count, created_at)
+                     VALUES (?1, 'legacy-workspace', 'legacy-device', 'update', ?2, ?1, ?4, ?3, 1, 1)",
+                    params![operation_id, entity_type, state, payload],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let database = Database::initialize_at(path).unwrap();
+        let rows = collect_strings(
+            &database.open().unwrap(),
+            "SELECT operation_id FROM sync_outbox ORDER BY operation_id",
+        )
+        .unwrap();
+        assert_eq!(rows, vec!["keep-time-entry"]);
+        let payload: String = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT payload_json FROM sync_outbox WHERE operation_id = 'keep-time-entry'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            payload["origin_unassigned_session_id"],
+            serde_json::Value::Null
+        );
+        assert_eq!(payload["title"], "保留");
     }
 
     #[test]
@@ -639,7 +800,7 @@ mod tests {
 
         let database = Database::initialize_at(path).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 5);
+        assert_eq!(status.schema_version, 7);
         assert!(status.tables.iter().any(|table| table == "device_hooks"));
         assert!(status
             .tables

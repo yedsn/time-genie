@@ -15,6 +15,7 @@
         "test:cloud-device-presentation": "tsc src-ui/src/services/cloudDevicePresentation.ts src-ui/src/services/cloudDevicePresentationTypes.ts --outDir .tmp-cloud-device-presentation-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-cloud-device-presentation.mjs",
         "test:transient-state-guard": "tsc src-ui/src/services/transientStateGuard.ts --outDir .tmp-transient-state-guard-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-transient-state-guard.mjs",
         "test:supabase:schema": "node scripts/verify-supabase-schema.mjs",
+        "test:supabase:planning-e2e": "cargo test --manifest-path src-tauri/Cargo.toml cloud_e2e::isolated_supabase_planning_two_device_flow -- --nocapture",
         "test:supabase:e2e": "node scripts/run-supabase-e2e.mjs",
         "tauri": "tauri",
         "tauri:dev": "tauri dev",

@@ -16,6 +16,10 @@ use crate::settings::{self, SettingsScope, SettingsUpdate};
 
 const SESSION_PROVIDER: &str = "supabase";
 const SESSION_ACCOUNT: &str = "supabase:session";
+#[cfg(not(test))]
+const SESSION_CREDENTIAL_SERVICE: &str = "timegenie";
+#[cfg(all(not(test), windows))]
+const SESSION_CREDENTIAL_TARGET_PREFIX: &str = "com.timegenie.desktop";
 const SESSION_METADATA_SETTING: &str = "supabase_session_metadata";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 12;
 pub(crate) const CLOUD_SCHEMA: &str = "timegenie";
@@ -1577,9 +1581,25 @@ fn save_session(database: &Database, session: &CloudSession) -> Result<(), Strin
     cache_session(&workspace_id, session)
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), windows))]
 fn session_entry(account: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new("timegenie", account)
+    keyring::Entry::new_with_target(
+        &format!("{SESSION_CREDENTIAL_TARGET_PREFIX}:{account}"),
+        SESSION_CREDENTIAL_SERVICE,
+        account,
+    )
+    .map_err(|error| format!("无法访问系统凭据库: {error}"))
+}
+
+#[cfg(all(not(test), not(windows)))]
+fn session_entry(account: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(SESSION_CREDENTIAL_SERVICE, account)
+        .map_err(|error| format!("无法访问系统凭据库: {error}"))
+}
+
+#[cfg(not(test))]
+fn legacy_session_entry(account: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(SESSION_CREDENTIAL_SERVICE, account)
         .map_err(|error| format!("无法访问系统凭据库: {error}"))
 }
 
@@ -1610,10 +1630,24 @@ fn read_session_credential(account: &str) -> Result<String, String> {
     #[cfg(not(test))]
     {
         let entry = session_entry(account)?;
-        entry.get_password().map_err(|error| match error {
-            keyring::Error::NoEntry => "NO_ENTRY".to_string(),
-            _ => format!("CREDENTIAL_UNAVAILABLE: 本机凭据暂时无法读取: {error}"),
-        })
+        match entry.get_password() {
+            Ok(serialized) => Ok(serialized),
+            Err(keyring::Error::NoEntry) => {
+                let legacy = legacy_session_entry(account)?;
+                let serialized = legacy.get_password().map_err(|error| match error {
+                    keyring::Error::NoEntry => "NO_ENTRY".to_string(),
+                    _ => format!("CREDENTIAL_UNAVAILABLE: 本机凭据暂时无法读取: {error}"),
+                })?;
+                entry.set_password(&serialized).map_err(|error| {
+                    format!("CREDENTIAL_UNAVAILABLE: 无法迁移 Supabase 会话: {error}")
+                })?;
+                let _ = legacy.delete_credential();
+                Ok(serialized)
+            }
+            Err(error) => Err(format!(
+                "CREDENTIAL_UNAVAILABLE: 本机凭据暂时无法读取: {error}"
+            )),
+        }
     }
 }
 
@@ -1633,9 +1667,17 @@ fn write_session_credential(account: &str, serialized: &str) -> Result<(), Strin
     }
     #[cfg(not(test))]
     {
-        session_entry(account)?
+        let entry = session_entry(account)?;
+        entry
             .set_password(serialized)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let persisted = entry
+            .get_password()
+            .map_err(|error| format!("写入后无法读取系统凭据: {error}"))?;
+        if persisted != serialized {
+            return Err("系统凭据写入校验失败".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -1653,10 +1695,15 @@ fn delete_session_credential(account: &str) -> Result<(), String> {
     }
     #[cfg(not(test))]
     {
-        match session_entry(account)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(error.to_string()),
+        let mut first_error = None;
+        for entry in [session_entry(account)?, legacy_session_entry(account)?] {
+            match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(error) if first_error.is_none() => first_error = Some(error.to_string()),
+                Err(_) => {}
+            }
         }
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -1736,6 +1783,23 @@ pub(crate) fn force_cached_session_expiry_for_test(database: &Database) -> Resul
     let mut session = session(&workspace_id)?;
     session.expires_at = Some(0);
     cache_session(&workspace_id, &session)
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_session_for_database(
+    database: &Database,
+    user_id: &str,
+) -> Result<(), String> {
+    save_session(
+        database,
+        &CloudSession {
+            user_id: user_id.to_string(),
+            email: Some(format!("{user_id}@example.com")),
+            access_token: format!("access-{user_id}"),
+            refresh_token: format!("refresh-{user_id}"),
+            expires_at: Some(now_seconds() + 3600),
+        },
+    )
 }
 
 fn session_snapshot(session: &CloudSession) -> CloudSessionSnapshot {
@@ -2010,6 +2074,13 @@ fn classify_http_error(status: StatusCode, body: &str, fallback: &str) -> String
         .and_then(Value::as_str)
         .unwrap_or_default();
     let lower_message = message.to_ascii_lowercase();
+    let planning_operation_missing = lower_message.contains("unsupported_operation")
+        && (lower_message.contains("task_daily_estimate")
+            || lower_message.contains("task_recurrence_rule"));
+    if planning_operation_missing {
+        return "CLOUD_SCHEMA_MISSING: 云端数据库版本过旧，请部署 TimeGenie 事项规划同步补丁"
+            .to_string();
+    }
     let code = if matches!(remote_code, "PGRST202" | "PGRST205" | "42P01" | "42883")
         || lower_message.contains("could not find the function")
         || lower_message.contains("could not find the table")
@@ -2982,6 +3053,17 @@ mod tests {
         );
         assert!(missing.starts_with("CLOUD_SCHEMA_MISSING:"));
 
+        for entity_type in ["task_daily_estimate", "task_recurrence_rule"] {
+            let planning_missing = classify_http_error(
+                StatusCode::BAD_REQUEST,
+                &format!(r#"{{"code":"P0001","message":"UNSUPPORTED_OPERATION: {entity_type}"}}"#),
+                "CLOUD_REQUEST_FAILED",
+            );
+            assert!(planning_missing.starts_with("CLOUD_SCHEMA_MISSING:"));
+            assert!(planning_missing.contains("事项规划同步补丁"));
+            assert!(!planning_missing.starts_with("AUTH_FAILED:"));
+        }
+
         let denied = classify_http_error(
             StatusCode::BAD_REQUEST,
             r#"{"code":"42501","message":"permission denied for table workspaces"}"#,
@@ -3747,6 +3829,119 @@ mod tests {
             snapshot["task_daily_estimates"][0]["estimate_minutes"],
             json!(60)
         );
+    }
+
+    #[test]
+    fn migration_preview_counts_planning_entities() {
+        let _guard = lock_test_session_state();
+        reset_test_credentials();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        let server = TestHttpServer::start(vec![
+            TestHttpResponse {
+                path: "/rest/v1/workspaces",
+                status: 200,
+                body: Box::leak(
+                    format!(
+                        r#"[{{"id":"{cloud_workspace_id}","name":"云端工作空间","timezone":"Asia/Shanghai"}}]"#
+                    )
+                    .into_boxed_str(),
+                ),
+            },
+            TestHttpResponse {
+                path: "/rest/v1/workspace_changes",
+                status: 200,
+                body: "[]",
+            },
+            TestHttpResponse {
+                path: "/rest/v1/rpc/cloud_snapshot_get",
+                status: 200,
+                body: r#"{"subjects":[],"tasks":[],"time_entries":[],"time_allocations":[],"reports":[],"task_daily_estimates":[],"task_recurrence_rules":[],"task_occurrences":[],"work_days":[],"unassigned_sessions":[]}"#,
+            },
+        ]);
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("planning-preview.sqlite3")).unwrap();
+        configure_test_cloud_state(&database, &server.base_url(), &cloud_workspace_id);
+        save_session(
+            &database,
+            &test_session("planning-preview", Some(now_seconds() + 3600)),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id,
+                parent_id: None,
+                title: "迁移预览规划事项".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        set_task_daily_estimate(
+            &database,
+            TaskDailyEstimateSetRequest {
+                task_id: task.id.clone(),
+                work_date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+                estimate_minutes: Some(30),
+            },
+        )
+        .unwrap();
+        let rule = save_rule(
+            &database,
+            RecurrenceSaveRequest {
+                task_id: task.id.clone(),
+                task_expected_version: task.version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: chrono::Local::now().format("%Y-%m-%d").to_string(),
+                rule_expected_version: None,
+            },
+        )
+        .unwrap();
+        let now = now_seconds() * 1000;
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "INSERT INTO task_occurrences(workspace_id,task_id,occurrence_date,origin,status,created_at,updated_at,version) VALUES (?1,?2,?3,'scheduled','open',?4,?4,1)",
+                params![workspace_id, task.id, rule.effective_start, now],
+            )
+            .unwrap();
+
+        let preview = migration_preview(
+            &database,
+            MigrationPreviewRequest {
+                direction: "local_to_cloud".to_string(),
+            },
+        )
+        .unwrap();
+        let count = |entity: &str| {
+            preview
+                .entities
+                .iter()
+                .find(|item| item.entity == entity)
+                .map(|item| item.local_count)
+                .unwrap()
+        };
+        assert_eq!(count("task_daily_estimates"), 1);
+        assert_eq!(count("task_recurrence_rules"), 1);
+        assert_eq!(count("task_occurrences"), 1);
+        assert!(preview.can_execute);
+        assert!(preview.conflicts.is_empty());
+        assert_eq!(server.finish().len(), 3);
+        reset_test_credentials();
     }
 
     #[test]

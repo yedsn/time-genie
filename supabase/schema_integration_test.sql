@@ -36,6 +36,8 @@ end $$;
 \ir 20261004c_timegenie_work_day_version_guard_patch.sql
 \ir 20261004d_timegenie_session_revocation_patch.sql
 \ir 20261004_verify_timegenie_cloud_guards.sql
+\ir 20261005_timegenie_timer_sync_coordination_patch.sql
+\ir 20261005_timegenie_cloud_task_planning_patch.sql
 
 do $$
 begin
@@ -74,6 +76,9 @@ begin
   end if;
   if not has_function_privilege('authenticated', 'timegenie.cloud_apply_patch(uuid, uuid, uuid, text, text, text, bigint, jsonb)', 'execute') then
     raise exception 'authenticated is missing cloud apply RPC execute privilege';
+  end if;
+  if not has_function_privilege('authenticated', 'timegenie.cloud_apply_patch(uuid, uuid, uuid, text, text, text, bigint, bigint, bigint, jsonb)', 'execute') then
+    raise exception 'authenticated is missing coalesced timer apply RPC execute privilege';
   end if;
   if not has_function_privilege('authenticated', 'timegenie.device_authorize(uuid, uuid, text, text, text)', 'execute')
      or not has_function_privilege('authenticated', 'timegenie.device_authorization_get(uuid, uuid)', 'execute')
@@ -1242,6 +1247,372 @@ begin
   exception
     when others then
       if sqlerrm not like '%SYNC_CONFLICT%' then raise; end if;
+  end;
+end $$;
+
+-- Daily estimates support composite identity, explicit clears, idempotent retries,
+-- and optimistic concurrency without coupling different dates.
+reset role;
+insert into timegenie.subjects(id, workspace_id, name, sort_order)
+values('51000000-0000-0000-0000-000000000090','20000000-0000-0000-0000-000000000001','规划同步测试',90);
+insert into timegenie.tasks(id, workspace_id, subject_id, title, status, source_type, sort_order, version)
+values('61000000-0000-0000-0000-000000000090','20000000-0000-0000-0000-000000000001','51000000-0000-0000-0000-000000000090','每日计划','open','manual',90,1);
+set role authenticated;
+do $$
+declare first_result jsonb; retry_result jsonb;
+begin
+  first_result := timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000150','task_daily_estimate.set','task_daily_estimate',
+    '61000000-0000-0000-0000-000000000090|2026-10-05',null,
+    jsonb_build_object('task_id','61000000-0000-0000-0000-000000000090','work_date','2026-10-05','estimate_minutes',45,'created_at',1791158400000,'updated_at',1791158400000,'version',1)
+  );
+  retry_result := timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000150','task_daily_estimate.set','task_daily_estimate',
+    '61000000-0000-0000-0000-000000000090|2026-10-05',null,
+    jsonb_build_object('task_id','61000000-0000-0000-0000-000000000090','work_date','2026-10-05','estimate_minutes',45,'created_at',1791158400000,'updated_at',1791158400000,'version',1)
+  );
+  if first_result is distinct from retry_result then raise exception 'daily estimate retry changed result'; end if;
+
+  perform timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000151','task_daily_estimate.set','task_daily_estimate',
+    '61000000-0000-0000-0000-000000000090|2026-10-05',1,
+    jsonb_build_object('task_id','61000000-0000-0000-0000-000000000090','work_date','2026-10-05','estimate_minutes',60,'created_at',1791158400000,'updated_at',1791158460000,'version',2)
+  );
+  perform timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000152','task_daily_estimate.set','task_daily_estimate',
+    '61000000-0000-0000-0000-000000000090|2026-10-06',null,
+    jsonb_build_object('task_id','61000000-0000-0000-0000-000000000090','work_date','2026-10-06','estimate_minutes',30,'created_at',1791244800000,'updated_at',1791244800000,'version',1)
+  );
+  reset role;
+  if (select estimate_minutes from timegenie.task_daily_estimates where task_id='61000000-0000-0000-0000-000000000090' and work_date='2026-10-05') <> 60
+     or (select estimate_minutes from timegenie.task_daily_estimates where task_id='61000000-0000-0000-0000-000000000090' and work_date='2026-10-06') <> 30 then
+    raise exception 'daily estimate dates were not independent';
+  end if;
+  set role authenticated;
+
+  begin
+    perform timegenie.cloud_apply_patch(
+      '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002',
+      '40000000-0000-0000-0000-000000000153','task_daily_estimate.set','task_daily_estimate',
+      '61000000-0000-0000-0000-000000000090|2026-10-05',1,
+      jsonb_build_object('task_id','61000000-0000-0000-0000-000000000090','work_date','2026-10-05','estimate_minutes',90,'created_at',1791158400000,'updated_at',1791158520000,'version',2)
+    );
+    raise exception 'stale daily estimate was accepted';
+  exception when others then if sqlerrm not like '%SYNC_CONFLICT%' then raise; end if; end;
+
+  first_result := timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000154','task_daily_estimate.clear','task_daily_estimate',
+    '61000000-0000-0000-0000-000000000090|2026-10-05',2,
+    jsonb_build_object('task_id','61000000-0000-0000-0000-000000000090','work_date','2026-10-05','deleted',true,'updated_at',1791158580000,'version',3)
+  );
+  retry_result := timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000154','task_daily_estimate.clear','task_daily_estimate',
+    '61000000-0000-0000-0000-000000000090|2026-10-05',2,
+    jsonb_build_object('task_id','61000000-0000-0000-0000-000000000090','work_date','2026-10-05','deleted',true,'updated_at',1791158580000,'version',3)
+  );
+  reset role;
+  if first_result is distinct from retry_result or exists(select 1 from timegenie.task_daily_estimates where task_id='61000000-0000-0000-0000-000000000090' and work_date='2026-10-05') then
+    raise exception 'daily estimate clear was not idempotent';
+  end if;
+  if not exists(
+    select 1 from timegenie.workspace_changes
+    where workspace_id='20000000-0000-0000-0000-000000000001'
+      and entity_type='task_daily_estimates'
+      and entity_id='61000000-0000-0000-0000-000000000090|2026-10-05'
+      and operation='delete'
+  ) then
+    raise exception 'daily estimate clear did not publish its composite delete identity';
+  end if;
+  set role authenticated;
+end $$;
+
+-- Recurrence changes are one task-scoped atomic operation: rule history and the
+-- task version advance together, while stale devices leave no partial rows.
+do $$
+declare before_rules jsonb; first_result jsonb; retry_result jsonb;
+begin
+  first_result := timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000160','task_recurrence.save','task_recurrence_rule',
+    '61000000-0000-0000-0000-000000000090',null,
+    jsonb_build_object('action','save','task_id','61000000-0000-0000-0000-000000000090','task_expected_version',1,'task_version',2,'rule_id','91000000-0000-0000-0000-000000000090','frequency','daily','weekdays_mask',null,'effective_start','2026-10-05','version',1,'rules',jsonb_build_array(jsonb_build_object('id','91000000-0000-0000-0000-000000000090','task_id','61000000-0000-0000-0000-000000000090','frequency','daily','weekdays_mask',null,'effective_start','2026-10-05','effective_end',null,'created_at',1791158400000,'updated_at',1791158400000,'version',1)))
+  );
+  retry_result := timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000160','task_recurrence.save','task_recurrence_rule',
+    '61000000-0000-0000-0000-000000000090',null,
+    jsonb_build_object('action','save','task_id','61000000-0000-0000-0000-000000000090','task_expected_version',1,'task_version',2,'rule_id','91000000-0000-0000-0000-000000000090','frequency','daily','weekdays_mask',null,'effective_start','2026-10-05','version',1,'rules',jsonb_build_array(jsonb_build_object('id','91000000-0000-0000-0000-000000000090','task_id','61000000-0000-0000-0000-000000000090','frequency','daily','weekdays_mask',null,'effective_start','2026-10-05','effective_end',null,'created_at',1791158400000,'updated_at',1791158400000,'version',1)))
+  );
+  if first_result is distinct from retry_result then raise exception 'recurrence retry changed result'; end if;
+
+  perform timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000161','task_recurrence.save','task_recurrence_rule',
+    '61000000-0000-0000-0000-000000000090',1,
+    jsonb_build_object('action','save','task_id','61000000-0000-0000-0000-000000000090','task_expected_version',2,'task_version',3,'rule_expected_version',1,'rule_id','91000000-0000-0000-0000-000000000090','frequency','weekdays','weekdays_mask',null,'effective_start','2026-10-05','version',2,'rules',jsonb_build_array(jsonb_build_object('id','91000000-0000-0000-0000-000000000090','task_id','61000000-0000-0000-0000-000000000090','frequency','weekdays','weekdays_mask',null,'effective_start','2026-10-05','effective_end',null,'created_at',1791158400000,'updated_at',1791158460000,'version',2)))
+  );
+  reset role;
+  before_rules := (select jsonb_agg(to_jsonb(r) order by effective_start,id) from timegenie.task_recurrence_rules r where task_id='61000000-0000-0000-0000-000000000090');
+  set role authenticated;
+  begin
+    perform timegenie.cloud_apply_patch(
+      '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002',
+      '40000000-0000-0000-0000-000000000162','task_recurrence.save','task_recurrence_rule',
+      '61000000-0000-0000-0000-000000000090',1,
+      jsonb_build_object('action','save','task_id','61000000-0000-0000-0000-000000000090','task_expected_version',2,'task_version',3,'rule_expected_version',1,'rule_id','91000000-0000-0000-0000-000000000091','frequency','weekly','weekdays_mask',5,'effective_start','2026-10-06','version',1,'rules',jsonb_build_array())
+    );
+    raise exception 'stale recurrence update was accepted';
+  exception when others then if sqlerrm not like '%SYNC_CONFLICT%' then raise; end if; end;
+  reset role;
+  if before_rules is distinct from (select jsonb_agg(to_jsonb(r) order by effective_start,id) from timegenie.task_recurrence_rules r where task_id='61000000-0000-0000-0000-000000000090') then
+    raise exception 'stale recurrence changed rule rows';
+  end if;
+  set role authenticated;
+
+  perform timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000163','task_recurrence.close','task_recurrence_rule',
+    '61000000-0000-0000-0000-000000000090',2,
+    jsonb_build_object('action','close','task_id','61000000-0000-0000-0000-000000000090','task_expected_version',3,'task_version',4,'rule_expected_version',2,'rule_id','91000000-0000-0000-0000-000000000090','effective_end','2026-10-05','version',3,'rules',jsonb_build_array(jsonb_build_object('id','91000000-0000-0000-0000-000000000090','task_id','61000000-0000-0000-0000-000000000090','frequency','weekdays','weekdays_mask',null,'effective_start','2026-10-05','effective_end','2026-10-05','created_at',1791158400000,'updated_at',1791158520000,'version',3)))
+  );
+  reset role;
+  if exists(select 1 from timegenie.task_recurrence_rules where task_id='61000000-0000-0000-0000-000000000090' and effective_end is null)
+     or (select version from timegenie.tasks where id='61000000-0000-0000-0000-000000000090') <> 4 then
+    raise exception 'recurrence close did not atomically update task and rule';
+  end if;
+  set role authenticated;
+end $$;
+
+-- Cross-day replacements create a new rule id while preserving the old
+-- interval. Closing a rule before its start removes it, and both update/delete
+-- changes stay keyed by task id for incremental refresh.
+reset role;
+insert into timegenie.tasks(id, workspace_id, subject_id, title, status, source_type, sort_order, version) values
+  ('61000000-0000-0000-0000-000000000091','20000000-0000-0000-0000-000000000001','51000000-0000-0000-0000-000000000090','跨日规则','open','manual',91,1),
+  ('61000000-0000-0000-0000-000000000092','20000000-0000-0000-0000-000000000001','51000000-0000-0000-0000-000000000090','未来规则','open','manual',92,1);
+set role authenticated;
+do $$
+begin
+  perform timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000164','task_recurrence.save','task_recurrence_rule',
+    '61000000-0000-0000-0000-000000000091',null,
+    jsonb_build_object('action','save','task_id','61000000-0000-0000-0000-000000000091','task_expected_version',1,'task_version',2,'rule_id','91000000-0000-0000-0000-000000000091','frequency','daily','weekdays_mask',null,'effective_start','2026-10-05','version',1,'rules',jsonb_build_array(jsonb_build_object('id','91000000-0000-0000-0000-000000000091','task_id','61000000-0000-0000-0000-000000000091','frequency','daily','weekdays_mask',null,'effective_start','2026-10-05','effective_end',null,'created_at',1791158400000,'updated_at',1791158400000,'version',1)))
+  );
+  perform timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000165','task_recurrence.save','task_recurrence_rule',
+    '61000000-0000-0000-0000-000000000091',1,
+    jsonb_build_object('action','save','task_id','61000000-0000-0000-0000-000000000091','task_expected_version',2,'task_version',3,'rule_expected_version',1,'rule_id','91000000-0000-0000-0000-000000000092','frequency','weekly','weekdays_mask',21,'effective_start','2026-10-06','version',1,'rules',jsonb_build_array(
+      jsonb_build_object('id','91000000-0000-0000-0000-000000000091','task_id','61000000-0000-0000-0000-000000000091','frequency','daily','weekdays_mask',null,'effective_start','2026-10-05','effective_end','2026-10-05','created_at',1791158400000,'updated_at',1791244800000,'version',2),
+      jsonb_build_object('id','91000000-0000-0000-0000-000000000092','task_id','61000000-0000-0000-0000-000000000091','frequency','weekly','weekdays_mask',21,'effective_start','2026-10-06','effective_end',null,'created_at',1791244800000,'updated_at',1791244800000,'version',1)
+    ))
+  );
+
+  reset role;
+  if (select count(*) from timegenie.task_recurrence_rules where task_id='61000000-0000-0000-0000-000000000091') <> 2
+     or (select effective_end from timegenie.task_recurrence_rules where id='91000000-0000-0000-0000-000000000091') <> '2026-10-05'::date
+     or not exists(select 1 from timegenie.task_recurrence_rules where id='91000000-0000-0000-0000-000000000092' and frequency='weekly' and weekdays_mask=21 and effective_end is null) then
+    raise exception 'cross-day recurrence replacement did not preserve history';
+  end if;
+  if not exists(
+    select 1 from timegenie.workspace_changes
+    where entity_type='task_recurrence_rules'
+      and entity_id='61000000-0000-0000-0000-000000000091'
+      and operation in ('insert','update')
+  ) then
+    raise exception 'recurrence replacement did not publish task-scoped changes';
+  end if;
+  set role authenticated;
+
+  perform timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000166','task_recurrence.save','task_recurrence_rule',
+    '61000000-0000-0000-0000-000000000092',null,
+    jsonb_build_object('action','save','task_id','61000000-0000-0000-0000-000000000092','task_expected_version',1,'task_version',2,'rule_id','91000000-0000-0000-0000-000000000093','frequency','weekdays','weekdays_mask',null,'effective_start','2026-10-10','version',1,'rules',jsonb_build_array(jsonb_build_object('id','91000000-0000-0000-0000-000000000093','task_id','61000000-0000-0000-0000-000000000092','frequency','weekdays','weekdays_mask',null,'effective_start','2026-10-10','effective_end',null,'created_at',1791590400000,'updated_at',1791590400000,'version',1)))
+  );
+  perform timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000167','task_recurrence.close','task_recurrence_rule',
+    '61000000-0000-0000-0000-000000000092',1,
+    jsonb_build_object('action','close','task_id','61000000-0000-0000-0000-000000000092','task_expected_version',2,'task_version',3,'rule_expected_version',1,'rule_id','91000000-0000-0000-0000-000000000093','effective_end','2026-10-09','version',2,'rules',jsonb_build_array())
+  );
+  reset role;
+  if exists(select 1 from timegenie.task_recurrence_rules where id='91000000-0000-0000-0000-000000000093') then
+    raise exception 'closing a future recurrence did not delete the rule';
+  end if;
+  if not exists(
+    select 1 from timegenie.workspace_changes
+    where entity_type='task_recurrence_rules'
+      and entity_id='61000000-0000-0000-0000-000000000092'
+      and operation='delete'
+  ) then
+    raise exception 'future recurrence delete did not publish its task identity';
+  end if;
+  set role authenticated;
+end $$;
+
+-- Coalesced timer snapshots may jump only across the exact number of local
+-- operations declared by the client. The final image is applied once and the
+-- original operation id remains the sole idempotency boundary.
+do $$
+declare timer_payload jsonb; first_result jsonb; retry_result jsonb; timer_change_count bigint;
+begin
+  timer_payload := jsonb_build_object(
+    'id', '70000000-0000-0000-0000-000000000099',
+    'work_date', '2026-09-30',
+    'kind', 'work',
+    'source_type', 'timer',
+    'state', 'ended',
+    'default_task_id', '60000000-0000-0000-0000-000000000002',
+    'label_snapshot', '运维相关 / 合并计时验证',
+    'started_at', 1790730000000,
+    'ended_at', 1790731800000,
+    'duration_seconds', 1800,
+    'note', '开始、暂停并结束后的最终镜像',
+    'created_at', 1790730000000,
+    'updated_at', 1790731800000,
+    'version', 3,
+    'segments', jsonb_build_array(jsonb_build_object(
+      'id', '73000000-0000-0000-0000-000000000099',
+      'sequence_no', 1,
+      'started_at', 1790730000000,
+      'ended_at', 1790731800000,
+      'duration_seconds', 1800
+    )),
+    'allocations', jsonb_build_array()
+  );
+  select count(*) into timer_change_count
+  from timegenie.workspace_changes
+  where workspace_id = '20000000-0000-0000-0000-000000000001'
+    and entity_type = 'time_entries'
+    and entity_id = '70000000-0000-0000-0000-000000000099';
+  first_result := timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000090',
+    'timer_stop',
+    'time_entry',
+    '70000000-0000-0000-0000-000000000099',
+    null,
+    3,
+    3,
+    timer_payload
+  );
+  retry_result := timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000090',
+    'timer_stop',
+    'time_entry',
+    '70000000-0000-0000-0000-000000000099',
+    null,
+    3,
+    3,
+    timer_payload
+  );
+  if first_result is distinct from retry_result then
+    raise exception 'coalesced timer retry returned a different result';
+  end if;
+  if (select version from timegenie.time_entries where id = '70000000-0000-0000-0000-000000000099') <> 3 then
+    raise exception 'coalesced timer final image was not applied at version 3';
+  end if;
+  if (
+    select count(*) from timegenie.workspace_changes
+    where workspace_id = '20000000-0000-0000-0000-000000000001'
+      and entity_type = 'time_entries'
+      and entity_id = '70000000-0000-0000-0000-000000000099'
+  ) <> timer_change_count + 1 then
+    raise exception 'coalesced timer retry created duplicate cloud writes';
+  end if;
+
+  begin
+    perform timegenie.cloud_apply_patch(
+      '20000000-0000-0000-0000-000000000001',
+      '30000000-0000-0000-0000-000000000001',
+      '40000000-0000-0000-0000-000000000094',
+      'time_allocation_replace',
+      'time_entry',
+      '70000000-0000-0000-0000-000000000099',
+      3,
+      4,
+      null,
+      jsonb_set(timer_payload, '{version}', '4'::jsonb, true)
+    );
+    raise exception 'coalesced timer request without chain proof was accepted';
+  exception
+    when others then
+      if sqlerrm not like '%VERSION_CONFLICT%' then raise; end if;
+  end;
+
+  begin
+    perform timegenie.cloud_apply_patch(
+      '20000000-0000-0000-0000-000000000001',
+      '30000000-0000-0000-0000-000000000001',
+      '40000000-0000-0000-0000-000000000091',
+      'time_allocation_replace',
+      'time_entry',
+      '70000000-0000-0000-0000-000000000099',
+      3,
+      4,
+      2,
+      jsonb_set(timer_payload, '{version}', '4'::jsonb, true)
+    );
+    raise exception 'mismatched coalesced timer span was accepted';
+  exception
+    when others then
+      if sqlerrm not like '%VERSION_CONFLICT%' then raise; end if;
+  end;
+
+  begin
+    perform timegenie.cloud_apply_patch(
+      '20000000-0000-0000-0000-000000000001',
+      '30000000-0000-0000-0000-000000000002',
+      '40000000-0000-0000-0000-000000000092',
+      'timer_stop',
+      'time_entry',
+      '70000000-0000-0000-0000-000000000099',
+      2,
+      4,
+      2,
+      jsonb_set(timer_payload, '{version}', '4'::jsonb, true)
+    );
+    raise exception 'coalesced timer overwrote an unknown cloud version';
+  exception
+    when others then
+      if sqlerrm not like '%SYNC_CONFLICT%' then raise; end if;
+  end;
+
+  begin
+    perform timegenie.cloud_apply_patch(
+      '20000000-0000-0000-0000-000000000001',
+      '30000000-0000-0000-0000-000000000001',
+      '40000000-0000-0000-0000-000000000093',
+      'subject.create',
+      'subject',
+      '61000000-0000-0000-0000-000000000099',
+      null,
+      2,
+      2,
+      jsonb_build_object(
+        'id', '61000000-0000-0000-0000-000000000099',
+        'name', '普通实体不可跳版本',
+        'sort_order', 99,
+        'created_at', 1790730000000,
+        'updated_at', 1790730000000,
+        'version', 2
+      )
+    );
+    raise exception 'non-timer entity used coalesced proof to jump versions';
+  exception
+    when others then
+      if sqlerrm not like '%VERSION_CONFLICT%' then raise; end if;
   end;
 end $$;
 

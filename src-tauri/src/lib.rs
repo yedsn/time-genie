@@ -391,12 +391,14 @@ pub fn run() {
             supabase::storage_migration_preview,
             supabase::storage_migration_execute,
             cloud_sync::cloud_sync_status,
+            cloud_sync::cloud_sync_queue,
             cloud_sync::cloud_sync_pull,
             cloud_sync::cloud_sync_push,
             cloud_sync::cloud_sync_refresh,
             cloud_sync::cloud_sync_reset_local_cache,
             cloud_sync::cloud_sync_conflicts,
             cloud_sync::cloud_sync_resolve_conflict,
+            cloud_sync::cloud_sync_resolve_all_conflicts,
             cloud_sync::tracking_lease_acquire,
             cloud_sync::tracking_lease_renew,
             cloud_sync::tracking_lease_release,
@@ -1406,7 +1408,7 @@ mod tests {
         let connection = database.open().unwrap();
         let queued = connection
             .prepare(
-                "SELECT operation_type, entity_type, entity_id, base_version FROM sync_outbox WHERE workspace_id = ?1 ORDER BY created_at, rowid",
+                "SELECT operation_type, entity_type, entity_id, base_version, payload_version, coalesced_count, payload_json FROM sync_outbox WHERE workspace_id = ?1 ORDER BY created_at, rowid",
             )
             .unwrap()
             .query_map([cloud_workspace_id], |row| {
@@ -1415,20 +1417,23 @@ mod tests {
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             })
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert_eq!(queued.len(), 2);
-        assert_eq!(queued[0].0, "timer_start");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, "timer_stop");
         assert_eq!(queued[0].1, "time_entry");
-        assert_eq!(queued[0].2.as_deref(), started["id"].as_str());
+        assert_eq!(queued[0].2.as_deref(), stopped["id"].as_str());
         assert_eq!(queued[0].3, None);
-        assert_eq!(queued[1].0, "timer_stop");
-        assert_eq!(queued[1].1, "time_entry");
-        assert_eq!(queued[1].2.as_deref(), stopped["id"].as_str());
-        assert_eq!(queued[1].3, started["version"].as_i64());
+        assert_eq!(queued[0].4, stopped["version"].as_i64());
+        assert_eq!(queued[0].5, 2);
+        let payload: serde_json::Value = serde_json::from_str(&queued[0].6).unwrap();
+        assert_eq!(payload["state"], "ended");
     }
 }

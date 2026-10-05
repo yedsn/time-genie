@@ -137,8 +137,25 @@ export type CloudSyncConflict = {
   entityId?: string;
   baseVersion?: number;
   localPayload: Record<string, unknown> | null;
+  cloudPayload?: Record<string, unknown> | null;
+  cloudPayloadError?: string;
   error?: string;
   attemptCount: number;
+  createdAt: number;
+  lastAttemptAt?: number;
+};
+
+export type CloudSyncQueueItem = {
+  operationId: string;
+  operationType: string;
+  entityType: string;
+  entityId?: string;
+  state: "pending" | "sending" | "failed" | "conflict" | string;
+  payload: Record<string, unknown> | null;
+  attemptCount: number;
+  error?: string;
+  coalescedCount: number;
+  dependsOnOperationId?: string;
   createdAt: number;
   lastAttemptAt?: number;
 };
@@ -904,6 +921,10 @@ export async function getCloudSyncStatus(): Promise<StorageModeSnapshot> {
   return await invoke("cloud_sync_status");
 }
 
+export async function listCloudSyncQueue(): Promise<CloudSyncQueueItem[]> {
+  return await invoke("cloud_sync_queue");
+}
+
 export async function listCloudDevices(): Promise<CloudDevice[]> {
   return await invoke("cloud_device_list");
 }
@@ -937,6 +958,12 @@ export async function resolveCloudSyncConflict(
   strategy: "use_cloud" | "keep_local",
 ): Promise<StorageModeSnapshot> {
   return await invoke("cloud_sync_resolve_conflict", { request: { operationId, strategy } });
+}
+
+export async function resolveAllCloudSyncConflicts(
+  strategy: "use_cloud" | "keep_local",
+): Promise<StorageModeSnapshot> {
+  return await invoke("cloud_sync_resolve_all_conflicts", { request: { strategy } });
 }
 
 export async function testSeaTableConnection(): Promise<SeaTableConnectionResult> {

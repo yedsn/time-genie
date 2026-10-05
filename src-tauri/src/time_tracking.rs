@@ -1092,7 +1092,7 @@ fn replace_allocations_with_cloud_operation(
     bump_revision(&transaction)?;
     let result = load_entry(&transaction, &request.entry_id, now)?;
     if let Some((state, operation_type)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
+        let time_entry_operation_id = crate::cloud_sync::enqueue_entity_in_transaction(
             &transaction,
             state,
             operation_type,
@@ -1102,7 +1102,7 @@ fn replace_allocations_with_cloud_operation(
             None,
         )?;
         for (task_id, base_version) in completed_task_outbox {
-            crate::cloud_sync::enqueue_entity_in_transaction(
+            crate::cloud_sync::enqueue_entity_in_transaction_with_dependency(
                 &transaction,
                 state,
                 "task_set_completed_from_allocation",
@@ -1110,10 +1110,11 @@ fn replace_allocations_with_cloud_operation(
                 Some(&task_id),
                 Some(base_version),
                 None,
+                time_entry_operation_id.as_deref(),
             )?;
         }
         for (entity_id, base_version) in completed_occurrence_outbox {
-            crate::cloud_sync::enqueue_entity_in_transaction(
+            crate::cloud_sync::enqueue_entity_in_transaction_with_dependency(
                 &transaction,
                 state,
                 "task_occurrence_set_completed_from_allocation",
@@ -1121,6 +1122,7 @@ fn replace_allocations_with_cloud_operation(
                 Some(&entity_id),
                 base_version,
                 None,
+                time_entry_operation_id.as_deref(),
             )?;
         }
     }
@@ -1881,7 +1883,7 @@ mod tests {
         let connection = database.open().unwrap();
         let outbox = connection
             .prepare(
-                "SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json FROM sync_outbox ORDER BY created_at, operation_type",
+                "SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json, depends_on_operation_id, payload_version, coalesced_count FROM sync_outbox ORDER BY created_at, rowid",
             )
             .unwrap()
             .query_map([], |row| {
@@ -1892,60 +1894,39 @@ mod tests {
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<i64>>(4)?,
                     row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, i64>(8)?,
                 ))
             })
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert!(outbox.iter().any(
-            |(queued_operation_id, operation, entity_type, entity_id, base_version, payload)| {
-                let value: Value = serde_json::from_str(payload).unwrap();
-                queued_operation_id == &operation_id
-                    && operation == "time_entry_create_manual"
-                    && entity_type == "time_entry"
-                    && entity_id.as_deref() == Some(&created.id)
-                    && base_version.is_none()
-                    && value["allocations"]
-                        .as_array()
-                        .is_some_and(|items| items.len() == 1)
-            }
-        ));
-        assert!(outbox.iter().any(
-            |(_, operation, entity_type, entity_id, base_version, payload)| {
-                let value: Value = serde_json::from_str(payload).unwrap();
-                operation == "time_entry_update"
-                    && entity_type == "time_entry"
-                    && entity_id.as_deref() == Some(&created.id)
-                    && *base_version == Some(created.version)
-                    && value["note"] == "修正后的云端手动记录"
-                    && value["duration_seconds"] == 2_400
-            }
-        ));
-        assert!(outbox.iter().any(
-            |(_, operation, entity_type, entity_id, base_version, payload)| {
-                let value: Value = serde_json::from_str(payload).unwrap();
-                operation == "time_allocation_replace"
-                    && entity_type == "time_entry"
-                    && entity_id.as_deref() == Some(&created.id)
-                    && *base_version == Some(updated.version)
-                    && value["allocations"].as_array().is_some_and(|items| {
-                        items
-                            .iter()
-                            .any(|item| item["task_id"] == task_id && item["minutes"] == 40)
-                    })
-            }
-        ));
-        assert!(outbox.iter().any(
-            |(_, operation, entity_type, entity_id, base_version, payload)| {
-                let value: Value = serde_json::from_str(payload).unwrap();
-                operation == "task_set_completed_from_allocation"
-                    && entity_type == "task"
-                    && entity_id.as_deref() == Some(&task_id)
-                    && *base_version == Some(1)
-                    && value["status"] == "done"
-            }
-        ));
+        assert_eq!(outbox.len(), 2);
+        let time_entry = outbox.iter().find(|row| row.2 == "time_entry").unwrap();
+        let value: Value = serde_json::from_str(&time_entry.5).unwrap();
+        assert_eq!(time_entry.0, operation_id);
+        assert_eq!(time_entry.1, "time_allocation_replace");
+        assert_eq!(time_entry.3.as_deref(), Some(created.id.as_str()));
+        assert_eq!(time_entry.4, None);
+        assert_eq!(time_entry.7, Some(3));
+        assert_eq!(time_entry.8, 3);
+        assert_eq!(value["note"], "修正后的云端手动记录");
+        assert_eq!(value["duration_seconds"], 2_400);
+        assert!(value["allocations"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["task_id"] == task_id && item["minutes"] == 40)
+        }));
+        let task_completion = outbox
+            .iter()
+            .find(|row| row.1 == "task_set_completed_from_allocation")
+            .unwrap();
+        assert_eq!(task_completion.2, "task");
+        assert_eq!(task_completion.3.as_deref(), Some(task_id.as_str()));
+        assert_eq!(task_completion.4, Some(1));
+        assert_eq!(task_completion.6.as_deref(), Some(operation_id.as_str()));
     }
 
     #[test]
@@ -2004,6 +1985,58 @@ mod tests {
                 entry.id
             )
         );
+    }
+
+    #[test]
+    fn read_only_timer_refresh_does_not_grow_the_outbox() {
+        let (database, _workspace_id, task_id) = setup();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let state = crate::supabase::storage_mode(&database).unwrap();
+        let started = start_timer_with_cloud_operation(
+            &database,
+            TimerStartRequest {
+                task_id: Some(task_id),
+                note: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+            Some((&state, "timer_start", None)),
+        )
+        .unwrap();
+        let before: i64 = database
+            .open()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+
+        for _ in 0..12 {
+            let refreshed = get_timer_state(&database).unwrap().unwrap();
+            assert_eq!(refreshed.id, started.id);
+        }
+
+        let after: i64 = database
+            .open()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, before);
     }
 
     #[test]
@@ -2075,7 +2108,7 @@ mod tests {
         let connection = database.open().unwrap();
         let outbox = connection
             .prepare(
-                "SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json FROM sync_outbox ORDER BY created_at, rowid",
+                "SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json, payload_version, coalesced_count FROM sync_outbox ORDER BY created_at, rowid",
             )
             .unwrap()
             .query_map([], |row| {
@@ -2086,28 +2119,28 @@ mod tests {
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<i64>>(4)?,
                     row.get::<_, String>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, i64>(7)?,
                 ))
             })
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert_eq!(outbox.len(), 4);
+        assert_eq!(outbox.len(), 1);
         assert_eq!(outbox[0].0, start_operation_id);
-        assert_eq!(outbox[0].1, "timer_start");
+        assert_eq!(outbox[0].1, "timer_stop");
         assert_eq!(outbox[0].4, None);
-        assert_eq!(outbox[1].1, "timer_pause");
-        assert_eq!(outbox[1].4, Some(started.version));
-        assert_eq!(outbox[2].0, resume_operation_id);
-        assert_eq!(outbox[2].1, "timer_resume");
-        assert_eq!(outbox[2].4, Some(paused.version));
-        assert_eq!(outbox[3].1, "timer_stop");
-        assert_eq!(outbox[3].4, Some(resumed.version));
-        for (_, _, entity_type, entity_id, _, payload) in outbox {
+        assert_eq!(outbox[0].6, Some(4));
+        assert_eq!(outbox[0].7, 4);
+        for (_, _, entity_type, entity_id, _, payload, _, _) in outbox {
             let value: Value = serde_json::from_str(&payload).unwrap();
             assert_eq!(entity_type, "time_entry");
             assert_eq!(entity_id.as_deref(), Some(started.id.as_str()));
             assert_eq!(value["id"], started.id);
+            assert_eq!(value["state"], "ended");
+            assert_eq!(value["version"], resumed.version + 1);
+            assert_eq!(value["segments"].as_array().map(Vec::len), Some(2));
         }
     }
 
@@ -2840,6 +2873,109 @@ mod tests {
             )
             .unwrap();
         assert_eq!(base_done_count, 0);
+    }
+
+    #[test]
+    fn cloud_recurring_completion_depends_on_the_final_time_entry_operation() {
+        let (database, _workspace_id, task_id) = setup();
+        let task_version: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT version FROM tasks WHERE id = ?1",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let today = local_date();
+        save_rule(
+            &database,
+            RecurrenceSaveRequest {
+                task_id: task_id.clone(),
+                task_expected_version: task_version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: today.clone(),
+                rule_expected_version: None,
+            },
+        )
+        .unwrap();
+        let current_task_version: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT version FROM tasks WHERE id = ?1",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(Uuid::now_v7().to_string()),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let state = crate::supabase::storage_mode(&database).unwrap();
+        let operation_id = Uuid::now_v7().to_string();
+        let entry = create_manual_entry_with_cloud_operation(
+            &database,
+            ManualEntryRequest {
+                task_id: None,
+                work_date: today.clone(),
+                started_at: None,
+                ended_at: None,
+                minutes: Some(30),
+                note: None,
+                complete_task: false,
+                task_expected_version: None,
+                client_request_id: operation_id.clone(),
+            },
+            Some((
+                &state,
+                "time_entry_create_manual",
+                Some(operation_id.as_str()),
+            )),
+        )
+        .unwrap();
+        replace_allocations_with_cloud_operation(
+            &database,
+            AllocationReplaceRequest {
+                entry_id: entry.id,
+                expected_version: entry.version,
+                allocations: vec![AllocationInput {
+                    task_id: task_id.clone(),
+                    minutes: 30,
+                    note: None,
+                    complete_task: true,
+                    task_expected_version: Some(current_task_version),
+                }],
+            },
+            Some((&state, "time_allocation_replace")),
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let occurrence: (String, Option<String>) = connection
+            .query_row(
+                "SELECT entity_id, depends_on_operation_id FROM sync_outbox WHERE operation_type = 'task_occurrence_set_completed_from_allocation'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(occurrence.0, format!("{task_id}|{today}"));
+        assert_eq!(occurrence.1.as_deref(), Some(operation_id.as_str()));
     }
 
     #[test]

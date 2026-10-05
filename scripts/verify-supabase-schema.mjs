@@ -12,6 +12,9 @@ const schemaFile = path.join(repoRoot, "supabase", "schema.sql");
 const migrationPatchFile = path.join(repoRoot, "supabase", "20261003_timegenie_recurring_migration_patch.sql");
 const cloudSyncPatchFile = path.join(repoRoot, "supabase", "20261004_timegenie_cloud_sync_patch.sql");
 const sessionRevocationPatchFile = path.join(repoRoot, "supabase", "20261004d_timegenie_session_revocation_patch.sql");
+const timerSyncPatchFile = path.join(repoRoot, "supabase", "20261005_timegenie_timer_sync_coordination_patch.sql");
+const taskPlanningPatchFile = path.join(repoRoot, "supabase", "20261005_timegenie_cloud_task_planning_patch.sql");
+const freshPlanningTestFile = path.join(repoRoot, "supabase", "schema_fresh_planning_test.sql");
 const schemaTestFile = path.join(repoRoot, "supabase", "schema_integration_test.sql");
 
 const binaryNames = process.platform === "win32"
@@ -74,6 +77,8 @@ function verifyStaticSchemaInvariants() {
   const migrationPatch = fs.readFileSync(migrationPatchFile, "utf8");
   const cloudSyncPatch = fs.readFileSync(cloudSyncPatchFile, "utf8");
   const sessionRevocationPatch = fs.readFileSync(sessionRevocationPatchFile, "utf8");
+  const timerSyncPatch = fs.readFileSync(timerSyncPatchFile, "utf8");
+  const taskPlanningPatch = fs.readFileSync(taskPlanningPatchFile, "utf8");
   const importStart = schema.indexOf("create or replace function timegenie.migration_import_snapshot");
   const applyPatchStart = schema.indexOf("create or replace function timegenie.cloud_apply_patch");
   if (importStart < 0 || applyPatchStart < 0 || applyPatchStart <= importStart) {
@@ -99,6 +104,39 @@ function verifyStaticSchemaInvariants() {
   }
   if (!cloudApplyPatch.includes("p_entity_type = 'unassigned_session'")) {
     throw new Error("cloud_apply_patch must accept unassigned_session entity payloads.");
+  }
+  for (const expected of [
+    "p_coalesced_count bigint",
+    "final_version <> p_base_version + p_coalesced_count",
+    "pg_advisory_xact_lock",
+    "cloud_apply_patch(uuid, uuid, uuid, text, text, text, bigint, bigint, bigint, jsonb)",
+  ]) {
+    if (!schema.includes(expected) || !timerSyncPatch.includes(expected)) {
+      throw new Error(`The schema and timer sync patch must include: ${expected}`);
+    }
+  }
+  if (timerSyncPatch.includes("while current_step <= final_version")) {
+    throw new Error("The timer sync patch must apply the final image atomically instead of replaying intermediate versions.");
+  }
+  for (const expected of [
+    "task_daily_estimate",
+    "task_recurrence_rule",
+    "when 'task_daily_estimates' then (row_image->>'task_id') || '|' || (row_image->>'work_date')",
+    "when 'task_recurrence_rules' then row_image->>'task_id'",
+  ]) {
+    if (!schema.includes(expected) || !taskPlanningPatch.includes(expected)) {
+      throw new Error(`The schema and cloud task planning patch must include: ${expected}`);
+    }
+  }
+  if (!taskPlanningPatch.includes("cloud_apply_task_planning_patch")) {
+    throw new Error("The cloud task planning patch must define its planning apply helper.");
+  }
+  if (!taskPlanningPatch.replaceAll(" ", "").includes("grantexecuteonfunctiontimegenie.cloud_apply_patch(uuid,uuid,uuid,text,text,text,bigint,jsonb)toauthenticated")) {
+    throw new Error("The cloud task planning patch must grant the compatibility apply RPC to authenticated clients.");
+  }
+  if (!taskPlanningPatch.includes("rename to cloud_apply_patch_legacy")
+      || !taskPlanningPatch.includes("return timegenie.cloud_apply_patch_legacy")) {
+    throw new Error("The cloud task planning patch must preserve all legacy cloud_apply_patch branches.");
   }
   if (!cloudApplyPatch.includes("delete from timegenie.unassigned_segments where session_id = p_entity_id::uuid")) {
     throw new Error("cloud_apply_patch must replace unassigned session segments with the complete payload image.");
@@ -268,6 +306,24 @@ async function main() {
     run(pgCtl, ["-D", dataDir, "-o", `-p ${port}`, "-l", logFile, "start"]);
     started = true;
     await waitForPostgres(psql, port);
+    run(psql, [
+      "-h", "127.0.0.1",
+      "-p", String(port),
+      "-U", "postgres",
+      "-d", "postgres",
+      "-w",
+      "-v", "ON_ERROR_STOP=1",
+      "-c", "create database timegenie_fresh_planning_test;",
+    ]);
+    run(psql, [
+      "-h", "127.0.0.1",
+      "-p", String(port),
+      "-U", "postgres",
+      "-d", "timegenie_fresh_planning_test",
+      "-w",
+      "-v", "ON_ERROR_STOP=1",
+      "-f", freshPlanningTestFile,
+    ]);
     run(psql, [
       "-h", "127.0.0.1",
       "-p", String(port),

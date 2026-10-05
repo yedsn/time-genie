@@ -93,7 +93,6 @@ fn resolve_work_with_cloud_operation(
     cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
 ) -> Result<UnassignedResolveResult, String> {
     validate_operation_id(&request.operation_id)?;
-    let session_base_version = request.expected_version;
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     let device_id = device_id(&connection, &workspace_id)?;
@@ -235,28 +234,22 @@ fn resolve_work_with_cloud_operation(
     start_next_session_if_idle(&transaction, &workspace_id, now)?;
     bump_revision(&transaction)?;
     if let Some((state, operation_type, operation_id)) = cloud_operation {
-        if let Some(entry_id) = result.generated_entry_id.as_deref() {
-            crate::cloud_sync::enqueue_entity_in_transaction(
-                &transaction,
-                state,
-                operation_type,
-                "time_entry",
-                Some(entry_id),
-                None,
-                operation_id,
-            )?;
-        }
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            "unassigned_session.update",
-            "unassigned_session",
-            Some(&result.session_id),
-            Some(session_base_version),
-            None,
-        )?;
+        let generated_entry_operation_id =
+            if let Some(entry_id) = result.generated_entry_id.as_deref() {
+                crate::cloud_sync::enqueue_entity_in_transaction(
+                    &transaction,
+                    state,
+                    operation_type,
+                    "time_entry",
+                    Some(entry_id),
+                    None,
+                    operation_id,
+                )?
+            } else {
+                None
+            };
         for (entity_id, base_version) in completed_occurrence_outbox {
-            crate::cloud_sync::enqueue_entity_in_transaction(
+            crate::cloud_sync::enqueue_entity_in_transaction_with_dependency(
                 &transaction,
                 state,
                 "task_occurrence_set_completed_from_unassigned",
@@ -264,6 +257,7 @@ fn resolve_work_with_cloud_operation(
                 Some(&entity_id),
                 base_version,
                 None,
+                generated_entry_operation_id.as_deref(),
             )?;
         }
     }
@@ -336,7 +330,6 @@ fn resolve_without_allocations(
     cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
 ) -> Result<UnassignedResolveResult, String> {
     validate_operation_id(&request.operation_id)?;
-    let session_base_version = request.expected_version;
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     let device_id = device_id(&connection, &workspace_id)?;
@@ -425,15 +418,6 @@ fn resolve_without_allocations(
                 operation_id,
             )?;
         }
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            "unassigned_session.update",
-            "unassigned_session",
-            Some(&result.session_id),
-            Some(session_base_version),
-            None,
-        )?;
     }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
@@ -1190,27 +1174,21 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(outbox.len(), 2);
+        assert_eq!(outbox.len(), 1);
         assert_eq!(outbox[0].0, operation_id);
         assert_eq!(outbox[0].1, "unassigned_resolve_work");
         assert_eq!(outbox[0].2, "time_entry");
         assert_eq!(outbox[0].3, entry_id);
         assert_eq!(outbox[0].4, None);
-        assert_eq!(outbox[1].1, "unassigned_session.update");
-        assert_eq!(outbox[1].2, "unassigned_session");
-        assert_eq!(outbox[1].3, result.session_id);
-        assert_eq!(outbox[1].4, Some(due.version));
-        let session_payload: serde_json::Value = serde_json::from_str(&outbox[1].5).unwrap();
+        let entry_payload: serde_json::Value = serde_json::from_str(&outbox[0].5).unwrap();
         assert_eq!(
-            session_payload
-                .get("generated_entry_id")
-                .and_then(serde_json::Value::as_str),
-            Some(entry_id.as_str())
+            entry_payload.get("origin_unassigned_session_id"),
+            Some(&serde_json::Value::Null)
         );
-        assert!(session_payload
-            .get("segments")
+        assert!(entry_payload
+            .get("allocations")
             .and_then(serde_json::Value::as_array)
-            .is_some_and(|segments| !segments.is_empty()));
+            .is_some_and(|allocations| !allocations.is_empty()));
     }
 
     #[test]
@@ -1310,7 +1288,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert_eq!(outbox.len(), 4);
+        assert_eq!(outbox.len(), 2);
         assert_eq!(outbox[0].0, break_operation_id);
         assert_eq!(outbox[0].1, "unassigned_resolve_break");
         assert_eq!(outbox[0].2, "time_entry");
@@ -1319,27 +1297,13 @@ mod tests {
             break_result.generated_entry_id.as_deref()
         );
         assert_eq!(outbox[0].4, None);
-        assert_eq!(outbox[1].1, "unassigned_session.update");
-        assert_eq!(outbox[1].2, "unassigned_session");
+        assert_eq!(outbox[1].0, discard_operation_id);
+        assert_eq!(outbox[1].1, "unassigned_discard");
+        assert_eq!(outbox[1].2, "time_entry");
         assert_eq!(
             outbox[1].3.as_deref(),
-            Some(break_result.session_id.as_str())
-        );
-        assert_eq!(outbox[1].4, Some(first.version));
-        assert_eq!(outbox[2].0, discard_operation_id);
-        assert_eq!(outbox[2].1, "unassigned_discard");
-        assert_eq!(outbox[2].2, "time_entry");
-        assert_eq!(
-            outbox[2].3.as_deref(),
             discard_result.generated_entry_id.as_deref()
         );
-        assert_eq!(outbox[2].4, None);
-        assert_eq!(outbox[3].1, "unassigned_session.update");
-        assert_eq!(outbox[3].2, "unassigned_session");
-        assert_eq!(
-            outbox[3].3.as_deref(),
-            Some(discard_result.session_id.as_str())
-        );
-        assert_eq!(outbox[3].4, Some(second.version));
+        assert_eq!(outbox[1].4, None);
     }
 }

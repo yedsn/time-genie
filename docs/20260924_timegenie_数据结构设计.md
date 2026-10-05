@@ -680,13 +680,18 @@ SeaTable Token、Supabase refresh token 等敏感值应使用 Windows Credential
 | `entity_id` | TEXT NULL | 实体 ID |
 | `base_version` | INTEGER NULL | 离线编辑前版本 |
 | `payload_json` | TEXT NOT NULL | 完整命令参数 |
+| `payload_version` | INTEGER NULL | 完整实体镜像中的最终版本；旧队列记录可为空 |
+| `depends_on_operation_id` | TEXT NULL | 发送前必须先完成的 outbox 操作 ID |
+| `coalesced_count` | INTEGER NOT NULL DEFAULT 1 | 当前行合并的连续本地操作数，用于证明计时版本跨度 |
 | `state` | TEXT NOT NULL | `pending`、`sending`、`conflict`、`failed` |
 | `attempt_count` | INTEGER NOT NULL DEFAULT 0 | 重试次数 |
 | `created_at` | INTEGER NOT NULL | 本地创建时间 |
 | `last_attempt_at` | INTEGER NULL | 最近尝试时间 |
 | `error_json` | TEXT NULL | 失败或冲突详情 |
 
-普通待办、报告正文和设置编辑可以进入 outbox。以下全局单例操作在云端模式离线时不允许新发起：开始/暂停/继续/结束计时、处理未归属时间、获取后台采集租约。正在运行的计时器断网后仍可按本地时间显示；“结束”可记录为本地待提交请求，但在同步完成前禁止开始下一条计时。
+业务写入先提交本地 SQLite，再进入 outbox；开始、暂停、继续、结束计时和归属确认不等待网络。运行中的秒数由本地时间戳派生，秒级显示和 5 秒只读刷新不会新增队列操作。
+
+同一 `time_entry` 只有在现有行全部为从未尝试发送的 `pending`、版本基线连续且没有外部依赖时才可压缩。压缩保留最早的 `operation_id` 和 `base_version`，以最新完整实体镜像替换 payload，并累加 `coalesced_count`；`sending`、`failed`、`conflict` 均为不可跨越的结果边界。归属确认产生的 `task` 或 `task_occurrence` 完成操作通过 `depends_on_operation_id` 指向最终时间记录操作，领取队列时仅在依赖行已成功删除后发送；放弃时间记录冲突时同时清理其依赖链，避免事项被单独完成。
 
 #### `local_report_outputs`
 
