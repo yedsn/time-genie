@@ -1,6 +1,6 @@
 [package]
 name = "timegenie"
-version = "0.2.1"
+version = "0.2.2"
 description = "TimeGenie — local-first desktop app for work hours and daily reports"
 authors = ["TimeGenie"]
 license = "MIT"
