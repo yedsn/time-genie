@@ -21,6 +21,7 @@ const summary = computed(() => overview.value?.summary ?? {
   activeCount: 0,
   notStartedCount: 0,
   unassignedMinutes: 0,
+  historicalUnassignedCount: 0,
   completionRate: 0,
 });
 const subjectOptions = computed(() => [{ id: "", name: "全部主体" }, ...store.subjects.map((subject) => ({ id: subject.id, name: subject.name }))]);
@@ -68,8 +69,7 @@ function formatWeekday(date: string) {
 
 function formatTime(timestamp?: number) {
   if (!timestamp) return "--:--";
-  const date = new Date(timestamp);
-  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: store.workspaceTimezone }).format(timestamp);
 }
 
 function isToday(date: string) {
@@ -119,8 +119,8 @@ function timelineStateLabel(item: TodayWorkOverviewTimelineItemRecord) {
 function timelineStyle(item: TodayWorkOverviewTimelineItemRecord) {
   const current = Date.now();
   const day = overview.value?.scope.todayDate ?? "";
-  const dayStart = new Date(`${day}T00:00:00`).getTime();
-  const dayEnd = dayStart + 24 * 60 * 60 * 1000;
+  const dayStart = isToday(day) ? store.workspaceDayStartAt : new Date(`${day}T00:00:00Z`).getTime();
+  const dayEnd = isToday(day) ? store.workspaceDayEndAt : dayStart + 24 * 60 * 60 * 1000;
   const startedAt = Math.min(Math.max(item.startedAt, dayStart), dayEnd);
   const endedAt = item.endedAt ?? (item.state === "running" || item.state === "collecting" ? current : item.startedAt + item.minutes * 60_000);
   const safeEndedAt = Math.min(Math.max(endedAt, startedAt + 60_000), dayEnd);
@@ -168,8 +168,9 @@ function taskTitle(task: TodayWorkOverviewTaskRecord) {
       <div class="today-summary-item emphasis"><span>今日投入</span><strong>{{ formatMinutes(summary.actualMinutes) }}</strong><small>{{ overview?.scope.subjectName ?? '全部主体' }}</small></div>
       <div class="today-summary-item"><span>今日预计</span><strong>{{ formatMinutes(summary.estimatedMinutes) }}</strong><small>{{ summary.estimatedMinutes ? '按今日预计优先' : '暂无预计' }}</small></div>
       <div class="today-summary-item"><span>完成率</span><strong>{{ completionPercent }}%</strong><small>{{ summary.completedCount }} 完成 · {{ summary.activeCount }} 已开始 · {{ summary.notStartedCount }} 未开始</small></div>
-      <button class="today-summary-item action" type="button" :disabled="summary.unassignedMinutes <= 0" @click="emit('resolveUnassigned')">
+      <button class="today-summary-item action" type="button" :disabled="summary.unassignedMinutes <= 0 && summary.historicalUnassignedCount <= 0" @click="emit('resolveUnassigned')">
         <span>{{ allSubjectScope ? '未归属' : '未归属（全局）' }}</span><strong>{{ formatMinutes(summary.unassignedMinutes) }}</strong><small>{{ summary.unassignedMinutes ? '点击处理' : '无待处理时间' }}</small>
+        <small v-if="summary.historicalUnassignedCount">另有 {{ summary.historicalUnassignedCount }} 个历史日期待处理</small>
       </button>
     </div>
 

@@ -1709,6 +1709,7 @@ mod tests {
         TaskDailyEstimateSetRequest, TaskStatusRequest,
     };
     use crate::time_tracking::{create_manual_entry, ManualEntryRequest};
+    use crate::today_overview::{get_today_work_overview, TodayWorkOverviewRequest};
     use serde_json::{json, Value};
     use tempfile::tempdir;
 
@@ -2052,6 +2053,70 @@ mod tests {
         .unwrap();
         assert!(report.markdown.contains("预计：120min 实际：30min"));
         assert!(!report.markdown.contains("实际：90min"));
+    }
+
+    #[test]
+    fn daily_report_and_today_overview_use_the_same_daily_actual_minutes() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("daily-consistency.sqlite3")).unwrap();
+        let connection = database.open().unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                parent_id: None,
+                title: "同日口径事项".to_string(),
+                planned_date: Some("2026-09-29".to_string()),
+                estimate_minutes: Some(60),
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        create_manual_entry(
+            &database,
+            ManualEntryRequest {
+                task_id: Some(task.id.clone()),
+                work_date: "2026-09-29".to_string(),
+                started_at: None,
+                ended_at: None,
+                minutes: Some(37),
+                note: None,
+                complete_task: false,
+                task_expected_version: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        let overview = get_today_work_overview(
+            &database,
+            TodayWorkOverviewRequest {
+                subject_id: Some(subject_id.clone()),
+                today_date: "2026-09-29".to_string(),
+                history_days: Some(1),
+                trend_days: Some(1),
+            },
+        )
+        .unwrap();
+        let report = create_report(
+            &database,
+            ReportCreateRequest {
+                report_type: "daily".to_string(),
+                reference_date: "2026-09-29".to_string(),
+                subject_id,
+                task_ids: vec![task.id],
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(overview.summary.actual_minutes, 37);
+        assert!(report.markdown.contains("实际：37min"));
     }
 
     #[test]

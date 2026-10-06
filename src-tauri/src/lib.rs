@@ -28,6 +28,7 @@ mod tasks;
 mod time_tracking;
 mod today_overview;
 mod unassigned;
+mod work_calendar;
 
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
@@ -381,6 +382,7 @@ pub fn run() {
             automation_hooks::automation_hook_run_get,
             automation_hooks::automation_hook_test,
             settings::settings_get,
+            work_calendar::work_calendar_get_context,
             settings::settings_update,
             settings::integration_config_update,
             settings::integration_secret_set,
@@ -453,6 +455,8 @@ pub fn run() {
             time_tracking::time_entry_update_disposition,
             time_tracking::time_allocation_replace,
             unassigned::unassigned_get_state,
+            unassigned::unassigned_get_state_snapshot,
+            unassigned::unassigned_get_session,
             unassigned::unassigned_resolve_work,
             unassigned::unassigned_resolve_break,
             unassigned::unassigned_discard,
@@ -1464,6 +1468,9 @@ mod tests {
             .iter()
             .find(|row| row.1 == "unassigned_session")
             .unwrap();
-        assert_eq!(unassigned.0, "unassigned_session_create");
+        assert!(matches!(
+            unassigned.0.as_str(),
+            "unassigned_session_create" | "unassigned_session_resume"
+        ));
     }
 }

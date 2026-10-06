@@ -10,6 +10,7 @@ use crate::database::Database;
 #[serde(rename_all = "camelCase")]
 pub struct UnassignedStateDto {
     pub session_id: String,
+    pub work_date: String,
     pub state: String,
     pub first_started_at: i64,
     pub last_ended_at: Option<i64>,
@@ -20,6 +21,8 @@ pub struct UnassignedStateDto {
     pub must_resolve: bool,
     pub version: i64,
 }
+
+const CONTINUITY_GRACE_MILLIS: i64 = 90_000;
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -58,8 +61,76 @@ pub struct UnassignedResolveResult {
     pub required_minutes: i64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UnassignedStateSnapshotDto {
+    pub current: Option<UnassignedStateDto>,
+    pub historical_pending: Vec<UnassignedStateDto>,
+    pub historical_pending_count: i64,
+    pub earliest_historical_date: Option<String>,
+}
+
 pub fn get_state(database: &Database) -> Result<Option<UnassignedStateDto>, String> {
     get_state_with_cloud_context(database, None)
+}
+
+#[cfg(test)]
+pub fn get_state_snapshot(database: &Database) -> Result<UnassignedStateSnapshotDto, String> {
+    let current = get_state(database)?;
+    let connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    load_state_snapshot(&connection, &workspace_id, current, now_millis())
+}
+
+fn load_state_snapshot(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    current: Option<UnassignedStateDto>,
+    now: i64,
+) -> Result<UnassignedStateSnapshotDto, String> {
+    let current_date = crate::work_calendar::current_work_date(connection, now)?;
+    let ids = connection
+        .prepare(
+            "SELECT id FROM unassigned_sessions
+             WHERE workspace_id=?1 AND work_date<?2 AND state IN ('collecting','awaiting_resolution')
+             ORDER BY work_date,id",
+        )
+        .map_err(|error| error.to_string())?
+        .query_map(params![workspace_id, current_date], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let historical_pending = ids
+        .iter()
+        .map(|id| load_state(connection, id, now, false))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(UnassignedStateSnapshotDto {
+        historical_pending_count: historical_pending.len() as i64,
+        earliest_historical_date: historical_pending
+            .first()
+            .map(|item| item.work_date.clone()),
+        current,
+        historical_pending,
+    })
+}
+
+pub fn get_session_state(
+    database: &Database,
+    session_id: &str,
+) -> Result<UnassignedStateDto, String> {
+    let connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    let exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM unassigned_sessions WHERE id=?1 AND workspace_id=?2 AND state IN ('collecting','awaiting_resolution'))",
+            params![session_id, workspace_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !exists {
+        return Err("NOT_FOUND: 未归属会话不存在或已处理".to_string());
+    }
+    load_state(&connection, session_id, now_millis(), false)
 }
 
 pub(crate) fn get_state_with_cloud_context(
@@ -72,13 +143,26 @@ pub(crate) fn get_state_with_cloud_context(
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
-    let active_timer = has_active_timer(&transaction, &workspace_id)?;
-    let session_id = active_session_id(&transaction, &workspace_id)?;
-    let existing_version = session_id
+    let current_date = crate::work_calendar::current_work_date(&transaction, now)?;
+    let session_before_coordinate = active_session_id(&transaction, &workspace_id, &current_date)?;
+    let version_before_coordinate = session_before_coordinate
         .as_deref()
         .map(|id| session_version(&transaction, id))
         .transpose()?;
-    let mut created = false;
+    coordinate_unassigned_sessions(
+        &transaction,
+        &workspace_id,
+        now,
+        if cloud_state.is_some() {
+            "cloud"
+        } else {
+            "local"
+        },
+    )?;
+    let active_timer = has_active_timer(&transaction, &workspace_id)?;
+    let session_id = active_session_id(&transaction, &workspace_id, &current_date)?;
+    let existing_version = version_before_coordinate;
+    let mut created = session_before_coordinate.is_none() && session_id.is_some();
     let session_id = match (session_id, active_timer) {
         (Some(id), _) => Some(id),
         (None, false) => {
@@ -119,7 +203,20 @@ pub(crate) fn get_state_with_cloud_context(
                 )
                 .map_err(|error| error.to_string())?;
         }
-        if created || migrated_candidate || existing_version != Some(result.version) {
+        let candidate_already_queued: bool = migrated_candidate
+            && transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sync_outbox
+                     WHERE workspace_id=?1 AND entity_type='unassigned_session'
+                       AND entity_id=?2 AND state IN ('pending','sending','failed'))",
+                    params![state.workspace_id, result.session_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+        if created
+            || (migrated_candidate && !candidate_already_queued)
+            || (!migrated_candidate && existing_version != Some(result.version))
+        {
             crate::cloud_sync::enqueue_entity_in_transaction(
                 &transaction,
                 state,
@@ -141,6 +238,16 @@ pub(crate) fn get_state_with_cloud_context(
     }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
+}
+
+pub(crate) fn coordinate_sessions(database: &Database, now: i64) -> Result<(), String> {
+    let mut connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    coordinate_unassigned_sessions(&transaction, &workspace_id, now, "local")?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -246,13 +353,13 @@ fn resolve_work_with_cloud_operation(
                 &workspace_id,
                 task_id,
                 *expected_version,
-                &local_date(),
+                &state.work_date,
             )?;
         }
     }
     let mut completed_occurrence_outbox = Vec::<(String, Option<i64>)>::new();
     for (task_id, (minutes, complete_task, expected_version)) in merged {
-        let work_date = local_date();
+        let work_date = state.work_date.clone();
         crate::recurring::ensure_occurrence_if_recurring(
             &transaction,
             &workspace_id,
@@ -377,7 +484,14 @@ fn resolve_work_with_hooks_and_cloud_operation(
     request: ResolveWorkRequest,
     cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
 ) -> Result<UnassignedResolveResult, String> {
-    let work_date = local_date();
+    let connection = database.open()?;
+    let work_date: String = connection
+        .query_row(
+            "SELECT work_date FROM unassigned_sessions WHERE id=?1",
+            [&request.session_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
     let operation_id = request.operation_id.clone();
     let candidates = request
         .allocations
@@ -594,7 +708,18 @@ pub fn pause_for_timer(
     now: i64,
     cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
 ) -> Result<(), String> {
-    let Some(session_id) = active_session_id(transaction, workspace_id)? else {
+    coordinate_unassigned_sessions(
+        transaction,
+        workspace_id,
+        now,
+        if cloud_state.is_some() {
+            "cloud"
+        } else {
+            "local"
+        },
+    )?;
+    let current_date = crate::work_calendar::current_work_date(transaction, now)?;
+    let Some(session_id) = active_session_id(transaction, workspace_id, &current_date)? else {
         return Ok(());
     };
     let base_version = session_version(transaction, &session_id)?;
@@ -620,7 +745,18 @@ pub fn resume_after_timer(
     now: i64,
     cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
 ) -> Result<(), String> {
-    let existing_session = active_session_id(transaction, workspace_id)?;
+    coordinate_unassigned_sessions(
+        transaction,
+        workspace_id,
+        now,
+        if cloud_state.is_some() {
+            "cloud"
+        } else {
+            "local"
+        },
+    )?;
+    let current_date = crate::work_calendar::current_work_date(transaction, now)?;
+    let existing_session = active_session_id(transaction, workspace_id, &current_date)?;
     let session_id = match existing_session.as_ref() {
         Some(id) => id.clone(),
         None => create_session(
@@ -706,9 +842,27 @@ fn seal_session(
     if version != Some(expected_version) {
         return Err("VERSION_CONFLICT: 未归属时间已变化，请刷新后重试".to_string());
     }
-    close_open_segment(transaction, session_id, now)?;
-    refresh_session_duration(transaction, session_id, now)?;
-    load_state(transaction, session_id, now, false)
+    let open_segment: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM unassigned_segments WHERE session_id=?1 AND ended_at IS NULL)",
+            [session_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let effective_end = if open_segment {
+        close_open_segment(transaction, session_id, now)?;
+        now
+    } else {
+        transaction
+            .query_row(
+                "SELECT COALESCE(MAX(ended_at),?2) FROM unassigned_segments WHERE session_id=?1",
+                params![session_id, now],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?
+    };
+    refresh_session_duration(transaction, session_id, effective_end)?;
+    load_state(transaction, session_id, effective_end, false)
 }
 
 fn finish_session(
@@ -754,35 +908,71 @@ fn insert_generated_entry(
     label: &str,
     now: i64,
 ) -> Result<(), String> {
+    let ended_at = state.last_ended_at.unwrap_or(now);
     transaction
         .execute(
             "INSERT INTO time_entries(
                id, workspace_id, work_date, kind, source_type, state, default_task_id,
                label_snapshot, started_at, ended_at, duration_seconds, note, origin_unassigned_session_id,
                created_at, updated_at, version, created_by_device_id, updated_by_device_id
-             ) VALUES (?1, ?2, ?3, ?4, 'unassigned', 'ended', NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?7, ?7, 1, ?11, ?11)",
+             ) VALUES (?1, ?2, ?3, ?4, 'unassigned', 'ended', NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, 1, ?12, ?12)",
             params![
                 entry_id,
                 workspace_id,
-                local_date(),
+                state.work_date,
                 kind,
                 label,
                 state.first_started_at,
-                now,
+                ended_at,
                 state.elapsed_seconds,
                 if kind == "break" { "未执行事项期间记录为休息" } else { "未启动事项期间补分配" },
                 state.session_id,
+                now,
                 device_id
             ],
         )
         .map_err(|error| error.to_string())?;
-    transaction
-        .execute(
-            "INSERT INTO time_segments(id, workspace_id, entry_id, sequence_no, started_at, ended_at, duration_seconds)
-             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6)",
-            params![Uuid::now_v7().to_string(), workspace_id, entry_id, state.first_started_at, now, state.elapsed_seconds],
-        )
-        .map_err(|error| error.to_string())?;
+    let segments = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT started_at,ended_at,duration_seconds FROM unassigned_segments
+                 WHERE session_id=?1 AND ended_at IS NOT NULL ORDER BY sequence_no",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([&state.session_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    if segments.is_empty() {
+        transaction
+            .execute(
+                "INSERT INTO time_segments(id,workspace_id,entry_id,sequence_no,started_at,ended_at,duration_seconds)
+                 VALUES (?1,?2,?3,1,?4,?5,?6)",
+                params![Uuid::now_v7().to_string(),workspace_id,entry_id,state.first_started_at,ended_at,state.elapsed_seconds],
+            )
+            .map_err(|error| error.to_string())?;
+    } else {
+        for (index, (started_at, segment_ended_at, duration_seconds)) in
+            segments.into_iter().enumerate()
+        {
+            transaction
+                .execute(
+                    "INSERT INTO time_segments(id,workspace_id,entry_id,sequence_no,started_at,ended_at,duration_seconds)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    params![Uuid::now_v7().to_string(),workspace_id,entry_id,index as i64 + 1,started_at,segment_ended_at,duration_seconds],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
     Ok(())
 }
 
@@ -793,31 +983,74 @@ fn create_session(
     shared_source: &str,
     predecessor_session_id: Option<&str>,
 ) -> Result<String, String> {
+    let work_date = crate::work_calendar::current_work_date(transaction, now)?;
+    create_session_for_date(
+        transaction,
+        workspace_id,
+        &work_date,
+        now,
+        None,
+        shared_source,
+        predecessor_session_id,
+    )
+}
+
+fn create_session_for_date(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    work_date: &str,
+    started_at: i64,
+    ended_at: Option<i64>,
+    shared_source: &str,
+    predecessor_session_id: Option<&str>,
+) -> Result<String, String> {
     let id = Uuid::now_v7().to_string();
     let threshold = prompt_threshold(transaction, workspace_id)?;
+    let duration_seconds = ended_at
+        .map(|ended| ended.saturating_sub(started_at) / 1_000)
+        .unwrap_or(0);
+    let state = if duration_seconds > threshold {
+        "awaiting_resolution"
+    } else {
+        "collecting"
+    };
+    let updated_at = ended_at.unwrap_or(started_at);
     transaction
         .execute(
             "INSERT INTO unassigned_sessions(
-               id, workspace_id, work_date, state, threshold_seconds, duration_seconds,
-               first_started_at, created_at, updated_at, version, shared_source,
-               predecessor_session_id, migration_state
-             ) VALUES (?1, ?2, ?3, 'collecting', ?4, 0, ?5, ?5, ?5, 1, ?6, ?7, 'ready')",
+               id,workspace_id,work_date,state,threshold_seconds,duration_seconds,
+               first_started_at,last_ended_at,prompted_at,created_at,updated_at,version,
+               shared_source,predecessor_session_id,migration_state,last_continuous_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?7,?10,1,?11,?12,'ready',?10)",
             params![
                 id,
                 workspace_id,
-                local_date(),
+                work_date,
+                state,
                 threshold,
-                now,
+                duration_seconds,
+                started_at,
+                ended_at,
+                (duration_seconds > threshold).then_some(updated_at),
+                updated_at,
                 shared_source,
-                predecessor_session_id
+                predecessor_session_id,
             ],
         )
         .map_err(|error| error.to_string())?;
     transaction
         .execute(
-            "INSERT INTO unassigned_segments(id, workspace_id, session_id, sequence_no, started_at, duration_seconds)
-             VALUES (?1, ?2, ?3, 1, ?4, 0)",
-            params![Uuid::now_v7().to_string(), workspace_id, id, now],
+            "INSERT INTO unassigned_segments(
+               id,workspace_id,session_id,sequence_no,started_at,ended_at,duration_seconds
+             ) VALUES (?1,?2,?3,1,?4,?5,?6)",
+            params![
+                Uuid::now_v7().to_string(),
+                workspace_id,
+                id,
+                started_at,
+                ended_at,
+                duration_seconds,
+            ],
         )
         .map_err(|error| error.to_string())?;
     Ok(id)
@@ -858,13 +1091,13 @@ fn load_state(
     now: i64,
     update_threshold_state: bool,
 ) -> Result<UnassignedStateDto, String> {
-    let (state, first_started_at, last_ended_at, duration_seconds, threshold_seconds, version):
-        (String, i64, Option<i64>, i64, i64, i64) = connection
+    let (work_date, state, first_started_at, last_ended_at, duration_seconds, threshold_seconds, version):
+        (String, String, i64, Option<i64>, i64, i64, i64) = connection
         .query_row(
-            "SELECT state, first_started_at, last_ended_at, duration_seconds, threshold_seconds, version
+            "SELECT work_date, state, first_started_at, last_ended_at, duration_seconds, threshold_seconds, version
              FROM unassigned_sessions WHERE id = ?1",
             [session_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
         )
         .map_err(|error| error.to_string())?;
     let current_segment_started_at: Option<i64> = connection
@@ -896,6 +1129,7 @@ fn load_state(
     }
     Ok(UnassignedStateDto {
         session_id: session_id.to_string(),
+        work_date,
         state: next_state,
         first_started_at,
         last_ended_at,
@@ -957,16 +1191,178 @@ fn refresh_session_duration(
     Ok(())
 }
 
+fn coordinate_unassigned_sessions(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    now: i64,
+    shared_source: &str,
+) -> Result<(), String> {
+    let timezone = crate::work_calendar::workspace_timezone(transaction, workspace_id)?;
+    let current_date = crate::work_calendar::work_date_at(timezone, now)?;
+    type ActiveSession = (
+        String,
+        String,
+        i64,
+        i64,
+        Option<String>,
+        String,
+        Option<i64>,
+    );
+    let sessions = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT u.id,u.work_date,u.first_started_at,
+                        COALESCE(last_continuous_at,updated_at,first_started_at),
+                        predecessor_session_id,shared_source,
+                        (SELECT started_at FROM unassigned_segments s
+                         WHERE s.session_id=u.id AND s.ended_at IS NULL LIMIT 1)
+                 FROM unassigned_sessions u
+                 WHERE u.workspace_id=?1 AND u.state IN ('collecting','awaiting_resolution')
+                 ORDER BY u.work_date,u.created_at",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([workspace_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<ActiveSession>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    let has_timer = has_active_timer(transaction, workspace_id)?;
+    let current = sessions
+        .iter()
+        .find(|session| session.1 == current_date)
+        .cloned();
+    let latest_open_old = sessions
+        .iter()
+        .filter(|session| session.1 < current_date && session.6.is_some())
+        .max_by(|left, right| left.1.cmp(&right.1).then(left.2.cmp(&right.2)))
+        .cloned();
+
+    for (session_id, work_date, first_started_at, last_continuous_at, _, _, open_started_at) in
+        sessions.iter().filter(|session| session.1 < current_date)
+    {
+        let Some(open_started_at) = open_started_at else {
+            continue;
+        };
+        let bounds = crate::work_calendar::day_bounds(timezone, work_date)?;
+        let is_latest = latest_open_old
+            .as_ref()
+            .is_some_and(|latest| latest.0 == *session_id);
+        let continuous =
+            is_latest && now.saturating_sub(*last_continuous_at) <= CONTINUITY_GRACE_MILLIS;
+        let boundary = if continuous {
+            bounds.end_at.min(now)
+        } else {
+            (*last_continuous_at)
+                .max(*first_started_at)
+                .max(*open_started_at)
+                .min(bounds.end_at)
+                .min(now)
+        };
+        close_open_segment(transaction, session_id, boundary)?;
+        refresh_session_duration(transaction, session_id, boundary)?;
+        transaction
+            .execute(
+                "UPDATE unassigned_sessions SET last_continuous_at=?1 WHERE id=?2",
+                params![boundary, session_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+
+    if let Some((session_id, _, first_started_at, last_continuous_at, _, _, open_started_at)) =
+        current.as_ref()
+    {
+        if let Some(open_started_at) = open_started_at {
+            if now.saturating_sub(*last_continuous_at) > CONTINUITY_GRACE_MILLIS {
+                let confirmed_end = (*last_continuous_at)
+                    .max(*first_started_at)
+                    .max(*open_started_at)
+                    .min(now);
+                close_open_segment(transaction, session_id, confirmed_end)?;
+                refresh_session_duration(transaction, session_id, confirmed_end)?;
+                if !has_timer {
+                    let sequence: i64 = transaction
+                        .query_row(
+                            "SELECT COALESCE(MAX(sequence_no),0)+1 FROM unassigned_segments WHERE session_id=?1",
+                            [session_id],
+                            |row| row.get(0),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    transaction.execute(
+                        "INSERT INTO unassigned_segments(id,workspace_id,session_id,sequence_no,started_at,duration_seconds) VALUES (?1,?2,?3,?4,?5,0)",
+                        params![Uuid::now_v7().to_string(),workspace_id,session_id,sequence,now],
+                    ).map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        transaction.execute(
+            "UPDATE unassigned_sessions SET last_continuous_at=?1,updated_at=MAX(updated_at,?1) WHERE id=?2",
+            params![now,session_id],
+        ).map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+
+    if has_timer {
+        return Ok(());
+    }
+
+    let continuous_old = latest_open_old
+        .as_ref()
+        .is_some_and(|session| now.saturating_sub(session.3) <= CONTINUITY_GRACE_MILLIS);
+    if continuous_old {
+        let latest = latest_open_old.as_ref().unwrap();
+        let old_end = crate::work_calendar::day_bounds(timezone, &latest.1)?.end_at;
+        let slices = crate::work_calendar::split_interval_by_day(timezone, old_end, now)?;
+        let mut predecessor = Some(latest.0.clone());
+        for (index, slice) in slices.iter().enumerate() {
+            let is_last = index + 1 == slices.len();
+            let session_id = create_session_for_date(
+                transaction,
+                workspace_id,
+                &slice.work_date,
+                slice.started_at,
+                (!is_last).then_some(slice.ended_at),
+                shared_source,
+                predecessor.as_deref(),
+            )?;
+            predecessor = Some(session_id.clone());
+            let _ = is_last;
+        }
+    } else {
+        create_session(
+            transaction,
+            workspace_id,
+            now,
+            shared_source,
+            latest_open_old.as_ref().map(|session| session.0.as_str()),
+        )?;
+    }
+    Ok(())
+}
+
 fn active_session_id(
     connection: &rusqlite::Connection,
     workspace_id: &str,
+    work_date: &str,
 ) -> Result<Option<String>, String> {
     connection
         .query_row(
             "SELECT id FROM unassigned_sessions
-             WHERE workspace_id = ?1 AND state IN ('collecting', 'awaiting_resolution')
+             WHERE workspace_id = ?1 AND work_date=?2
+               AND state IN ('collecting', 'awaiting_resolution')
              ORDER BY created_at LIMIT 1",
-            [workspace_id],
+            params![workspace_id, work_date],
             |row| row.get(0),
         )
         .optional()
@@ -1078,10 +1474,6 @@ fn settlement_minutes(duration_seconds: i64) -> i64 {
     }
 }
 
-fn local_date() -> String {
-    chrono::Local::now().format("%Y-%m-%d").to_string()
-}
-
 fn workspace_id(connection: &rusqlite::Connection) -> Result<String, String> {
     connection
         .query_row(
@@ -1129,6 +1521,29 @@ pub fn unassigned_get_state(
     } else {
         get_state(&database)
     }
+}
+
+#[tauri::command]
+pub fn unassigned_get_state_snapshot(
+    database: tauri::State<'_, Database>,
+) -> Result<UnassignedStateSnapshotDto, String> {
+    let state = crate::supabase::storage_mode(&database)?;
+    let current = if state.mode == "cloud" {
+        crate::cloud_sync::refresh_unassigned_state_for_cloud_mode(&database)?
+    } else {
+        get_state(&database)?
+    };
+    let connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    load_state_snapshot(&connection, &workspace_id, current, now_millis())
+}
+
+#[tauri::command]
+pub fn unassigned_get_session(
+    database: tauri::State<'_, Database>,
+    session_id: String,
+) -> Result<UnassignedStateDto, String> {
+    get_session_state(&database, &session_id)
 }
 
 #[tauri::command]
@@ -1595,5 +2010,245 @@ mod tests {
             discard_result.generated_entry_id.as_deref()
         );
         assert_eq!(outbox[3].4, None);
+    }
+
+    fn shanghai_millis(value: &str) -> i64 {
+        use chrono::{NaiveDateTime, TimeZone};
+        let timezone: chrono_tz::Tz = "Asia/Shanghai".parse().unwrap();
+        timezone
+            .from_local_datetime(
+                &NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").unwrap(),
+            )
+            .single()
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    fn reset_unassigned_sessions(database: &Database) -> String {
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        connection
+            .execute("DELETE FROM unassigned_segments", [])
+            .unwrap();
+        connection
+            .execute("DELETE FROM unassigned_sessions", [])
+            .unwrap();
+        workspace_id
+    }
+
+    fn seed_unassigned_session(
+        database: &Database,
+        workspace_id: &str,
+        work_date: &str,
+        started_at: i64,
+        last_continuous_at: i64,
+    ) -> String {
+        let session_id = Uuid::now_v7().to_string();
+        let connection = database.open().unwrap();
+        connection.execute(
+            "INSERT INTO unassigned_sessions(
+               id,workspace_id,work_date,state,threshold_seconds,duration_seconds,
+               first_started_at,created_at,updated_at,version,shared_source,migration_state,last_continuous_at
+             ) VALUES (?1,?2,?3,'collecting',300,0,?4,?4,?5,1,'local','ready',?5)",
+            params![session_id,workspace_id,work_date,started_at,last_continuous_at],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO unassigned_segments(id,workspace_id,session_id,sequence_no,started_at,duration_seconds) VALUES (?1,?2,?3,1,?4,0)",
+            params![Uuid::now_v7().to_string(),workspace_id,session_id,started_at],
+        ).unwrap();
+        session_id
+    }
+
+    #[test]
+    fn unassigned_continuity_creates_one_session_per_calendar_day() {
+        let (database, _) = setup();
+        let workspace_id = reset_unassigned_sessions(&database);
+        let started_at = shanghai_millis("2026-10-05 23:59:30");
+        let now = shanghai_millis("2026-10-07 00:00:30");
+        let first_session = seed_unassigned_session(
+            &database,
+            &workspace_id,
+            "2026-10-05",
+            started_at,
+            now - 1_000,
+        );
+        let mut connection = database.open().unwrap();
+        let transaction = connection.transaction().unwrap();
+        coordinate_unassigned_sessions(&transaction, &workspace_id, now, "local").unwrap();
+        transaction.commit().unwrap();
+
+        let connection = database.open().unwrap();
+        let rows = connection.prepare("SELECT id,work_date,duration_seconds,predecessor_session_id FROM unassigned_sessions ORDER BY work_date").unwrap().query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,Option<String>>(3)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter().map(|row| row.1.as_str()).collect::<Vec<_>>(),
+            vec!["2026-10-05", "2026-10-06", "2026-10-07"]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            vec![30, 86_400, 0]
+        );
+        assert_eq!(rows[1].3.as_deref(), Some(first_session.as_str()));
+        assert_eq!(rows[2].3.as_deref(), Some(rows[1].0.as_str()));
+        let open_segments: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM unassigned_segments WHERE ended_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(open_segments, 1);
+    }
+
+    #[test]
+    fn existing_today_session_does_not_leave_yesterday_segment_open() {
+        let (database, _) = setup();
+        let workspace_id = reset_unassigned_sessions(&database);
+        let old_start = shanghai_millis("2026-10-05 23:59:00");
+        let today_start = shanghai_millis("2026-10-06 08:00:00");
+        let now = shanghai_millis("2026-10-06 08:01:00");
+        let old_session = seed_unassigned_session(
+            &database,
+            &workspace_id,
+            "2026-10-05",
+            old_start,
+            shanghai_millis("2026-10-06 00:00:00"),
+        );
+        seed_unassigned_session(
+            &database,
+            &workspace_id,
+            "2026-10-06",
+            today_start,
+            now - 1_000,
+        );
+        let mut connection = database.open().unwrap();
+        let transaction = connection.transaction().unwrap();
+        coordinate_unassigned_sessions(&transaction, &workspace_id, now, "local").unwrap();
+        transaction.commit().unwrap();
+        let connection = database.open().unwrap();
+        let old_open: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM unassigned_segments WHERE session_id=?1 AND ended_at IS NULL",
+                [&old_session],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_open, 0);
+    }
+
+    #[test]
+    fn overnight_unassigned_interruption_excludes_offline_gap() {
+        let (database, _) = setup();
+        let workspace_id = reset_unassigned_sessions(&database);
+        let started_at = shanghai_millis("2026-10-05 23:50:00");
+        let last_continuous = shanghai_millis("2026-10-05 23:51:00");
+        let now = shanghai_millis("2026-10-06 08:00:00");
+        let old_session = seed_unassigned_session(
+            &database,
+            &workspace_id,
+            "2026-10-05",
+            started_at,
+            last_continuous,
+        );
+        let mut connection = database.open().unwrap();
+        let transaction = connection.transaction().unwrap();
+        coordinate_unassigned_sessions(&transaction, &workspace_id, now, "local").unwrap();
+        transaction.commit().unwrap();
+        let connection = database.open().unwrap();
+        let old_duration: i64 = connection
+            .query_row(
+                "SELECT duration_seconds FROM unassigned_sessions WHERE id=?1",
+                [&old_session],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let today: (String,i64) = connection.query_row("SELECT work_date,first_started_at FROM unassigned_sessions WHERE work_date='2026-10-06'",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(old_duration, 60);
+        assert_eq!(today, ("2026-10-06".to_string(), now));
+    }
+
+    #[test]
+    fn resolving_yesterday_uses_session_date_and_real_segment_end() {
+        let (database, task_id) = setup();
+        let workspace_id = reset_unassigned_sessions(&database);
+        let started_at = shanghai_millis("2026-10-05 23:58:00");
+        let ended_at = shanghai_millis("2026-10-05 23:59:00");
+        let session_id =
+            seed_unassigned_session(&database, &workspace_id, "2026-10-05", started_at, ended_at);
+        let connection = database.open().unwrap();
+        connection.execute("UPDATE unassigned_segments SET ended_at=?1,duration_seconds=60 WHERE session_id=?2",params![ended_at,session_id]).unwrap();
+        connection.execute("UPDATE unassigned_sessions SET duration_seconds=60,last_ended_at=?1,state='awaiting_resolution',version=2 WHERE id=?2",params![ended_at,session_id]).unwrap();
+        drop(connection);
+        let result = resolve_work(
+            &database,
+            ResolveWorkRequest {
+                session_id: session_id.clone(),
+                allocations: vec![UnassignedAllocationInput {
+                    task_id,
+                    minutes: 1,
+                    complete_task: false,
+                    task_expected_version: None,
+                }],
+                expected_version: 2,
+                operation_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        let entry_id = result.generated_entry_id.unwrap();
+        let connection = database.open().unwrap();
+        let entry: (String, i64, i64) = connection
+            .query_row(
+                "SELECT work_date,started_at,ended_at FROM time_entries WHERE id=?1",
+                [&entry_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(entry, ("2026-10-05".to_string(), started_at, ended_at));
+    }
+
+    #[test]
+    fn state_snapshot_lists_historical_pending_sessions_separately_by_date() {
+        let (database, _) = setup();
+        let workspace_id = reset_unassigned_sessions(&database);
+        let first_start = shanghai_millis("2026-10-04 10:00:00");
+        let first_end = shanghai_millis("2026-10-04 10:10:00");
+        let second_start = shanghai_millis("2026-10-05 11:00:00");
+        let second_end = shanghai_millis("2026-10-05 11:20:00");
+        for (date, started_at, ended_at, duration) in [
+            ("2026-10-04", first_start, first_end, 600),
+            ("2026-10-05", second_start, second_end, 1200),
+        ] {
+            let session_id =
+                seed_unassigned_session(&database, &workspace_id, date, started_at, ended_at);
+            let connection = database.open().unwrap();
+            connection.execute("UPDATE unassigned_segments SET ended_at=?1,duration_seconds=?2 WHERE session_id=?3",params![ended_at,duration,session_id]).unwrap();
+            connection.execute("UPDATE unassigned_sessions SET state='awaiting_resolution',duration_seconds=?1,last_ended_at=?2 WHERE id=?3",params![duration,ended_at,session_id]).unwrap();
+        }
+
+        let snapshot = get_state_snapshot(&database).unwrap();
+        assert!(snapshot.current.is_some());
+        assert_eq!(snapshot.historical_pending_count, 2);
+        assert_eq!(
+            snapshot.earliest_historical_date.as_deref(),
+            Some("2026-10-04")
+        );
+        assert_eq!(
+            snapshot
+                .historical_pending
+                .iter()
+                .map(|state| state.work_date.as_str())
+                .collect::<Vec<_>>(),
+            vec!["2026-10-04", "2026-10-05"]
+        );
+        assert_eq!(
+            snapshot
+                .historical_pending
+                .iter()
+                .map(|state| state.elapsed_seconds)
+                .collect::<Vec<_>>(),
+            vec![600, 1200]
+        );
     }
 }

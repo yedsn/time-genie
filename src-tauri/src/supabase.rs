@@ -269,6 +269,13 @@ pub fn ensure_repository_write_mode(database: &Database) -> Result<(), String> {
 
 pub fn storage_mode(database: &Database) -> Result<StorageModeSnapshot, String> {
     let connection = database.open()?;
+    storage_mode_from_connection(&connection, current_session(database).is_ok())
+}
+
+pub(crate) fn storage_mode_from_connection(
+    connection: &rusqlite::Connection,
+    online: bool,
+) -> Result<StorageModeSnapshot, String> {
     let local_workspace_id: String = connection
         .query_row(
             "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
@@ -341,7 +348,7 @@ pub fn storage_mode(database: &Database) -> Result<StorageModeSnapshot, String> 
         })
         .unwrap_or((false, None));
     Ok(StorageModeSnapshot {
-        online: mode == "local" || current_session(database).is_ok(),
+        online: mode == "local" || online,
         sync_state: if conflicts > 0 {
             "conflict".to_string()
         } else if pending > 0 {

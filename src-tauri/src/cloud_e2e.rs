@@ -691,6 +691,29 @@ fn handle_planning_cloud_request(
             );
         }
         "time_entry" => {
+            if body["p_operation_type"].as_str() == Some("timer_rollover_create") {
+                let chain_id = payload["timer_chain_id"].as_str();
+                let work_date = payload["work_date"].as_str();
+                let authoritative = state.time_entries.values().find(|entry| {
+                    entry["source_type"].as_str() == Some("timer")
+                        && entry["timer_chain_id"].as_str() == chain_id
+                        && entry["work_date"].as_str() == work_date
+                        && entry["deleted_at"].is_null()
+                });
+                if let Some(authoritative) = authoritative.cloned() {
+                    if authoritative["id"].as_str() != Some(entity_id) {
+                        return write_http_json(
+                            &mut stream,
+                            200,
+                            json!({
+                                "superseded": true,
+                                "candidateEntityId": entity_id,
+                                "authoritative": authoritative
+                            }),
+                        );
+                    }
+                }
+            }
             let current = state
                 .time_entries
                 .get(entity_id)
@@ -1444,6 +1467,235 @@ fn isolated_supabase_planning_two_device_flow() {
     )
     .unwrap();
     assert_eq!(cloud.request_counts().1, snapshots_before_reset + 1);
+}
+
+#[test]
+fn isolated_calendar_day_two_device_candidates_converge_to_one_authoritative_slice() {
+    let directory = tempfile::tempdir().unwrap();
+    let device_a = Database::initialize_at(directory.path().join("calendar-a.sqlite3")).unwrap();
+    let device_b = Database::initialize_at(directory.path().join("calendar-b.sqlite3")).unwrap();
+    let cloud = PlanningCloudServer::start();
+    let cloud_workspace_id = Uuid::now_v7().to_string();
+    let state_a = configure_isolated_planning_device(
+        &device_a,
+        &cloud.base_url,
+        &cloud_workspace_id,
+        "calendar-user-a",
+    );
+    let state_b = configure_isolated_planning_device(
+        &device_b,
+        &cloud.base_url,
+        &cloud_workspace_id,
+        "calendar-user-b",
+    );
+    let chain_id = Uuid::now_v7().to_string();
+    let previous_entry_id = Uuid::now_v7().to_string();
+    let candidate_a = Uuid::now_v7().to_string();
+    let candidate_b = Uuid::now_v7().to_string();
+    assert_ne!(candidate_a, candidate_b);
+
+    for (database, candidate_id, state) in [
+        (&device_a, candidate_a.as_str(), &state_a),
+        (&device_b, candidate_b.as_str(), &state_b),
+    ] {
+        let connection = database.open().unwrap();
+        let local_workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO time_entries(
+               id,workspace_id,work_date,kind,source_type,state,label_snapshot,
+               started_at,ended_at,duration_seconds,created_at,updated_at,version,
+               timer_chain_id,last_continuous_at
+             ) VALUES (?1,?2,'2026-10-05','work','timer','ended','跨日前一切片',
+               1000,31000,30,1000,31000,1,?3,31000)",
+                rusqlite::params![previous_entry_id, local_workspace_id, chain_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO time_entries(
+               id,workspace_id,work_date,kind,source_type,state,label_snapshot,
+               started_at,ended_at,duration_seconds,created_at,updated_at,version,
+               timer_chain_id,previous_entry_id,split_boundary_at,last_continuous_at
+             ) VALUES (?1,?2,'2026-10-06','work','timer','ended','跨日当天候选',
+               31000,91000,60,31000,91000,1,?3,?4,31000,91000)",
+                rusqlite::params![
+                    candidate_id,
+                    local_workspace_id,
+                    chain_id,
+                    previous_entry_id
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        cloud_sync::enqueue_entity_deferred(
+            database,
+            "timer_rollover_create",
+            "time_entry",
+            Some(candidate_id),
+            None,
+            None,
+        )
+        .unwrap();
+        let pending = cloud_sync::sync_status(database).unwrap();
+        assert_eq!(pending.pending_operations, 1);
+        assert_eq!(pending.conflict_count, 0);
+        assert_eq!(state.workspace_id, cloud_workspace_id);
+    }
+
+    let pushed_a = push_all(&device_a);
+    assert_eq!((pushed_a.pending, pushed_a.conflicts), (0, 0));
+    let pushed_b = push_all(&device_b);
+    assert_eq!((pushed_b.pending, pushed_b.conflicts), (0, 0));
+
+    let cloud_timer_ids = {
+        let state = cloud.state.lock().unwrap();
+        state
+            .time_entries
+            .values()
+            .filter(|entry| {
+                entry["timer_chain_id"].as_str() == Some(chain_id.as_str())
+                    && entry["work_date"].as_str() == Some("2026-10-06")
+            })
+            .filter_map(|entry| entry["id"].as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(cloud_timer_ids, vec![candidate_a.clone()]);
+
+    for database in [&device_a, &device_b] {
+        let connection = database.open().unwrap();
+        let slices = connection
+            .prepare(
+                "SELECT id,work_date,duration_seconds FROM time_entries
+                 WHERE timer_chain_id=?1 ORDER BY work_date",
+            )
+            .unwrap()
+            .query_map([&chain_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            slices,
+            vec![
+                (previous_entry_id.clone(), "2026-10-05".to_string(), 30),
+                (candidate_a.clone(), "2026-10-06".to_string(), 60),
+            ]
+        );
+        let status = cloud_sync::sync_status(database).unwrap();
+        assert_eq!(status.pending_operations, 0);
+        assert_eq!(status.conflict_count, 0);
+    }
+}
+
+#[test]
+fn isolated_unassigned_resolution_stops_the_old_clock_on_both_devices() {
+    let directory = tempfile::tempdir().unwrap();
+    let device_a = Database::initialize_at(directory.path().join("unassigned-a.sqlite3")).unwrap();
+    let device_b = Database::initialize_at(directory.path().join("unassigned-b.sqlite3")).unwrap();
+    let cloud = PlanningCloudServer::start();
+    let cloud_workspace_id = Uuid::now_v7().to_string();
+    configure_isolated_planning_device(
+        &device_a,
+        &cloud.base_url,
+        &cloud_workspace_id,
+        "unassigned-user-a",
+    );
+    configure_isolated_planning_device(
+        &device_b,
+        &cloud.base_url,
+        &cloud_workspace_id,
+        "unassigned-user-b",
+    );
+
+    let local_a = unassigned::get_state(&device_a).unwrap().unwrap();
+    let started_at = chrono::Utc::now().timestamp_millis() - 120_000;
+    let active_payload = json!({
+        "id": local_a.session_id,
+        "work_date": local_a.work_date,
+        "state": "collecting",
+        "threshold_seconds": 300,
+        "duration_seconds": 0,
+        "first_started_at": started_at,
+        "last_ended_at": null,
+        "prompted_at": null,
+        "resolution_type": null,
+        "generated_entry_id": null,
+        "resolved_at": null,
+        "created_at": started_at,
+        "updated_at": started_at,
+        "version": local_a.version,
+        "last_continuous_at": started_at,
+        "segments": [{
+            "id": Uuid::now_v7().to_string(),
+            "sequence_no": 1,
+            "started_at": started_at,
+            "ended_at": null,
+            "duration_seconds": 0
+        }]
+    });
+    for database in [&device_a, &device_b] {
+        cloud_sync::apply_remote_unassigned_session_for_test(database, &active_payload).unwrap();
+        let state = unassigned::get_state(database).unwrap().unwrap();
+        assert_eq!(state.session_id, active_payload["id"].as_str().unwrap());
+    }
+
+    let resolved_at = chrono::Utc::now().timestamp_millis();
+    let resolved_payload = json!({
+        "id": active_payload["id"],
+        "work_date": active_payload["work_date"],
+        "state": "discarded",
+        "threshold_seconds": 300,
+        "duration_seconds": 120,
+        "first_started_at": started_at,
+        "last_ended_at": resolved_at,
+        "prompted_at": null,
+        "resolution_type": "discard",
+        "generated_entry_id": null,
+        "resolved_at": resolved_at,
+        "created_at": started_at,
+        "updated_at": resolved_at,
+        "version": local_a.version + 1,
+        "last_continuous_at": resolved_at,
+        "segments": [{
+            "id": active_payload["segments"][0]["id"],
+            "sequence_no": 1,
+            "started_at": started_at,
+            "ended_at": resolved_at,
+            "duration_seconds": 120
+        }]
+    });
+    for database in [&device_a, &device_b] {
+        cloud_sync::apply_remote_unassigned_session_for_test(database, &resolved_payload).unwrap();
+        let connection = database.open().unwrap();
+        let old: (String, i64, i64) = connection.query_row(
+            "SELECT state,duration_seconds,(SELECT COUNT(*) FROM unassigned_segments WHERE session_id=?1 AND ended_at IS NULL) FROM unassigned_sessions WHERE id=?1",
+            [resolved_payload["id"].as_str().unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(old, ("discarded".to_string(), 120, 0));
+        let next: (String, i64, String) = connection.query_row(
+            "SELECT id,first_started_at,predecessor_session_id FROM unassigned_sessions WHERE predecessor_session_id=?1 AND state IN ('collecting','awaiting_resolution')",
+            [resolved_payload["id"].as_str().unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_ne!(next.0, resolved_payload["id"].as_str().unwrap());
+        assert_eq!(next.1, resolved_at);
+        assert_eq!(next.2, resolved_payload["id"].as_str().unwrap());
+        drop(connection);
+        let current = unassigned::get_state(database).unwrap().unwrap();
+        assert_eq!(current.session_id, next.0);
+        let status = cloud_sync::sync_status(database).unwrap();
+        assert_eq!(status.pending_operations, 0);
+        assert_eq!(status.conflict_count, 0);
+    }
 }
 
 #[test]

@@ -168,6 +168,18 @@ fn update_setting_with_cloud_operation(
                     params![workspace_id, request.key, serialized, now],
                 )
                 .map_err(|error| error.to_string())?;
+            if request.key == "timezone" {
+                let timezone = request
+                    .value
+                    .as_str()
+                    .ok_or_else(|| "工作空间时区必须是 IANA 时区名称".to_string())?;
+                transaction
+                    .execute(
+                        "UPDATE workspaces SET timezone=?1,updated_at=?2,version=version+1 WHERE id=?3",
+                        params![timezone, now, workspace_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
             if let Some(state) = cloud_state {
                 crate::cloud_sync::enqueue_entity_in_transaction(
                     &transaction,
@@ -549,6 +561,12 @@ fn validate_setting_key(scope: &SettingsScope, key: &str) -> Result<(), String> 
 }
 
 fn validate_setting_value(key: &str, value: &Value) -> Result<(), String> {
+    if key == "timezone" {
+        let timezone = value
+            .as_str()
+            .ok_or_else(|| "工作空间时区必须是 IANA 时区名称".to_string())?;
+        crate::work_calendar::validate_timezone(timezone)?;
+    }
     if matches!(
         key,
         "completion_feedback_enabled" | "completion_feedback_sound_enabled"
@@ -668,6 +686,64 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use uuid::Uuid;
+
+    #[test]
+    fn workspace_timezone_update_is_validated_and_updates_workspace_metadata() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(directory.path().join("timezone.sqlite3")).unwrap();
+        let before: (String, i64) = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT timezone, version FROM workspaces WHERE deleted_at IS NULL LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Shared,
+                key: "timezone".to_string(),
+                value: serde_json::json!("America/New_York"),
+            },
+        )
+        .unwrap();
+        let after: (String, i64) = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT timezone, version FROM workspaces WHERE deleted_at IS NULL LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(before.0, "Asia/Shanghai");
+        assert_eq!(after.0, "America/New_York");
+        assert_eq!(after.1, before.1 + 1);
+
+        let error = update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Shared,
+                key: "timezone".to_string(),
+                value: serde_json::json!("Mars/Olympus"),
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("无效的工作空间时区"));
+        let unchanged: String = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT timezone FROM workspaces WHERE deleted_at IS NULL LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unchanged, "America/New_York");
+    }
 
     #[test]
     fn shared_and_device_settings_persist_without_exposing_secrets() {

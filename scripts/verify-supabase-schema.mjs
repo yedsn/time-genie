@@ -18,6 +18,8 @@ const eventDrivenSyncPatchFile = path.join(repoRoot, "supabase", "20261005b_time
 const sharedUnassignedPatchFile = path.join(repoRoot, "supabase", "20261006_timegenie_shared_unassigned_patch.sql");
 const freshPlanningTestFile = path.join(repoRoot, "supabase", "schema_fresh_planning_test.sql");
 const schemaTestFile = path.join(repoRoot, "supabase", "schema_integration_test.sql");
+const calendarDayPatchFile = path.join(repoRoot, "supabase", "20261006b_timegenie_calendar_day_accounting_patch.sql");
+const unassignedSegmentBoundaryPatchFile = path.join(repoRoot, "supabase", "20261007_timegenie_unassigned_segment_boundary_fix.sql");
 
 const binaryNames = process.platform === "win32"
   ? {
@@ -83,6 +85,8 @@ function verifyStaticSchemaInvariants() {
   const taskPlanningPatch = fs.readFileSync(taskPlanningPatchFile, "utf8");
   const eventDrivenSyncPatch = fs.readFileSync(eventDrivenSyncPatchFile, "utf8");
   const sharedUnassignedPatch = fs.readFileSync(sharedUnassignedPatchFile, "utf8");
+  const calendarDayPatch = fs.readFileSync(calendarDayPatchFile, "utf8");
+  const unassignedSegmentBoundaryPatch = fs.readFileSync(unassignedSegmentBoundaryPatchFile, "utf8");
   const schemaIntegrationTest = fs.readFileSync(schemaTestFile, "utf8");
   const importStart = schema.indexOf("create or replace function timegenie.migration_import_snapshot");
   const applyPatchStart = schema.indexOf("create or replace function timegenie.cloud_apply_patch");
@@ -166,6 +170,61 @@ function verifyStaticSchemaInvariants() {
   }
   if ((schemaIntegrationTest.match(/\\ir 20261006_timegenie_shared_unassigned_patch\.sql/g) ?? []).length < 2) {
     throw new Error("The schema integration test must prove the shared unassigned patch is idempotent.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261006b_timegenie_calendar_day_accounting_patch\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the calendar-day patch is idempotent.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261007_timegenie_unassigned_segment_boundary_fix\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the unassigned segment boundary patch is idempotent.");
+  }
+  for (const expected of [
+    "greatest(started_at,least(day_end,p_observed_at))",
+    "where ended_at is not null and ended_at<started_at",
+  ]) {
+    if (!unassignedSegmentBoundaryPatch.replaceAll(" ", "").toLowerCase().includes(expected.replaceAll(" ", "").toLowerCase())) {
+      throw new Error(`The unassigned segment boundary patch must include: ${expected}`);
+    }
+  }
+  for (const expected of [
+    "timer_chain_id uuid",
+    "last_continuous_at timestamptz",
+    "last_confirmed_at timestamptz",
+    "uq_time_entries_timer_chain_date",
+    "uq_unassigned_sessions_active_date",
+    "create or replace function timegenie.workspace_work_date",
+    "create or replace function timegenie.workspace_day_start",
+    "create or replace function timegenie.workspace_day_end",
+    "create or replace function timegenie.coordinate_timer_calendar_day",
+    "create or replace function timegenie.coordinate_timer_calendar_day_at",
+    "create or replace function timegenie.coordinate_unassigned_calendar_day",
+    "create or replace function timegenie.coordinate_unassigned_calendar_day_at",
+    "create or replace function timegenie.close_expired_unassigned_lease",
+    "create or replace function timegenie.apply_calendar_time_entry",
+  ]) {
+    if (!calendarDayPatch.toLowerCase().includes(expected.toLowerCase())) {
+      throw new Error(`The calendar-day patch must include: ${expected}`);
+    }
+  }
+  if (calendarDayPatch.includes("at time zone 'Asia/Shanghai'")) {
+    throw new Error("The calendar-day patch must derive dates from the workspace timezone, not a database or hard-coded timezone.");
+  }
+  for (const signature of [
+    "timegenie.coordinate_timer_calendar_day(uuid,uuid)",
+    "timegenie.coordinate_unassigned_calendar_day(uuid,uuid,uuid)",
+  ]) {
+    const compact = `grant execute on function ${signature} to authenticated`.replaceAll(" ", "").toLowerCase();
+    if (!calendarDayPatch.replaceAll(" ", "").toLowerCase().includes(compact)) {
+      throw new Error(`Authenticated clients must execute ${signature}.`);
+    }
+  }
+  for (const signature of [
+    "timegenie.coordinate_timer_calendar_day_at(uuid,uuid,timestamptz)",
+    "timegenie.coordinate_unassigned_calendar_day_at(uuid,uuid,uuid,timestamptz)",
+  ]) {
+    const compact = `revoke execute on function ${signature} from public,anon,authenticated`.replaceAll(" ", "").toLowerCase();
+    if (!calendarDayPatch.replaceAll(" ", "").toLowerCase().includes(compact)) {
+      throw new Error(`Clients must not execute internal calendar coordinator ${signature}.`);
+    }
   }
   for (const expected of [
     "create or replace function timegenie.unassigned_get_or_create_shared",

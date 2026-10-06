@@ -12,6 +12,7 @@ const props = defineProps<{
   recentCompletedId?: string;
   runningTaskId?: string;
   formatMinutes: (minutes: number) => string;
+  todayDate: string;
 }>();
 
 const emit = defineEmits<{
@@ -43,7 +44,7 @@ const listRenderVersion = ref(0);
 const recurrenceDialogOpen = ref(false);
 const recurrenceTaskId = ref("");
 const recurrenceFrequency = ref<"none" | "daily" | "weekdays" | "weekly">("none");
-const recurrenceStart = ref(formatLocalDate(new Date()));
+const recurrenceStart = ref(props.todayDate);
 const recurrenceWeekdays = ref<number[]>([]);
 let sortable: Sortable | undefined;
 let levelChangedTimer: number | undefined;
@@ -285,7 +286,7 @@ function openRecurrenceEditor(task: Task) {
   if (hasChildren(task.id)) return;
   recurrenceTaskId.value = task.id;
   recurrenceFrequency.value = task.recurrence?.frequency ?? "none";
-  recurrenceStart.value = task.recurrence?.effectiveStart ?? formatLocalDate(new Date());
+  recurrenceStart.value = task.recurrence?.effectiveStart ?? props.todayDate;
   recurrenceWeekdays.value = task.recurrence?.weekdaysMask
     ? Array.from({ length: 7 }, (_, index) => index).filter((index) => Boolean(task.recurrence!.weekdaysMask! & (1 << index)))
     : [];
@@ -312,13 +313,6 @@ function saveRecurrence() {
     });
   }
   recurrenceDialogOpen.value = false;
-}
-
-function formatLocalDate(date: Date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
 }
 
 async function confirmDelete(task: Task) {

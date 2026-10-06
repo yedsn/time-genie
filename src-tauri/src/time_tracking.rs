@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use chrono::Local;
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -35,6 +34,9 @@ pub struct TimeEntryDto {
     pub source_type: String,
     pub state: String,
     pub version: i64,
+    pub timer_chain_id: Option<String>,
+    pub previous_entry_id: Option<String>,
+    pub split_boundary_at: Option<i64>,
     pub allocations: Vec<TimeAllocationDto>,
 }
 
@@ -48,6 +50,17 @@ pub struct TimeEntryListResult {
     pub break_minutes: i64,
     pub revision: i64,
 }
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TimerStopResultDto {
+    pub current_entry: TimeEntryDto,
+    pub slices: Vec<TimeEntryDto>,
+    pub total_duration_seconds: i64,
+    pub total_settlement_minutes: i64,
+}
+
+const CONTINUITY_GRACE_MILLIS: i64 = 90_000;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -140,6 +153,7 @@ pub struct AllocationInput {
 }
 
 pub fn get_timer_state(database: &Database) -> Result<Option<TimeEntryDto>, String> {
+    coordinate_active_timer(database, now_millis())?;
     let connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     let entry_id: Option<String> = connection
@@ -222,6 +236,47 @@ fn stop_timer_with_hooks_and_cloud_operation(
     Ok(result)
 }
 
+fn timer_chain_result(
+    database: &Database,
+    current_entry: TimeEntryDto,
+) -> Result<TimerStopResultDto, String> {
+    let connection = database.open()?;
+    let chain_id = current_entry
+        .timer_chain_id
+        .clone()
+        .unwrap_or_else(|| current_entry.id.clone());
+    let mut statement = connection
+        .prepare(
+            "SELECT id FROM time_entries
+             WHERE workspace_id = (SELECT workspace_id FROM time_entries WHERE id = ?1)
+               AND COALESCE(timer_chain_id, id) = ?2 AND deleted_at IS NULL
+             ORDER BY work_date, started_at, id",
+        )
+        .map_err(|error| error.to_string())?;
+    let ids = statement
+        .query_map(params![current_entry.id, chain_id], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let now = now_millis();
+    let slices = ids
+        .iter()
+        .map(|id| load_entry(&connection, id, now))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(TimerStopResultDto {
+        total_duration_seconds: slices.iter().map(|entry| entry.duration_seconds).sum(),
+        total_settlement_minutes: slices.iter().map(|entry| entry.settlement_minutes).sum(),
+        current_entry: slices
+            .iter()
+            .find(|entry| entry.id == current_entry.id)
+            .cloned()
+            .unwrap_or(current_entry),
+        slices,
+    })
+}
+
 pub(crate) fn publish_timer_hook(
     database: &Database,
     event_type: &str,
@@ -269,6 +324,7 @@ fn start_timer_with_cloud_operation(
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
+    coordinate_active_timer_in_transaction(&transaction, &workspace_id, now)?;
     let active: i64 = transaction
         .query_row(
             "SELECT COUNT(*) FROM time_entries
@@ -280,7 +336,7 @@ fn start_timer_with_cloud_operation(
     if active > 0 {
         return Err("ACTIVE_TIMER_EXISTS: 已有计时正在运行或暂停".to_string());
     }
-    let work_date = local_date();
+    let work_date = crate::work_calendar::current_work_date(&transaction, now)?;
     if let Some(task_id) = request.task_id.as_deref() {
         crate::recurring::ensure_occurrence_if_recurring(
             &transaction,
@@ -301,8 +357,8 @@ fn start_timer_with_cloud_operation(
             "INSERT INTO time_entries(
                id, workspace_id, work_date, kind, source_type, state, default_task_id,
                label_snapshot, started_at, duration_seconds, note, created_at, updated_at, version,
-               created_by_device_id, updated_by_device_id
-             ) VALUES (?1, ?2, ?3, 'work', 'timer', 'running', ?4, ?5, ?6, 0, ?7, ?6, ?6, 1, ?8, ?8)",
+               created_by_device_id, updated_by_device_id, timer_chain_id, last_continuous_at
+             ) VALUES (?1, ?2, ?3, 'work', 'timer', 'running', ?4, ?5, ?6, 0, ?7, ?6, ?6, 1, ?8, ?8, ?1, ?6)",
             params![entry_id, workspace_id, work_date, request.task_id, label, now, request.note, device_id],
         )
         .map_err(map_active_timer_error)?;
@@ -313,6 +369,7 @@ fn start_timer_with_cloud_operation(
             params![Uuid::now_v7().to_string(), workspace_id, entry_id, now],
         )
         .map_err(|error| error.to_string())?;
+    record_runtime_heartbeat(&transaction, &workspace_id, now)?;
     bump_revision(&transaction)?;
     let result = load_entry(&transaction, &entry_id, now)?;
     save_processed_result(
@@ -360,36 +417,38 @@ fn pause_timer_with_cloud_operation(
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
-    let state = entry_state(
+    let (entry_id, active_version) = resolve_active_timer_request(
         &transaction,
         &workspace_id,
         &request.entry_id,
         request.expected_version,
+        now,
     )?;
+    let state = entry_state(&transaction, &workspace_id, &entry_id, active_version)?;
     if state != "running" {
         return Err("VALIDATION_ERROR: 只有运行中的计时可以暂停".to_string());
     }
-    close_open_segment(&transaction, &request.entry_id, now)?;
-    let duration = segment_duration_sum(&transaction, &request.entry_id)?;
+    close_open_segment(&transaction, &entry_id, now)?;
+    let duration = segment_duration_sum(&transaction, &entry_id)?;
     update_entry_state(
         &transaction,
-        &request.entry_id,
-        request.expected_version,
+        &entry_id,
+        active_version,
         "paused",
         None,
         duration,
         now,
     )?;
     bump_revision(&transaction)?;
-    let result = load_entry(&transaction, &request.entry_id, now)?;
+    let result = load_entry(&transaction, &entry_id, now)?;
     if let Some((state, operation_type)) = cloud_operation {
         crate::cloud_sync::enqueue_entity_in_transaction(
             &transaction,
             state,
             operation_type,
             "time_entry",
-            Some(&request.entry_id),
-            Some(request.expected_version),
+            Some(&entry_id),
+            Some(active_version),
             None,
         )?;
     }
@@ -430,19 +489,21 @@ fn resume_timer_with_cloud_operation(
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
-    let state = entry_state(
+    let (entry_id, active_version) = resolve_active_timer_request(
         &transaction,
         &workspace_id,
         &request.entry_id,
         request.expected_version,
+        now,
     )?;
+    let state = entry_state(&transaction, &workspace_id, &entry_id, active_version)?;
     if state != "paused" {
         return Err("VALIDATION_ERROR: 只有暂停中的计时可以继续".to_string());
     }
     let sequence: i64 = transaction
         .query_row(
             "SELECT COALESCE(MAX(sequence_no), 0) + 1 FROM time_segments WHERE entry_id = ?1",
-            [&request.entry_id],
+            [&entry_id],
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
@@ -450,21 +511,22 @@ fn resume_timer_with_cloud_operation(
         .execute(
             "INSERT INTO time_segments(id, workspace_id, entry_id, sequence_no, started_at, duration_seconds)
              VALUES (?1, ?2, ?3, ?4, ?5, 0)",
-            params![Uuid::now_v7().to_string(), workspace_id, request.entry_id, sequence, now],
+            params![Uuid::now_v7().to_string(), workspace_id, entry_id, sequence, now],
         )
         .map_err(|error| error.to_string())?;
     let changed = transaction
         .execute(
-            "UPDATE time_entries SET state = 'running', updated_at = ?1, version = version + 1
+            "UPDATE time_entries SET state = 'running', last_continuous_at = ?1, updated_at = ?1, version = version + 1
              WHERE id = ?2 AND version = ?3 AND state = 'paused' AND deleted_at IS NULL",
-            params![now, request.entry_id, request.expected_version],
+            params![now, entry_id, active_version],
         )
         .map_err(|error| error.to_string())?;
     if changed == 0 {
         return Err("VERSION_CONFLICT: 计时状态已变化".to_string());
     }
     bump_revision(&transaction)?;
-    let result = load_entry(&transaction, &request.entry_id, now)?;
+    record_runtime_heartbeat(&transaction, &workspace_id, now)?;
+    let result = load_entry(&transaction, &entry_id, now)?;
     save_processed_result(
         &transaction,
         &workspace_id,
@@ -479,8 +541,8 @@ fn resume_timer_with_cloud_operation(
             state,
             operation_type,
             "time_entry",
-            Some(&request.entry_id),
-            Some(request.expected_version),
+            Some(&entry_id),
+            Some(active_version),
             operation_id,
         )?;
     }
@@ -504,58 +566,88 @@ fn stop_timer_with_cloud_operation(
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
-    let state = entry_state(
+    let (entry_id, active_version) = resolve_active_timer_request(
         &transaction,
         &workspace_id,
         &request.entry_id,
         request.expected_version,
+        now,
     )?;
+    let state = entry_state(&transaction, &workspace_id, &entry_id, active_version)?;
     if state == "running" {
-        close_open_segment(&transaction, &request.entry_id, now)?;
+        close_open_segment(&transaction, &entry_id, now)?;
     } else if state != "paused" {
         return Err("VALIDATION_ERROR: 当前计时已经结束".to_string());
     }
-    let duration = segment_duration_sum(&transaction, &request.entry_id)?;
+    let duration = segment_duration_sum(&transaction, &entry_id)?;
     update_entry_state(
         &transaction,
-        &request.entry_id,
-        request.expected_version,
+        &entry_id,
+        active_version,
         "ended",
         Some(now),
         duration,
         now,
     )?;
     if request.create_default_allocation {
-        let (default_task_id, work_date): (Option<String>, String) = transaction
+        let (default_task_id, chain_id): (Option<String>, String) = transaction
             .query_row(
-                "SELECT default_task_id, work_date FROM time_entries WHERE id = ?1",
-                [&request.entry_id],
+                "SELECT default_task_id, COALESCE(timer_chain_id,id) FROM time_entries WHERE id = ?1",
+                [&entry_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|error| error.to_string())?;
-        let minutes = settlement_minutes(duration);
-        if let Some(task_id) = default_task_id.filter(|_| minutes > 0) {
+        if let Some(task_id) = default_task_id {
             if is_selectable_task(&transaction, &workspace_id, &task_id)? {
-                crate::recurring::ensure_occurrence_if_recurring(
-                    &transaction,
-                    &workspace_id,
-                    &task_id,
-                    &work_date,
-                    now,
-                )?;
-                transaction
-                    .execute(
-                        "INSERT INTO time_allocations(id, workspace_id, entry_id, task_id, minutes, created_at, updated_at, version)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 1)
-                         ON CONFLICT(entry_id, task_id) DO UPDATE SET minutes = excluded.minutes, updated_at = excluded.updated_at, version = time_allocations.version + 1",
-                        params![Uuid::now_v7().to_string(), workspace_id, request.entry_id, task_id, minutes, now],
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT id,work_date,started_at,duration_seconds FROM time_entries
+                         WHERE workspace_id=?1 AND COALESCE(timer_chain_id,id)=?2
+                           AND source_type='timer' AND state='ended' AND deleted_at IS NULL
+                         ORDER BY work_date,started_at,id",
                     )
                     .map_err(|error| error.to_string())?;
+                let slices = statement
+                    .query_map(params![workspace_id, chain_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    })
+                    .map_err(|error| error.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?;
+                drop(statement);
+                let minutes_by_entry = allocate_chain_minutes(&slices);
+                for (slice_id, work_date, _, _) in slices {
+                    let minutes = minutes_by_entry.get(&slice_id).copied().unwrap_or(0);
+                    if minutes <= 0 {
+                        continue;
+                    }
+                    crate::recurring::ensure_occurrence_if_recurring(
+                        &transaction,
+                        &workspace_id,
+                        &task_id,
+                        &work_date,
+                        now,
+                    )?;
+                    transaction
+                        .execute(
+                            "INSERT INTO time_allocations(id, workspace_id, entry_id, task_id, minutes, created_at, updated_at, version)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 1)
+                             ON CONFLICT(entry_id, task_id) DO UPDATE SET minutes = excluded.minutes, updated_at = excluded.updated_at, version = time_allocations.version + 1",
+                            params![Uuid::now_v7().to_string(), workspace_id, slice_id, task_id, minutes, now],
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
             } else {
                 transaction
                     .execute(
-                        "UPDATE time_entries SET default_task_id = NULL WHERE id = ?1",
-                        [&request.entry_id],
+                        "UPDATE time_entries SET default_task_id = NULL
+                         WHERE workspace_id=?1 AND COALESCE(timer_chain_id,id)=?2",
+                        params![workspace_id, chain_id],
                     )
                     .map_err(|error| error.to_string())?;
             }
@@ -568,15 +660,16 @@ fn stop_timer_with_cloud_operation(
         cloud_operation.map(|value| value.0),
     )?;
     bump_revision(&transaction)?;
-    let result = load_entry(&transaction, &request.entry_id, now)?;
+    record_runtime_heartbeat(&transaction, &workspace_id, now)?;
+    let result = load_entry(&transaction, &entry_id, now)?;
     if let Some((state, operation_type)) = cloud_operation {
         crate::cloud_sync::enqueue_entity_in_transaction(
             &transaction,
             state,
             operation_type,
             "time_entry",
-            Some(&request.entry_id),
-            Some(request.expected_version),
+            Some(&entry_id),
+            Some(active_version),
             None,
         )?;
     }
@@ -589,6 +682,7 @@ pub fn list_time_entries(
     request: TimeEntryListRequest,
 ) -> Result<TimeEntryListResult, String> {
     validate_date(&request.work_date)?;
+    coordinate_active_timer(database, now_millis())?;
     let connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     let now = now_millis();
@@ -1173,7 +1267,8 @@ fn load_entry(
     let mut entry: TimeEntryDto = connection
         .query_row(
             "SELECT id, work_date, label_snapshot, started_at, ended_at, duration_seconds,
-                    default_task_id, note, kind, source_type, state, version
+                    default_task_id, note, kind, source_type, state, version,
+                    timer_chain_id, previous_entry_id, split_boundary_at
              FROM time_entries WHERE id = ?1 AND deleted_at IS NULL",
             [entry_id],
             |row| {
@@ -1192,6 +1287,9 @@ fn load_entry(
                     source_type: row.get(9)?,
                     state: row.get(10)?,
                     version: row.get(11)?,
+                    timer_chain_id: row.get(12)?,
+                    previous_entry_id: row.get(13)?,
+                    split_boundary_at: row.get(14)?,
                     allocations: Vec::new(),
                 })
             },
@@ -1233,9 +1331,86 @@ fn load_entry(
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
-    entry.settlement_minutes = settlement_minutes(entry.duration_seconds);
+    entry.settlement_minutes = chain_settlement_minutes(connection, &entry)?
+        .unwrap_or_else(|| settlement_minutes(entry.duration_seconds));
     entry.allocated_minutes = entry.allocations.iter().map(|item| item.minutes).sum();
     Ok(entry)
+}
+
+fn chain_settlement_minutes(
+    connection: &rusqlite::Connection,
+    entry: &TimeEntryDto,
+) -> Result<Option<i64>, String> {
+    if entry.source_type != "timer" || entry.state != "ended" {
+        return Ok(None);
+    }
+    let chain_id = entry.timer_chain_id.as_deref().unwrap_or(&entry.id);
+    let active_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM time_entries
+             WHERE COALESCE(timer_chain_id,id)=?1 AND state IN ('running','paused')
+               AND deleted_at IS NULL",
+            [chain_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if active_count > 0 {
+        return Ok(None);
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT id,work_date,started_at,duration_seconds FROM time_entries
+             WHERE COALESCE(timer_chain_id,id)=?1 AND source_type='timer'
+               AND state='ended' AND deleted_at IS NULL
+             ORDER BY work_date,started_at,id",
+        )
+        .map_err(|error| error.to_string())?;
+    let slices = statement
+        .query_map([chain_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(allocate_chain_minutes(&slices).remove(&entry.id))
+}
+
+fn allocate_chain_minutes(slices: &[(String, String, i64, i64)]) -> HashMap<String, i64> {
+    let total_seconds = slices
+        .iter()
+        .map(|(_, _, _, seconds)| (*seconds).max(0))
+        .sum::<i64>();
+    let total_minutes = settlement_minutes(total_seconds);
+    let mut result = slices
+        .iter()
+        .map(|(id, _, _, seconds)| (id.clone(), (*seconds).max(0) / 60))
+        .collect::<HashMap<_, _>>();
+    let base_minutes = result.values().sum::<i64>();
+    let mut remaining = (total_minutes - base_minutes).max(0);
+    let mut ranked = slices
+        .iter()
+        .filter(|(_, _, _, seconds)| *seconds > 0 && *seconds % 60 > 0)
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        (right.3 % 60)
+            .cmp(&(left.3 % 60))
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    for (id, _, _, _) in ranked {
+        if remaining == 0 {
+            break;
+        }
+        *result.entry(id.clone()).or_default() += 1;
+        remaining -= 1;
+    }
+    result
 }
 
 fn entry_state(
@@ -1256,6 +1431,46 @@ fn entry_state(
         .ok_or_else(|| "VERSION_CONFLICT: 计时状态已变化".to_string())
 }
 
+fn resolve_active_timer_request(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    requested_entry_id: &str,
+    expected_version: i64,
+    now: i64,
+) -> Result<(String, i64), String> {
+    let requested: Option<(String, String, i64)> = transaction
+        .query_row(
+            "SELECT COALESCE(timer_chain_id,id),state,version FROM time_entries
+             WHERE id=?1 AND workspace_id=?2 AND source_type='timer' AND deleted_at IS NULL",
+            params![requested_entry_id, workspace_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((chain_id, requested_state, requested_version)) = requested else {
+        return Err("NOT_FOUND: 计时记录不存在".to_string());
+    };
+    if matches!(requested_state.as_str(), "running" | "paused")
+        && requested_version != expected_version
+    {
+        return Err("VERSION_CONFLICT: 计时状态已变化".to_string());
+    }
+
+    coordinate_active_timer_in_transaction(transaction, workspace_id, now)?;
+    transaction
+        .query_row(
+            "SELECT id,version FROM time_entries
+             WHERE workspace_id=?1 AND COALESCE(timer_chain_id,id)=?2
+               AND state IN ('running','paused') AND deleted_at IS NULL
+             ORDER BY started_at DESC LIMIT 1",
+            params![workspace_id, chain_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "VALIDATION_ERROR: 当前计时已经结束".to_string())
+}
+
 fn update_entry_state(
     transaction: &Transaction<'_>,
     entry_id: &str,
@@ -1268,7 +1483,7 @@ fn update_entry_state(
     let changed = transaction
         .execute(
             "UPDATE time_entries SET state = ?1, ended_at = ?2, duration_seconds = ?3,
-                    updated_at = ?4, version = version + 1
+                    last_continuous_at = ?4, updated_at = ?4, version = version + 1
              WHERE id = ?5 AND version = ?6 AND deleted_at IS NULL",
             params![
                 state,
@@ -1322,6 +1537,437 @@ fn segment_duration_sum(connection: &rusqlite::Connection, entry_id: &str) -> Re
             [entry_id],
             |row| row.get(0),
         )
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn coordinate_active_timer(database: &Database, now: i64) -> Result<(), String> {
+    let mut connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    coordinate_active_timer_in_transaction(&transaction, &workspace_id, now)?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn coordinate_active_timer_in_transaction(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    now: i64,
+) -> Result<Option<String>, String> {
+    let cloud_state = crate::supabase::storage_mode_from_connection(transaction, false).ok();
+    type ActiveTimer = (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        i64,
+        String,
+        i64,
+        i64,
+    );
+    let active: Option<ActiveTimer> = transaction
+        .query_row(
+            "SELECT id,work_date,state,COALESCE(timer_chain_id,id),default_task_id,
+                    label_snapshot,note,started_at,kind,version,
+                    COALESCE(last_continuous_at,updated_at,started_at)
+             FROM time_entries
+             WHERE workspace_id=?1 AND state IN ('running','paused') AND deleted_at IS NULL
+             LIMIT 1",
+            [workspace_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((
+        entry_id,
+        work_date,
+        state,
+        chain_id,
+        default_task_id,
+        label,
+        note,
+        _started_at,
+        kind,
+        version,
+        last_continuous_at,
+    )) = active
+    else {
+        return Ok(None);
+    };
+    let timezone = crate::work_calendar::workspace_timezone(transaction, workspace_id)?;
+    let current_date = crate::work_calendar::work_date_at(timezone, now)?;
+    let interrupted = now.saturating_sub(last_continuous_at) > CONTINUITY_GRACE_MILLIS;
+    if current_date == work_date {
+        if interrupted && state == "running" {
+            let open_started_at: i64 = transaction
+                .query_row(
+                    "SELECT started_at FROM time_segments WHERE entry_id=?1 AND ended_at IS NULL",
+                    [&entry_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "VALIDATION_ERROR: 找不到运行中的有效时间段".to_string())?;
+            let confirmed_end = last_continuous_at.min(now).max(open_started_at);
+            close_open_segment(transaction, &entry_id, confirmed_end)?;
+            let duration = segment_duration_sum(transaction, &entry_id)?;
+            let sequence: i64 = transaction
+                .query_row(
+                    "SELECT COALESCE(MAX(sequence_no),0)+1 FROM time_segments WHERE entry_id=?1",
+                    [&entry_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO time_segments(id,workspace_id,entry_id,sequence_no,started_at,duration_seconds)
+                     VALUES (?1,?2,?3,?4,?5,0)",
+                    params![Uuid::now_v7().to_string(), workspace_id, entry_id, sequence, now],
+                )
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "UPDATE time_entries SET duration_seconds=?1,last_continuous_at=?2,
+                            updated_at=?2,version=version+1 WHERE id=?3",
+                    params![duration, now, entry_id],
+                )
+                .map_err(|error| error.to_string())?;
+            bump_revision(transaction)?;
+            enqueue_timer_coordination_rows(
+                transaction,
+                cloud_state.as_ref(),
+                workspace_id,
+                &[(&entry_id, version, "timer_continuity_close", None)],
+            )?;
+        } else {
+            transaction
+                .execute(
+                    "UPDATE time_entries SET last_continuous_at=?1 WHERE id=?2",
+                    params![now, entry_id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        record_runtime_heartbeat(transaction, workspace_id, now)?;
+        return Ok(Some(entry_id));
+    }
+
+    let device_id = device_id(transaction, workspace_id)?;
+    if state == "paused" {
+        let boundary = crate::work_calendar::day_bounds(timezone, &work_date)?
+            .end_at
+            .min(now);
+        transaction
+            .execute(
+                "UPDATE time_entries SET state='ended',ended_at=?1,split_boundary_at=?1,
+                        last_continuous_at=?1,updated_at=?2,version=version+1
+                 WHERE id=?3 AND version=?4",
+                params![boundary, now, entry_id, version],
+            )
+            .map_err(|error| error.to_string())?;
+        let next_id = insert_timer_slice(
+            transaction,
+            workspace_id,
+            &device_id,
+            &chain_id,
+            Some(&entry_id),
+            &current_date,
+            &kind,
+            "paused",
+            default_task_id.as_deref(),
+            &label,
+            note.as_deref(),
+            now,
+            None,
+            now,
+            now,
+        )?;
+        enqueue_timer_coordination_rows(
+            transaction,
+            cloud_state.as_ref(),
+            workspace_id,
+            &[
+                (&entry_id, version, "timer_rollover_close", None),
+                (
+                    &next_id,
+                    0,
+                    "timer_rollover_create",
+                    Some(entry_id.as_str()),
+                ),
+            ],
+        )?;
+        record_runtime_heartbeat(transaction, workspace_id, now)?;
+        bump_revision(transaction)?;
+        return Ok(Some(next_id));
+    }
+
+    let open_started_at: i64 = transaction
+        .query_row(
+            "SELECT started_at FROM time_segments WHERE entry_id=?1 AND ended_at IS NULL",
+            [&entry_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "VALIDATION_ERROR: 找不到运行中的有效时间段".to_string())?;
+    if interrupted {
+        let confirmed_end = last_continuous_at.min(now).max(open_started_at);
+        close_open_segment(transaction, &entry_id, confirmed_end)?;
+        let duration = segment_duration_sum(transaction, &entry_id)?;
+        transaction
+            .execute(
+                "UPDATE time_entries SET state='ended',ended_at=?1,duration_seconds=?2,
+                        split_boundary_at=?1,last_continuous_at=?1,updated_at=?3,version=version+1
+                 WHERE id=?4 AND version=?5",
+                params![confirmed_end, duration, now, entry_id, version],
+            )
+            .map_err(|error| error.to_string())?;
+        let next_id = insert_timer_slice(
+            transaction,
+            workspace_id,
+            &device_id,
+            &chain_id,
+            Some(&entry_id),
+            &current_date,
+            &kind,
+            "running",
+            default_task_id.as_deref(),
+            &label,
+            note.as_deref(),
+            now,
+            None,
+            now,
+            now,
+        )?;
+        enqueue_timer_coordination_rows(
+            transaction,
+            cloud_state.as_ref(),
+            workspace_id,
+            &[
+                (&entry_id, version, "timer_interruption_close", None),
+                (
+                    &next_id,
+                    0,
+                    "timer_rollover_create",
+                    Some(entry_id.as_str()),
+                ),
+            ],
+        )?;
+        record_runtime_heartbeat(transaction, workspace_id, now)?;
+        bump_revision(transaction)?;
+        return Ok(Some(next_id));
+    }
+
+    let slices = crate::work_calendar::split_interval_by_day(timezone, open_started_at, now)?;
+    if slices.len() < 2 {
+        return Err("VALIDATION_ERROR: 计时日期与有效时间段边界不一致".to_string());
+    }
+    let first = &slices[0];
+    close_open_segment(transaction, &entry_id, first.ended_at)?;
+    let duration = segment_duration_sum(transaction, &entry_id)?;
+    transaction
+        .execute(
+            "UPDATE time_entries SET state='ended',ended_at=?1,duration_seconds=?2,
+                    split_boundary_at=?1,last_continuous_at=?1,updated_at=?3,version=version+1
+             WHERE id=?4 AND version=?5",
+            params![first.ended_at, duration, now, entry_id, version],
+        )
+        .map_err(|error| error.to_string())?;
+
+    let closed_entry_id = entry_id.clone();
+    let mut previous_id = entry_id;
+    let mut coordinated_rows = vec![(
+        closed_entry_id.clone(),
+        version,
+        "timer_rollover_close",
+        None,
+    )];
+    for (index, slice) in slices.iter().enumerate().skip(1) {
+        let is_last = index + 1 == slices.len();
+        let next_id = insert_timer_slice(
+            transaction,
+            workspace_id,
+            &device_id,
+            &chain_id,
+            Some(&previous_id),
+            &slice.work_date,
+            &kind,
+            if is_last { "running" } else { "ended" },
+            default_task_id.as_deref(),
+            &label,
+            note.as_deref(),
+            slice.started_at,
+            (!is_last).then_some(slice.ended_at),
+            slice.started_at,
+            if is_last { now } else { slice.ended_at },
+        )?;
+        coordinated_rows.push((
+            next_id.clone(),
+            0,
+            "timer_rollover_create",
+            Some(previous_id.clone()),
+        ));
+        previous_id = next_id;
+    }
+    let row_refs = coordinated_rows
+        .iter()
+        .map(|(id, base_version, operation_type, predecessor)| {
+            (
+                id.as_str(),
+                *base_version,
+                *operation_type,
+                predecessor.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    enqueue_timer_coordination_rows(transaction, cloud_state.as_ref(), workspace_id, &row_refs)?;
+    record_runtime_heartbeat(transaction, workspace_id, now)?;
+    bump_revision(transaction)?;
+    Ok(Some(previous_id))
+}
+
+fn stable_calendar_operation_id(chain_id: &str, work_date: &str, action: &str) -> String {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_OID,
+        format!("timegenie:calendar-timer:{chain_id}:{work_date}:{action}").as_bytes(),
+    )
+    .to_string()
+}
+
+fn enqueue_timer_coordination_rows(
+    transaction: &Transaction<'_>,
+    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+    workspace_id: &str,
+    rows: &[(&str, i64, &str, Option<&str>)],
+) -> Result<(), String> {
+    let Some(cloud_state) = cloud_state.filter(|state| state.mode == "cloud") else {
+        return Ok(());
+    };
+    let mut operation_by_entry = std::collections::HashMap::<String, String>::new();
+    for (entry_id, base_version, operation_type, predecessor_id) in rows {
+        let (chain_id, work_date): (String, String) = transaction
+            .query_row(
+                "SELECT COALESCE(timer_chain_id,id),work_date FROM time_entries WHERE workspace_id=?1 AND id=?2",
+                params![workspace_id, entry_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        let operation_id = stable_calendar_operation_id(&chain_id, &work_date, operation_type);
+        let dependency = predecessor_id
+            .and_then(|id| operation_by_entry.get(id))
+            .map(String::as_str);
+        crate::cloud_sync::enqueue_entity_in_transaction_with_dependency(
+            transaction,
+            cloud_state,
+            operation_type,
+            "time_entry",
+            Some(entry_id),
+            (*base_version > 0).then_some(*base_version),
+            Some(&operation_id),
+            dependency,
+        )?;
+        operation_by_entry.insert((*entry_id).to_string(), operation_id);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_timer_slice(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    device_id: &str,
+    chain_id: &str,
+    previous_entry_id: Option<&str>,
+    work_date: &str,
+    kind: &str,
+    state: &str,
+    default_task_id: Option<&str>,
+    label: &str,
+    note: Option<&str>,
+    started_at: i64,
+    ended_at: Option<i64>,
+    split_boundary_at: i64,
+    last_continuous_at: i64,
+) -> Result<String, String> {
+    let entry_id = Uuid::now_v7().to_string();
+    let duration_seconds = ended_at
+        .map(|ended| ended.saturating_sub(started_at) / 1_000)
+        .unwrap_or(0);
+    transaction
+        .execute(
+            "INSERT INTO time_entries(
+               id,workspace_id,work_date,kind,source_type,state,default_task_id,
+               label_snapshot,started_at,ended_at,duration_seconds,note,created_at,updated_at,
+               version,created_by_device_id,updated_by_device_id,timer_chain_id,
+               previous_entry_id,split_boundary_at,last_continuous_at
+             ) VALUES (?1,?2,?3,?4,'timer',?5,?6,?7,?8,?9,?10,?11,?8,?12,1,?13,?13,?14,?15,?16,?17)",
+            params![
+                entry_id, workspace_id, work_date, kind, state, default_task_id, label,
+                started_at, ended_at, duration_seconds, note, last_continuous_at, device_id,
+                chain_id, previous_entry_id, split_boundary_at, last_continuous_at,
+            ],
+        )
+        .map_err(map_active_timer_error)?;
+    if state == "running" {
+        transaction
+            .execute(
+                "INSERT INTO time_segments(id,workspace_id,entry_id,sequence_no,started_at,duration_seconds)
+                 VALUES (?1,?2,?3,1,?4,0)",
+                params![Uuid::now_v7().to_string(), workspace_id, entry_id, started_at],
+            )
+            .map_err(|error| error.to_string())?;
+    } else if ended_at.is_some() {
+        transaction
+            .execute(
+                "INSERT INTO time_segments(id,workspace_id,entry_id,sequence_no,started_at,ended_at,duration_seconds)
+                 VALUES (?1,?2,?3,1,?4,?5,?6)",
+                params![Uuid::now_v7().to_string(), workspace_id, entry_id, started_at, ended_at, duration_seconds],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(task_id) = default_task_id {
+        crate::recurring::ensure_occurrence_if_recurring(
+            transaction,
+            workspace_id,
+            task_id,
+            work_date,
+            last_continuous_at,
+        )?;
+    }
+    Ok(entry_id)
+}
+
+fn record_runtime_heartbeat(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    now: i64,
+) -> Result<(), String> {
+    transaction
+        .execute(
+            "INSERT INTO tracking_runtime_state(workspace_id,last_heartbeat_at,updated_at)
+             VALUES (?1,?2,?2)
+             ON CONFLICT(workspace_id) DO UPDATE SET
+               last_heartbeat_at=excluded.last_heartbeat_at,updated_at=excluded.updated_at",
+            params![workspace_id, now],
+        )
+        .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
@@ -1566,10 +2212,6 @@ fn settlement_minutes(duration_seconds: i64) -> i64 {
     }
 }
 
-fn local_date() -> String {
-    Local::now().format("%Y-%m-%d").to_string()
-}
-
 fn current_revision(connection: &rusqlite::Connection) -> Result<i64, String> {
     connection
         .query_row(
@@ -1685,7 +2327,7 @@ pub fn timer_resume(
 pub fn timer_stop(
     database: tauri::State<'_, Database>,
     request: TimerStopRequest,
-) -> Result<TimeEntryDto, String> {
+) -> Result<TimerStopResultDto, String> {
     let expected_version = request.expected_version;
     let state = crate::supabase::storage_mode(&database)?;
     let result = stop_timer_with_hooks_and_cloud_operation(
@@ -1695,7 +2337,7 @@ pub fn timer_stop(
     )?;
     crate::cloud_sync::flush_if_online(&database)?;
     let _ = expected_version;
-    Ok(result)
+    timer_chain_result(&database, result)
 }
 
 #[tauri::command]
@@ -1783,6 +2425,13 @@ mod tests {
     use crate::tasks::{create_task, TaskCreateRequest};
     use serde_json::{json, Value};
     use tempfile::tempdir;
+
+    fn test_work_date() -> String {
+        let timezone =
+            crate::work_calendar::validate_timezone(crate::work_calendar::DEFAULT_TIMEZONE)
+                .unwrap();
+        crate::work_calendar::work_date_at(timezone, now_millis()).unwrap()
+    }
 
     fn setup() -> (Database, String, String) {
         let directory = tempdir().unwrap();
@@ -1982,7 +2631,8 @@ mod tests {
         let connection = database.open().unwrap();
         let outbox: (String, String, String) = connection
             .query_row(
-                "SELECT operation_type, entity_type, entity_id FROM sync_outbox WHERE workspace_id = ?1",
+                "SELECT operation_type, entity_type, entity_id FROM sync_outbox
+                 WHERE workspace_id = ?1 AND entity_type = 'time_entry'",
                 [cloud_workspace_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -2154,7 +2804,10 @@ mod tests {
             .iter()
             .find(|row| row.2 == "unassigned_session")
             .unwrap();
-        assert_eq!(unassigned.1, "unassigned_session_create");
+        assert!(matches!(
+            unassigned.1.as_str(),
+            "unassigned_session_create" | "unassigned_session_resume"
+        ));
     }
 
     #[test]
@@ -2498,7 +3151,7 @@ mod tests {
             &database,
             ManualEntryRequest {
                 task_id: None,
-                work_date: local_date(),
+                work_date: test_work_date(),
                 started_at: None,
                 ended_at: None,
                 minutes: Some(30),
@@ -2560,7 +3213,7 @@ mod tests {
             &database,
             ManualEntryRequest {
                 task_id: Some(task_id.clone()),
-                work_date: local_date(),
+                work_date: test_work_date(),
                 started_at: None,
                 ended_at: None,
                 minutes: Some(25),
@@ -2599,7 +3252,7 @@ mod tests {
             &database,
             ManualEntryRequest {
                 task_id: None,
-                work_date: local_date(),
+                work_date: test_work_date(),
                 started_at: None,
                 ended_at: None,
                 minutes: Some(30),
@@ -2672,7 +3325,7 @@ mod tests {
             &database,
             ManualEntryRequest {
                 task_id: None,
-                work_date: local_date(),
+                work_date: test_work_date(),
                 started_at: None,
                 ended_at: None,
                 minutes: Some(90),
@@ -2788,7 +3441,7 @@ mod tests {
             },
         )
         .unwrap();
-        let today = local_date();
+        let today = test_work_date();
         save_rule(
             &database,
             RecurrenceSaveRequest {
@@ -2900,7 +3553,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let today = local_date();
+        let today = test_work_date();
         save_rule(
             &database,
             RecurrenceSaveRequest {
@@ -2998,7 +3651,7 @@ mod tests {
             &database,
             ManualEntryRequest {
                 task_id: None,
-                work_date: local_date(),
+                work_date: test_work_date(),
                 started_at: None,
                 ended_at: None,
                 minutes: Some(30),
@@ -3072,7 +3725,7 @@ mod tests {
             &database,
             ManualEntryRequest {
                 task_id: None,
-                work_date: local_date(),
+                work_date: test_work_date(),
                 started_at: None,
                 ended_at: None,
                 minutes: Some(30),
@@ -3145,7 +3798,7 @@ mod tests {
                    id, workspace_id, work_date, kind, source_type, state, label_snapshot,
                    started_at, ended_at, duration_seconds, note, created_at, updated_at, version
                  ) VALUES (?1, ?2, ?3, 'break', 'unassigned', 'ended', '误记为休息', ?4, ?5, 600, '稍后重新分配', ?5, ?5, 1)",
-                params![entry_id, workspace_id, local_date(), now - 600_000, now],
+                params![entry_id, workspace_id, test_work_date(), now - 600_000, now],
             )
             .unwrap();
 
@@ -3177,7 +3830,7 @@ mod tests {
             &database,
             ManualEntryRequest {
                 task_id: Some(task_id.clone()),
-                work_date: local_date(),
+                work_date: test_work_date(),
                 started_at: None,
                 ended_at: None,
                 minutes: Some(15),
@@ -3222,5 +3875,351 @@ mod tests {
             )
             .unwrap();
         assert!(deleted_at.is_some());
+    }
+
+    fn shanghai_millis(value: &str) -> i64 {
+        use chrono::NaiveDateTime;
+        use chrono::TimeZone;
+        let timezone: chrono_tz::Tz = "Asia/Shanghai".parse().unwrap();
+        timezone
+            .from_local_datetime(
+                &NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").unwrap(),
+            )
+            .single()
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    fn seed_active_timer_at(
+        database: &Database,
+        workspace_id: &str,
+        task_id: &str,
+        state: &str,
+        started_at: i64,
+        last_continuous_at: i64,
+    ) -> String {
+        let entry_id = Uuid::now_v7().to_string();
+        let work_date =
+            crate::work_calendar::work_date_at("Asia/Shanghai".parse().unwrap(), started_at)
+                .unwrap();
+        let connection = database.open().unwrap();
+        connection
+            .execute(
+                "INSERT INTO time_entries(
+                   id,workspace_id,work_date,kind,source_type,state,default_task_id,
+                   label_snapshot,started_at,duration_seconds,created_at,updated_at,version,
+                   timer_chain_id,last_continuous_at
+                 ) VALUES (?1,?2,?3,'work','timer',?4,?5,'跨日测试',?6,0,?6,?7,1,?1,?7)",
+                params![
+                    entry_id,
+                    workspace_id,
+                    work_date,
+                    state,
+                    task_id,
+                    started_at,
+                    last_continuous_at
+                ],
+            )
+            .unwrap();
+        if state == "running" {
+            connection
+                .execute(
+                    "INSERT INTO time_segments(id,workspace_id,entry_id,sequence_no,started_at,duration_seconds)
+                     VALUES (?1,?2,?3,1,?4,0)",
+                    params![Uuid::now_v7().to_string(), workspace_id, entry_id, started_at],
+                )
+                .unwrap();
+        }
+        entry_id
+    }
+
+    #[test]
+    fn running_timer_is_split_into_every_workspace_calendar_day() {
+        let (database, workspace_id, task_id) = setup();
+        let started_at = shanghai_millis("2026-10-05 23:59:30");
+        let now = shanghai_millis("2026-10-07 00:00:30");
+        let entry_id = seed_active_timer_at(
+            &database,
+            &workspace_id,
+            &task_id,
+            "running",
+            started_at,
+            now - 1_000,
+        );
+
+        coordinate_active_timer(&database, now).unwrap();
+        let connection = database.open().unwrap();
+        let rows = connection
+            .prepare("SELECT id,work_date,state,duration_seconds,previous_entry_id FROM time_entries WHERE timer_chain_id=?1 ORDER BY work_date")
+            .unwrap()
+            .query_map([&entry_id], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,i64>(3)?,row.get::<_,Option<String>>(4)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>,_>>()
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter().map(|row| row.1.as_str()).collect::<Vec<_>>(),
+            vec!["2026-10-05", "2026-10-06", "2026-10-07"]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+            vec![30, 86_400, 0]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.2.as_str()).collect::<Vec<_>>(),
+            vec!["ended", "ended", "running"]
+        );
+        assert_eq!(rows[1].4.as_deref(), Some(rows[0].0.as_str()));
+        assert_eq!(rows[2].4.as_deref(), Some(rows[1].0.as_str()));
+        let open_segments: i64 = connection.query_row("SELECT COUNT(*) FROM time_segments WHERE ended_at IS NULL AND entry_id IN (SELECT id FROM time_entries WHERE timer_chain_id=?1)",[&entry_id],|row|row.get(0)).unwrap();
+        assert_eq!(open_segments, 1);
+    }
+
+    #[test]
+    fn paused_timer_crosses_day_without_counting_pause_interval() {
+        let (database, workspace_id, task_id) = setup();
+        let started_at = shanghai_millis("2026-10-05 23:50:00");
+        let now = shanghai_millis("2026-10-06 08:00:00");
+        let entry_id = seed_active_timer_at(
+            &database,
+            &workspace_id,
+            &task_id,
+            "paused",
+            started_at,
+            started_at + 60_000,
+        );
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE time_entries SET duration_seconds=60 WHERE id=?1",
+                [&entry_id],
+            )
+            .unwrap();
+
+        coordinate_active_timer(&database, now).unwrap();
+        let connection = database.open().unwrap();
+        let rows = connection.prepare("SELECT work_date,state,duration_seconds,started_at FROM time_entries WHERE timer_chain_id=?1 ORDER BY work_date").unwrap().query_map([&entry_id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "2026-10-05".to_string(),
+                    "ended".to_string(),
+                    60,
+                    started_at
+                ),
+                ("2026-10-06".to_string(), "paused".to_string(), 0, now)
+            ]
+        );
+    }
+
+    #[test]
+    fn interrupted_running_timer_excludes_gap_and_restarts_at_recovery() {
+        let (database, workspace_id, task_id) = setup();
+        let started_at = shanghai_millis("2026-10-06 09:00:00");
+        let last_continuous = shanghai_millis("2026-10-06 09:01:00");
+        let now = shanghai_millis("2026-10-06 10:00:00");
+        let entry_id = seed_active_timer_at(
+            &database,
+            &workspace_id,
+            &task_id,
+            "running",
+            started_at,
+            last_continuous,
+        );
+
+        coordinate_active_timer(&database, now).unwrap();
+        let connection = database.open().unwrap();
+        let duration: i64 = connection
+            .query_row(
+                "SELECT duration_seconds FROM time_entries WHERE id=?1",
+                [&entry_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let segments = connection.prepare("SELECT started_at,ended_at,duration_seconds FROM time_segments WHERE entry_id=?1 ORDER BY sequence_no").unwrap().query_map([&entry_id],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,Option<i64>>(1)?,row.get::<_,i64>(2)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        assert_eq!(duration, 60);
+        assert_eq!(
+            segments,
+            vec![(started_at, Some(last_continuous), 60), (now, None, 0)]
+        );
+    }
+
+    #[test]
+    fn overnight_interruption_closes_old_day_and_restarts_today() {
+        let (database, workspace_id, task_id) = setup();
+        let started_at = shanghai_millis("2026-10-05 23:50:00");
+        let last_continuous = shanghai_millis("2026-10-05 23:51:00");
+        let now = shanghai_millis("2026-10-06 08:00:00");
+        let entry_id = seed_active_timer_at(
+            &database,
+            &workspace_id,
+            &task_id,
+            "running",
+            started_at,
+            last_continuous,
+        );
+
+        coordinate_active_timer(&database, now).unwrap();
+        let connection = database.open().unwrap();
+        let rows = connection.prepare("SELECT work_date,state,duration_seconds,started_at FROM time_entries WHERE timer_chain_id=?1 ORDER BY work_date").unwrap().query_map([&entry_id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "2026-10-05".to_string(),
+                    "ended".to_string(),
+                    60,
+                    started_at
+                ),
+                ("2026-10-06".to_string(), "running".to_string(), 0, now)
+            ]
+        );
+    }
+
+    #[test]
+    fn chain_settlement_allocates_one_rounded_total_across_calendar_slices() {
+        let slices = vec![
+            ("a".to_string(), "2026-10-05".to_string(), 100, 30),
+            ("b".to_string(), "2026-10-06".to_string(), 200, 30),
+        ];
+        let minutes = allocate_chain_minutes(&slices);
+        assert_eq!(minutes.values().sum::<i64>(), 1);
+        assert_eq!(minutes["a"], 1);
+        assert_eq!(minutes["b"], 0);
+
+        let multi_day = vec![
+            ("a".to_string(), "2026-10-05".to_string(), 100, 59),
+            ("b".to_string(), "2026-10-06".to_string(), 200, 61),
+            ("c".to_string(), "2026-10-07".to_string(), 300, 121),
+        ];
+        let minutes = allocate_chain_minutes(&multi_day);
+        assert_eq!(minutes.values().sum::<i64>(), settlement_minutes(241));
+        assert_eq!(minutes["a"], 1);
+        assert_eq!(minutes["b"], 2);
+        assert_eq!(minutes["c"], 2);
+    }
+
+    #[test]
+    fn cloud_rollover_queues_deterministic_close_then_create_operations() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("cloud-rollover-outbox.sqlite3"))
+                .unwrap();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        crate::settings::update_setting(
+            &database,
+            crate::settings::SettingsUpdate {
+                scope: crate::settings::SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: serde_json::json!(cloud_workspace_id.clone()),
+            },
+        )
+        .unwrap();
+        crate::settings::update_setting(
+            &database,
+            crate::settings::SettingsUpdate {
+                scope: crate::settings::SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: serde_json::json!("cloud"),
+            },
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let timezone =
+            crate::work_calendar::workspace_timezone(&connection, &workspace_id).unwrap();
+        let today = crate::work_calendar::work_date_at(timezone, now_millis()).unwrap();
+        let yesterday = (chrono::NaiveDate::parse_from_str(&today, "%Y-%m-%d").unwrap()
+            - chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+        let boundary = crate::work_calendar::day_bounds(timezone, &yesterday)
+            .unwrap()
+            .end_at;
+        let entry_id = Uuid::now_v7().to_string();
+        let device_id: String = connection
+            .query_row(
+                "SELECT id FROM devices WHERE workspace_id=?1 LIMIT 1",
+                [&workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection.execute("INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,label_snapshot,started_at,duration_seconds,created_at,updated_at,version,created_by_device_id,updated_by_device_id,timer_chain_id,last_continuous_at) VALUES (?1,?2,?3,'work','timer','running','跨日队列',?4,0,?4,?4,1,?5,?5,?1,?4)",params![entry_id,workspace_id,yesterday,boundary-60_000,device_id]).unwrap();
+        connection.execute("INSERT INTO time_segments(id,workspace_id,entry_id,sequence_no,started_at,duration_seconds) VALUES (?1,?2,?3,1,?4,0)",params![Uuid::now_v7().to_string(),workspace_id,entry_id,boundary-60_000]).unwrap();
+        drop(connection);
+        coordinate_active_timer(&database, boundary + 30_000).unwrap();
+        let connection = database.open().unwrap();
+        let rows=connection.prepare("SELECT operation_type,depends_on_operation_id,operation_id FROM sync_outbox WHERE workspace_id=?1 AND operation_type LIKE 'timer_rollover_%' ORDER BY created_at,rowid").unwrap().query_map([cloud_workspace_id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,Option<String>>(1)?,row.get::<_,String>(2)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "timer_rollover_close");
+        assert_eq!(rows[1].0, "timer_rollover_create");
+        assert_eq!(rows[1].1.as_deref(), Some(rows[0].2.as_str()));
+        drop(connection);
+        coordinate_active_timer(&database, boundary + 30_000).unwrap();
+        let count: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE operation_type LIKE 'timer_rollover_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn stopped_cross_day_chain_returns_all_slices_with_chain_level_minutes() {
+        let (database, workspace_id, task_id) = setup();
+        let timezone = "Asia/Shanghai".parse().unwrap();
+        let today = crate::work_calendar::work_date_at(timezone, now_millis()).unwrap();
+        let yesterday = (chrono::NaiveDate::parse_from_str(&today, "%Y-%m-%d").unwrap()
+            - chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+        let boundary = crate::work_calendar::day_bounds(timezone, &today)
+            .unwrap()
+            .start_at;
+        let started_at = boundary - 30_000;
+        let stop_at = boundary + 30_000;
+        let _entry_id = seed_active_timer_at(
+            &database,
+            &workspace_id,
+            &task_id,
+            "running",
+            started_at,
+            stop_at - 1_000,
+        );
+        coordinate_active_timer(&database, stop_at).unwrap();
+        let active = get_timer_state(&database).unwrap().unwrap();
+        let stopped = stop_timer(
+            &database,
+            TimerStopRequest {
+                entry_id: active.id,
+                expected_version: active.version,
+                create_default_allocation: false,
+            },
+        )
+        .unwrap();
+        let chain = timer_chain_result(&database, stopped).unwrap();
+        assert_eq!(chain.slices.len(), 2);
+        assert_eq!(chain.total_duration_seconds, 60);
+        assert_eq!(chain.total_settlement_minutes, 1);
+        assert_eq!(
+            chain
+                .slices
+                .iter()
+                .map(|slice| slice.settlement_minutes)
+                .sum::<i64>(),
+            1
+        );
+        assert_eq!(chain.slices[0].work_date, yesterday);
+        assert_eq!(chain.slices[0].settlement_minutes, 1);
+        assert_eq!(chain.slices[1].work_date, today);
+        assert_eq!(chain.slices[1].settlement_minutes, 0);
     }
 }

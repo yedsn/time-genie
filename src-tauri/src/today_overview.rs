@@ -32,6 +32,7 @@ pub struct TodayWorkOverviewSummaryDto {
     pub active_count: i64,
     pub not_started_count: i64,
     pub unassigned_minutes: i64,
+    pub historical_unassigned_count: i64,
     pub completion_rate: f64,
 }
 
@@ -100,8 +101,8 @@ struct TaskRow {
     estimate_minutes: Option<i64>,
     sort_order: i64,
     created_at: i64,
-    occurrence_status: Option<String>,
-    occurrence_date: Option<String>,
+    recurrence_rules: Vec<crate::recurring::RecurrenceRuleDto>,
+    occurrence_statuses: HashMap<String, String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -138,6 +139,7 @@ pub fn get_today_work_overview(
         &connection,
         &workspace_id,
         subject.as_deref(),
+        &start_text,
         &request.today_date,
     )?;
     let children = build_children(&tasks);
@@ -219,6 +221,15 @@ pub fn get_today_work_overview(
         .get(&request.today_date)
         .copied()
         .unwrap_or(0);
+    today_summary.historical_unassigned_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM unassigned_sessions
+             WHERE workspace_id=?1 AND work_date<?2
+               AND state IN ('collecting','awaiting_resolution')",
+            params![workspace_id, request.today_date],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
     let total_count = today_summary.completed_count
         + today_summary.active_count
         + today_summary.not_started_count;
@@ -258,24 +269,22 @@ fn load_tasks(
     connection: &rusqlite::Connection,
     workspace_id: &str,
     subject_id: Option<&str>,
-    today_date: &str,
+    start_date: &str,
+    end_date: &str,
 ) -> Result<Vec<TaskRow>, String> {
     let mut statement = connection
         .prepare(
             "SELECT t.id, t.subject_id, s.name, t.parent_id, t.title, t.status, t.planned_date,
-                    t.estimate_minutes, t.sort_order, t.created_at,
-                    o.status, o.occurrence_date
+                    t.estimate_minutes, t.sort_order, t.created_at
              FROM tasks t
              JOIN subjects s ON s.id = t.subject_id
-             LEFT JOIN task_occurrences o
-               ON o.task_id = t.id AND o.workspace_id = t.workspace_id AND o.occurrence_date = ?3
              WHERE t.workspace_id = ?1 AND t.deleted_at IS NULL
                AND (?2 IS NULL OR t.subject_id = ?2)
              ORDER BY t.subject_id, t.sort_order, t.created_at",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map(params![workspace_id, subject_id, today_date], |row| {
+        .query_map(params![workspace_id, subject_id], |row| {
             Ok(TaskRow {
                 id: row.get(0)?,
                 subject_id: row.get(1)?,
@@ -287,13 +296,77 @@ fn load_tasks(
                 estimate_minutes: row.get(7)?,
                 sort_order: row.get(8)?,
                 created_at: row.get(9)?,
-                occurrence_status: row.get(10)?,
-                occurrence_date: row.get(11)?,
+                recurrence_rules: Vec::new(),
+                occurrence_statuses: HashMap::new(),
             })
         })
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
+    let mut rows = rows;
+    let indexes = rows
+        .iter()
+        .enumerate()
+        .map(|(index, task)| (task.id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let mut rule_statement = connection
+        .prepare(
+            "SELECT id, task_id, frequency, weekdays_mask, effective_start, effective_end, version
+             FROM task_recurrence_rules
+             WHERE workspace_id = ?1 AND effective_start <= ?3
+               AND (effective_end IS NULL OR effective_end >= ?2)
+             ORDER BY task_id, effective_start",
+        )
+        .map_err(|error| error.to_string())?;
+    for rule in rule_statement
+        .query_map(params![workspace_id, start_date, end_date], |row| {
+            let frequency: String = row.get(2)?;
+            let weekdays_mask: Option<i64> = row.get(3)?;
+            Ok(crate::recurring::RecurrenceRuleDto {
+                id: row.get(0)?,
+                task_id: row.get(1)?,
+                summary: match frequency.as_str() {
+                    "daily" => "每天".to_string(),
+                    "weekdays" => "工作日".to_string(),
+                    "weekly" => "每周".to_string(),
+                    _ => frequency.clone(),
+                },
+                frequency,
+                weekdays_mask,
+                effective_start: row.get(4)?,
+                effective_end: row.get(5)?,
+                version: row.get(6)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+    {
+        let rule = rule.map_err(|error| error.to_string())?;
+        if let Some(index) = indexes.get(&rule.task_id) {
+            rows[*index].recurrence_rules.push(rule);
+        }
+    }
+    let mut occurrence_statement = connection
+        .prepare(
+            "SELECT task_id, occurrence_date, status
+             FROM task_occurrences
+             WHERE workspace_id = ?1 AND occurrence_date BETWEEN ?2 AND ?3",
+        )
+        .map_err(|error| error.to_string())?;
+    for occurrence in occurrence_statement
+        .query_map(params![workspace_id, start_date, end_date], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+    {
+        let (task_id, date, status) = occurrence.map_err(|error| error.to_string())?;
+        if let Some(index) = indexes.get(&task_id) {
+            rows[*index].occurrence_statuses.insert(date, status);
+        }
+    }
     Ok(rows)
 }
 
@@ -386,7 +459,9 @@ fn load_timeline(
     let mut statement = connection
         .prepare(
             "SELECT e.id, e.kind, e.default_task_id, e.label_snapshot, e.started_at, e.ended_at,
-                    e.duration_seconds, e.state, t.subject_id, s.name
+                    e.duration_seconds, e.state, t.subject_id, s.name,
+                    (SELECT started_at FROM time_segments segment
+                     WHERE segment.entry_id=e.id AND segment.ended_at IS NULL LIMIT 1)
              FROM time_entries e
              LEFT JOIN tasks t ON t.id = e.default_task_id
              LEFT JOIN subjects s ON s.id = t.subject_id
@@ -408,6 +483,7 @@ fn load_timeline(
                 row.get::<_, String>(7)?,
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<i64>>(10)?,
             ))
         })
         .map_err(|error| error.to_string())?
@@ -423,9 +499,12 @@ fn load_timeline(
             state,
             row_subject_id,
             subject_name,
+            open_segment_started_at,
         ) = row.map_err(|error| error.to_string())?;
         if state == "running" {
-            duration_seconds += (current_time - started_at).max(0) / 1_000;
+            duration_seconds += open_segment_started_at
+                .map(|open_started_at| (current_time - open_started_at).max(0) / 1_000)
+                .unwrap_or(0);
         }
         timeline.push(TodayWorkOverviewTimelineItemDto {
             id,
@@ -456,7 +535,9 @@ fn append_unassigned_timeline(
     let current_time = now_millis();
     let mut statement = connection
         .prepare(
-            "SELECT id, first_started_at, last_ended_at, duration_seconds, state
+            "SELECT id, first_started_at, last_ended_at, duration_seconds, state,
+                    (SELECT started_at FROM unassigned_segments segment
+                     WHERE segment.session_id=unassigned_sessions.id AND segment.ended_at IS NULL LIMIT 1)
              FROM unassigned_sessions
              WHERE workspace_id = ?1 AND work_date = ?2 AND state IN ('collecting', 'awaiting_resolution')",
         )
@@ -469,14 +550,17 @@ fn append_unassigned_timeline(
                 row.get::<_, Option<i64>>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, Option<i64>>(5)?,
             ))
         })
         .map_err(|error| error.to_string())?
     {
-        let (id, started_at, ended_at, duration_seconds, state) =
+        let (id, started_at, ended_at, duration_seconds, state, open_segment_started_at) =
             row.map_err(|error| error.to_string())?;
-        let live_seconds = if state == "collecting" && ended_at.is_none() {
-            (current_time - started_at).max(0) / 1_000
+        let live_seconds = if state == "collecting" {
+            open_segment_started_at
+                .map(|open_started_at| (current_time - open_started_at).max(0) / 1_000)
+                .unwrap_or(0)
         } else {
             0
         };
@@ -515,12 +599,14 @@ fn task_ids_for_day(
             ids.insert(task.id.clone());
             continue;
         }
-        if task.occurrence_date.as_deref() == Some(date)
-            || task
-                .planned_date
-                .as_deref()
-                .is_some_and(|planned| planned <= date)
-            || effective_status(task, date) == "done"
+        if task.occurrence_statuses.contains_key(date)
+            || recurrence_matches(task, date)
+            || (task.recurrence_rules.is_empty()
+                && task
+                    .planned_date
+                    .as_deref()
+                    .is_some_and(|planned| planned <= date))
+            || (task.recurrence_rules.is_empty() && effective_status(task, date) == "done")
         {
             ids.insert(task.id.clone());
         }
@@ -539,13 +625,19 @@ fn task_execution_status(task: &TaskRow, actual_minutes: i64, date: &str) -> Str
 }
 
 fn effective_status(task: &TaskRow, date: &str) -> String {
-    if task.occurrence_date.as_deref() == Some(date) {
-        task.occurrence_status
-            .clone()
-            .unwrap_or_else(|| task.status.clone())
+    if let Some(status) = task.occurrence_statuses.get(date) {
+        status.clone()
+    } else if recurrence_matches(task, date) {
+        "open".to_string()
     } else {
         task.status.clone()
     }
+}
+
+fn recurrence_matches(task: &TaskRow, date: &str) -> bool {
+    task.recurrence_rules
+        .iter()
+        .any(|rule| crate::recurring::rule_matches_date(rule, date).unwrap_or(false))
 }
 
 fn estimate_for_day(
@@ -897,6 +989,112 @@ mod tests {
         assert_eq!(item.status, "done");
         assert_eq!(item.actual_minutes, 15);
         assert!(item.selectable);
+    }
+
+    #[test]
+    fn overview_merges_virtual_recurring_occurrences_daily_estimates_and_manual_work_days() {
+        let (database, workspace_id, subject_id) = setup();
+        let task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id,
+                parent_id: None,
+                title: "每日梳理".to_string(),
+                planned_date: None,
+                estimate_minutes: Some(45),
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        connection
+            .execute(
+                "INSERT INTO task_recurrence_rules(
+                    id, workspace_id, task_id, frequency, effective_start, created_at, updated_at, version
+                 ) VALUES (?1, ?2, ?3, 'daily', '2026-09-01', 1000, 1000, 1)",
+                params![Uuid::now_v7().to_string(), workspace_id, task.id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO task_daily_estimates(
+                    workspace_id, task_id, work_date, estimate_minutes, created_at, updated_at, version
+                 ) VALUES (?1, ?2, '2026-09-29', 20, 1000, 1000, 1)",
+                params![workspace_id, task.id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let virtual_today = get_today_work_overview(&database, request(None)).unwrap();
+        let item = virtual_today
+            .tasks
+            .iter()
+            .find(|item| item.task_id == task.id)
+            .unwrap();
+        assert_eq!(item.status, "not_started");
+        assert_eq!(item.today_estimate_minutes, Some(20));
+        assert_eq!(virtual_today.summary.estimated_minutes, 20);
+
+        let connection = database.open().unwrap();
+        connection
+            .execute(
+                "INSERT INTO task_occurrences(
+                    workspace_id, task_id, occurrence_date, origin, status, completed_at, created_at, updated_at, version
+                 ) VALUES (?1, ?2, '2026-09-29', 'scheduled', 'done', 2000, 1000, 2000, 2)",
+                params![workspace_id, task.id],
+            )
+            .unwrap();
+        insert_entry(&connection, &workspace_id, &task.id, "2026-09-28", 12, 1000);
+        drop(connection);
+
+        let completed_today = get_today_work_overview(&database, request(None)).unwrap();
+        assert_eq!(
+            completed_today
+                .tasks
+                .iter()
+                .find(|item| item.task_id == task.id)
+                .unwrap()
+                .status,
+            "done"
+        );
+        let previous_day = completed_today
+            .days
+            .iter()
+            .find(|day| day.date == "2026-09-28")
+            .unwrap();
+        assert_eq!(previous_day.actual_minutes, 12);
+    }
+
+    #[test]
+    fn overview_keeps_historical_unassigned_out_of_today_minutes() {
+        let (database, workspace_id, _) = setup();
+        let connection = database.open().unwrap();
+        insert_unassigned(&connection, &workspace_id, "2026-09-28", 1_200, 1_000);
+        insert_unassigned(&connection, &workspace_id, "2026-09-29", 300, 2_000);
+        drop(connection);
+
+        let overview = get_today_work_overview(&database, request(None)).unwrap();
+        assert_eq!(overview.summary.unassigned_minutes, 5);
+        assert_eq!(overview.summary.historical_unassigned_count, 1);
+        assert_eq!(
+            overview
+                .timeline
+                .iter()
+                .filter(|item| item.item_type == "unassigned")
+                .count(),
+            1
+        );
+        assert_eq!(
+            overview
+                .timeline
+                .iter()
+                .find(|item| item.item_type == "unassigned")
+                .unwrap()
+                .minutes,
+            5
+        );
     }
 
     fn request(subject_id: Option<String>) -> TodayWorkOverviewRequest {

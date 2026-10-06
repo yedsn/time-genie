@@ -60,6 +60,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "shared_unassigned_sessions",
         sql: include_str!("../migrations/0009_shared_unassigned_sessions.sql"),
     },
+    Migration {
+        version: 10,
+        name: "calendar_day_time_accounting",
+        sql: include_str!("../migrations/0010_calendar_day_time_accounting.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -86,6 +91,9 @@ impl Database {
         let mut connection = database.open()?;
         apply_migrations(&mut connection)?;
         ensure_initial_data(&mut connection)?;
+        crate::work_calendar::validate_all_workspace_timezones(&connection)?;
+        drop(connection);
+        recover_local_tracking_state(&database)?;
         Ok(database)
     }
 
@@ -98,6 +106,9 @@ impl Database {
         let mut connection = database.open()?;
         apply_migrations(&mut connection)?;
         ensure_initial_data(&mut connection)?;
+        crate::work_calendar::validate_all_workspace_timezones(&connection)?;
+        drop(connection);
+        recover_local_tracking_state(&database)?;
         Ok(database)
     }
 
@@ -137,6 +148,30 @@ impl Database {
             tables,
         })
     }
+}
+
+fn recover_local_tracking_state(database: &Database) -> Result<(), String> {
+    recover_local_tracking_state_at(database, now_millis())
+}
+
+fn recover_local_tracking_state_at(database: &Database, now: i64) -> Result<(), String> {
+    let connection = database.open()?;
+    let storage_mode: String = connection
+        .query_row(
+            "SELECT value_json FROM device_settings WHERE key='storage_mode'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .and_then(|value| serde_json::from_str::<String>(&value).ok())
+        .unwrap_or_else(|| "local".to_string());
+    drop(connection);
+    if storage_mode != "local" {
+        return Ok(());
+    }
+    crate::time_tracking::coordinate_active_timer(database, now)?;
+    crate::unassigned::coordinate_sessions(database, now)
 }
 
 fn configure_connection(connection: &Connection) -> Result<(), String> {
@@ -452,6 +487,7 @@ mod tests {
         "local_report_outputs",
         "device_hooks",
         "device_hook_runs",
+        "tracking_runtime_state",
     ];
 
     #[test]
@@ -459,7 +495,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let database = Database::initialize_at(directory.path().join("test.sqlite3")).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 9);
+        assert_eq!(status.schema_version, 10);
         for table in REQUIRED_TABLES {
             assert!(
                 status.tables.iter().any(|value| value == table),
@@ -499,7 +535,7 @@ mod tests {
         let workspace_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migration_count, 9);
+        assert_eq!(migration_count, 10);
         assert_eq!(workspace_count, 1);
     }
 
@@ -586,7 +622,7 @@ mod tests {
         assert_eq!(task_title, "升级前事项");
         assert_eq!(queued, 1);
         assert_eq!(deferred_table, 6);
-        assert_eq!(database.status().unwrap().schema_version, 9);
+        assert_eq!(database.status().unwrap().schema_version, 10);
     }
 
     #[test]
@@ -798,6 +834,220 @@ mod tests {
     }
 
     #[test]
+    fn calendar_day_migration_preserves_history_and_initializes_chain_metadata() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("calendar-day-upgrade.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                   version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        for migration in &MIGRATIONS[..9] {
+            let transaction = connection.transaction().unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version,name,applied_at) VALUES (?1,?2,?3)",
+                    params![migration.version, migration.name, now_millis()],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        connection.execute("INSERT INTO workspaces(id,name,timezone,storage_mode,created_at,updated_at,version) VALUES ('calendar-workspace','日期升级','Asia/Shanghai','local',1,1,1)",[]).unwrap();
+        connection.execute("INSERT INTO devices(id,workspace_id,device_name,platform,app_version,last_seen_at,created_at) VALUES ('calendar-device','calendar-workspace','设备','test','1',1,1)",[]).unwrap();
+        connection.execute("INSERT INTO device_settings(key,value_json,updated_at) VALUES ('storage_mode','\"cloud\"',1)",[]).unwrap();
+        connection.execute("INSERT INTO subjects(id,workspace_id,name,sort_order,created_at,updated_at,version) VALUES ('calendar-subject','calendar-workspace','默认',10,1,1,1)",[]).unwrap();
+        connection.execute("INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version) VALUES ('calendar-task','calendar-workspace','calendar-subject','历史事项','open','manual',10,1,1,1)",[]).unwrap();
+        connection.execute("INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,label_snapshot,started_at,ended_at,duration_seconds,created_at,updated_at,version) VALUES ('history','calendar-workspace','2026-10-05','work','manual','ended','历史',1000,61000,60,1000,61000,1)",[]).unwrap();
+        connection.execute("INSERT INTO time_allocations(id,workspace_id,entry_id,task_id,minutes,created_at,updated_at,version) VALUES ('history-allocation','calendar-workspace','history','calendar-task',1,1000,61000,1)",[]).unwrap();
+        connection.execute("INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,label_snapshot,started_at,duration_seconds,created_at,updated_at,version) VALUES ('active','calendar-workspace','2026-10-06','work','timer','paused','活动',100000,60,100000,160000,2)",[]).unwrap();
+        connection.execute("INSERT INTO unassigned_sessions(id,workspace_id,work_date,state,threshold_seconds,duration_seconds,first_started_at,created_at,updated_at,version) VALUES ('unassigned','calendar-workspace','2026-10-06','awaiting_resolution',300,600,100000,100000,700000,2)",[]).unwrap();
+        drop(connection);
+
+        let database = Database::initialize_at(path).unwrap();
+        let connection = database.open().unwrap();
+        let history: (String, i64) = connection
+            .query_row(
+                "SELECT work_date,duration_seconds FROM time_entries WHERE id='history'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let active: (String, i64) = connection
+            .query_row(
+                "SELECT timer_chain_id,last_continuous_at FROM time_entries WHERE id='active'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let unassigned_last: i64 = connection
+            .query_row(
+                "SELECT last_continuous_at FROM unassigned_sessions WHERE id='unassigned'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let allocation: (String, String, i64) = connection.query_row("SELECT entry_id,task_id,minutes FROM time_allocations WHERE id='history-allocation'",[],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(history, ("2026-10-05".to_string(), 60));
+        assert_eq!(active, ("active".to_string(), 160000));
+        assert_eq!(unassigned_last, 700000);
+        assert_eq!(
+            allocation,
+            ("history".to_string(), "calendar-task".to_string(), 1)
+        );
+    }
+
+    #[test]
+    fn calendar_day_migration_defaults_blank_timezone_and_rejects_invalid_timezone() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("calendar-timezone-upgrade.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                   version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        for migration in &MIGRATIONS[..9] {
+            let transaction = connection.transaction().unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version,name,applied_at) VALUES (?1,?2,?3)",
+                    params![migration.version, migration.name, now_millis()],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        connection.execute("INSERT INTO workspaces(id,name,timezone,storage_mode,created_at,updated_at,version) VALUES ('blank-workspace','空时区','','local',1,1,1)",[]).unwrap();
+        connection.execute("INSERT INTO devices(id,workspace_id,device_name,platform,app_version,last_seen_at,created_at) VALUES ('blank-device','blank-workspace','设备','test','1',1,1)",[]).unwrap();
+        connection.execute("INSERT INTO subjects(id,workspace_id,name,sort_order,created_at,updated_at,version) VALUES ('blank-subject','blank-workspace','默认',10,1,1,1)",[]).unwrap();
+        drop(connection);
+
+        let database = Database::initialize_at(path).unwrap();
+        let timezone: String = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT timezone FROM workspaces WHERE id='blank-workspace'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(timezone, crate::work_calendar::DEFAULT_TIMEZONE);
+
+        let invalid_path = directory.path().join("calendar-invalid-timezone.sqlite3");
+        let invalid = Database::initialize_at(invalid_path.clone()).unwrap();
+        invalid
+            .open()
+            .unwrap()
+            .execute("UPDATE workspaces SET timezone='Mars/Olympus'", [])
+            .unwrap();
+        drop(invalid);
+        let error = Database::initialize_at(invalid_path).unwrap_err();
+        assert!(error.contains("无效的工作空间时区"));
+    }
+
+    #[test]
+    fn local_startup_recovery_preserves_history_and_recovers_active_states_at_confirmed_boundaries()
+    {
+        use chrono::{NaiveDateTime, TimeZone};
+        let timezone: chrono_tz::Tz = "Asia/Shanghai".parse().unwrap();
+        let millis = |value: &str| {
+            timezone
+                .from_local_datetime(
+                    &NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").unwrap(),
+                )
+                .single()
+                .unwrap()
+                .timestamp_millis()
+        };
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("startup-recovery.sqlite3")).unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let task_id: String = connection
+            .query_row(
+                "SELECT id FROM tasks WHERE parent_id IS NULL LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute("DELETE FROM unassigned_segments", [])
+            .unwrap();
+        connection
+            .execute("DELETE FROM unassigned_sessions", [])
+            .unwrap();
+        connection.execute("DELETE FROM time_segments", []).unwrap();
+        connection
+            .execute("DELETE FROM time_allocations", [])
+            .unwrap();
+        connection.execute("DELETE FROM time_entries", []).unwrap();
+        let history_started = millis("2026-10-04 10:00:00");
+        let history_ended = millis("2026-10-04 10:10:00");
+        connection.execute("INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,label_snapshot,started_at,ended_at,duration_seconds,created_at,updated_at,version) VALUES ('history',?1,'2026-10-04','work','manual','ended','历史',?2,?3,600,?2,?3,1)",params![workspace_id,history_started,history_ended]).unwrap();
+        let paused_started = millis("2026-10-05 23:00:00");
+        connection.execute("INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,default_task_id,label_snapshot,started_at,duration_seconds,created_at,updated_at,version,timer_chain_id,last_continuous_at) VALUES ('paused',?1,'2026-10-05','work','timer','paused',?2,'暂停',?3,300,?3,?4,1,'paused',?4)",params![workspace_id,task_id,paused_started,millis("2026-10-05 23:05:00")]).unwrap();
+        let pending_started = millis("2026-10-05 22:00:00");
+        let pending_ended = millis("2026-10-05 22:10:00");
+        connection.execute("INSERT INTO unassigned_sessions(id,workspace_id,work_date,state,threshold_seconds,duration_seconds,first_started_at,last_ended_at,prompted_at,created_at,updated_at,version,shared_source,migration_state,last_continuous_at) VALUES ('pending',?1,'2026-10-05','awaiting_resolution',300,600,?2,?3,?3,?2,?3,1,'local','ready',?3)",params![workspace_id,pending_started,pending_ended]).unwrap();
+        connection.execute("INSERT INTO unassigned_segments(id,workspace_id,session_id,sequence_no,started_at,ended_at,duration_seconds) VALUES ('pending-segment',?1,'pending',1,?2,?3,600)",params![workspace_id,pending_started,pending_ended]).unwrap();
+        drop(connection);
+
+        let now = millis("2026-10-06 08:00:00");
+        recover_local_tracking_state_at(&database, now).unwrap();
+        let connection = database.open().unwrap();
+        let history: (String, i64, i64) = connection
+            .query_row(
+                "SELECT work_date,duration_seconds,ended_at FROM time_entries WHERE id='history'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(history, ("2026-10-04".to_string(), 600, history_ended));
+        let timer_rows = connection.prepare("SELECT work_date,state,duration_seconds,started_at FROM time_entries WHERE timer_chain_id='paused' ORDER BY work_date").unwrap().query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        assert_eq!(
+            timer_rows,
+            vec![
+                (
+                    "2026-10-05".to_string(),
+                    "ended".to_string(),
+                    300,
+                    paused_started
+                ),
+                ("2026-10-06".to_string(), "paused".to_string(), 0, now)
+            ]
+        );
+        let pending: (String,i64,String) = connection.query_row("SELECT work_date,duration_seconds,state FROM unassigned_sessions WHERE id='pending'",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(
+            pending,
+            (
+                "2026-10-05".to_string(),
+                600,
+                "awaiting_resolution".to_string()
+            )
+        );
+        let today_sessions: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM unassigned_sessions WHERE work_date='2026-10-06'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(today_sessions, 0);
+    }
+
+    #[test]
     fn recurring_task_constraints_and_date_index_are_available() {
         let directory = tempdir().unwrap();
         let database = Database::initialize_at(directory.path().join("test.sqlite3")).unwrap();
@@ -954,7 +1204,7 @@ mod tests {
 
         let database = Database::initialize_at(path).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 9);
+        assert_eq!(status.schema_version, 10);
         assert!(status.tables.iter().any(|table| table == "device_hooks"));
         assert!(status
             .tables

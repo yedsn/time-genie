@@ -21,6 +21,13 @@ export type SettingsSnapshot = {
   };
 };
 
+export type WorkspaceCalendarContext = {
+  timezone: string;
+  currentWorkDate: string;
+  currentDayStartAt: number;
+  currentDayEndAt: number;
+};
+
 export type AppUpdateSummary = {
   version: string;
   currentVersion: string;
@@ -263,7 +270,17 @@ export type TimeEntryRecord = {
   sourceType: "timer" | "manual" | "unassigned" | string;
   state: "running" | "paused" | "ended";
   version: number;
+  timerChainId?: string;
+  previousEntryId?: string;
+  splitBoundaryAt?: number;
   allocations: TimeAllocationRecord[];
+};
+
+export type TimerStopResultRecord = {
+  currentEntry: TimeEntryRecord;
+  slices: TimeEntryRecord[];
+  totalDurationSeconds: number;
+  totalSettlementMinutes: number;
 };
 
 export type TimeEntryListResult = {
@@ -288,6 +305,7 @@ export type TodayWorkOverviewSummaryRecord = {
   activeCount: number;
   notStartedCount: number;
   unassignedMinutes: number;
+  historicalUnassignedCount: number;
   completionRate: number;
 };
 
@@ -338,6 +356,7 @@ export type TodayWorkOverviewRecord = {
 
 export type UnassignedStateRecord = {
   sessionId: string;
+  workDate: string;
   state: "collecting" | "awaiting_resolution";
   firstStartedAt: number;
   lastEndedAt?: number;
@@ -347,6 +366,13 @@ export type UnassignedStateRecord = {
   thresholdSeconds: number;
   mustResolve: boolean;
   version: number;
+};
+
+export type UnassignedStateSnapshotRecord = {
+  current?: UnassignedStateRecord;
+  historicalPending: UnassignedStateRecord[];
+  historicalPendingCount: number;
+  earliestHistoricalDate?: string;
 };
 
 export type UnassignedResolveResult = {
@@ -469,8 +495,7 @@ export async function renameSubject(subjectId: string, name: string, expectedVer
   return await invoke<SubjectRecord>("subject_rename", { request: { subjectId, name, expectedVersion } });
 }
 
-export async function listTasks(subjectId?: string, plannedDate?: string): Promise<TaskListResult> {
-  const dailyEstimateDate = formatLocalDate(new Date());
+export async function listTasks(subjectId?: string, plannedDate?: string, dailyEstimateDate?: string): Promise<TaskListResult> {
   return await invoke<TaskListResult>("task_list", {
     request: { subjectId, includeCompleted: true, plannedDate, todayDate: dailyEstimateDate, todayOnly: false, dailyEstimateDate, query: null },
   });
@@ -558,13 +583,6 @@ export async function closeTaskRecurrence(request: {
   await invoke("task_recurrence_close", { request });
 }
 
-function formatLocalDate(date: Date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
-
 export async function deleteTaskSubtree(id: string, expectedVersion: number): Promise<void> {
   await invoke("task_delete_subtree", { request: { id, expectedVersion } });
 }
@@ -621,8 +639,8 @@ export async function stopTimerRecord(
   entryId: string,
   expectedVersion: number,
   createDefaultAllocation = false,
-): Promise<TimeEntryRecord> {
-  return await invoke<TimeEntryRecord>("timer_stop", {
+): Promise<TimerStopResultRecord> {
+  return await invoke<TimerStopResultRecord>("timer_stop", {
     request: { entryId, expectedVersion, createDefaultAllocation },
   });
 }
@@ -685,6 +703,14 @@ export async function replaceTimeAllocations(
 
 export async function getUnassignedState(): Promise<UnassignedStateRecord | null> {
   return await invoke<UnassignedStateRecord | null>("unassigned_get_state");
+}
+
+export async function getUnassignedStateSnapshot(): Promise<UnassignedStateSnapshotRecord> {
+  return await invoke<UnassignedStateSnapshotRecord>("unassigned_get_state_snapshot");
+}
+
+export async function getUnassignedSession(sessionId: string): Promise<UnassignedStateRecord> {
+  return await invoke<UnassignedStateRecord>("unassigned_get_session", { sessionId });
 }
 
 export async function resolveUnassignedWork(
@@ -806,6 +832,10 @@ export async function executeObsidianReportWrite(
 
 export async function getSettings(): Promise<SettingsSnapshot> {
   return await invoke<SettingsSnapshot>("settings_get");
+}
+
+export async function getWorkspaceCalendarContext(): Promise<WorkspaceCalendarContext> {
+  return await invoke<WorkspaceCalendarContext>("work_calendar_get_context");
 }
 
 export async function listAutomationHooks(): Promise<AutomationHookRule[]> {

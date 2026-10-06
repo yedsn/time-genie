@@ -42,6 +42,10 @@ end $$;
 \ir 20261005b_timegenie_event_driven_sync_patch.sql
 \ir 20261006_timegenie_shared_unassigned_patch.sql
 \ir 20261006_timegenie_shared_unassigned_patch.sql
+\ir 20261006b_timegenie_calendar_day_accounting_patch.sql
+\ir 20261006b_timegenie_calendar_day_accounting_patch.sql
+\ir 20261007_timegenie_unassigned_segment_boundary_fix.sql
+\ir 20261007_timegenie_unassigned_segment_boundary_fix.sql
 
 do $$
 begin
@@ -1860,6 +1864,128 @@ begin
   );
 end $$;
 
+reset role;
+
+-- Calendar-day helpers use the workspace IANA timezone, including DST days.
+do $$
+begin
+  update timegenie.workspaces set timezone='America/New_York'
+  where id='20000000-0000-0000-0000-000000000001';
+  if timegenie.workspace_work_date('20000000-0000-0000-0000-000000000001','2026-03-08 04:30:00+00') <> date '2026-03-07' then
+    raise exception 'workspace date ignored America/New_York timezone';
+  end if;
+  if extract(epoch from (
+    timegenie.workspace_day_end('20000000-0000-0000-0000-000000000001',date '2026-03-08') -
+    timegenie.workspace_day_start('20000000-0000-0000-0000-000000000001',date '2026-03-08')
+  ))::bigint <> 82800 then
+    raise exception 'DST spring day was treated as fixed 24 hours';
+  end if;
+  update timegenie.workspaces set timezone='Asia/Shanghai'
+  where id='20000000-0000-0000-0000-000000000001';
+end $$;
+
+-- The same timer chain/date candidate converges to one authoritative row.
+set local role authenticated;
+select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+do $$
+declare first_result jsonb; second_result jsonb; chain_id uuid:='74000000-0000-0000-0000-000000000001';
+begin
+  first_result:=timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '44000000-0000-0000-0000-000000000001','timer_rollover_create','time_entry',
+    '74100000-0000-0000-0000-000000000001',null,
+    jsonb_build_object('id','74100000-0000-0000-0000-000000000001','work_date','2026-10-06','kind','work','source_type','timer','state','ended',
+      'label_snapshot','日切测试','started_at',1791216000000,'ended_at',1791216060000,'duration_seconds',60,'created_at',1791216000000,
+      'updated_at',1791216060000,'version',1,'timer_chain_id',chain_id::text,'last_continuous_at',1791216060000,'segments','[]'::jsonb,'allocations','[]'::jsonb)
+  );
+  second_result:=timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002',
+    '44000000-0000-0000-0000-000000000002','timer_rollover_create','time_entry',
+    '74100000-0000-0000-0000-000000000002',null,
+    jsonb_build_object('id','74100000-0000-0000-0000-000000000002','work_date','2026-10-06','kind','work','source_type','timer','state','ended',
+      'label_snapshot','竞争候选','started_at',1791216000000,'ended_at',1791216060000,'duration_seconds',60,'created_at',1791216000000,
+      'updated_at',1791216060000,'version',1,'timer_chain_id',chain_id::text,'last_continuous_at',1791216060000,'segments','[]'::jsonb,'allocations','[]'::jsonb)
+  );
+  if not coalesce((second_result->>'superseded')::boolean,false)
+     or second_result->'authoritative'->>'id'<>'74100000-0000-0000-0000-000000000001' then
+    raise exception 'timer chain/date candidates did not converge to the first authoritative row';
+  end if;
+  if (select count(*) from timegenie.time_entries where timer_chain_id=chain_id and work_date='2026-10-06')<>1 then
+    raise exception 'timer chain/date uniqueness was not preserved';
+  end if;
+end $$;
+reset role;
+
+-- A stale session date must never close a later-started segment before its start.
+reset role;
+delete from timegenie.unassigned_segments
+where session_id in (select id from timegenie.unassigned_sessions where workspace_id='20000000-0000-0000-0000-000000000001' and state in ('collecting','awaiting_resolution'));
+delete from timegenie.unassigned_sessions
+where workspace_id='20000000-0000-0000-0000-000000000001' and state in ('collecting','awaiting_resolution');
+insert into timegenie.unassigned_sessions(
+  id,workspace_id,work_date,state,threshold_seconds,duration_seconds,first_started_at,shared_source,migration_state,created_at,updated_at,version,last_continuous_at
+) values(
+  '95200000-0000-0000-0000-000000000001','20000000-0000-0000-0000-000000000001','2026-10-04','collecting',300,0,
+  '2026-10-06 14:25:42+00','cloud','adopted','2026-10-06 14:25:42+00','2026-10-06 14:25:42+00',1,'2026-10-06 14:25:42+00'
+);
+insert into timegenie.unassigned_segments(id,workspace_id,session_id,sequence_no,started_at,duration_seconds,lease_token)
+values('95210000-0000-0000-0000-000000000001','20000000-0000-0000-0000-000000000001','95200000-0000-0000-0000-000000000001',1,'2026-10-06 14:25:42+00',0,'50000000-0000-0000-0000-000000000001');
+update timegenie.tracking_leases set holder_device_id='30000000-0000-0000-0000-000000000001',
+  lease_token='50000000-0000-0000-0000-000000000001',expires_at='2026-10-07 01:00:00+00',last_confirmed_at='2026-10-07 00:00:00+00'
+where workspace_id='20000000-0000-0000-0000-000000000001';
+select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+select timegenie.coordinate_unassigned_calendar_day_at(
+  '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+  '50000000-0000-0000-0000-000000000001','2026-10-07 00:00:00+00'
+);
+do $$
+begin
+  if exists(select 1 from timegenie.unassigned_segments where id='95210000-0000-0000-0000-000000000001' and ended_at<started_at) then
+    raise exception 'calendar rollover closed an unassigned segment before it started';
+  end if;
+  if not exists(select 1 from timegenie.unassigned_segments where id='95210000-0000-0000-0000-000000000001' and ended_at=started_at and duration_seconds=0) then
+    raise exception 'stale-date unassigned segment was not closed safely at zero duration';
+  end if;
+  if not exists(select 1 from timegenie.unassigned_sessions where id='95200000-0000-0000-0000-000000000001' and state='discarded' and resolution_type='discard' and resolved_at is not null) then
+    raise exception 'zero-duration stale session was not finalized with terminal metadata';
+  end if;
+end $$;
+
+-- Expired leases close the old open segment at the last confirmed boundary; a
+-- replacement lease starts a new segment at reacquire time and does not backfill.
+set local role authenticated;
+select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+do $$
+declare first_lease jsonb; second_lease jsonb; old_end timestamptz; new_start timestamptz; confirmed timestamptz;
+begin
+  first_lease:=timegenie.tracking_lease_acquire('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001','94000000-0000-0000-0000-000000000001');
+  reset role;
+  delete from timegenie.time_segments where entry_id in (select id from timegenie.time_entries where workspace_id='20000000-0000-0000-0000-000000000001' and state in ('running','paused'));
+  delete from timegenie.time_entries where workspace_id='20000000-0000-0000-0000-000000000001' and state in ('running','paused');
+  delete from timegenie.unassigned_segments where session_id in (select id from timegenie.unassigned_sessions where workspace_id='20000000-0000-0000-0000-000000000001' and state in ('collecting','awaiting_resolution'));
+  delete from timegenie.unassigned_sessions where workspace_id='20000000-0000-0000-0000-000000000001' and state in ('collecting','awaiting_resolution');
+  insert into timegenie.unassigned_sessions(id,workspace_id,work_date,state,threshold_seconds,duration_seconds,first_started_at,shared_source,migration_state,created_at,updated_at,version,last_continuous_at)
+  values('95000000-0000-0000-0000-000000000001','20000000-0000-0000-0000-000000000001',timegenie.workspace_work_date('20000000-0000-0000-0000-000000000001',clock_timestamp()),
+    'collecting',300,0,clock_timestamp()-interval '120 seconds','cloud','adopted',clock_timestamp()-interval '120 seconds',clock_timestamp(),1,clock_timestamp()-interval '90 seconds')
+  on conflict do nothing;
+  insert into timegenie.unassigned_segments(id,workspace_id,session_id,sequence_no,started_at,duration_seconds,lease_token)
+  values('95100000-0000-0000-0000-000000000001','20000000-0000-0000-0000-000000000001','95000000-0000-0000-0000-000000000001',1,clock_timestamp()-interval '120 seconds',0,'94000000-0000-0000-0000-000000000001')
+  on conflict do nothing;
+  update timegenie.unassigned_segments set started_at=clock_timestamp()-interval '120 seconds'
+  where lease_token='94000000-0000-0000-0000-000000000001' and ended_at is null;
+  update timegenie.tracking_leases set last_confirmed_at=clock_timestamp()-interval '90 seconds',expires_at=clock_timestamp()-interval '45 seconds'
+  where workspace_id='20000000-0000-0000-0000-000000000001' returning last_confirmed_at into confirmed;
+  set local role authenticated;
+  perform set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+  second_lease:=timegenie.tracking_lease_acquire('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002','94000000-0000-0000-0000-000000000002');
+  reset role;
+  select max(ended_at) into old_end from timegenie.unassigned_segments where lease_token='94000000-0000-0000-0000-000000000001';
+  select min(started_at) into new_start from timegenie.unassigned_segments where lease_token='94000000-0000-0000-0000-000000000002';
+  if old_end is null or abs(extract(epoch from (old_end-confirmed)))>0.01 then
+    raise exception 'expired lease counted beyond its last confirmed boundary: end %, confirmed %',old_end,confirmed;
+  end if;
+  if new_start is null or new_start<=old_end then raise exception 'replacement lease did not restart after the disconnected gap'; end if;
+end $$;
 reset role;
 
 -- Shared unassigned time has one root per workspace. Repeated create calls

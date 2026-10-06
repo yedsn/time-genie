@@ -1,4 +1,4 @@
-use chrono::{Datelike, Duration, Local, NaiveDate};
+use chrono::{Datelike, Duration, NaiveDate};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -267,11 +267,13 @@ fn save_rule_with_cloud_operation(
 ) -> Result<RecurrenceRuleDto, String> {
     validate_frequency(&request.frequency, request.weekdays_mask)?;
     let start = parse_date(&request.effective_start)?;
-    if start < Local::now().date_naive() {
-        return Err("VALIDATION_ERROR: 重复规则开始日期不能早于今天".to_string());
-    }
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
+    let now = now_millis();
+    let today = parse_date(&crate::work_calendar::current_work_date(&connection, now)?)?;
+    if start < today {
+        return Err("VALIDATION_ERROR: 重复规则开始日期不能早于今天".to_string());
+    }
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
@@ -282,13 +284,12 @@ fn save_rule_with_cloud_operation(
         request.task_expected_version,
     )?;
     let current = get_active_rule(&transaction, &workspace_id, &request.task_id)?;
-    let now = now_millis();
     let rule_id = if let Some(current) = current {
         if request.rule_expected_version != Some(current.version) {
             return Err("VERSION_CONFLICT: 重复规则已变化".to_string());
         }
         if current.effective_start == request.effective_start
-            || parse_date(&current.effective_start)? > Local::now().date_naive()
+            || parse_date(&current.effective_start)? > today
         {
             let changed = transaction
                 .execute(
@@ -748,6 +749,7 @@ mod tests {
         TaskStatusRequest,
     };
     use crate::time_tracking::{create_manual_entry, ManualEntryRequest};
+    use chrono::Local;
     use serde_json::json;
     use tempfile::tempdir;
 

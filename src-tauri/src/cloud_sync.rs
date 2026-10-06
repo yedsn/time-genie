@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use chrono::TimeZone;
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -597,8 +596,9 @@ struct SharedUnassignedPayload {
     id: String,
     state: String,
     version: i64,
+    #[serde(deserialize_with = "deserialize_millis")]
     first_started_at: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_millis")]
     resolved_at: Option<i64>,
     #[serde(default)]
     resolution_type: Option<String>,
@@ -613,10 +613,33 @@ struct SharedUnassignedSegmentPayload {
     id: String,
     session_id: String,
     sequence_no: i64,
+    #[serde(deserialize_with = "deserialize_millis")]
     started_at: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_millis")]
     ended_at: Option<i64>,
     duration_seconds: i64,
+}
+
+fn deserialize_millis<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    timestamp_value_millis(&value)
+        .ok_or_else(|| serde::de::Error::custom("expected Unix milliseconds or RFC 3339 timestamp"))
+}
+
+fn deserialize_optional_millis<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    timestamp_value_millis(&value)
+        .map(Some)
+        .ok_or_else(|| serde::de::Error::custom("expected Unix milliseconds or RFC 3339 timestamp"))
 }
 
 fn validate_shared_unassigned_payload(
@@ -648,16 +671,29 @@ fn validate_shared_unassigned_payload(
         }
     }
     for segment in &payload.segments {
-        if Uuid::parse_str(&segment.id).is_err()
-            || segment.session_id != payload.id
-            || segment.sequence_no < 1
-            || segment.started_at <= 0
-            || segment.duration_seconds < 0
-            || segment
-                .ended_at
-                .is_some_and(|ended_at| ended_at < segment.started_at)
+        let reason = if Uuid::parse_str(&segment.id).is_err() {
+            Some("分段 ID 无效")
+        } else if segment.session_id != payload.id {
+            Some("分段所属会话不匹配")
+        } else if segment.sequence_no < 1 {
+            Some("分段序号无效")
+        } else if segment.started_at <= 0 {
+            Some("分段开始时间无效")
+        } else if segment.duration_seconds < 0 {
+            Some("分段时长为负数")
+        } else if segment
+            .ended_at
+            .is_some_and(|ended_at| ended_at < segment.started_at)
         {
-            return Err("VALIDATION_ERROR: 共享未归属会话分段无效".to_string());
+            Some("分段结束时间早于开始时间")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(format!(
+                "VALIDATION_ERROR: 共享未归属会话分段无效: {reason}（序号 {}）",
+                segment.sequence_no
+            ));
         }
     }
     Ok(payload)
@@ -740,6 +776,10 @@ struct OutboxOperation {
 
 struct ActiveTimerEntryOverlay {
     entry_id: String,
+    timer_chain_id: Option<String>,
+    previous_entry_id: Option<String>,
+    split_boundary_at: Option<i64>,
+    last_continuous_at: Option<i64>,
     work_date: String,
     kind: String,
     source_type: String,
@@ -776,6 +816,7 @@ struct ActiveUnassignedSegmentOverlay {
 
 struct ActiveUnassignedSessionOverlay {
     session_id: String,
+    last_continuous_at: Option<i64>,
     work_date: String,
     state: String,
     threshold_seconds: i64,
@@ -1381,22 +1422,17 @@ fn ensure_next_shared_unassigned_session(
         .map_err(|error| error.to_string())?;
     if let Some((active_session_id, predecessor)) = active_session {
         if predecessor.as_deref() == Some(predecessor_session_id) {
+            let work_date = crate::work_calendar::work_date_at(
+                crate::work_calendar::workspace_timezone(transaction, workspace_id)?,
+                resolved_at,
+            )?;
             transaction
                 .execute(
                     "UPDATE unassigned_sessions
                      SET first_started_at=?1,work_date=?2,duration_seconds=0,
                          last_ended_at=NULL,prompted_at=NULL,updated_at=?1
                      WHERE id=?3",
-                    params![
-                        resolved_at,
-                        chrono::Local
-                            .timestamp_millis_opt(resolved_at)
-                            .single()
-                            .unwrap_or_else(chrono::Local::now)
-                            .format("%Y-%m-%d")
-                            .to_string(),
-                        active_session_id
-                    ],
+                    params![resolved_at, work_date, active_session_id],
                 )
                 .map_err(|error| error.to_string())?;
             transaction
@@ -1422,12 +1458,10 @@ fn ensure_next_shared_unassigned_session(
         .and_then(|value| serde_json::from_str(&value).ok())
         .unwrap_or(300);
     let session_id = Uuid::now_v7().to_string();
-    let work_date = chrono::Local
-        .timestamp_millis_opt(resolved_at)
-        .single()
-        .unwrap_or_else(chrono::Local::now)
-        .format("%Y-%m-%d")
-        .to_string();
+    let work_date = crate::work_calendar::work_date_at(
+        crate::work_calendar::workspace_timezone(transaction, workspace_id)?,
+        resolved_at,
+    )?;
     let inserted = transaction
         .execute(
             "INSERT OR IGNORE INTO unassigned_sessions(
@@ -1771,6 +1805,14 @@ fn apply_incremental_time_entry(
     data: &Value,
 ) -> rusqlite::Result<usize> {
     let entry_id = text(data, "id");
+    let source_type = text(data, "source_type");
+    let timer_chain_id = optional_text(data, "timer_chain_id")
+        .or_else(|| (source_type == "timer").then(|| entry_id.clone()));
+    let last_continuous_at = optional_millis(data, "last_continuous_at").or_else(|| {
+        optional_millis(data, "ended_at")
+            .or_else(|| optional_millis(data, "updated_at"))
+            .or_else(|| optional_millis(data, "started_at"))
+    });
     let origin_unassigned_session_id = optional_text(data, "origin_unassigned_session_id");
     transaction.execute(
         "DELETE FROM time_segments WHERE workspace_id=?1 AND entry_id=?2",
@@ -1780,7 +1822,7 @@ fn apply_incremental_time_entry(
         "DELETE FROM time_allocations WHERE workspace_id=?1 AND entry_id=?2",
         params![workspace_id, entry_id],
     )?;
-    let changed = transaction.execute("INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,default_task_id,label_snapshot,started_at,ended_at,duration_seconds,note,origin_unassigned_session_id,created_at,updated_at,version,deleted_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) ON CONFLICT(id) DO UPDATE SET work_date=excluded.work_date,kind=excluded.kind,source_type=excluded.source_type,state=excluded.state,default_task_id=excluded.default_task_id,label_snapshot=excluded.label_snapshot,started_at=excluded.started_at,ended_at=excluded.ended_at,duration_seconds=excluded.duration_seconds,note=excluded.note,origin_unassigned_session_id=excluded.origin_unassigned_session_id,updated_at=excluded.updated_at,version=excluded.version,deleted_at=excluded.deleted_at", params![entry_id,workspace_id,text(data,"work_date"),text(data,"kind"),text(data,"source_type"),text(data,"state"),optional_text(data,"default_task_id"),text(data,"label_snapshot"),millis(data,"started_at"),optional_millis(data,"ended_at"),integer(data,"duration_seconds"),optional_text(data,"note"),origin_unassigned_session_id,millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version"),optional_millis(data,"deleted_at")])?;
+    let changed = transaction.execute("INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,default_task_id,label_snapshot,started_at,ended_at,duration_seconds,note,origin_unassigned_session_id,created_at,updated_at,version,deleted_at,timer_chain_id,previous_entry_id,split_boundary_at,last_continuous_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21) ON CONFLICT(id) DO UPDATE SET work_date=excluded.work_date,kind=excluded.kind,source_type=excluded.source_type,state=excluded.state,default_task_id=excluded.default_task_id,label_snapshot=excluded.label_snapshot,started_at=excluded.started_at,ended_at=excluded.ended_at,duration_seconds=excluded.duration_seconds,note=excluded.note,origin_unassigned_session_id=excluded.origin_unassigned_session_id,updated_at=excluded.updated_at,version=excluded.version,deleted_at=excluded.deleted_at,timer_chain_id=excluded.timer_chain_id,previous_entry_id=excluded.previous_entry_id,split_boundary_at=excluded.split_boundary_at,last_continuous_at=excluded.last_continuous_at", params![entry_id,workspace_id,text(data,"work_date"),text(data,"kind"),source_type,text(data,"state"),optional_text(data,"default_task_id"),text(data,"label_snapshot"),millis(data,"started_at"),optional_millis(data,"ended_at"),integer(data,"duration_seconds"),optional_text(data,"note"),origin_unassigned_session_id,millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version"),optional_millis(data,"deleted_at"),timer_chain_id,optional_text(data,"previous_entry_id"),optional_millis(data,"split_boundary_at"),last_continuous_at])?;
     for row in data
         .get("segments")
         .and_then(Value::as_array)
@@ -1833,6 +1875,10 @@ fn apply_incremental_unassigned_session(
             .flatten()
             .is_some()
     });
+    let last_continuous_at = optional_millis(data, "last_continuous_at")
+        .or_else(|| optional_millis(data, "last_ended_at"))
+        .or_else(|| optional_millis(data, "updated_at"))
+        .or_else(|| optional_millis(data, "first_started_at"));
     transaction.execute(
         "UPDATE unassigned_segments
          SET ended_at=MAX(started_at,?1),
@@ -1919,8 +1965,8 @@ fn apply_incremental_unassigned_session(
            id,workspace_id,work_date,state,threshold_seconds,duration_seconds,
            first_started_at,last_ended_at,prompted_at,resolution_type,generated_entry_id,
            resolved_at,created_at,updated_at,version,shared_source,predecessor_session_id,
-           migration_state,resolution_operation_id
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,'cloud',?16,'adopted',?17)
+           migration_state,resolution_operation_id,last_continuous_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,'cloud',?16,'adopted',?17,?18)
          ON CONFLICT(id) DO UPDATE SET
            work_date=excluded.work_date,state=excluded.state,
            threshold_seconds=excluded.threshold_seconds,duration_seconds=excluded.duration_seconds,
@@ -1929,7 +1975,8 @@ fn apply_incremental_unassigned_session(
            generated_entry_id=excluded.generated_entry_id,resolved_at=excluded.resolved_at,
            updated_at=excluded.updated_at,version=excluded.version,shared_source='cloud',
            predecessor_session_id=excluded.predecessor_session_id,migration_state='adopted',
-           resolution_operation_id=excluded.resolution_operation_id",
+           resolution_operation_id=excluded.resolution_operation_id,
+           last_continuous_at=excluded.last_continuous_at",
         params![
             session_id,
             workspace_id,
@@ -1948,6 +1995,7 @@ fn apply_incremental_unassigned_session(
             integer(data, "version"),
             incoming_predecessor,
             optional_text(data, "resolution_operation_id"),
+            last_continuous_at,
         ],
     )?;
     transaction.execute(
@@ -2710,6 +2758,9 @@ fn push_outbox_locked(
                     {
                         adopt_shared_unassigned_resolution_result(database, operation, &value)?;
                     }
+                    if operation.entity_type == "time_entry" {
+                        adopt_authoritative_calendar_timer_result(database, operation, &value)?;
+                    }
                     delete_outbox(database, &operation.operation_id)?;
                     pushed += 1;
                 }
@@ -2744,6 +2795,85 @@ fn push_outbox_locked(
         pending,
         conflicts,
     })
+}
+
+fn adopt_authoritative_calendar_timer_result(
+    database: &Database,
+    operation: &OutboxOperation,
+    value: &Value,
+) -> Result<(), String> {
+    let Some(candidate_id) = operation.entity_id.as_deref() else {
+        return Ok(());
+    };
+    let authoritative = if value
+        .get("superseded")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        value.get("authoritative")
+    } else {
+        value.get("authoritative")
+    };
+    let Some(authoritative) = authoritative.filter(|row| !row.is_null()) else {
+        return Ok(());
+    };
+    let authoritative_id = authoritative
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "SYNC_ERROR: 权威计时切片缺少 ID".to_string())?;
+    if authoritative_id == candidate_id {
+        return Ok(());
+    }
+    let mut connection = database.open()?;
+    let local_workspace_id: String = connection
+        .query_row(
+            "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE time_entries SET timer_chain_id=NULL, deleted_at=COALESCE(deleted_at,updated_at) WHERE workspace_id=?1 AND id=?2",
+            params![local_workspace_id, candidate_id],
+        )
+        .map_err(|error| error.to_string())?;
+    apply_incremental_time_entry(&transaction, &local_workspace_id, authoritative)
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE time_allocations SET entry_id=?1 WHERE workspace_id=?2 AND entry_id=?3",
+            params![authoritative_id, local_workspace_id, candidate_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE time_entries SET previous_entry_id=?1 WHERE workspace_id=?2 AND previous_entry_id=?3",
+            params![authoritative_id, local_workspace_id, candidate_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE sync_outbox SET entity_id=?1 WHERE entity_id=?2 AND operation_id<>?3",
+            params![authoritative_id, candidate_id, operation.operation_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM time_segments WHERE workspace_id=?1 AND entry_id=?2",
+            params![local_workspace_id, candidate_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM time_entries WHERE workspace_id=?1 AND id=?2",
+            params![local_workspace_id, candidate_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 fn is_shared_unassigned_lifecycle_operation(operation: &OutboxOperation) -> bool {
@@ -2803,6 +2933,14 @@ fn adopt_shared_unassigned_rpc_result(database: &Database, value: &Value) -> Res
         )
         .map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+pub(crate) fn apply_remote_unassigned_session_for_test(
+    database: &Database,
+    value: &Value,
+) -> Result<(), String> {
+    adopt_shared_unassigned_rpc_result(database, value)
 }
 
 fn adopt_shared_unassigned_resolution_result(
@@ -3619,8 +3757,7 @@ fn rebase_recurrence_payload(
                     .and_then(Value::as_str)
                     .and_then(|value| chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
                     .ok_or_else(|| "CACHE_ERROR: 云端重复规则开始日期无效".to_string())?;
-                if active_start == desired_start || active_start > chrono::Local::now().date_naive()
-                {
+                if active_start == desired_start || active_start > desired_start {
                     let id = cloud_rules[index]
                         .get("id")
                         .and_then(Value::as_str)
@@ -4871,7 +5008,8 @@ fn local_tracking_overlay(
 
     let mut timer_entry_statement = transaction
         .prepare(
-            "SELECT id, work_date, kind, source_type, state, default_task_id,
+            "SELECT id, timer_chain_id, previous_entry_id, split_boundary_at,
+                    last_continuous_at, work_date, kind, source_type, state, default_task_id,
                     label_snapshot, started_at, ended_at, duration_seconds, note,
                     origin_unassigned_session_id, created_at, updated_at, version, deleted_at
              FROM time_entries
@@ -4882,21 +5020,25 @@ fn local_tracking_overlay(
         .query_map([workspace_id], |row| {
             Ok(ActiveTimerEntryOverlay {
                 entry_id: row.get(0)?,
-                work_date: row.get(1)?,
-                kind: row.get(2)?,
-                source_type: row.get(3)?,
-                state: row.get(4)?,
-                default_task_id: row.get(5)?,
-                label_snapshot: row.get(6)?,
-                started_at: row.get(7)?,
-                ended_at: row.get(8)?,
-                duration_seconds: row.get(9)?,
-                note: row.get(10)?,
-                origin_unassigned_session_id: row.get(11)?,
-                created_at: row.get(12)?,
-                updated_at: row.get(13)?,
-                version: row.get(14)?,
-                deleted_at: row.get(15)?,
+                timer_chain_id: row.get(1)?,
+                previous_entry_id: row.get(2)?,
+                split_boundary_at: row.get(3)?,
+                last_continuous_at: row.get(4)?,
+                work_date: row.get(5)?,
+                kind: row.get(6)?,
+                source_type: row.get(7)?,
+                state: row.get(8)?,
+                default_task_id: row.get(9)?,
+                label_snapshot: row.get(10)?,
+                started_at: row.get(11)?,
+                ended_at: row.get(12)?,
+                duration_seconds: row.get(13)?,
+                note: row.get(14)?,
+                origin_unassigned_session_id: row.get(15)?,
+                created_at: row.get(16)?,
+                updated_at: row.get(17)?,
+                version: row.get(18)?,
+                deleted_at: row.get(19)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -5009,7 +5151,7 @@ fn local_tracking_overlay(
 
     let mut session_statement = transaction
         .prepare(
-            "SELECT id, work_date, state, threshold_seconds, duration_seconds,
+            "SELECT id, last_continuous_at, work_date, state, threshold_seconds, duration_seconds,
                     first_started_at, last_ended_at, prompted_at, resolution_type,
                     generated_entry_id, resolved_at, created_at, updated_at, version
              FROM unassigned_sessions
@@ -5020,19 +5162,20 @@ fn local_tracking_overlay(
         .query_map([workspace_id], |row| {
             Ok(ActiveUnassignedSessionOverlay {
                 session_id: row.get(0)?,
-                work_date: row.get(1)?,
-                state: row.get(2)?,
-                threshold_seconds: row.get(3)?,
-                duration_seconds: row.get(4)?,
-                first_started_at: row.get(5)?,
-                last_ended_at: row.get(6)?,
-                prompted_at: row.get(7)?,
-                resolution_type: row.get(8)?,
-                generated_entry_id: row.get(9)?,
-                resolved_at: row.get(10)?,
-                created_at: row.get(11)?,
-                updated_at: row.get(12)?,
-                version: row.get(13)?,
+                last_continuous_at: row.get(1)?,
+                work_date: row.get(2)?,
+                state: row.get(3)?,
+                threshold_seconds: row.get(4)?,
+                duration_seconds: row.get(5)?,
+                first_started_at: row.get(6)?,
+                last_ended_at: row.get(7)?,
+                prompted_at: row.get(8)?,
+                resolution_type: row.get(9)?,
+                generated_entry_id: row.get(10)?,
+                resolved_at: row.get(11)?,
+                created_at: row.get(12)?,
+                updated_at: row.get(13)?,
+                version: row.get(14)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -5132,8 +5275,9 @@ fn restore_local_tracking_overlay(
                 "INSERT INTO unassigned_sessions(
                    id, workspace_id, work_date, state, threshold_seconds, duration_seconds,
                    first_started_at, last_ended_at, prompted_at, resolution_type,
-                   generated_entry_id, resolved_at, created_at, updated_at, version
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                   generated_entry_id, resolved_at, created_at, updated_at, version,
+                   last_continuous_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                  ON CONFLICT(id) DO UPDATE SET
                    work_date = excluded.work_date, state = excluded.state,
                    threshold_seconds = excluded.threshold_seconds,
@@ -5146,7 +5290,8 @@ fn restore_local_tracking_overlay(
                    resolved_at = excluded.resolved_at,
                    created_at = excluded.created_at,
                    updated_at = excluded.updated_at,
-                   version = excluded.version",
+                   version = excluded.version,
+                   last_continuous_at = excluded.last_continuous_at",
                 params![
                     session.session_id,
                     workspace_id,
@@ -5162,7 +5307,8 @@ fn restore_local_tracking_overlay(
                     session.resolved_at,
                     session.created_at,
                     session.updated_at,
-                    session.version
+                    session.version,
+                    session.last_continuous_at
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -5185,8 +5331,9 @@ fn restore_local_tracking_overlay(
                 "INSERT INTO time_entries(
                    id, workspace_id, work_date, kind, source_type, state, default_task_id,
                    label_snapshot, started_at, ended_at, duration_seconds, note,
-                   origin_unassigned_session_id, created_at, updated_at, version, deleted_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                   origin_unassigned_session_id, created_at, updated_at, version, deleted_at,
+                   timer_chain_id, previous_entry_id, split_boundary_at, last_continuous_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
                  ON CONFLICT(id) DO UPDATE SET
                    work_date = excluded.work_date,
                    kind = excluded.kind,
@@ -5201,7 +5348,11 @@ fn restore_local_tracking_overlay(
                    origin_unassigned_session_id = excluded.origin_unassigned_session_id,
                    updated_at = excluded.updated_at,
                    version = excluded.version,
-                   deleted_at = excluded.deleted_at",
+                   deleted_at = excluded.deleted_at,
+                   timer_chain_id = excluded.timer_chain_id,
+                   previous_entry_id = excluded.previous_entry_id,
+                   split_boundary_at = excluded.split_boundary_at,
+                   last_continuous_at = excluded.last_continuous_at",
                 params![
                     entry.entry_id,
                     workspace_id,
@@ -5219,7 +5370,11 @@ fn restore_local_tracking_overlay(
                     entry.created_at,
                     entry.updated_at,
                     entry.version,
-                    entry.deleted_at
+                    entry.deleted_at,
+                    entry.timer_chain_id,
+                    entry.previous_entry_id,
+                    entry.split_boundary_at,
+                    entry.last_continuous_at
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -5340,7 +5495,15 @@ fn replace_snapshot_table(
         }
         "time_entries" => {
             replace_simple_rows(transaction, table, workspace_id, rows, |tx, row, ws| {
-                tx.execute("INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,default_task_id,label_snapshot,started_at,ended_at,duration_seconds,note,origin_unassigned_session_id,created_at,updated_at,version,deleted_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)", params![text(row,"id"),ws,text(row,"work_date"),text(row,"kind"),text(row,"source_type"),text(row,"state"),optional_text(row,"default_task_id"),text(row,"label_snapshot"),millis(row,"started_at"),optional_millis(row,"ended_at"),integer(row,"duration_seconds"),optional_text(row,"note"),optional_text(row,"origin_unassigned_session_id"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version"),optional_millis(row,"deleted_at")])
+                let entry_id = text(row, "id");
+                let source_type = text(row, "source_type");
+                let timer_chain_id = optional_text(row, "timer_chain_id")
+                    .or_else(|| (source_type == "timer").then(|| entry_id.clone()));
+                let last_continuous_at = optional_millis(row, "last_continuous_at")
+                    .or_else(|| optional_millis(row, "ended_at"))
+                    .or_else(|| optional_millis(row, "updated_at"))
+                    .or_else(|| optional_millis(row, "started_at"));
+                tx.execute("INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,default_task_id,label_snapshot,started_at,ended_at,duration_seconds,note,origin_unassigned_session_id,created_at,updated_at,version,deleted_at,timer_chain_id,previous_entry_id,split_boundary_at,last_continuous_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)", params![entry_id,ws,text(row,"work_date"),text(row,"kind"),source_type,text(row,"state"),optional_text(row,"default_task_id"),text(row,"label_snapshot"),millis(row,"started_at"),optional_millis(row,"ended_at"),integer(row,"duration_seconds"),optional_text(row,"note"),optional_text(row,"origin_unassigned_session_id"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version"),optional_millis(row,"deleted_at"),timer_chain_id,optional_text(row,"previous_entry_id"),optional_millis(row,"split_boundary_at"),last_continuous_at])
             })?
         }
         "time_segments" => {
@@ -5355,7 +5518,11 @@ fn replace_snapshot_table(
         }
         "unassigned_sessions" => {
             replace_simple_rows(transaction, table, workspace_id, rows, |tx, row, ws| {
-                tx.execute("INSERT INTO unassigned_sessions(id,workspace_id,work_date,state,threshold_seconds,duration_seconds,first_started_at,last_ended_at,prompted_at,resolution_type,generated_entry_id,resolved_at,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)", params![text(row,"id"),ws,text(row,"work_date"),text(row,"state"),integer(row,"threshold_seconds"),integer(row,"duration_seconds"),millis(row,"first_started_at"),optional_millis(row,"last_ended_at"),optional_millis(row,"prompted_at"),optional_text(row,"resolution_type"),optional_text(row,"generated_entry_id"),optional_millis(row,"resolved_at"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version")])
+                let last_continuous_at = optional_millis(row, "last_continuous_at")
+                    .or_else(|| optional_millis(row, "last_ended_at"))
+                    .or_else(|| optional_millis(row, "updated_at"))
+                    .or_else(|| optional_millis(row, "first_started_at"));
+                tx.execute("INSERT INTO unassigned_sessions(id,workspace_id,work_date,state,threshold_seconds,duration_seconds,first_started_at,last_ended_at,prompted_at,resolution_type,generated_entry_id,resolved_at,created_at,updated_at,version,last_continuous_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)", params![text(row,"id"),ws,text(row,"work_date"),text(row,"state"),integer(row,"threshold_seconds"),integer(row,"duration_seconds"),millis(row,"first_started_at"),optional_millis(row,"last_ended_at"),optional_millis(row,"prompted_at"),optional_text(row,"resolution_type"),optional_text(row,"generated_entry_id"),optional_millis(row,"resolved_at"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version"),last_continuous_at])
             })?
         }
         "unassigned_segments" => {
@@ -5507,11 +5674,13 @@ fn optional_millis(value: &Value, key: &str) -> Option<i64> {
     if candidate.is_null() {
         return None;
     }
-    candidate.as_i64().or_else(|| {
-        candidate
-            .as_str()
-            .and_then(|value| parse_timestamp_millis(value))
-    })
+    timestamp_value_millis(candidate)
+}
+
+fn timestamp_value_millis(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(parse_timestamp_millis))
 }
 
 fn parse_timestamp_millis(value: &str) -> Option<i64> {
@@ -5876,6 +6045,92 @@ mod tests {
             local_workspace_id,
             subject_id,
         )
+    }
+
+    #[test]
+    fn authoritative_calendar_timer_replaces_conflicting_local_candidate_and_redirects_dependents()
+    {
+        let (_directory, database, cloud_workspace_id, local_workspace_id, _subject_id) =
+            cloud_database_for_incremental_test("calendar-timer-authoritative.sqlite3");
+        let connection = database.open().unwrap();
+        let device_id: String = connection
+            .query_row(
+                "SELECT id FROM devices WHERE workspace_id=?1 LIMIT 1",
+                [&local_workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let candidate_id = Uuid::now_v7().to_string();
+        let authoritative_id = Uuid::now_v7().to_string();
+        let chain_id = Uuid::now_v7().to_string();
+        let task_id: String = connection
+            .query_row(
+                "SELECT id FROM tasks WHERE workspace_id=?1 AND deleted_at IS NULL LIMIT 1",
+                [&local_workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| {
+                let subject_id: String = connection.query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0)).unwrap();
+                let id=Uuid::now_v7().to_string();
+                connection.execute("INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version) VALUES (?1,?2,?3,'候选映射','open','manual',1,1,1,1)",params![id,local_workspace_id,subject_id]).unwrap();
+                id
+            });
+        connection.execute("INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,default_task_id,label_snapshot,started_at,ended_at,duration_seconds,created_at,updated_at,version,timer_chain_id,last_continuous_at) VALUES (?1,?2,'2026-10-06','work','timer','ended',?3,'本地候选',1000,61000,60,1000,61000,1,?4,61000)",params![candidate_id,local_workspace_id,task_id,chain_id]).unwrap();
+        connection.execute("INSERT INTO time_segments(id,workspace_id,entry_id,sequence_no,started_at,ended_at,duration_seconds) VALUES (?1,?2,?3,1,1000,61000,60)",params![Uuid::now_v7().to_string(),local_workspace_id,candidate_id]).unwrap();
+        connection.execute("INSERT INTO time_allocations(id,workspace_id,entry_id,task_id,minutes,created_at,updated_at,version) VALUES (?1,?2,?3,?4,1,61000,61000,1)",params![Uuid::now_v7().to_string(),local_workspace_id,candidate_id,task_id]).unwrap();
+        let operation = OutboxOperation {
+            operation_id: Uuid::now_v7().to_string(),
+            operation_type: "timer_rollover_create".to_string(),
+            entity_type: "time_entry".to_string(),
+            entity_id: Some(candidate_id.clone()),
+            base_version: None,
+            payload_version: Some(1),
+            coalesced_count: 1,
+            depends_on_operation_id: None,
+            payload: json!({}),
+        };
+        connection.execute("INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,payload_json,state,attempt_count,created_at) VALUES (?1,?2,?3,'allocation_followup','time_entry',?4,'{}','pending',0,2)",params![Uuid::now_v7().to_string(),cloud_workspace_id,device_id,candidate_id]).unwrap();
+        drop(connection);
+        adopt_authoritative_calendar_timer_result(&database,&operation,&json!({
+            "superseded":true,
+            "authoritative":{
+                "id":authoritative_id,"work_date":"2026-10-06","kind":"work","source_type":"timer","state":"ended",
+                "default_task_id":task_id,"label_snapshot":"云端权威","started_at":1000,"ended_at":61000,"duration_seconds":60,
+                "created_at":1000,"updated_at":61000,"version":1,"timer_chain_id":chain_id,"last_continuous_at":61000,
+                "segments":[],"allocations":[]
+            }
+        })).unwrap();
+        let connection = database.open().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM time_entries WHERE id=?1",
+                    [candidate_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM time_entries WHERE id=?1",
+                    [authoritative_id.clone()],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT entity_id FROM sync_outbox WHERE operation_type='allocation_followup'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            authoritative_id
+        );
     }
 
     #[test]
@@ -6473,6 +6728,7 @@ mod tests {
             cloud_database_for_incremental_test("incremental-unassigned-hint.sqlite3");
         let device_id = storage_mode(&database).unwrap().device_id;
         let local_state = crate::unassigned::get_state(&database).unwrap().unwrap();
+        let work_date = local_state.work_date.clone();
         let remote_id = Uuid::now_v7().to_string();
         let now = now_millis();
         let domains = apply_incremental_entities(
@@ -6486,7 +6742,7 @@ mod tests {
                 remote_id.clone(),
                 false,
                 Some(json!({
-                    "id":remote_id,"work_date":"2026-10-06","state":"collecting",
+                    "id":remote_id,"work_date":work_date,"state":"collecting",
                     "threshold_seconds":300,"duration_seconds":1,"first_started_at":now,
                     "last_ended_at":null,"prompted_at":null,"resolution_type":null,
                     "generated_entry_id":null,"resolved_at":null,"created_at":now,
@@ -6553,6 +6809,60 @@ mod tests {
                 .unwrap_err()
                 .contains("缺少终态")
         );
+    }
+
+    #[test]
+    fn shared_unassigned_payload_accepts_postgrest_timestamp_strings() {
+        let session_id = Uuid::now_v7().to_string();
+        let segment_id = Uuid::now_v7().to_string();
+        let payload = json!({
+            "id": session_id,
+            "state": "resolved",
+            "version": 2,
+            "first_started_at": "2026-10-04T16:08:51.957933+00:00",
+            "resolved_at": "2026-10-04T16:09:51.957933+00:00",
+            "resolution_type": "work",
+            "predecessor_session_id": null,
+            "segments": [{
+                "id": segment_id,
+                "session_id": session_id,
+                "sequence_no": 1,
+                "started_at": "2026-10-04T16:08:51.957933+00:00",
+                "ended_at": "2026-10-04T16:09:51.957933+00:00",
+                "duration_seconds": 60
+            }]
+        });
+
+        let parsed = validate_shared_unassigned_payload(&session_id, &payload).unwrap();
+        assert_eq!(parsed.first_started_at, 1_791_130_131_957);
+        assert_eq!(parsed.resolved_at, Some(1_791_130_191_957));
+        assert_eq!(parsed.segments[0].started_at, parsed.first_started_at);
+        assert_eq!(parsed.segments[0].ended_at, parsed.resolved_at);
+    }
+
+    #[test]
+    fn shared_unassigned_payload_reports_reversed_segment_boundary() {
+        let session_id = Uuid::now_v7().to_string();
+        let payload = json!({
+            "id": session_id,
+            "state": "awaiting_resolution",
+            "version": 2,
+            "first_started_at": "2026-10-04T16:09:51.957933+00:00",
+            "resolved_at": null,
+            "resolution_type": null,
+            "segments": [{
+                "id": Uuid::now_v7().to_string(),
+                "session_id": session_id,
+                "sequence_no": 132,
+                "started_at": "2026-10-06T14:25:42.110728+00:00",
+                "ended_at": "2026-10-04T16:00:00+00:00",
+                "duration_seconds": 0
+            }]
+        });
+
+        let error = validate_shared_unassigned_payload(&session_id, &payload).unwrap_err();
+        assert!(error.contains("结束时间早于开始时间"));
+        assert!(error.contains("序号 132"));
     }
 
     #[test]
@@ -7205,6 +7515,171 @@ mod tests {
     }
 
     #[test]
+    fn calendar_day_fields_are_compatible_across_incremental_snapshot_and_payloads() {
+        let (_directory, database, cloud_workspace_id, local_workspace_id, _subject_id) =
+            cloud_database_for_incremental_test("calendar-day-protocol.sqlite3");
+        let device_id = storage_mode(&database).unwrap().device_id;
+        let now = now_millis();
+        let legacy_entry_id = Uuid::now_v7().to_string();
+        let modern_entry_id = Uuid::now_v7().to_string();
+        let legacy_session_id = Uuid::now_v7().to_string();
+        let modern_chain_id = Uuid::now_v7().to_string();
+        let modern_boundary = now - 30_000;
+
+        let legacy_entry = json!({
+            "id": legacy_entry_id, "work_date": "2026-10-05",
+            "kind": "work", "source_type": "timer", "state": "ended",
+            "default_task_id": null, "label_snapshot": "旧计时",
+            "started_at": now - 60_000, "ended_at": now, "duration_seconds": 60,
+            "note": null, "origin_unassigned_session_id": null,
+            "created_at": now - 60_000, "updated_at": now, "version": 1,
+            "deleted_at": null, "segments": [], "allocations": []
+        });
+        let modern_entry = json!({
+            "id": modern_entry_id, "timer_chain_id": modern_chain_id,
+            "previous_entry_id": legacy_entry_id, "split_boundary_at": modern_boundary,
+            "last_continuous_at": now, "work_date": "2026-10-06",
+            "kind": "work", "source_type": "timer", "state": "ended",
+            "default_task_id": null, "label_snapshot": "新计时",
+            "started_at": modern_boundary, "ended_at": now, "duration_seconds": 30,
+            "note": null, "origin_unassigned_session_id": null,
+            "created_at": modern_boundary, "updated_at": now, "version": 1,
+            "deleted_at": null, "segments": [], "allocations": []
+        });
+        let legacy_session = json!({
+            "id": legacy_session_id, "work_date": "2026-10-05",
+            "state": "resolved", "threshold_seconds": 300, "duration_seconds": 60,
+            "first_started_at": now - 60_000, "last_ended_at": now,
+            "prompted_at": null, "resolution_type": "discard",
+            "generated_entry_id": null, "resolved_at": now,
+            "created_at": now - 60_000, "updated_at": now, "version": 1,
+            "predecessor_session_id": null, "resolution_operation_id": null,
+            "segments": []
+        });
+        apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &device_id,
+            10,
+            &[
+                incremental_entity(
+                    "time_entries",
+                    "time_entries",
+                    legacy_entry_id.clone(),
+                    false,
+                    Some(legacy_entry),
+                ),
+                incremental_entity(
+                    "time_entries",
+                    "time_entries",
+                    modern_entry_id.clone(),
+                    false,
+                    Some(modern_entry),
+                ),
+                incremental_entity(
+                    "unassigned_sessions",
+                    "unassigned_sessions",
+                    legacy_session_id.clone(),
+                    false,
+                    Some(legacy_session),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let legacy_fields: (String, i64) = connection
+            .query_row(
+                "SELECT timer_chain_id,last_continuous_at FROM time_entries WHERE id=?1",
+                [&legacy_entry_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy_fields, (legacy_entry_id.clone(), now));
+        let modern_fields: (String, String, i64, i64) = connection.query_row(
+            "SELECT timer_chain_id,previous_entry_id,split_boundary_at,last_continuous_at FROM time_entries WHERE id=?1",
+            [&modern_entry_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(
+            modern_fields,
+            (
+                modern_chain_id.clone(),
+                legacy_entry_id.clone(),
+                modern_boundary,
+                now
+            )
+        );
+        let session_continuity: i64 = connection
+            .query_row(
+                "SELECT last_continuous_at FROM unassigned_sessions WHERE id=?1",
+                [&legacy_session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_continuity, now);
+        drop(connection);
+
+        let payload = entity_payload(&database, "time_entry", Some(&modern_entry_id)).unwrap();
+        assert_eq!(payload["timer_chain_id"], json!(modern_chain_id));
+        assert_eq!(payload["previous_entry_id"], json!(legacy_entry_id));
+        assert_eq!(payload["split_boundary_at"], json!(modern_boundary));
+        assert_eq!(payload["last_continuous_at"], json!(now));
+
+        let snapshot_entry_id = Uuid::now_v7().to_string();
+        let snapshot_session_id = Uuid::now_v7().to_string();
+        let snapshot = json!({
+            "time_entries": [{
+                "id": snapshot_entry_id, "work_date": "2026-10-04",
+                "kind": "work", "source_type": "timer", "state": "ended",
+                "default_task_id": null, "label_snapshot": "旧快照",
+                "started_at": now - 120_000, "ended_at": now - 60_000,
+                "duration_seconds": 60, "note": null,
+                "origin_unassigned_session_id": null, "created_at": now - 120_000,
+                "updated_at": now - 60_000, "version": 1, "deleted_at": null
+            }],
+            "unassigned_sessions": [{
+                "id": snapshot_session_id, "work_date": "2026-10-04",
+                "state": "discarded", "threshold_seconds": 300,
+                "duration_seconds": 0, "first_started_at": now - 120_000,
+                "last_ended_at": now - 60_000, "prompted_at": null,
+                "resolution_type": "discard", "generated_entry_id": null,
+                "resolved_at": now - 60_000, "created_at": now - 120_000,
+                "updated_at": now - 60_000, "version": 1
+            }]
+        });
+        let mut connection = database.open().unwrap();
+        let transaction = connection.transaction().unwrap();
+        replace_snapshot_table(&transaction, &snapshot, "time_entries", &local_workspace_id)
+            .unwrap();
+        replace_snapshot_table(
+            &transaction,
+            &snapshot,
+            "unassigned_sessions",
+            &local_workspace_id,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let connection = database.open().unwrap();
+        let snapshot_chain: String = connection
+            .query_row(
+                "SELECT timer_chain_id FROM time_entries WHERE id=?1",
+                [&snapshot_entry_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let snapshot_continuity: i64 = connection
+            .query_row(
+                "SELECT last_continuous_at FROM unassigned_sessions WHERE id=?1",
+                [&snapshot_session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(snapshot_chain, snapshot_entry_id);
+        assert_eq!(snapshot_continuity, now - 60_000);
+    }
+
+    #[test]
     fn planning_payload_validation_covers_composite_ids_dates_and_actions() {
         let task_id = Uuid::now_v7().to_string();
         let estimate_id = format!("{task_id}|2026-10-05");
@@ -7747,7 +8222,10 @@ mod tests {
             .iter()
             .find(|row| row.2 == "unassigned_session")
             .unwrap();
-        assert_eq!(unassigned.1, "unassigned_session_create");
+        assert!(matches!(
+            unassigned.1.as_str(),
+            "unassigned_session_create" | "unassigned_session_resume"
+        ));
     }
 
     #[test]
@@ -9632,7 +10110,7 @@ mod tests {
 
         let now = now_millis();
         let snapshot = json!({
-            "unassigned_sessions": [{"id": state.session_id, "work_date": "2026-10-04", "state": "collecting", "threshold_seconds": 300, "duration_seconds": 0, "first_started_at": state.first_started_at, "last_ended_at": null, "prompted_at": null, "resolution_type": null, "generated_entry_id": null, "resolved_at": null, "created_at": now, "updated_at": now, "version": state.version}],
+            "unassigned_sessions": [{"id": state.session_id, "work_date": state.work_date, "state": "collecting", "threshold_seconds": 300, "duration_seconds": 0, "first_started_at": state.first_started_at, "last_ended_at": null, "prompted_at": null, "resolution_type": null, "generated_entry_id": null, "resolved_at": null, "created_at": now, "updated_at": now, "version": state.version}],
             "unassigned_segments": []
         });
         apply_snapshot(&database, &snapshot, None, None, None).unwrap();

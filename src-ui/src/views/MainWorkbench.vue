@@ -92,6 +92,7 @@ const settingsDraft = reactive({
   subjectName: "默认",
   salaryHourlyRate: 0,
   reportDurationFormat: "minutes" as "minutes" | "hours",
+  timezone: "Asia/Shanghai",
   appTheme: "forest" as AppTheme,
   completionFeedbackEnabled: true,
   completionFeedbackSoundEnabled: true,
@@ -415,6 +416,7 @@ async function loadSettings() {
     settingsDraft.subjectName = store.subjects.find((subject) => subject.id === settingString("shared", "default_subject_id"))?.name ?? "默认";
     settingsDraft.salaryHourlyRate = settingNumber("shared", "salary_hourly_rate");
     settingsDraft.reportDurationFormat = settingString("shared", "report_duration_format", "minutes") === "hours" ? "hours" : "minutes";
+    settingsDraft.timezone = settingString("shared", "timezone", store.workspaceTimezone);
     const appTheme = settingString("device", "app_theme", "forest");
     settingsDraft.appTheme = isAppTheme(appTheme) ? appTheme : "forest";
     applyAppTheme(settingsDraft.appTheme, true);
@@ -455,6 +457,8 @@ async function saveSettings() {
     if (settingsDraft.storageMode === "local") storageState.value = await setLocalStorageMode();
     await updateSetting("shared", "salary_hourly_rate", Number(settingsDraft.salaryHourlyRate) || 0);
     await updateSetting("shared", "report_duration_format", settingsDraft.reportDurationFormat);
+    await updateSetting("shared", "timezone", settingsDraft.timezone);
+    await store.refreshWorkspaceCalendar();
     const integration = settingsSnapshot.value?.integrations.seatable;
     settingsSnapshot.value = await updateIntegrationConfig("seatable", Boolean(settingsDraft.seatableServerUrl), {
       serverUrl: settingsDraft.seatableServerUrl,
@@ -1047,7 +1051,7 @@ async function openSeaTableSync() {
   try {
     seaTablePreview.value = await previewSeaTableTaskSync({
       subjectId: store.selectedSubjectId,
-      workDate: formatLocalDate(new Date()),
+      workDate: store.workspaceToday,
       taskIds: store.selectedSubjectTasks.map((task) => task.id),
     });
     seaTableResult.value = undefined;
@@ -1271,6 +1275,7 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           :recent-completed-id="recentCompletedTaskId"
           :running-task-id="store.runningEntry?.defaultTask"
           :format-minutes="formatMinutes"
+          :today-date="store.workspaceToday"
           @select="store.selectedTaskId = $event"
           @add="store.addTask('', store.selectedSubjectId)"
           @add-child="store.addChildTask"
@@ -1333,6 +1338,17 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           <label>日报路径规则<input v-model="settingsDraft.obsidianDailyPathPattern" :disabled="!settingsLoaded" placeholder="工作日报/{date}.md" /></label>
           <label>默认主体<input v-model="settingsDraft.subjectName" disabled /></label>
           <label>工资时薪<input v-model.number="settingsDraft.salaryHourlyRate" :disabled="!settingsLoaded" min="0" type="number" /></label>
+          <div class="settings-choice-field">
+            <span>工作空间时区</span>
+            <select v-model="settingsDraft.timezone" :disabled="!settingsLoaded">
+              <option value="Asia/Shanghai">中国标准时间（Asia/Shanghai）</option>
+              <option value="Asia/Tokyo">日本标准时间（Asia/Tokyo）</option>
+              <option value="Europe/London">英国时间（Europe/London）</option>
+              <option value="America/New_York">美国东部时间（America/New_York）</option>
+              <option value="America/Los_Angeles">美国西部时间（America/Los_Angeles）</option>
+            </select>
+            <small class="settings-hint">工作空间时区决定“今天”和每天零点。修改后只影响后续日期边界，不会重写已有工时、轮次或报告。</small>
+          </div>
           <div class="settings-choice-field">
             <span>报告时长格式</span>
             <div class="settings-segmented" role="radiogroup" aria-label="报告时长格式">

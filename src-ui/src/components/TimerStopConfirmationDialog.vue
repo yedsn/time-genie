@@ -20,7 +20,7 @@ const defaultTask = computed(() => {
   const taskId = entry.value?.defaultTask;
   return store.tasks.find((task) => task.id === taskId && task.selectable && task.status !== "done");
 });
-const canUseDefaultTask = computed(() => Boolean(defaultTask.value && entry.value && entry.value.minutes > 0));
+const canUseDefaultTask = computed(() => Boolean(defaultTask.value && store.timerStopConfirmationSlices.some((slice) => slice.minutes > 0)));
 const defaultTaskLabel = computed(() => store.taskDisplayLabel(entry.value?.defaultTask));
 
 watch(() => store.timerStopConfirmationEntryId, () => {
@@ -85,22 +85,29 @@ function errorText(error: unknown, fallback: string) {
       <div class="timer-stop-confirm-head">
         <span class="timer-stop-confirm-icon"><TimerReset :size="20" /></span>
         <div>
-          <h2>确认本段归属</h2>
-          <p>计时已经结束，可以按默认事项保存，也可以进入计时页面调整。</p>
+          <h2>确认本次计时归属</h2>
+          <p>跨日计时已按日期拆分保存，可一次确认整条计时。</p>
         </div>
       </div>
 
       <div class="timer-stop-confirm-summary">
-        <span>本段用时</span>
-        <strong>{{ formatMinutes(entry.minutes) }}</strong>
+        <span>本次用时</span>
+        <strong>{{ formatMinutes(store.timerStopConfirmation?.totalSettlementMinutes ?? entry.minutes) }}</strong>
         <small>{{ store.timeEntryLabel(entry) }}</small>
+      </div>
+
+      <div v-if="store.timerStopConfirmationSlices.length > 1" class="timer-stop-chain-slices">
+        <div v-for="slice in store.timerStopConfirmationSlices" :key="slice.id" class="timer-stop-chain-slice">
+          <span>{{ slice.workDate }}</span>
+          <strong>{{ formatMinutes(slice.minutes) }}</strong>
+        </div>
       </div>
 
       <section class="timer-stop-default-allocation" :class="{ disabled: !canUseDefaultTask }">
         <div>
           <span>默认归属</span>
           <strong>{{ canUseDefaultTask ? defaultTaskLabel : '需要选择具体事项' }}</strong>
-          <small>{{ canUseDefaultTask ? `保存 ${formatMinutes(entry.minutes)} 到该事项` : '当前计时没有有效默认事项，请进入计时页面调整' }}</small>
+          <small>{{ canUseDefaultTask ? `按日期分别保存到该事项，共 ${formatMinutes(store.timerStopConfirmation?.totalSettlementMinutes ?? entry.minutes)}` : '当前计时没有有效默认事项，请进入计时页面调整' }}</small>
         </div>
         <label class="allocation-complete-toggle" title="保存工时时同时完成这个事项">
           <input v-model="completeTask" :disabled="!canUseDefaultTask || saving" type="checkbox" />
