@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { rmSync } from "node:fs";
 
 const modulePath = resolve(".tmp-cloud-sync-presentation-test/cloudSyncPresentation.js");
-const { cloudSyncPresentation, cloudSyncRetryFeedback } = await import(pathToFileURL(modulePath));
+const { cloudSaveStatusLabel, cloudSyncPresentation, cloudSyncRetryFeedback } = await import(pathToFileURL(modulePath));
 
 const formatSyncTime = (value) => `time:${value}`;
 const cloud = {
@@ -28,6 +28,15 @@ assert.deepEqual(cloudSyncPresentation({ ...cloud, mode: "local" }, formatSyncTi
   needsAttention: false,
   attentionLevel: "",
 });
+
+assert.equal(cloudSaveStatusLabel(undefined), "仅保存在本机");
+assert.equal(cloudSaveStatusLabel({ ...cloud, mode: "local" }), "仅保存在本机");
+assert.equal(cloudSaveStatusLabel({ ...cloud, pendingOperations: 3 }), "还有 3 项待保存");
+assert.equal(cloudSaveStatusLabel({ ...cloud, conflictCount: 1 }), "还有 1 项待保存");
+assert.equal(cloudSaveStatusLabel({ ...cloud, pendingOperations: 2, conflictCount: 1 }), "还有 3 项待保存");
+assert.equal(cloudSaveStatusLabel({ ...cloud, lastError: "网络失败" }), "保存失败");
+assert.equal(cloudSaveStatusLabel({ ...cloud, online: false }), "云端连接不可用");
+assert.equal(cloudSaveStatusLabel(cloud), "所有更改均已保存");
 
 const conflict = cloudSyncPresentation({ ...cloud, online: false, lastError: "网络失败", pendingOperations: 3, conflictCount: 2 }, formatSyncTime);
 assert.equal(conflict.label, "2 项冲突，3 项待处理");

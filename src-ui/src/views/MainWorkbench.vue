@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
-import { AlertTriangle, CalendarDays, CheckCircle2, Clock3, Copy, Database, FileText, Home, LoaderCircle, Minus, Pencil, Plus, RefreshCw, Settings, Square, UserRound, X } from "lucide-vue-next";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { AlertTriangle, CalendarDays, CheckCircle2, Clock3, Copy, Database, FileText, Home, LoaderCircle, Minus, Pencil, Plus, RefreshCw, Save, Settings, Square, UserRound, X } from "lucide-vue-next";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useWorkdayStore, type Task } from "../store";
-import { checkAppUpdate, closeMainWindow, confirmObsidianPlan, configureCloud, downloadAndInstallUpdate, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listCloudSyncConflicts, listCloudSyncQueue, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onTrayCheckUpdate, previewObsidianPlan, previewSeaTableTaskSync, previewStorageMigration, refreshCloudSync, registerCloudDevice, resetLocalCacheFromCloud, resolveAllCloudSyncConflicts, restartApp, resumeCloudSyncAfterReauth, retryFailedSeaTableSync, revokeCloudDevice, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudSessionSnapshot, type CloudSyncConflict, type CloudSyncQueueItem, type PlanImportPreviewResult, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
+import { checkAppUpdate, closeMainWindow, confirmObsidianPlan, configureCloud, downloadAndInstallUpdate, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listCloudSyncConflicts, listCloudSyncQueue, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onTrayCheckUpdate, previewObsidianPlan, previewSeaTableTaskSync, previewStorageMigration, registerCloudDevice, resetLocalCacheFromCloud, resolveAllCloudSyncConflicts, restartApp, resumeCloudSyncAfterReauth, retryFailedSeaTableSync, revokeCloudDevice, saveCloudSync, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudSessionSnapshot, type CloudSyncConflict, type CloudSyncQueueItem, type PlanImportPreviewResult, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
 import PlanListEditor from "../components/PlanListEditor.vue";
 import GlobalTimerBar from "../components/GlobalTimerBar.vue";
 import UnassignedTimeIndicator from "../components/UnassignedTimeIndicator.vue";
@@ -14,7 +14,7 @@ import ReportWorkspace from "../components/ReportWorkspace.vue";
 import AutomationHooksSettings from "../components/AutomationHooksSettings.vue";
 import TimerStopConfirmationDialog from "../components/TimerStopConfirmationDialog.vue";
 import appIconUrl from "../../../src-tauri/icons/icon.svg";
-import { cloudSyncPresentation } from "../services/cloudSyncPresentation";
+import { cloudSaveStatusLabel, cloudSyncPresentation } from "../services/cloudSyncPresentation";
 import { cloudSessionLabel, cloudSessionNeedsPassword } from "../services/cloudSessionPresentation";
 import { cloudDeviceActionDisabled, cloudDeviceActionLabel, cloudDeviceKind, runConfirmedCloudAction } from "../services/cloudDevicePresentation";
 import { isCompletionFeedbackEnabled, playCompletionFeedback, setCompletionFeedbackEnabled, setCompletionFeedbackSoundEnabled } from "../services/completionFeedback";
@@ -61,6 +61,7 @@ const cloudWorking = ref(false);
 const cloudSession = ref<CloudSessionSnapshot>();
 const cloudDevices = ref<CloudDevice[]>([]);
 const storageState = ref<StorageModeSnapshot>();
+const visibleCloudSaveState = ref<StorageModeSnapshot>();
 const migrationPreview = ref<StorageMigrationPreview>();
 const cloudSyncWorking = ref(false);
 const cloudConflictDialogOpen = ref(false);
@@ -145,6 +146,8 @@ let unlistenNavigatePage: (() => void) | undefined;
 let unlistenCloudSyncState: (() => void) | undefined;
 let unlistenTrayCheckUpdate: (() => void) | undefined;
 let unlistenAppUpdateEvent: (() => void) | undefined;
+let cloudSaveSettledTimer: number | undefined;
+let cloudSavePendingSince = 0;
 const completingTaskIds = new Set<string>();
 const recentCompletedTaskId = ref("");
 let recentCompletedTimer: number | undefined;
@@ -154,17 +157,16 @@ const cloudSyncLabel = computed(() => cloudSyncView.value.label);
 const cloudSyncDetail = computed(() => cloudSyncView.value.detail);
 const cloudSyncNeedsAttention = computed(() => cloudSyncView.value.needsAttention);
 const cloudSyncAttentionLevel = computed(() => cloudSyncView.value.attentionLevel);
+const cloudSaveView = computed(() => cloudSyncPresentation(visibleCloudSaveState.value, formatSyncTime));
+const cloudSaveLabel = computed(() => cloudSaveStatusLabel(visibleCloudSaveState.value));
+const cloudSaveNeedsAttention = computed(() => cloudSaveView.value.needsAttention);
+const cloudSaveAttentionLevel = computed(() => cloudSaveView.value.attentionLevel);
 const cloudAccountLabel = computed(() => {
   if (storageState.value?.mode !== "cloud") return "本地模式";
   return cloudSessionLabel(cloudSession.value);
 });
 const cloudNeedsReauth = computed(() => cloudSessionNeedsPassword(cloudSession.value));
 const cloudAuthBlocked = computed(() => Boolean(storageState.value?.authBlocked));
-const cloudDockDetail = computed(() => {
-  if (cloudSyncDetail.value) return cloudSyncDetail.value;
-  if (storageState.value?.mode === "cloud") return `变更序号 ${storageState.value.lastChangeSeq}`;
-  return "数据只保存在本机";
-});
 const cloudDockSyncDisabled = computed(() => cloudSyncWorking.value);
 const cloudDockRequiresStorageAttention = computed(() => (
   storageState.value?.mode !== "cloud"
@@ -179,14 +181,60 @@ const cloudDockSyncTitle = computed(() => {
   if (!cloudSession.value?.signedIn) return "前往数据存储设置登录";
   if (storageState.value.conflictCount > 0) return "前往数据存储设置处理同步冲突";
   if (!storageState.value.online || storageState.value.authBlocked || storageState.value.lastError) return "前往数据存储设置处理同步异常";
-  return "实时同步正常，无需手动操作";
+  return "立即保存并同步到云端";
 });
 const cloudDockSyncLabel = computed(() => {
   if (storageState.value?.mode !== "cloud" || !cloudSession.value?.signedIn) return "设置";
   if (storageState.value.conflictCount) return "处理冲突";
   if (!storageState.value.online || storageState.value.authBlocked || storageState.value.lastError) return "处理异常";
-  return "实时";
+  return "保存";
 });
+
+const CLOUD_SAVE_PENDING_MIN_VISIBLE_MS = 650;
+
+function hasVisiblePendingSave(state: StorageModeSnapshot | undefined): boolean {
+  return Boolean(state?.mode === "cloud" && state.pendingOperations > 0 && state.conflictCount === 0);
+}
+
+function updateVisibleCloudSaveState(state: StorageModeSnapshot | undefined) {
+  if (cloudSaveSettledTimer) {
+    window.clearTimeout(cloudSaveSettledTimer);
+    cloudSaveSettledTimer = undefined;
+  }
+
+  if (!state) {
+    visibleCloudSaveState.value = undefined;
+    cloudSavePendingSince = 0;
+    return;
+  }
+
+  if (hasVisiblePendingSave(state)) {
+    if (!hasVisiblePendingSave(visibleCloudSaveState.value)) cloudSavePendingSince = Date.now();
+    visibleCloudSaveState.value = state;
+    return;
+  }
+
+  const shouldShowSettledImmediately = state.mode !== "cloud"
+    || state.conflictCount > 0
+    || Boolean(state.lastError)
+    || state.syncState === "error"
+    || !state.online;
+  const elapsed = Date.now() - cloudSavePendingSince;
+  const remaining = CLOUD_SAVE_PENDING_MIN_VISIBLE_MS - elapsed;
+  if (!shouldShowSettledImmediately && hasVisiblePendingSave(visibleCloudSaveState.value) && remaining > 0) {
+    cloudSaveSettledTimer = window.setTimeout(() => {
+      visibleCloudSaveState.value = state;
+      cloudSavePendingSince = 0;
+      cloudSaveSettledTimer = undefined;
+    }, remaining);
+    return;
+  }
+
+  visibleCloudSaveState.value = state;
+  cloudSavePendingSince = 0;
+}
+
+watch(storageState, updateVisibleCloudSaveState, { immediate: true });
 const cloudBusinessEntities = new Set([
   "tasks",
   "task_daily_estimates",
@@ -529,8 +577,16 @@ async function wakeCloudSync(showFeedback: boolean) {
   if (storageState.value?.mode !== "cloud" || cloudSyncWorking.value) return;
   cloudSyncWorking.value = true;
   try {
-    await refreshCloudSync();
-    if (showFeedback) ElMessage.success("已唤醒后台重试，可继续使用应用");
+    const result = await saveCloudSync();
+    storageState.value = await getCloudSyncStatus();
+    if (result.conflicts > 0 || storageState.value.conflictCount > 0) {
+      if (showFeedback) ElMessage.warning("保存遇到版本冲突，请先处理冲突");
+    } else if (result.pending > 0 || storageState.value.pendingOperations > 0) {
+      const pending = Math.max(result.pending, storageState.value.pendingOperations);
+      if (showFeedback) ElMessage.warning(`本机修改已保存，仍有 ${pending} 项等待同步`);
+    } else if (showFeedback) {
+      ElMessage.success(result.pushed > 0 ? `保存成功，已同步 ${result.pushed} 项修改` : "保存成功");
+    }
   } catch (error) {
     if (showFeedback) ElMessage.error(error instanceof Error ? error.message : String(error));
   } finally {
@@ -618,7 +674,7 @@ async function handleCloudDockSync() {
     await openCloudAccountSettings();
     return;
   }
-  return;
+  await wakeCloudSync(true);
 }
 
 async function resolveAllConflicts(strategy: "use_cloud" | "keep_local") {
@@ -854,6 +910,7 @@ onMounted(async () => {
     if (pages.some((item) => item.id === page)) store.activePage = page;
   });
   unlistenCloudSyncState = await onCloudSyncStateChanged((state) => {
+    updateVisibleCloudSaveState(state);
     storageState.value = state;
     void refreshOpenCloudSyncQueue();
   });
@@ -870,6 +927,7 @@ onUnmounted(() => {
   unlistenTrayCheckUpdate?.();
   unlistenAppUpdateEvent?.();
   if (recentCompletedTimer) window.clearTimeout(recentCompletedTimer);
+  if (cloudSaveSettledTimer) window.clearTimeout(cloudSaveSettledTimer);
 });
 
 function openSubjectDialog() {
@@ -1380,22 +1438,22 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
         </div>
       </section>
       </div>
-      <footer class="sync-status-dock" aria-label="同步状态">
+      <footer class="sync-status-dock" aria-label="保存状态">
         <div class="sync-status-main" :class="[cloudSyncAttentionLevel, { working: cloudSyncWorking }]">
           <button class="sync-user-pill" type="button" :title="`${cloudAccountLabel}，点击管理账号`" @click="openCloudAccountSettings"><UserRound :size="14" /><strong>{{ cloudAccountLabel }}</strong></button>
-          <button class="sync-state-pill" :class="[cloudSyncAttentionLevel, { synced: storageState?.mode === 'cloud' && !cloudSyncNeedsAttention }]" type="button" :title="`${cloudSyncDetail || cloudSyncLabel}，点击查看待同步列表`" @click="openCloudSyncQueue">
+          <button class="sync-state-pill" :class="[cloudSaveAttentionLevel, { synced: visibleCloudSaveState?.mode === 'cloud' && !cloudSaveNeedsAttention }]" type="button" :title="`${cloudSaveLabel}，点击查看待保存列表`" @click="openCloudSyncQueue">
             <LoaderCircle v-if="cloudSyncWorking" class="sync-spin" :size="14" />
-            <AlertTriangle v-else-if="cloudSyncNeedsAttention" :size="14" />
+            <AlertTriangle v-else-if="cloudSaveNeedsAttention" :size="14" />
             <CheckCircle2 v-else :size="14" />
-            <span>{{ cloudSyncWorking ? '同步中' : cloudSyncLabel }}</span>
+            <span>{{ cloudSaveLabel }}</span>
           </button>
-          <small class="sync-status-detail" :title="cloudDockDetail">{{ cloudDockDetail }}</small>
         </div>
-        <button v-if="cloudDockRequiresStorageAttention" class="sync-dock-button" :class="{ running: cloudSyncWorking, 'has-conflict': storageState?.conflictCount }" type="button" :disabled="cloudDockSyncDisabled" :title="cloudDockSyncTitle" @click="handleCloudDockSync">
+        <button class="sync-dock-button" :class="{ running: cloudSyncWorking, 'has-conflict': storageState?.conflictCount }" type="button" :disabled="cloudDockSyncDisabled" :title="cloudDockSyncTitle" @click="handleCloudDockSync">
           <LoaderCircle v-if="cloudSyncWorking" class="sync-spin" :size="14" />
           <AlertTriangle v-else-if="storageState?.conflictCount" :size="14" />
-          <RefreshCw v-else :size="14" />
-          <span class="sync-dock-label">{{ cloudSyncWorking ? '同步中' : cloudDockSyncLabel }}</span>
+          <RefreshCw v-else-if="cloudDockRequiresStorageAttention" :size="14" />
+          <Save v-else :size="14" />
+          <span class="sync-dock-label">{{ cloudSyncWorking ? '保存中' : cloudDockSyncLabel }}</span>
         </button>
       </footer>
     </section>

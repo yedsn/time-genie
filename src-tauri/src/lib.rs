@@ -402,6 +402,7 @@ pub fn run() {
             cloud_sync::cloud_sync_status,
             cloud_sync::cloud_sync_queue,
             cloud_sync::cloud_sync_refresh,
+            cloud_sync::cloud_sync_save,
             cloud_sync::cloud_sync_reset_local_cache,
             cloud_sync::cloud_sync_conflicts,
             cloud_sync::cloud_sync_resolve_conflict,

@@ -32,6 +32,7 @@ static TRACKING_LEASE_TOKEN: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static CLOUD_SYNC_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CLOUD_SYNC_WAKEUP: OnceLock<Arc<Notify>> = OnceLock::new();
 static CLOUD_MODE_WAKEUP: OnceLock<Arc<Notify>> = OnceLock::new();
+static CLOUD_SYNC_APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 static CLOUD_SYNC_SIGNALS: AtomicU8 = AtomicU8::new(0);
 static CLOUD_SYNC_OBSERVED_REMOTE_SEQ: AtomicI64 = AtomicI64::new(0);
 static CLOUD_SYNC_ENABLED: std::sync::atomic::AtomicBool =
@@ -40,6 +41,7 @@ static CLOUD_SYNC_ENABLED: std::sync::atomic::AtomicBool =
 static CLOUD_SYNC_TEST_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub fn spawn_background_services(database: Database, app: AppHandle) {
+    let _ = CLOUD_SYNC_APP_HANDLE.set(app.clone());
     spawn_sync_coordinator(database.clone(), app.clone());
     spawn_tracking_lease_maintainer(database.clone(), app.clone());
     spawn_realtime_listener(database.clone(), app);
@@ -2002,8 +2004,13 @@ fn ensure_supported_cloud_entity_type(entity_type: &str) -> Result<(), String> {
     }
 }
 
-pub fn flush_if_online(_database: &Database) -> Result<(), String> {
+pub fn flush_if_online(database: &Database) -> Result<(), String> {
     if CLOUD_SYNC_ENABLED.load(Ordering::Acquire) {
+        if let Some(app) = CLOUD_SYNC_APP_HANDLE.get() {
+            if let Ok(status) = sync_status(database) {
+                let _ = app.emit("cloud-sync-state-changed", &status);
+            }
+        }
         signal_cloud_sync(SYNC_SIGNAL_LOCAL_DIRTY, None);
     }
     Ok(())
@@ -4678,6 +4685,44 @@ pub fn cloud_sync_queue(
 pub fn cloud_sync_refresh(_database: tauri::State<'_, Database>) -> Result<(), String> {
     signal_cloud_sync(SYNC_SIGNAL_MANUAL_RETRY, None);
     Ok(())
+}
+
+#[tauri::command]
+pub async fn cloud_sync_save(
+    database: tauri::State<'_, Database>,
+    app: AppHandle,
+) -> Result<CloudSyncPushResult, String> {
+    let database = database.inner().clone();
+    let database_for_sync = database.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        push_outbox_with_retry_mode(&database_for_sync, true, true)
+    })
+    .await
+    .map_err(|error| format!("SYNC_WORKER_ERROR: 手动保存任务异常: {error}"))?;
+
+    match result {
+        Ok(result) => {
+            if result.pending == 0 && result.conflicts == 0 {
+                if let Ok(state) = storage_mode(&database) {
+                    let _ = update_sync_state(
+                        &database,
+                        &state.workspace_id,
+                        &state.device_id,
+                        state.last_change_seq,
+                        None,
+                    );
+                }
+            }
+            if let Ok(status) = sync_status(&database) {
+                let _ = app.emit("cloud-sync-state-changed", &status);
+            }
+            Ok(result)
+        }
+        Err(error) => {
+            emit_cloud_error(&app, &database, &error);
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]

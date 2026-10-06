@@ -160,6 +160,12 @@ export type CloudSyncQueueItem = {
   lastAttemptAt?: number;
 };
 
+export type CloudSyncPushResult = {
+  pushed: number;
+  pending: number;
+  conflicts: number;
+};
+
 export type SubjectRecord = {
   id: string;
   name: string;
@@ -939,6 +945,10 @@ export async function resumeCloudSyncAfterReauth(): Promise<StorageModeSnapshot>
 
 export async function refreshCloudSync(): Promise<void> {
   await invoke("cloud_sync_refresh");
+}
+
+export async function saveCloudSync(): Promise<CloudSyncPushResult> {
+  return await invoke("cloud_sync_save");
 }
 
 export async function resetLocalCacheFromCloud(): Promise<StorageModeSnapshot> {

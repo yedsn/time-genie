@@ -28,6 +28,16 @@ export type CloudSyncRetryFeedback = {
   message: string;
 };
 
+export function cloudSaveStatusLabel(state: CloudSyncPresentationState | undefined): string {
+  if (!state || state.mode !== "cloud") return "仅保存在本机";
+
+  const pending = Math.max(0, state.pendingOperations) + Math.max(0, state.conflictCount);
+  if (pending > 0) return `还有 ${pending} 项待保存`;
+  if (state.lastError || state.syncState === "error") return "保存失败";
+  if (!state.online) return "云端连接不可用";
+  return "所有更改均已保存";
+}
+
 export function cloudSyncPresentation(
   state: CloudSyncPresentationState | undefined,
   formatSyncTime: (value: number) => string,
