@@ -52,6 +52,7 @@ import {
   type RecurrenceRuleRecord,
 } from "./services/tauri";
 import { transientMissingStateResult } from "./services/transientStateGuard";
+import { canSubmitUnassignedResolution } from "./services/unassignedResolutionGuard";
 
 export type TaskStatus = "open" | "done";
 
@@ -514,7 +515,10 @@ export const useWorkdayStore = defineStore("workday", () => {
       return;
     }
     unassignedStateMissingRefreshes = 0;
-    const previousSeconds = unassignedSessionId.value === state.sessionId ? unassignedSeconds.value : 0;
+    const previousSessionId = unassignedSessionId.value;
+    const sessionChanged = Boolean(previousSessionId && previousSessionId !== state.sessionId);
+    if (sessionChanged) unassignedDialogOpen.value = false;
+    const previousSeconds = previousSessionId === state.sessionId ? unassignedSeconds.value : 0;
     const liveSeconds = state.currentSegmentStartedAt
       ? Math.max(0, Math.floor((syncedAt - state.currentSegmentStartedAt) / 1_000))
       : 0;
@@ -603,6 +607,7 @@ export const useWorkdayStore = defineStore("workday", () => {
 
   function resetUnassignedTracking() {
     markUnassignedStateChanged();
+    unassignedDialogOpen.value = false;
     unassignedStartedAt.value = undefined;
     unassignedAccumulatedSeconds.value = 0;
     unassignedFirstStartedAt.value = undefined;
@@ -1249,6 +1254,8 @@ export const useWorkdayStore = defineStore("workday", () => {
   async function resolveUnassignedTime(action: UnassignedTimeAction, allocations: TimeAllocation[] = []): Promise<BatchCompletionResult | false> {
     const seconds = unassignedSeconds.value;
     if (seconds < 1 || !unassignedSessionId.value) return false;
+    const targetSessionId = unassignedSessionId.value;
+    const targetVersion = unassignedVersion.value;
 
     const completionCandidates = new Set<string>();
     if (action === "work") {
@@ -1274,11 +1281,23 @@ export const useWorkdayStore = defineStore("workday", () => {
       for (const allocation of normalizedAllocations) {
         if (allocation.completeTask && tasks.find((task) => task.id === allocation.taskId)?.status !== "done") completionCandidates.add(allocation.taskId);
       }
-      await resolveUnassignedWork(unassignedSessionId.value, unassignedVersion.value, normalizedAllocations);
+      if (!canSubmitUnassignedResolution(targetSessionId, targetVersion, unassignedSessionId.value, unassignedVersion.value)) {
+        unassignedDialogOpen.value = false;
+        return false;
+      }
+      await resolveUnassignedWork(targetSessionId, targetVersion, normalizedAllocations);
     } else if (action === "break") {
-      await resolveUnassignedBreak(unassignedSessionId.value, unassignedVersion.value);
+      if (!canSubmitUnassignedResolution(targetSessionId, targetVersion, unassignedSessionId.value, unassignedVersion.value)) {
+        unassignedDialogOpen.value = false;
+        return false;
+      }
+      await resolveUnassignedBreak(targetSessionId, targetVersion);
     } else {
-      await discardUnassignedTime(unassignedSessionId.value, unassignedVersion.value);
+      if (!canSubmitUnassignedResolution(targetSessionId, targetVersion, unassignedSessionId.value, unassignedVersion.value)) {
+        unassignedDialogOpen.value = false;
+        return false;
+      }
+      await discardUnassignedTime(targetSessionId, targetVersion);
     }
 
     unassignedDialogOpen.value = false;

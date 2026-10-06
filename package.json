@@ -15,6 +15,7 @@
         "test:cloud-session-presentation": "tsc src-ui/src/services/cloudSessionPresentation.ts src-ui/src/services/cloudSessionPresentationTypes.ts --outDir .tmp-cloud-session-presentation-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-cloud-session-presentation.mjs",
         "test:cloud-device-presentation": "tsc src-ui/src/services/cloudDevicePresentation.ts src-ui/src/services/cloudDevicePresentationTypes.ts --outDir .tmp-cloud-device-presentation-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-cloud-device-presentation.mjs",
         "test:transient-state-guard": "tsc src-ui/src/services/transientStateGuard.ts --outDir .tmp-transient-state-guard-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-transient-state-guard.mjs",
+        "test:unassigned-resolution-guard": "tsc src-ui/src/services/unassignedResolutionGuard.ts --outDir .tmp-unassigned-resolution-guard-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-unassigned-resolution-guard.mjs",
         "test:supabase:schema": "node scripts/verify-supabase-schema.mjs",
         "test:supabase:planning-e2e": "cargo test --manifest-path src-tauri/Cargo.toml cloud_e2e::isolated_supabase_planning_two_device_flow -- --nocapture",
         "test:supabase:e2e": "node scripts/run-supabase-e2e.mjs",

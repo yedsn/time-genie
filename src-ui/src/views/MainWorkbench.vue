@@ -260,6 +260,9 @@ function formatSyncTime(value: number) {
 
 function cloudConflictTitle(conflict: CloudSyncConflict) {
   const payload = conflict.localPayload ?? {};
+  if (conflict.entityType === "unassigned_session") {
+    return `未归属时间 ${payload.work_date ?? ""}`.trim();
+  }
   const title = payload.title ?? payload.name ?? payload.report_type ?? payload.key ?? payload.provider;
   if (conflict.entityType === "task_daily_estimate") return `按日预估 ${payload.work_date ?? conflict.entityId ?? ""}`.trim();
   if (conflict.entityType === "task_recurrence_rule") return `重复规则 ${payload.task_id ?? conflict.entityId ?? ""}`.trim();
@@ -296,6 +299,14 @@ function cloudConflictActionLabel(operationType: string) {
     task_daily_estimate_clear: "清空按日预估",
     task_recurrence_save: "保存重复规则",
     task_recurrence_close: "关闭重复规则",
+    unassigned_session_create: "开始共享未归属计时",
+    unassigned_session_pause: "暂停共享未归属计时",
+    unassigned_session_resume: "继续共享未归属计时",
+    unassigned_session_awaiting_resolution: "标记未归属时间待处理",
+    unassigned_resolve_work: "分配未归属时间",
+    unassigned_resolve_break: "记为休息",
+    unassigned_discard: "丢弃未归属时间",
+    unassigned_time_entry_create: "保存未归属处理结果",
   };
   return labels[operationType] ?? operationType;
 }
@@ -329,6 +340,10 @@ const conflictFieldLabels: Record<string, string> = {
   weekdays_mask: "重复星期",
   effective_start: "生效日期",
   effective_end: "结束日期",
+  resolution_type: "处理方式",
+  resolved_at: "处理时间",
+  first_started_at: "开始时间",
+  predecessor_session_id: "前一段未归属时间",
   rules: "规则区间",
   occurrence_date: "轮次日期",
   label_snapshot: "计时事项",

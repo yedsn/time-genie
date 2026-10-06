@@ -40,6 +40,8 @@ end $$;
 \ir 20261005_timegenie_cloud_task_planning_patch.sql
 \ir 20261005b_timegenie_event_driven_sync_patch.sql
 \ir 20261005b_timegenie_event_driven_sync_patch.sql
+\ir 20261006_timegenie_shared_unassigned_patch.sql
+\ir 20261006_timegenie_shared_unassigned_patch.sql
 
 do $$
 begin
@@ -1856,6 +1858,137 @@ begin
     '30000000-0000-0000-0000-000000000002',
     '90000000-0000-0000-0000-000000000002'
   );
+end $$;
+
+reset role;
+
+-- Shared unassigned time has one root per workspace. Repeated create calls
+-- adopt the same root, only the first concurrent resolution wins, and retrying
+-- the winning operation is idempotent.
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '10000000-0000-0000-0000-000000000002', true);
+
+do $$
+declare first_session jsonb; second_session jsonb; first_result jsonb; retry_result jsonb; loser_result jsonb;
+declare session_id uuid; session_version bigint;
+begin
+  first_session := timegenie.unassigned_get_or_create_shared(
+    '20000000-0000-0000-0000-000000000002',
+    '30000000-0000-0000-0000-000000000003',
+    jsonb_build_object(
+      'id','72000000-0000-0000-0000-000000000001',
+      'state','collecting','threshold_seconds',300,'duration_seconds',0,
+      'first_started_at',1791250000000
+    ), null, null
+  );
+  second_session := timegenie.unassigned_get_or_create_shared(
+    '20000000-0000-0000-0000-000000000002',
+    '30000000-0000-0000-0000-000000000003',
+    jsonb_build_object(
+      'id','72000000-0000-0000-0000-000000000002',
+      'state','collecting','threshold_seconds',300,'duration_seconds',999,
+      'first_started_at',1791250999000
+    ), null, null
+  );
+  if first_session->>'id' is distinct from second_session->>'id' then
+    raise exception 'parallel shared unassigned create returned different roots';
+  end if;
+  session_id := (first_session->>'id')::uuid;
+  session_version := (first_session->>'version')::bigint;
+  retry_result := timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000002',
+    '30000000-0000-0000-0000-000000000003',
+    '42000000-0000-0000-0000-000000000004',
+    'unassigned_session_awaiting_resolution',
+    'unassigned_session',
+    session_id::text,
+    session_version,
+    jsonb_build_object(
+      'id',session_id::text,'work_date','2026-10-06','state','awaiting_resolution',
+      'threshold_seconds',300,'duration_seconds',300,'first_started_at',1791250000000,
+      'created_at',1791250000000,'updated_at',1791250300000,'version',session_version+1,
+      'segments','[]'::jsonb
+    )
+  );
+  if retry_result->>'version' is distinct from (session_version+1)::text then
+    raise exception 'first shared unassigned lifecycle update was not accepted';
+  end if;
+  retry_result := timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000002',
+    '30000000-0000-0000-0000-000000000003',
+    '42000000-0000-0000-0000-000000000005',
+    'unassigned_session_awaiting_resolution',
+    'unassigned_session',
+    session_id::text,
+    session_version,
+    jsonb_build_object(
+      'id',session_id::text,'work_date','2026-10-06','state','awaiting_resolution',
+      'threshold_seconds',300,'duration_seconds',300,'first_started_at',1791250000000,
+      'created_at',1791250000000,'updated_at',1791250300001,'version',session_version+1,
+      'segments','[]'::jsonb
+    )
+  );
+  if not coalesce((retry_result->>'superseded')::boolean,false)
+     or retry_result->'session'->>'state' <> 'awaiting_resolution' then
+    raise exception 'duplicate shared unassigned lifecycle did not adopt current session';
+  end if;
+  session_version := (retry_result->'session'->>'version')::bigint;
+  first_result := timegenie.unassigned_resolve_shared(
+    '20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000003',
+    '42000000-0000-0000-0000-000000000001',session_id,session_version,'work',
+    jsonb_build_object('generated_entry_id','73000000-0000-0000-0000-000000000001')
+  );
+  retry_result := timegenie.unassigned_resolve_shared(
+    '20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000003',
+    '42000000-0000-0000-0000-000000000001',session_id,session_version,'work',
+    jsonb_build_object('generated_entry_id','73000000-0000-0000-0000-000000000001')
+  );
+  loser_result := timegenie.unassigned_resolve_shared(
+    '20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000003',
+    '42000000-0000-0000-0000-000000000002',session_id,session_version,'break','{}'::jsonb
+  );
+  if not (first_result->>'accepted')::boolean or retry_result <> first_result then
+    raise exception 'shared unassigned resolution retry was not idempotent';
+  end if;
+  if (loser_result->>'accepted')::boolean or loser_result->'session'->>'resolution_type' <> 'work' then
+    raise exception 'concurrent shared unassigned loser did not adopt winner';
+  end if;
+  if first_result->'session'->>'resolved_at' is null then
+    raise exception 'shared unassigned resolution did not use server resolved_at';
+  end if;
+  retry_result := timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000002',
+    '30000000-0000-0000-0000-000000000003',
+    '42000000-0000-0000-0000-000000000003',
+    'unassigned_session_awaiting_resolution',
+    'unassigned_session',
+    session_id::text,
+    session_version,
+    jsonb_build_object(
+      'id',session_id::text,'work_date','2026-10-06','state','awaiting_resolution',
+      'threshold_seconds',300,'duration_seconds',300,'first_started_at',1791250999000,
+      'created_at',1791250999000,'updated_at',1791251299000,'version',session_version+1,
+      'segments','[]'::jsonb
+    )
+  );
+  if not coalesce((retry_result->>'superseded')::boolean,false)
+     or retry_result->'session'->>'resolution_type' <> 'work' then
+    raise exception 'superseded shared unassigned lifecycle did not adopt terminal session';
+  end if;
+end $$;
+
+-- Owner isolation and registered-device checks also apply to the shared RPCs.
+select set_config('request.jwt.claim.sub', '10000000-0000-0000-0000-000000000001', true);
+do $$ begin
+  begin
+    perform timegenie.unassigned_get_or_create_shared(
+      '20000000-0000-0000-0000-000000000002',
+      '30000000-0000-0000-0000-000000000003',null,null,null
+    );
+    raise exception 'another owner read shared unassigned state';
+  exception when others then
+    if sqlerrm not like '%AUTH_REQUIRED%' then raise; end if;
+  end;
 end $$;
 
 reset role;

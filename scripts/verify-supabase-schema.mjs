@@ -15,6 +15,7 @@ const sessionRevocationPatchFile = path.join(repoRoot, "supabase", "20261004d_ti
 const timerSyncPatchFile = path.join(repoRoot, "supabase", "20261005_timegenie_timer_sync_coordination_patch.sql");
 const taskPlanningPatchFile = path.join(repoRoot, "supabase", "20261005_timegenie_cloud_task_planning_patch.sql");
 const eventDrivenSyncPatchFile = path.join(repoRoot, "supabase", "20261005b_timegenie_event_driven_sync_patch.sql");
+const sharedUnassignedPatchFile = path.join(repoRoot, "supabase", "20261006_timegenie_shared_unassigned_patch.sql");
 const freshPlanningTestFile = path.join(repoRoot, "supabase", "schema_fresh_planning_test.sql");
 const schemaTestFile = path.join(repoRoot, "supabase", "schema_integration_test.sql");
 
@@ -81,6 +82,7 @@ function verifyStaticSchemaInvariants() {
   const timerSyncPatch = fs.readFileSync(timerSyncPatchFile, "utf8");
   const taskPlanningPatch = fs.readFileSync(taskPlanningPatchFile, "utf8");
   const eventDrivenSyncPatch = fs.readFileSync(eventDrivenSyncPatchFile, "utf8");
+  const sharedUnassignedPatch = fs.readFileSync(sharedUnassignedPatchFile, "utf8");
   const schemaIntegrationTest = fs.readFileSync(schemaTestFile, "utf8");
   const importStart = schema.indexOf("create or replace function timegenie.migration_import_snapshot");
   const applyPatchStart = schema.indexOf("create or replace function timegenie.cloud_apply_patch");
@@ -161,6 +163,25 @@ function verifyStaticSchemaInvariants() {
   }
   if ((schemaIntegrationTest.match(/\\ir 20261005b_timegenie_event_driven_sync_patch\.sql/g) ?? []).length < 2) {
     throw new Error("The schema integration test must prove the event-driven sync patch is idempotent.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261006_timegenie_shared_unassigned_patch\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the shared unassigned patch is idempotent.");
+  }
+  for (const expected of [
+    "create or replace function timegenie.unassigned_get_or_create_shared",
+    "create or replace function timegenie.unassigned_resolve_shared",
+    "uq_unassigned_next_session",
+    "resolution_operation_id",
+    "when 'unassigned_sessions' then",
+  ]) {
+    if (!schema.toLowerCase().includes(expected.toLowerCase())
+        || !sharedUnassignedPatch.toLowerCase().includes(expected.toLowerCase())) {
+      throw new Error(`The schema and shared unassigned patch must include: ${expected}`);
+    }
+  }
+  if (!sharedUnassignedPatch.includes("cloud_apply_shared_unassigned_patch")
+      || !sharedUnassignedPatch.replaceAll(" ", "").replaceAll("\n", "").includes("jsonb_build_object('segments'")) {
+    throw new Error("The shared unassigned patch must deploy aggregate apply and segment reads.");
   }
   for (const expected of [
     "incremental first page metadata is invalid",

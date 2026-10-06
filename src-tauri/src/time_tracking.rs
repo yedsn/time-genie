@@ -290,7 +290,12 @@ fn start_timer_with_cloud_operation(
             now,
         )?;
     }
-    crate::unassigned::pause_for_timer(&transaction, &workspace_id, now)?;
+    crate::unassigned::pause_for_timer(
+        &transaction,
+        &workspace_id,
+        now,
+        cloud_operation.map(|value| value.0),
+    )?;
     transaction
         .execute(
             "INSERT INTO time_entries(
@@ -556,7 +561,12 @@ fn stop_timer_with_cloud_operation(
             }
         }
     }
-    crate::unassigned::resume_after_timer(&transaction, &workspace_id, now)?;
+    crate::unassigned::resume_after_timer(
+        &transaction,
+        &workspace_id,
+        now,
+        cloud_operation.map(|value| value.0),
+    )?;
     bump_revision(&transaction)?;
     let result = load_entry(&transaction, &request.entry_id, now)?;
     if let Some((state, operation_type)) = cloud_operation {
@@ -2127,21 +2137,24 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert_eq!(outbox.len(), 1);
-        assert_eq!(outbox[0].0, start_operation_id);
-        assert_eq!(outbox[0].1, "timer_stop");
-        assert_eq!(outbox[0].4, None);
-        assert_eq!(outbox[0].6, Some(4));
-        assert_eq!(outbox[0].7, 4);
-        for (_, _, entity_type, entity_id, _, payload, _, _) in outbox {
-            let value: Value = serde_json::from_str(&payload).unwrap();
-            assert_eq!(entity_type, "time_entry");
-            assert_eq!(entity_id.as_deref(), Some(started.id.as_str()));
-            assert_eq!(value["id"], started.id);
-            assert_eq!(value["state"], "ended");
-            assert_eq!(value["version"], resumed.version + 1);
-            assert_eq!(value["segments"].as_array().map(Vec::len), Some(2));
-        }
+        assert_eq!(outbox.len(), 2);
+        let timer = outbox.iter().find(|row| row.2 == "time_entry").unwrap();
+        assert_eq!(timer.0, start_operation_id);
+        assert_eq!(timer.1, "timer_stop");
+        assert_eq!(timer.4, None);
+        assert_eq!(timer.6, Some(4));
+        assert_eq!(timer.7, 4);
+        let value: Value = serde_json::from_str(&timer.5).unwrap();
+        assert_eq!(timer.3.as_deref(), Some(started.id.as_str()));
+        assert_eq!(value["id"], started.id);
+        assert_eq!(value["state"], "ended");
+        assert_eq!(value["version"], resumed.version + 1);
+        assert_eq!(value["segments"].as_array().map(Vec::len), Some(2));
+        let unassigned = outbox
+            .iter()
+            .find(|row| row.2 == "unassigned_session")
+            .unwrap();
+        assert_eq!(unassigned.1, "unassigned_session_create");
     }
 
     #[test]

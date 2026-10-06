@@ -55,6 +55,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "event_driven_cloud_sync",
         sql: include_str!("../migrations/0008_event_driven_cloud_sync.sql"),
     },
+    Migration {
+        version: 9,
+        name: "shared_unassigned_sessions",
+        sql: include_str!("../migrations/0009_shared_unassigned_sessions.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -454,7 +459,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let database = Database::initialize_at(directory.path().join("test.sqlite3")).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 8);
+        assert_eq!(status.schema_version, 9);
         for table in REQUIRED_TABLES {
             assert!(
                 status.tables.iter().any(|value| value == table),
@@ -494,7 +499,7 @@ mod tests {
         let workspace_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migration_count, 8);
+        assert_eq!(migration_count, 9);
         assert_eq!(workspace_count, 1);
     }
 
@@ -581,7 +586,7 @@ mod tests {
         assert_eq!(task_title, "升级前事项");
         assert_eq!(queued, 1);
         assert_eq!(deferred_table, 6);
-        assert_eq!(database.status().unwrap().schema_version, 8);
+        assert_eq!(database.status().unwrap().schema_version, 9);
     }
 
     #[test]
@@ -733,6 +738,63 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(payload["title"], "保留");
+    }
+
+    #[test]
+    fn shared_unassigned_migration_preserves_history_and_unrelated_outbox() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("shared-unassigned-upgrade.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                   version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        for migration in &MIGRATIONS[..8] {
+            let transaction = connection.transaction().unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version,name,applied_at) VALUES (?1,?2,?3)",
+                    params![migration.version, migration.name, now_millis()],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        let workspace_id = "shared-upgrade-workspace";
+        let device_id = "shared-upgrade-device";
+        connection.execute("INSERT INTO workspaces(id,name,timezone,storage_mode,created_at,updated_at,version) VALUES (?1,'共享升级','Asia/Shanghai','cloud',1,1,1)",[workspace_id]).unwrap();
+        connection.execute("INSERT INTO devices(id,workspace_id,device_name,platform,app_version,last_seen_at,created_at) VALUES (?1,?2,'测试设备','test','1',1,1)",params![device_id,workspace_id]).unwrap();
+        connection.execute("INSERT INTO unassigned_sessions(id,workspace_id,work_date,state,threshold_seconds,duration_seconds,first_started_at,created_at,updated_at,version) VALUES ('active-session',?1,'2026-10-06','collecting',300,60,1,1,1,2)",[workspace_id]).unwrap();
+        connection.execute("INSERT INTO unassigned_sessions(id,workspace_id,work_date,state,threshold_seconds,duration_seconds,first_started_at,last_ended_at,resolution_type,resolved_at,created_at,updated_at,version) VALUES ('resolved-session',?1,'2026-10-06','resolved',300,120,1,121000,'work',121000,1,121000,3)",[workspace_id]).unwrap();
+        connection.execute("INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,label_snapshot,started_at,ended_at,duration_seconds,origin_unassigned_session_id,created_at,updated_at,version) VALUES ('history-entry',?1,'2026-10-06','work','unassigned','ended','历史',1,121000,120,'resolved-session',1,121000,1)",[workspace_id]).unwrap();
+        connection.execute("UPDATE unassigned_sessions SET generated_entry_id='history-entry' WHERE id='resolved-session'",[]).unwrap();
+        connection.execute("INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,payload_json,state,attempt_count,created_at) VALUES ('keep-task-op',?1,?2,'task.update','task','task-1','{}','pending',0,1)",params![workspace_id,device_id]).unwrap();
+        drop(connection);
+
+        let database = Database::initialize_at(path).unwrap();
+        let connection = database.open().unwrap();
+        let active: (String, String) = connection.query_row("SELECT shared_source,migration_state FROM unassigned_sessions WHERE id='active-session'",[],|row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        let history: (String, Option<String>) = connection.query_row("SELECT state,generated_entry_id FROM unassigned_sessions WHERE id='resolved-session'",[],|row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        let kept: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE operation_id='keep-task-op'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            active,
+            ("legacy_local".to_string(), "candidate".to_string())
+        );
+        assert_eq!(
+            history,
+            ("resolved".to_string(), Some("history-entry".to_string()))
+        );
+        assert_eq!(kept, 1);
     }
 
     #[test]
@@ -892,7 +954,7 @@ mod tests {
 
         let database = Database::initialize_at(path).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 8);
+        assert_eq!(status.schema_version, 9);
         assert!(status.tables.iter().any(|table| table == "device_hooks"));
         assert!(status
             .tables

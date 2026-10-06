@@ -19,19 +19,22 @@ function freshState() {
         [subjectId]: { id: subjectId, name: "验收主体", sort_order: 10, created_at: now, updated_at: now, version: 1, deleted_at: null },
       },
       tasks: {}, task_status_events: {}, task_daily_estimates: {}, task_recurrence_rules: {}, task_occurrences: {},
-      work_days: {}, time_entries: {}, report_templates: {
+      work_days: {}, time_entries: {}, unassigned_sessions: {}, report_templates: {
         [`${templatePrefix}1`]: { id: `${templatePrefix}1`, report_type: "daily", subject_id: null, content: "# {{日期}}\n\n{{今日事项}}\n", is_builtin: true, created_at: now, updated_at: now, version: 1, deleted_at: null },
         [`${templatePrefix}2`]: { id: `${templatePrefix}2`, report_type: "weekly", subject_id: null, content: "# {{日期范围}}\n\n{{每日情况}}\n", is_builtin: true, created_at: now, updated_at: now, version: 1, deleted_at: null },
         [`${templatePrefix}3`]: { id: `${templatePrefix}3`, report_type: "monthly", subject_id: null, content: "# {{日期范围}}\n\n{{每日情况}}\n", is_builtin: true, created_at: now, updated_at: now, version: 1, deleted_at: null },
       },
       reports: {}, app_settings: {}, integration_configs: {}, external_bindings: {},
     },
+    processedOperations: {},
     control: { delayMs: 0, failNext: 0 },
   };
 }
 
 let state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : freshState();
 state.control ||= { delayMs: 0, failNext: 0 };
+state.processedOperations ||= {};
+state.entities.unassigned_sessions ||= {};
 const sockets = new Set();
 
 function save() {
@@ -57,6 +60,7 @@ function sourceType(entityType) {
     report_template: "report_templates", app_setting: "app_settings", integration_config: "integration_configs",
     external_binding: "external_bindings", task_occurrence: "task_occurrences",
     task_daily_estimate: "task_daily_estimates", task_recurrence_rule: "task_recurrence_rules",
+    unassigned_session: "unassigned_sessions",
   })[entityType];
 }
 
@@ -91,7 +95,14 @@ function applyPatch(body) {
   const base = body.p_base_version ?? null;
   const current = currentVersion(source, id);
   const deleting = payload.deleted === true || payload.deleted_at != null;
-  if (current !== base && !(deleting && current === null)) throw new Error(`SYNC_CONFLICT: expected version ${base}, current version ${current}`);
+  if (current !== base && !(deleting && current === null)) {
+    const currentValue = state.entities[source]?.[id] || null;
+    const lifecycleWasSuperseded = type === "unassigned_session"
+      && ["unassigned_session_pause", "unassigned_session_resume", "unassigned_session_awaiting_resolution"].includes(body.p_operation_type)
+      && currentValue != null;
+    if (lifecycleWasSuperseded) return { superseded: true, session: currentValue };
+    throw new Error(`SYNC_CONFLICT: expected version ${base}, current version ${current}`);
+  }
   if (deleting) delete state.entities[source][id];
   else state.entities[source][id] = payload;
   if (type === "task_recurrence_rule") {
@@ -103,6 +114,93 @@ function applyPatch(body) {
   recordChange(source, id, deleting ? "delete" : "update", version);
   if (type === "task_recurrence_rule" && state.entities.tasks[id]) recordChange("tasks", id, "update", Number(state.entities.tasks[id].version || 1));
   return { entityType: type, entityId: id, version };
+}
+
+function activeUnassignedSession() {
+  return Object.values(state.entities.unassigned_sessions)
+    .find((session) => session.state === "collecting" || session.state === "awaiting_resolution") || null;
+}
+
+function normalizeUnassignedSession(candidate, predecessorSessionId, startedAt) {
+  const boundary = Number(startedAt || candidate?.first_started_at || Date.now());
+  const id = candidate?.id || crypto.randomUUID();
+  const segments = Array.isArray(candidate?.segments) && candidate.segments.length
+    ? candidate.segments
+    : [{ id: crypto.randomUUID(), session_id: id, sequence_no: 1, started_at: boundary, ended_at: null, duration_seconds: 0 }];
+  return {
+    id,
+    work_date: candidate?.work_date || new Date(boundary).toISOString().slice(0, 10),
+    state: candidate?.state === "awaiting_resolution" ? "awaiting_resolution" : "collecting",
+    threshold_seconds: Number(candidate?.threshold_seconds || 300),
+    duration_seconds: Number(candidate?.duration_seconds || 0),
+    first_started_at: boundary,
+    last_ended_at: candidate?.last_ended_at ?? null,
+    prompted_at: candidate?.prompted_at ?? null,
+    resolution_type: null,
+    generated_entry_id: null,
+    resolved_at: null,
+    created_at: Number(candidate?.created_at || boundary),
+    updated_at: Date.now(),
+    version: Number(candidate?.version || 1),
+    shared_source: "cloud",
+    predecessor_session_id: predecessorSessionId || candidate?.predecessor_session_id || null,
+    migration_state: "adopted",
+    resolution_operation_id: null,
+    segments: segments.map((segment, index) => ({
+      ...segment,
+      id: segment.id || crypto.randomUUID(),
+      session_id: id,
+      sequence_no: Number(segment.sequence_no || index + 1),
+      started_at: Number(segment.started_at || boundary),
+      ended_at: segment.ended_at == null ? null : Number(segment.ended_at),
+      duration_seconds: Number(segment.duration_seconds || 0),
+    })),
+  };
+}
+
+function getOrCreateSharedUnassigned(body) {
+  const existing = activeUnassignedSession();
+  if (existing) return existing;
+  const session = normalizeUnassignedSession(
+    body.p_candidate || null,
+    body.p_predecessor_session_id || null,
+    body.p_started_at || null,
+  );
+  state.entities.unassigned_sessions[session.id] = session;
+  recordChange("unassigned_sessions", session.id, "update", session.version);
+  return session;
+}
+
+function resolveSharedUnassigned(body) {
+  const operationId = body.p_operation_id;
+  if (state.processedOperations[operationId]) return state.processedOperations[operationId];
+  const session = state.entities.unassigned_sessions[body.p_session_id];
+  if (!session) throw new Error("VALIDATION_ERROR: shared unassigned session not found");
+  const expectedVersion = Number(body.p_expected_version);
+  if ((session.state !== "collecting" && session.state !== "awaiting_resolution") || Number(session.version) !== expectedVersion) {
+    return { accepted: false, session };
+  }
+  const resolvedAt = Date.now();
+  const resolutionType = body.p_resolution_type;
+  for (const segment of session.segments || []) {
+    if (segment.ended_at == null) {
+      segment.ended_at = resolvedAt;
+      segment.duration_seconds = Math.max(0, Math.floor((resolvedAt - Number(segment.started_at)) / 1000));
+    }
+  }
+  session.state = resolutionType === "discard" ? "discarded" : "resolved";
+  session.resolution_type = resolutionType;
+  session.generated_entry_id = body.p_payload?.generated_entry_id || null;
+  session.resolved_at = resolvedAt;
+  session.last_ended_at = resolvedAt;
+  session.updated_at = resolvedAt;
+  session.duration_seconds = (session.segments || []).reduce((sum, segment) => sum + Number(segment.duration_seconds || 0), 0);
+  session.version = expectedVersion + 1;
+  session.resolution_operation_id = operationId;
+  const result = { accepted: true, session };
+  state.processedOperations[operationId] = result;
+  recordChange("unassigned_sessions", session.id, "update", session.version);
+  return result;
 }
 
 function incremental(body) {
@@ -138,11 +236,47 @@ const server = http.createServer(async (request, response) => {
   if (url.pathname === "/control/delay") { state.control.delayMs = Number(url.searchParams.get("ms") || 0); save(); return json(response, 200, state.control); }
   if (url.pathname === "/control/fail-next") { state.control.failNext = Number(url.searchParams.get("count") || 1); save(); return json(response, 200, state.control); }
   if (url.pathname === "/control/reset") { state = freshState(); save(); return json(response, 200, { reset: true }); }
+  if (url.pathname === "/control/unassigned/create") {
+    const secondsAgo = Math.max(0, Number(url.searchParams.get("secondsAgo") || 0));
+    const session = getOrCreateSharedUnassigned({ p_started_at: Date.now() - secondsAgo * 1000 });
+    return json(response, 200, session);
+  }
+  if (url.pathname === "/control/unassigned/age") {
+    const session = activeUnassignedSession();
+    if (!session) return json(response, 404, { message: "no active unassigned session" });
+    const seconds = Math.max(0, Number(url.searchParams.get("seconds") || 0));
+    const boundary = Date.now() - seconds * 1000;
+    session.first_started_at = boundary;
+    session.created_at = Math.min(Number(session.created_at || boundary), boundary);
+    session.updated_at = Date.now();
+    session.version = Number(session.version || 0) + 1;
+    for (const segment of session.segments || []) {
+      if (segment.ended_at == null) segment.started_at = boundary;
+    }
+    recordChange("unassigned_sessions", session.id, "update", session.version);
+    return json(response, 200, session);
+  }
+  if (url.pathname === "/control/unassigned/awaiting") {
+    const session = activeUnassignedSession();
+    if (!session) return json(response, 404, { message: "no active unassigned session" });
+    const seconds = Math.max(0, Number(url.searchParams.get("seconds") || 360));
+    const boundary = Date.now() - seconds * 1000;
+    session.state = "awaiting_resolution";
+    session.first_started_at = boundary;
+    session.duration_seconds = seconds;
+    session.prompted_at = Date.now();
+    session.updated_at = session.prompted_at;
+    session.version = Number(session.version || 0) + 1;
+    recordChange("unassigned_sessions", session.id, "update", session.version);
+    return json(response, 200, session);
+  }
   if (url.pathname === "/auth/v1/settings") return json(response, 200, { external: {}, disable_signup: false });
   const body = await bodyJson(request);
   if (url.pathname.endsWith("/device_authorization_get")) return json(response, 200, { authorized: true });
   if (url.pathname.endsWith("/cloud_incremental_pull")) return json(response, 200, incremental(body));
   if (url.pathname.endsWith("/cloud_snapshot_get")) return json(response, 200, snapshot());
+  if (url.pathname.endsWith("/unassigned_get_or_create_shared")) return json(response, 200, getOrCreateSharedUnassigned(body));
+  if (url.pathname.endsWith("/unassigned_resolve_shared")) return json(response, 200, resolveSharedUnassigned(body));
   if (url.pathname.includes("tracking_lease")) return json(response, 200, { lease_token: "dev-lease", expires_at: new Date(Date.now() + 90000).toISOString() });
   if (url.pathname.endsWith("/cloud_apply_patch")) {
     if (state.control.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, state.control.delayMs));

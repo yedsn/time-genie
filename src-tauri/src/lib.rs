@@ -472,8 +472,14 @@ pub fn run() {
             seatable::seatable_sync_retry_failed,
             seatable::seatable_reimbursements_query
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running TimeGenie");
+        .build(tauri::generate_context!())
+        .expect("error while building TimeGenie")
+        .run(|_app, _event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = _event {
+                show(_app, "main");
+            }
+        });
 }
 
 fn initialize_database(app_data_dir: &std::path::Path) -> Result<Database, std::io::Error> {
@@ -1445,14 +1451,19 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].0, "timer_stop");
-        assert_eq!(queued[0].1, "time_entry");
-        assert_eq!(queued[0].2.as_deref(), stopped["id"].as_str());
-        assert_eq!(queued[0].3, None);
-        assert_eq!(queued[0].4, stopped["version"].as_i64());
-        assert_eq!(queued[0].5, 2);
-        let payload: serde_json::Value = serde_json::from_str(&queued[0].6).unwrap();
+        assert_eq!(queued.len(), 2);
+        let timer = queued.iter().find(|row| row.1 == "time_entry").unwrap();
+        assert_eq!(timer.0, "timer_stop");
+        assert_eq!(timer.2.as_deref(), stopped["id"].as_str());
+        assert_eq!(timer.3, None);
+        assert_eq!(timer.4, stopped["version"].as_i64());
+        assert_eq!(timer.5, 2);
+        let payload: serde_json::Value = serde_json::from_str(&timer.6).unwrap();
         assert_eq!(payload["state"], "ended");
+        let unassigned = queued
+            .iter()
+            .find(|row| row.1 == "unassigned_session")
+            .unwrap();
+        assert_eq!(unassigned.0, "unassigned_session_create");
     }
 }

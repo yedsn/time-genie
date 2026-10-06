@@ -253,11 +253,17 @@ create table if not exists timegenie.unassigned_sessions (
   resolution_type text,
   generated_entry_id uuid references timegenie.time_entries(id),
   resolved_at timestamptz,
+  shared_source text not null default 'cloud' check (shared_source in ('legacy_local','local','cloud')),
+  predecessor_session_id uuid,
+  migration_state text not null default 'ready' check (migration_state in ('ready','candidate','adopted','superseded')),
+  resolution_operation_id uuid,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   version bigint not null default 1
 );
 create unique index if not exists uq_unassigned_active on timegenie.unassigned_sessions(workspace_id) where state in ('collecting', 'awaiting_resolution');
+create unique index if not exists uq_unassigned_next_session on timegenie.unassigned_sessions(workspace_id, predecessor_session_id) where predecessor_session_id is not null;
+create unique index if not exists uq_unassigned_resolution_operation on timegenie.unassigned_sessions(workspace_id, resolution_operation_id) where resolution_operation_id is not null;
 
 create table if not exists timegenie.unassigned_segments (
   id uuid primary key default gen_random_uuid(),
@@ -945,6 +951,107 @@ begin
   return cached;
 end $$;
 
+create or replace function timegenie.unassigned_get_or_create_shared(
+  p_workspace_id uuid,
+  p_device_id uuid,
+  p_candidate jsonb default null,
+  p_predecessor_session_id uuid default null,
+  p_started_at timestamptz default null
+) returns jsonb language plpgsql security definer set search_path = timegenie, extensions, pg_catalog
+as $$
+declare session_row timegenie.unassigned_sessions; boundary timestamptz; threshold integer; candidate_id uuid;
+begin
+  if not timegenie.is_workspace_owner(p_workspace_id) then raise exception 'AUTH_REQUIRED'; end if;
+  if not timegenie.is_registered_device(p_workspace_id, p_device_id) then raise exception 'DEVICE_NOT_REGISTERED'; end if;
+  perform pg_advisory_xact_lock(hashtextextended(p_workspace_id::text || ':shared-unassigned', 0));
+  select * into session_row from timegenie.unassigned_sessions
+  where workspace_id=p_workspace_id and state in ('collecting','awaiting_resolution')
+  order by created_at limit 1 for update;
+  if found then
+    return timegenie.cloud_incremental_entity_get(p_workspace_id,'unassigned_sessions',session_row.id::text)->'data';
+  end if;
+  if exists(select 1 from timegenie.time_entries where workspace_id=p_workspace_id and state in ('running','paused') and deleted_at is null) then
+    return null;
+  end if;
+  if p_predecessor_session_id is not null then
+    select resolved_at into boundary from timegenie.unassigned_sessions
+    where workspace_id=p_workspace_id and id=p_predecessor_session_id;
+  end if;
+  boundary := coalesce(boundary,p_started_at,case when p_candidate is null then null else to_timestamp((p_candidate->>'first_started_at')::double precision/1000) end,now());
+  threshold := coalesce((p_candidate->>'threshold_seconds')::integer,300);
+  candidate_id := coalesce(nullif(p_candidate->>'id','')::uuid,gen_random_uuid());
+  insert into timegenie.unassigned_sessions(
+    id,workspace_id,work_date,state,threshold_seconds,duration_seconds,first_started_at,
+    last_ended_at,prompted_at,resolution_type,generated_entry_id,resolved_at,
+    shared_source,predecessor_session_id,migration_state,created_at,updated_at,version
+  ) values(
+    candidate_id,p_workspace_id,(boundary at time zone 'Asia/Shanghai')::date,
+    case when p_candidate->>'state'='awaiting_resolution' then 'awaiting_resolution' else 'collecting' end,
+    threshold,coalesce((p_candidate->>'duration_seconds')::bigint,0),boundary,
+    null,null,null,null,null,'cloud',p_predecessor_session_id,'adopted',boundary,now(),1
+  ) returning * into session_row;
+  insert into timegenie.unassigned_segments(
+    id,workspace_id,session_id,sequence_no,started_at,ended_at,duration_seconds,lease_token
+  ) values(gen_random_uuid(),p_workspace_id,session_row.id,1,boundary,null,0,null);
+  return timegenie.cloud_incremental_entity_get(p_workspace_id,'unassigned_sessions',session_row.id::text)->'data';
+end $$;
+
+create or replace function timegenie.unassigned_resolve_shared(
+  p_workspace_id uuid,
+  p_device_id uuid,
+  p_operation_id uuid,
+  p_session_id uuid,
+  p_expected_version bigint,
+  p_resolution_type text,
+  p_payload jsonb
+) returns jsonb language plpgsql security definer set search_path = timegenie, extensions, pg_catalog
+as $$
+declare session_row timegenie.unassigned_sessions; cached jsonb; server_resolved_at timestamptz; result_value jsonb;
+begin
+  if p_resolution_type not in ('work','break','discard') then raise exception 'VALIDATION_ERROR: invalid unassigned resolution'; end if;
+  if not timegenie.is_workspace_owner(p_workspace_id) then raise exception 'AUTH_REQUIRED'; end if;
+  if not timegenie.is_registered_device(p_workspace_id,p_device_id) then raise exception 'DEVICE_NOT_REGISTERED'; end if;
+  cached := timegenie.processed_operation_result(
+    p_workspace_id,p_operation_id,'unassigned_resolve_shared',
+    jsonb_build_object('deviceId',p_device_id,'sessionId',p_session_id,'expectedVersion',p_expected_version,'resolutionType',p_resolution_type,'payload',coalesce(p_payload,'{}'::jsonb))
+  );
+  if cached is not null then return cached; end if;
+  perform pg_advisory_xact_lock(hashtextextended(p_workspace_id::text || ':shared-unassigned:' || p_session_id::text,0));
+  select * into session_row from timegenie.unassigned_sessions
+  where workspace_id=p_workspace_id and id=p_session_id for update;
+  if not found then raise exception 'NOT_FOUND: shared unassigned session'; end if;
+  if session_row.state in ('resolved','discarded') then
+    return jsonb_build_object(
+      'accepted',false,
+      'session',timegenie.cloud_incremental_entity_get(p_workspace_id,'unassigned_sessions',p_session_id::text)->'data'
+    );
+  end if;
+  if session_row.version <> p_expected_version then raise exception 'VERSION_CONFLICT'; end if;
+  server_resolved_at := clock_timestamp();
+  update timegenie.unassigned_segments
+  set ended_at=least(server_resolved_at,greatest(started_at,coalesce(ended_at,server_resolved_at))),
+      duration_seconds=greatest(0,extract(epoch from (least(server_resolved_at,greatest(started_at,coalesce(ended_at,server_resolved_at)))-started_at))::bigint)
+  where session_id=p_session_id;
+  update timegenie.unassigned_sessions
+  set state=case when p_resolution_type='discard' then 'discarded' else 'resolved' end,
+      duration_seconds=(select coalesce(sum(duration_seconds),0) from timegenie.unassigned_segments where session_id=p_session_id),
+      resolution_type=p_resolution_type,
+      generated_entry_id=null,
+      resolved_at=server_resolved_at,last_ended_at=server_resolved_at,updated_at=server_resolved_at,
+      resolution_operation_id=p_operation_id,shared_source='cloud',migration_state='adopted',version=version+1
+  where id=p_session_id;
+  result_value := jsonb_build_object(
+    'accepted',true,
+    'session',timegenie.cloud_incremental_entity_get(p_workspace_id,'unassigned_sessions',p_session_id::text)->'data'
+  );
+  perform timegenie.record_processed_operation(
+    p_workspace_id,p_operation_id,p_device_id,'unassigned_resolve_shared',
+    jsonb_build_object('deviceId',p_device_id,'sessionId',p_session_id,'expectedVersion',p_expected_version,'resolutionType',p_resolution_type,'payload',coalesce(p_payload,'{}'::jsonb)),
+    result_value
+  );
+  return result_value;
+end $$;
+
 create or replace function timegenie.unassigned_resolve_non_work(
   p_workspace_id uuid, p_session_id uuid, p_device_id uuid, p_expected_version bigint, p_operation_id uuid, p_resolution_type text
 ) returns jsonb language plpgsql security definer set search_path = timegenie, extensions, pg_catalog
@@ -1179,7 +1286,9 @@ begin
       'rules', coalesce((select jsonb_agg(to_jsonb(row_value) order by effective_start, id) from timegenie.task_recurrence_rules row_value where workspace_id = p_workspace_id and task_id::text = p_entity_id), '[]'::jsonb)
     )
     when 'task_occurrences' then (select to_jsonb(row_value) from timegenie.task_occurrences row_value where workspace_id = p_workspace_id and task_id::text = key_parts[1] and occurrence_date::text = key_parts[2])
-    when 'unassigned_sessions' then (select to_jsonb(row_value) from timegenie.unassigned_sessions row_value where workspace_id = p_workspace_id and id::text = p_entity_id)
+    when 'unassigned_sessions' then (select to_jsonb(row_value) || jsonb_build_object(
+      'segments', coalesce((select jsonb_agg(to_jsonb(segment_value) order by sequence_no, id) from timegenie.unassigned_segments segment_value where workspace_id = p_workspace_id and session_id = row_value.id), '[]'::jsonb)
+    ) from timegenie.unassigned_sessions row_value where workspace_id = p_workspace_id and id::text = p_entity_id)
     when 'time_entries' then (select to_jsonb(row_value) || jsonb_build_object(
       'segments', coalesce((select jsonb_agg(to_jsonb(segment_value) order by sequence_no, id) from timegenie.time_segments segment_value where workspace_id = p_workspace_id and entry_id = row_value.id), '[]'::jsonb),
       'allocations', coalesce((select jsonb_agg(to_jsonb(allocation_value) order by created_at, id) from timegenie.time_allocations allocation_value where workspace_id = p_workspace_id and entry_id = row_value.id), '[]'::jsonb)
@@ -1264,7 +1373,7 @@ create or replace function timegenie.cloud_apply_patch(
   p_payload jsonb
 ) returns jsonb language plpgsql security definer set search_path = timegenie, extensions, pg_catalog
 as $$
-declare current_version bigint; cached jsonb; result_value jsonb; row_data jsonb; payload_version bigint; current_task_version bigint; current_rule_version bigint; current_rule_id uuid; current_rule_start date; target_rule jsonb; expected_rule_count integer; actual_rule_count integer;
+declare current_version bigint; current_unassigned_state text; cached jsonb; result_value jsonb; row_data jsonb; payload_version bigint; current_task_version bigint; current_rule_version bigint; current_rule_id uuid; current_rule_start date; target_rule jsonb; expected_rule_count integer; actual_rule_count integer;
 begin
   if not timegenie.is_workspace_owner(p_workspace_id) then raise exception 'AUTH_REQUIRED'; end if;
   if not exists(select 1 from timegenie.devices where id = p_device_id and workspace_id = p_workspace_id and revoked_at is null) then
@@ -1424,11 +1533,24 @@ begin
       end if;
     end if;
   elsif p_entity_type = 'unassigned_session' then
-    select version into current_version from timegenie.unassigned_sessions where workspace_id = p_workspace_id and id = p_entity_id::uuid;
+    select version,state into current_version,current_unassigned_state from timegenie.unassigned_sessions where workspace_id = p_workspace_id and id = p_entity_id::uuid;
     payload_version := coalesce((row_data->>'version')::bigint, 1);
     if p_base_version is null and current_version is not null then
       raise exception 'SYNC_CONFLICT: expected new unassigned session, current version %', current_version;
     elsif p_base_version is not null and current_version is distinct from p_base_version then
+      if p_operation_type in ('unassigned_session_pause','unassigned_session_resume','unassigned_session_awaiting_resolution')
+         and current_unassigned_state is not null then
+        result_value := jsonb_build_object(
+          'superseded',true,
+          'session',timegenie.cloud_incremental_entity_get(p_workspace_id,'unassigned_sessions',p_entity_id)->'data'
+        );
+        perform timegenie.record_processed_operation(
+          p_workspace_id,p_operation_id,p_device_id,p_operation_type,
+          jsonb_build_object('deviceId',p_device_id,'entityType',p_entity_type,'entityId',p_entity_id,'baseVersion',p_base_version,'payload',row_data),
+          result_value
+        );
+        return result_value;
+      end if;
       raise exception 'SYNC_CONFLICT: expected unassigned session version %, current version %', p_base_version, current_version;
     elsif p_base_version is not null and payload_version <= p_base_version then
       raise exception 'VERSION_CONFLICT: unassigned session payload version % must be above base version %', payload_version, p_base_version;
@@ -1473,6 +1595,13 @@ begin
       values(p_workspace_id, (row_data->'work_day'->>'work_date')::date, row_data->'work_day'->>'timezone', row_data->'work_day'->>'work_period_text', row_data->'work_day'->>'note', case when row_data->'work_day'->>'settled_at' is null then null else to_timestamp((row_data->'work_day'->>'settled_at')::double precision / 1000) end, to_timestamp((row_data->'work_day'->>'created_at')::double precision / 1000), to_timestamp((row_data->'work_day'->>'updated_at')::double precision / 1000), coalesce((row_data->'work_day'->>'version')::bigint,1))
       on conflict(workspace_id, work_date) do update set timezone = excluded.timezone, work_period_text = excluded.work_period_text, note = excluded.note, settled_at = excluded.settled_at, updated_at = excluded.updated_at, version = excluded.version
       where timegenie.work_days.version <= excluded.version;
+    end if;
+    if nullif(row_data->>'origin_unassigned_session_id','') is not null then
+      update timegenie.unassigned_sessions
+      set generated_entry_id=(row_data->>'id')::uuid, updated_at=greatest(updated_at,now())
+      where workspace_id=p_workspace_id
+        and id=nullif(row_data->>'origin_unassigned_session_id','')::uuid
+        and state in ('resolved','discarded');
     end if;
     result_value := jsonb_build_object('entityType','time_entry','entityId',p_entity_id,'version',(select version from timegenie.time_entries where id = p_entity_id::uuid));
   elsif p_entity_type = 'unassigned_session' then
@@ -1709,6 +1838,13 @@ begin
     on conflict(workspace_id, work_date) do update set timezone = excluded.timezone, work_period_text = excluded.work_period_text, note = excluded.note, settled_at = excluded.settled_at, updated_at = excluded.updated_at, version = excluded.version
     where timegenie.work_days.version <= excluded.version;
   end if;
+  if nullif(row_data->>'origin_unassigned_session_id','') is not null then
+    update timegenie.unassigned_sessions
+    set generated_entry_id=(row_data->>'id')::uuid, updated_at=greatest(updated_at,now())
+    where workspace_id=p_workspace_id
+      and id=nullif(row_data->>'origin_unassigned_session_id','')::uuid
+      and state in ('resolved','discarded');
+  end if;
 
   result_value := jsonb_build_object('entityType','time_entry','entityId',p_entity_id,'version',final_version);
   perform timegenie.record_processed_operation(
@@ -1767,6 +1903,8 @@ begin
     grant execute on function timegenie.timer_resume(uuid, uuid, uuid, bigint, uuid) to authenticated;
     grant execute on function timegenie.timer_stop(uuid, uuid, uuid, bigint, uuid) to authenticated;
     grant execute on function timegenie.unassigned_get_state(uuid) to authenticated;
+    grant execute on function timegenie.unassigned_get_or_create_shared(uuid, uuid, jsonb, uuid, timestamptz) to authenticated;
+    grant execute on function timegenie.unassigned_resolve_shared(uuid, uuid, uuid, uuid, bigint, text, jsonb) to authenticated;
     grant execute on function timegenie.unassigned_resolve_work(uuid, uuid, uuid, bigint, jsonb, uuid) to authenticated;
     grant execute on function timegenie.unassigned_resolve_break(uuid, uuid, uuid, bigint, jsonb, uuid) to authenticated;
     grant execute on function timegenie.unassigned_discard(uuid, uuid, uuid, bigint, jsonb, uuid) to authenticated;

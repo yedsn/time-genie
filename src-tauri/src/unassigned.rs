@@ -59,6 +59,13 @@ pub struct UnassignedResolveResult {
 }
 
 pub fn get_state(database: &Database) -> Result<Option<UnassignedStateDto>, String> {
+    get_state_with_cloud_context(database, None)
+}
+
+pub(crate) fn get_state_with_cloud_context(
+    database: &Database,
+    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+) -> Result<Option<UnassignedStateDto>, String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     let now = now_millis();
@@ -67,14 +74,71 @@ pub fn get_state(database: &Database) -> Result<Option<UnassignedStateDto>, Stri
         .map_err(|error| error.to_string())?;
     let active_timer = has_active_timer(&transaction, &workspace_id)?;
     let session_id = active_session_id(&transaction, &workspace_id)?;
+    let existing_version = session_id
+        .as_deref()
+        .map(|id| session_version(&transaction, id))
+        .transpose()?;
+    let mut created = false;
     let session_id = match (session_id, active_timer) {
         (Some(id), _) => Some(id),
-        (None, false) => Some(create_session(&transaction, &workspace_id, now)?),
+        (None, false) => {
+            created = true;
+            Some(create_session(
+                &transaction,
+                &workspace_id,
+                now,
+                if cloud_state.is_some() {
+                    "cloud"
+                } else {
+                    "local"
+                },
+                None,
+            )?)
+        }
         (None, true) => None,
     };
     let result = session_id
         .map(|id| load_state(&transaction, &id, now, true))
         .transpose()?;
+    if let (Some(state), Some(result)) = (cloud_state, result.as_ref()) {
+        let migrated_candidate: bool = transaction
+            .query_row(
+                "SELECT shared_source <> 'cloud' OR migration_state = 'candidate'
+                 FROM unassigned_sessions WHERE id=?1",
+                [&result.session_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if migrated_candidate {
+            transaction
+                .execute(
+                    "UPDATE unassigned_sessions
+                     SET shared_source='cloud', migration_state='candidate'
+                     WHERE id=?1",
+                    [&result.session_id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        if created || migrated_candidate || existing_version != Some(result.version) {
+            crate::cloud_sync::enqueue_entity_in_transaction(
+                &transaction,
+                state,
+                if created || migrated_candidate {
+                    "unassigned_session_create"
+                } else {
+                    "unassigned_session_awaiting_resolution"
+                },
+                "unassigned_session",
+                Some(&result.session_id),
+                if created || migrated_candidate {
+                    None
+                } else {
+                    existing_version
+                },
+                None,
+            )?;
+        }
+    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -150,6 +214,15 @@ fn resolve_work_with_cloud_operation(
     }
 
     let entry_id = Uuid::now_v7().to_string();
+    let completed_task_outbox = merged
+        .iter()
+        .filter_map(|(task_id, (_, complete_task, expected_version))| {
+            complete_task
+                .then_some(*expected_version)
+                .flatten()
+                .map(|version| (task_id.clone(), version))
+        })
+        .collect::<Vec<_>>();
     let label = if merged.len() == 1 {
         let task_id = merged.keys().next().expect("single allocation");
         task_title(&transaction, task_id)?
@@ -216,8 +289,14 @@ fn resolve_work_with_cloud_operation(
         Some(&entry_id),
         now,
     )?;
+    transaction
+        .execute(
+            "UPDATE unassigned_sessions SET resolution_operation_id=?1 WHERE id=?2",
+            params![request.operation_id, request.session_id],
+        )
+        .map_err(|error| error.to_string())?;
     let result = UnassignedResolveResult {
-        session_id: request.session_id,
+        session_id: request.session_id.clone(),
         generated_entry_id: Some(entry_id),
         resolution_type: "work".to_string(),
         elapsed_seconds: state.elapsed_seconds,
@@ -231,23 +310,51 @@ fn resolve_work_with_cloud_operation(
         "unassigned_resolve_work",
         &result,
     )?;
-    start_next_session_if_idle(&transaction, &workspace_id, now)?;
+    start_next_session_if_idle(
+        &transaction,
+        &workspace_id,
+        now,
+        cloud_operation.is_some(),
+        Some(&request.session_id),
+    )?;
     bump_revision(&transaction)?;
     if let Some((state, operation_type, operation_id)) = cloud_operation {
+        let session_operation_id = crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "unassigned_session",
+            Some(&result.session_id),
+            Some(request.expected_version),
+            operation_id,
+        )?;
         let generated_entry_operation_id =
             if let Some(entry_id) = result.generated_entry_id.as_deref() {
-                crate::cloud_sync::enqueue_entity_in_transaction(
+                crate::cloud_sync::enqueue_entity_in_transaction_with_dependency(
                     &transaction,
                     state,
-                    operation_type,
+                    "unassigned_time_entry_create",
                     "time_entry",
                     Some(entry_id),
                     None,
-                    operation_id,
+                    None,
+                    session_operation_id.as_deref(),
                 )?
             } else {
                 None
             };
+        for (task_id, base_version) in completed_task_outbox {
+            crate::cloud_sync::enqueue_entity_in_transaction_with_dependency(
+                &transaction,
+                state,
+                "task_set_completed_from_unassigned",
+                "task",
+                Some(&task_id),
+                Some(base_version),
+                None,
+                generated_entry_operation_id.as_deref(),
+            )?;
+        }
         for (entity_id, base_version) in completed_occurrence_outbox {
             crate::cloud_sync::enqueue_entity_in_transaction_with_dependency(
                 &transaction,
@@ -385,8 +492,14 @@ fn resolve_without_allocations(
         entry_id.as_deref(),
         now,
     )?;
+    transaction
+        .execute(
+            "UPDATE unassigned_sessions SET resolution_operation_id=?1 WHERE id=?2",
+            params![request.operation_id, request.session_id],
+        )
+        .map_err(|error| error.to_string())?;
     let result = UnassignedResolveResult {
-        session_id: request.session_id,
+        session_id: request.session_id.clone(),
         generated_entry_id: entry_id,
         resolution_type: resolution_type.to_string(),
         elapsed_seconds: state.elapsed_seconds,
@@ -404,18 +517,34 @@ fn resolve_without_allocations(
         },
         &result,
     )?;
-    start_next_session_if_idle(&transaction, &workspace_id, now)?;
+    start_next_session_if_idle(
+        &transaction,
+        &workspace_id,
+        now,
+        cloud_operation.is_some(),
+        Some(&request.session_id),
+    )?;
     bump_revision(&transaction)?;
     if let Some((state, operation_type, operation_id)) = cloud_operation {
+        let session_operation_id = crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "unassigned_session",
+            Some(&result.session_id),
+            Some(request.expected_version),
+            operation_id,
+        )?;
         if let Some(entry_id) = result.generated_entry_id.as_deref() {
-            crate::cloud_sync::enqueue_entity_in_transaction(
+            crate::cloud_sync::enqueue_entity_in_transaction_with_dependency(
                 &transaction,
                 state,
-                operation_type,
+                "unassigned_time_entry_create",
                 "time_entry",
                 Some(entry_id),
                 None,
-                operation_id,
+                None,
+                session_operation_id.as_deref(),
             )?;
         }
     }
@@ -463,12 +592,25 @@ pub fn pause_for_timer(
     transaction: &Transaction<'_>,
     workspace_id: &str,
     now: i64,
+    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
 ) -> Result<(), String> {
     let Some(session_id) = active_session_id(transaction, workspace_id)? else {
         return Ok(());
     };
+    let base_version = session_version(transaction, &session_id)?;
     close_open_segment(transaction, &session_id, now)?;
     refresh_session_duration(transaction, &session_id, now)?;
+    if let Some(state) = cloud_state {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            transaction,
+            state,
+            "unassigned_session_pause",
+            "unassigned_session",
+            Some(&session_id),
+            Some(base_version),
+            None,
+        )?;
+    }
     Ok(())
 }
 
@@ -476,10 +618,27 @@ pub fn resume_after_timer(
     transaction: &Transaction<'_>,
     workspace_id: &str,
     now: i64,
+    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
 ) -> Result<(), String> {
-    let session_id = match active_session_id(transaction, workspace_id)? {
-        Some(id) => id,
-        None => create_session(transaction, workspace_id, now)?,
+    let existing_session = active_session_id(transaction, workspace_id)?;
+    let session_id = match existing_session.as_ref() {
+        Some(id) => id.clone(),
+        None => create_session(
+            transaction,
+            workspace_id,
+            now,
+            if cloud_state.is_some() {
+                "cloud"
+            } else {
+                "local"
+            },
+            None,
+        )?,
+    };
+    let base_version = if existing_session.is_some() {
+        Some(session_version(transaction, &session_id)?)
+    } else {
+        None
     };
     let open_count: i64 = transaction
         .query_row(
@@ -509,6 +668,21 @@ pub fn resume_after_timer(
                 params![now, session_id],
             )
             .map_err(|error| error.to_string())?;
+    }
+    if let Some(state) = cloud_state {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            transaction,
+            state,
+            if base_version.is_some() {
+                "unassigned_session_resume"
+            } else {
+                "unassigned_session_create"
+            },
+            "unassigned_session",
+            Some(&session_id),
+            base_version,
+            None,
+        )?;
     }
     Ok(())
 }
@@ -616,6 +790,8 @@ fn create_session(
     transaction: &Transaction<'_>,
     workspace_id: &str,
     now: i64,
+    shared_source: &str,
+    predecessor_session_id: Option<&str>,
 ) -> Result<String, String> {
     let id = Uuid::now_v7().to_string();
     let threshold = prompt_threshold(transaction, workspace_id)?;
@@ -623,9 +799,18 @@ fn create_session(
         .execute(
             "INSERT INTO unassigned_sessions(
                id, workspace_id, work_date, state, threshold_seconds, duration_seconds,
-               first_started_at, created_at, updated_at, version
-             ) VALUES (?1, ?2, ?3, 'collecting', ?4, 0, ?5, ?5, ?5, 1)",
-            params![id, workspace_id, local_date(), threshold, now],
+               first_started_at, created_at, updated_at, version, shared_source,
+               predecessor_session_id, migration_state
+             ) VALUES (?1, ?2, ?3, 'collecting', ?4, 0, ?5, ?5, ?5, 1, ?6, ?7, 'ready')",
+            params![
+                id,
+                workspace_id,
+                local_date(),
+                threshold,
+                now,
+                shared_source,
+                predecessor_session_id
+            ],
         )
         .map_err(|error| error.to_string())?;
     transaction
@@ -642,11 +827,29 @@ fn start_next_session_if_idle(
     transaction: &Transaction<'_>,
     workspace_id: &str,
     now: i64,
+    shared: bool,
+    predecessor_session_id: Option<&str>,
 ) -> Result<(), String> {
     if !has_active_timer(transaction, workspace_id)? {
-        create_session(transaction, workspace_id, now)?;
+        create_session(
+            transaction,
+            workspace_id,
+            now,
+            if shared { "cloud" } else { "local" },
+            predecessor_session_id,
+        )?;
     }
     Ok(())
+}
+
+fn session_version(connection: &rusqlite::Connection, session_id: &str) -> Result<i64, String> {
+    connection
+        .query_row(
+            "SELECT version FROM unassigned_sessions WHERE id=?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())
 }
 
 fn load_state(
@@ -1099,6 +1302,87 @@ mod tests {
     }
 
     #[test]
+    fn local_mode_refreshes_do_not_create_shared_outbox() {
+        let (database, _) = setup();
+        let first = get_state(&database).unwrap().unwrap();
+        for _ in 0..10 {
+            let refreshed = get_state(&database).unwrap().unwrap();
+            assert_eq!(refreshed.session_id, first.session_id);
+        }
+        let connection = database.open().unwrap();
+        let outbox_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE entity_type='unassigned_session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outbox_count, 0);
+        let shared_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM unassigned_sessions WHERE shared_source='cloud'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(shared_count, 0);
+    }
+
+    #[test]
+    fn cloud_mode_refreshes_do_not_upload_per_second() {
+        let (database, _) = setup();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id.clone()),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let state = crate::supabase::storage_mode(&database).unwrap();
+        let first = get_state_with_cloud_context(&database, Some(&state))
+            .unwrap()
+            .unwrap();
+        let initial_outbox: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1 AND entity_type='unassigned_session'",
+                [&cloud_workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(initial_outbox, 1);
+        for _ in 0..10 {
+            let refreshed = get_state_with_cloud_context(&database, Some(&state))
+                .unwrap()
+                .unwrap();
+            assert_eq!(refreshed.session_id, first.session_id);
+        }
+        let final_outbox: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1 AND entity_type='unassigned_session'",
+                [&cloud_workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(final_outbox, initial_outbox);
+    }
+
+    #[test]
     fn cloud_mode_unassigned_work_can_write_local_cache_when_cloud_is_unavailable() {
         let (database, task_id) = setup();
         let cloud_workspace_id = Uuid::now_v7().to_string();
@@ -1174,16 +1458,18 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox.len(), 2);
         assert_eq!(outbox[0].0, operation_id);
         assert_eq!(outbox[0].1, "unassigned_resolve_work");
-        assert_eq!(outbox[0].2, "time_entry");
-        assert_eq!(outbox[0].3, entry_id);
-        assert_eq!(outbox[0].4, None);
-        let entry_payload: serde_json::Value = serde_json::from_str(&outbox[0].5).unwrap();
+        assert_eq!(outbox[0].2, "unassigned_session");
+        assert_eq!(outbox[1].1, "unassigned_time_entry_create");
+        assert_eq!(outbox[1].2, "time_entry");
+        assert_eq!(outbox[1].3, entry_id);
+        assert_eq!(outbox[1].4, None);
+        let entry_payload: serde_json::Value = serde_json::from_str(&outbox[1].5).unwrap();
         assert_eq!(
             entry_payload.get("origin_unassigned_session_id"),
-            Some(&serde_json::Value::Null)
+            Some(&serde_json::Value::String(result.session_id))
         );
         assert!(entry_payload
             .get("allocations")
@@ -1288,22 +1574,26 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert_eq!(outbox.len(), 2);
+        assert_eq!(outbox.len(), 4);
         assert_eq!(outbox[0].0, break_operation_id);
         assert_eq!(outbox[0].1, "unassigned_resolve_break");
-        assert_eq!(outbox[0].2, "time_entry");
-        assert_eq!(
-            outbox[0].3.as_deref(),
-            break_result.generated_entry_id.as_deref()
-        );
-        assert_eq!(outbox[0].4, None);
-        assert_eq!(outbox[1].0, discard_operation_id);
-        assert_eq!(outbox[1].1, "unassigned_discard");
+        assert_eq!(outbox[0].2, "unassigned_session");
+        assert_eq!(outbox[1].1, "unassigned_time_entry_create");
         assert_eq!(outbox[1].2, "time_entry");
         assert_eq!(
             outbox[1].3.as_deref(),
-            discard_result.generated_entry_id.as_deref()
+            break_result.generated_entry_id.as_deref()
         );
         assert_eq!(outbox[1].4, None);
+        assert_eq!(outbox[2].0, discard_operation_id);
+        assert_eq!(outbox[2].1, "unassigned_discard");
+        assert_eq!(outbox[2].2, "unassigned_session");
+        assert_eq!(outbox[3].1, "unassigned_time_entry_create");
+        assert_eq!(outbox[3].2, "time_entry");
+        assert_eq!(
+            outbox[3].3.as_deref(),
+            discard_result.generated_entry_id.as_deref()
+        );
+        assert_eq!(outbox[3].4, None);
     }
 }
