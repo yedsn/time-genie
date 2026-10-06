@@ -38,6 +38,8 @@ end $$;
 \ir 20261004_verify_timegenie_cloud_guards.sql
 \ir 20261005_timegenie_timer_sync_coordination_patch.sql
 \ir 20261005_timegenie_cloud_task_planning_patch.sql
+\ir 20261005b_timegenie_event_driven_sync_patch.sql
+\ir 20261005b_timegenie_event_driven_sync_patch.sql
 
 do $$
 begin
@@ -73,6 +75,15 @@ begin
   end if;
   if not has_function_privilege('authenticated', 'timegenie.cloud_snapshot_get(uuid)', 'execute') then
     raise exception 'authenticated is missing RPC execute privilege';
+  end if;
+  if not has_function_privilege('authenticated', 'timegenie.cloud_incremental_pull(uuid, uuid, bigint, integer)', 'execute') then
+    raise exception 'authenticated is missing incremental pull RPC execute privilege';
+  end if;
+  if has_function_privilege('anon', 'timegenie.cloud_incremental_pull(uuid, uuid, bigint, integer)', 'execute') then
+    raise exception 'anon can execute incremental pull RPC';
+  end if;
+  if has_function_privilege('authenticated', 'timegenie.cloud_incremental_entity_get(uuid, text, text)', 'execute') then
+    raise exception 'authenticated can execute internal incremental entity helper';
   end if;
   if not has_function_privilege('authenticated', 'timegenie.cloud_apply_patch(uuid, uuid, uuid, text, text, text, bigint, jsonb)', 'execute') then
     raise exception 'authenticated is missing cloud apply RPC execute privilege';
@@ -312,6 +323,19 @@ begin
     when others then
       if sqlerrm not like '%DEVICE_NOT_REGISTERED%' then raise; end if;
   end;
+
+  begin
+    perform timegenie.cloud_incremental_pull(
+      '20000000-0000-0000-0000-000000000001',
+      '30000000-0000-0000-0000-000000000098',
+      0,
+      10
+    );
+    raise exception 'revoked device read incremental changes';
+  exception
+    when others then
+      if sqlerrm not like '%DEVICE_REVOKED%' then raise; end if;
+  end;
 end $$;
 
 select timegenie.cloud_apply_patch(
@@ -340,6 +364,18 @@ begin
   begin
     perform timegenie.cloud_snapshot_get('20000000-0000-0000-0000-000000000001');
     raise exception 'RLS exposed another user snapshot';
+  exception
+    when others then
+      if sqlerrm not like '%AUTH_REQUIRED%' then raise; end if;
+  end;
+  begin
+    perform timegenie.cloud_incremental_pull(
+      '20000000-0000-0000-0000-000000000001',
+      '30000000-0000-0000-0000-000000000001',
+      0,
+      10
+    );
+    raise exception 'incremental RPC exposed another user workspace';
   exception
     when others then
       if sqlerrm not like '%AUTH_REQUIRED%' then raise; end if;
@@ -524,6 +560,75 @@ begin
     when others then
       if sqlerrm not like '%IDEMPOTENCY_CONFLICT%' then raise; end if;
   end;
+end $$;
+
+-- Incremental reads preserve ordered cursor coverage, page without gaps,
+-- collapse repeated changes for one entity to its final image, and return an
+-- explicit tombstone after deletion.
+reset role;
+do $$
+declare before_seq bigint;
+begin
+  select coalesce(max(change_seq), 0) into before_seq
+  from timegenie.workspace_changes
+  where workspace_id = '20000000-0000-0000-0000-000000000001';
+  perform set_config('timegenie.incremental_test_before_seq', before_seq::text, true);
+
+  insert into timegenie.app_settings(workspace_id, key, value_json, version)
+  values('20000000-0000-0000-0000-000000000001', 'incremental_contract_probe', '{"step":1}'::jsonb, 1);
+  update timegenie.app_settings
+  set value_json = '{"step":2}'::jsonb, version = 2, updated_at = now()
+  where workspace_id = '20000000-0000-0000-0000-000000000001'
+    and key = 'incremental_contract_probe';
+  delete from timegenie.app_settings
+  where workspace_id = '20000000-0000-0000-0000-000000000001'
+    and key = 'incremental_contract_probe';
+end $$;
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '10000000-0000-0000-0000-000000000001', true);
+
+do $$
+declare before_seq bigint := current_setting('timegenie.incremental_test_before_seq')::bigint;
+declare first_page jsonb;
+declare folded jsonb;
+declare first_change_seq bigint;
+begin
+  first_page := timegenie.cloud_incremental_pull(
+    '20000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    before_seq,
+    1
+  );
+  if jsonb_array_length(first_page->'changes') <> 1
+     or not (first_page->>'has_more')::boolean
+     or (first_page->>'reset_required')::boolean then
+    raise exception 'incremental first page metadata is invalid: %', first_page;
+  end if;
+  first_change_seq := (first_page->'changes'->0->>'change_seq')::bigint;
+  if first_change_seq <> before_seq + 1
+     or (first_page->>'covered_change_seq')::bigint <> first_change_seq
+     or (first_page->>'latest_change_seq')::bigint < first_change_seq + 2 then
+    raise exception 'incremental first page cursor coverage is invalid: %', first_page;
+  end if;
+
+  folded := timegenie.cloud_incremental_pull(
+    '20000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    before_seq,
+    100
+  );
+  if jsonb_array_length(folded->'changes') <> 3
+     or jsonb_array_length(folded->'entities') <> 1
+     or (folded->>'has_more')::boolean then
+    raise exception 'incremental repeated changes were not folded: %', folded;
+  end if;
+  if folded->'entities'->0->>'source_entity_type' <> 'app_settings'
+     or folded->'entities'->0->>'entity_id' <> 'incremental_contract_probe'
+     or (folded->'entities'->0->>'change_seq')::bigint <> (folded->>'covered_change_seq')::bigint
+     or not (folded->'entities'->0->>'deleted')::boolean
+     or folded->'entities'->0->'data' is distinct from 'null'::jsonb then
+    raise exception 'incremental delete did not return an explicit tombstone: %', folded;
+  end if;
 end $$;
 
 do $$
@@ -1754,6 +1859,49 @@ begin
 end $$;
 
 reset role;
+
+-- Every entity type published by the supported workspace change triggers has
+-- a deterministic incremental representation. Child rows are intentionally
+-- aggregated to their time-entry or report root.
+do $$
+declare mapping record;
+declare entity jsonb;
+begin
+  for mapping in
+    select * from (values
+      ('subjects', '00000000-0000-0000-0000-000000000001', 'subjects'),
+      ('work_days', '2099-01-01', 'work_days'),
+      ('app_settings', 'missing-setting', 'app_settings'),
+      ('tasks', '00000000-0000-0000-0000-000000000002', 'tasks'),
+      ('task_status_events', '00000000-0000-0000-0000-000000000003', 'task_status_events'),
+      ('task_daily_estimates', '00000000-0000-0000-0000-000000000002|2099-01-01', 'task_daily_estimates'),
+      ('task_recurrence_rules', '00000000-0000-0000-0000-000000000002', 'task_recurrence_rules'),
+      ('task_occurrences', '00000000-0000-0000-0000-000000000002|2099-01-01', 'task_occurrences'),
+      ('unassigned_sessions', '00000000-0000-0000-0000-000000000007', 'unassigned_sessions'),
+      ('time_entries', '00000000-0000-0000-0000-000000000004', 'time_entries'),
+      ('time_segments', '00000000-0000-0000-0000-000000000004', 'time_entries'),
+      ('time_allocations', '00000000-0000-0000-0000-000000000004', 'time_entries'),
+      ('report_templates', '00000000-0000-0000-0000-000000000005', 'report_templates'),
+      ('reports', '00000000-0000-0000-0000-000000000006', 'reports'),
+      ('report_tasks', '00000000-0000-0000-0000-000000000006', 'reports'),
+      ('integration_configs', 'missing-provider', 'integration_configs'),
+      ('external_bindings', 'missing-provider|task|00000000-0000-0000-0000-000000000002', 'external_bindings')
+    ) values_table(source_type, entity_id, result_type)
+  loop
+    entity := timegenie.cloud_incremental_entity_get(
+      '20000000-0000-0000-0000-000000000001',
+      mapping.source_type,
+      mapping.entity_id
+    );
+    if entity->>'source_entity_type' <> mapping.source_type
+       or entity->>'entity_type' <> mapping.result_type
+       or entity->>'entity_id' <> mapping.entity_id
+       or not (entity ? 'deleted')
+       or not (entity ? 'data') then
+      raise exception 'incremental RPC has no applicable representation for %: %', mapping.source_type, entity;
+    end if;
+  end loop;
+end $$;
 
 do $$
 begin

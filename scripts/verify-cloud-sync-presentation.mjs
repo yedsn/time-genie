@@ -61,8 +61,8 @@ assert.equal(offline.attentionLevel, "offline");
 assert.equal(offline.needsAttention, true);
 
 const synced = cloudSyncPresentation({ ...cloud, lastSyncedAt: 1234 }, formatSyncTime);
-assert.equal(synced.label, "已同步");
-assert.equal(synced.detail, "最近同步 time:1234");
+assert.equal(synced.label, "实时同步");
+assert.equal(synced.detail, "已实时同步 · 最近更新 time:1234");
 assert.equal(synced.needsAttention, false);
 assert.equal(synced.attentionLevel, "");
 

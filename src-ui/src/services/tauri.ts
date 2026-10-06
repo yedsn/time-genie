@@ -937,16 +937,12 @@ export async function resumeCloudSyncAfterReauth(): Promise<StorageModeSnapshot>
   return await invoke("cloud_sync_resume_after_reauth");
 }
 
-export async function refreshCloudSync(): Promise<StorageModeSnapshot> {
-  return await invoke("cloud_sync_refresh");
+export async function refreshCloudSync(): Promise<void> {
+  await invoke("cloud_sync_refresh");
 }
 
 export async function resetLocalCacheFromCloud(): Promise<StorageModeSnapshot> {
   return await invoke("cloud_sync_reset_local_cache");
-}
-
-export async function pushCloudSync(): Promise<{ pushed: number; pending: number; conflicts: number }> {
-  return await invoke("cloud_sync_push");
 }
 
 export async function listCloudSyncConflicts(): Promise<CloudSyncConflict[]> {

@@ -50,6 +50,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "local_only_unassigned_sessions",
         sql: include_str!("../migrations/0007_local_only_unassigned_sessions.sql"),
     },
+    Migration {
+        version: 8,
+        name: "event_driven_cloud_sync",
+        sql: include_str!("../migrations/0008_event_driven_cloud_sync.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -438,6 +443,7 @@ mod tests {
         "integration_configs",
         "local_sync_state",
         "sync_outbox",
+        "cloud_deferred_entities",
         "local_report_outputs",
         "device_hooks",
         "device_hook_runs",
@@ -448,7 +454,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let database = Database::initialize_at(directory.path().join("test.sqlite3")).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 7);
+        assert_eq!(status.schema_version, 8);
         for table in REQUIRED_TABLES {
             assert!(
                 status.tables.iter().any(|value| value == table),
@@ -488,8 +494,94 @@ mod tests {
         let workspace_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migration_count, 7);
+        assert_eq!(migration_count, 8);
         assert_eq!(workspace_count, 1);
+    }
+
+    #[test]
+    fn event_driven_sync_migration_preserves_business_data_and_outbox() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("event-driven-upgrade.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                   version INTEGER PRIMARY KEY,
+                   name TEXT NOT NULL,
+                   applied_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        for migration in &MIGRATIONS[..7] {
+            let transaction = connection.transaction().unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?1, ?2, ?3)",
+                    params![migration.version, migration.name, now_millis()],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO workspaces(id, name, timezone, storage_mode, created_at, updated_at, version)
+                 VALUES ('upgrade-workspace', '升级工作空间', 'Asia/Shanghai', 'cloud', 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO subjects(id, workspace_id, name, sort_order, created_at, updated_at, version)
+                 VALUES ('upgrade-subject', 'upgrade-workspace', '升级主体', 1, 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, payload_json, state, attempt_count, created_at)
+                 VALUES ('upgrade-operation', 'upgrade-workspace', 'upgrade-device', 'task.update', 'task', 'upgrade-task', '{}', 'pending', 0, 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO tasks(id, workspace_id, subject_id, title, status, source_type, sort_order, created_at, updated_at, version)
+                 VALUES ('upgrade-task', 'upgrade-workspace', 'upgrade-subject', '升级前事项', 'open', 'manual', 99, 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::initialize_at(path).unwrap();
+        let connection = database.open().unwrap();
+        let task_title: String = connection
+            .query_row(
+                "SELECT title FROM tasks WHERE id = 'upgrade-task'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let queued: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE operation_id = 'upgrade-operation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let deferred_table: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('cloud_deferred_entities')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(task_title, "升级前事项");
+        assert_eq!(queued, 1);
+        assert_eq!(deferred_table, 6);
+        assert_eq!(database.status().unwrap().schema_version, 8);
     }
 
     #[test]
@@ -800,7 +892,7 @@ mod tests {
 
         let database = Database::initialize_at(path).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 7);
+        assert_eq!(status.schema_version, 8);
         assert!(status.tables.iter().any(|table| table == "device_hooks"));
         assert!(status
             .tables

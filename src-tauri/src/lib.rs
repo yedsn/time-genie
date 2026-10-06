@@ -207,15 +207,24 @@ fn window_size_for_scale(
 }
 
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+    let builder = tauri::Builder::default();
+    let builder = if cfg!(debug_assertions)
+        && std::env::var_os("TG_DEV_ALLOW_MULTIPLE_INSTANCES").is_some()
+    {
+        builder
+    } else {
+        builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show(app, "main");
         }))
+    };
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             let database = initialize_database(&app_data_dir)?;
+            #[cfg(debug_assertions)]
+            supabase::configure_dev_cloud_from_env(&database).map_err(std::io::Error::other)?;
             automation_hooks::recover_interrupted_runs(&database).map_err(std::io::Error::other)?;
             cloud_sync::spawn_background_services(database.clone(), app.handle().clone());
             app.manage(database.clone());
@@ -392,8 +401,6 @@ pub fn run() {
             supabase::storage_migration_execute,
             cloud_sync::cloud_sync_status,
             cloud_sync::cloud_sync_queue,
-            cloud_sync::cloud_sync_pull,
-            cloud_sync::cloud_sync_push,
             cloud_sync::cloud_sync_refresh,
             cloud_sync::cloud_sync_reset_local_cache,
             cloud_sync::cloud_sync_conflicts,
@@ -469,6 +476,17 @@ pub fn run() {
 }
 
 fn initialize_database(app_data_dir: &std::path::Path) -> Result<Database, std::io::Error> {
+    if cfg!(debug_assertions) {
+        if let Some(dev_dir) = std::env::var_os("TG_DEV_DATA_DIR") {
+            let dev_dir = std::path::PathBuf::from(dev_dir);
+            return Database::initialize(&dev_dir).map_err(|error| {
+                std::io::Error::other(format!(
+                    "数据库初始化失败: 指定开发目录 {} 失败: {error}",
+                    dev_dir.display()
+                ))
+            });
+        }
+    }
     if cfg!(debug_assertions) && std::env::var_os("TG_USE_APP_DATA_DIR").is_none() {
         let dev_dir = std::env::current_dir()
             .unwrap_or_else(|_| std::path::PathBuf::from("."))

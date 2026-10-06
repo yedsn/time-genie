@@ -1,0 +1,214 @@
+import { createHotContext as __vite__createHotContext } from "/@vite/client";import.meta.hot = __vite__createHotContext("/src/components/GlobalTimerBar.vue");import { defineComponent as _defineComponent } from "/@fs/D:/Workspaces/git/my/time-genie/node_modules/.vite/deps/vue.js?v=27b48170";
+import { computed, ref } from "/@fs/D:/Workspaces/git/my/time-genie/node_modules/.vite/deps/vue.js?v=27b48170";
+import { Pause, Play, Square } from "/@fs/D:/Workspaces/git/my/time-genie/node_modules/.vite/deps/lucide-vue-next.js?v=27b48170";
+import { ElMessage } from "/@fs/D:/Workspaces/git/my/time-genie/node_modules/.vite/deps/element-plus.js?v=27b48170";
+import { useWorkdayStore } from "/src/store.ts";
+import TaskSelectControl from "/src/components/TaskSelectControl.vue";
+const _sfc_main = /* @__PURE__ */ _defineComponent({
+  __name: "GlobalTimerBar",
+  emits: ["open"],
+  setup(__props, { expose: __expose, emit: __emit }) {
+    __expose();
+    const emit = __emit;
+    const store = useWorkdayStore();
+    const selectedTaskId = ref(store.selectedTaskId);
+    const taskControl = ref();
+    const busy = ref(false);
+    const elapsedSeconds = computed(() => {
+      const entry = store.runningEntry;
+      return entry ? store.entryDurationSeconds(entry) : 0;
+    });
+    const clockText = computed(() => {
+      const seconds = elapsedSeconds.value;
+      const hours = Math.floor(seconds / 3600);
+      const minutes = Math.floor(seconds % 3600 / 60);
+      const rest = seconds % 60;
+      return [hours, minutes, rest].map((value) => String(value).padStart(2, "0")).join(":");
+    });
+    async function startSelectedTimer() {
+      const taskId = taskControl.value?.commit() ?? selectedTaskId.value;
+      busy.value = true;
+      try {
+        await store.startTimer(taskId);
+      } catch (error) {
+        ElMessage.error(errorText(error, "开始计时失败"));
+      } finally {
+        busy.value = false;
+      }
+    }
+    async function runTimerAction(action, fallback) {
+      busy.value = true;
+      try {
+        await action();
+      } catch (error) {
+        ElMessage.error(errorText(error, fallback));
+      } finally {
+        busy.value = false;
+      }
+    }
+    function errorText(error, fallback) {
+      if (typeof error === "string" && error.trim()) return error;
+      return error instanceof Error ? error.message : fallback;
+    }
+    const __returned__ = { emit, store, selectedTaskId, taskControl, busy, elapsedSeconds, clockText, startSelectedTimer, runTimerAction, errorText, get Pause() {
+      return Pause;
+    }, get Play() {
+      return Play;
+    }, get Square() {
+      return Square;
+    }, TaskSelectControl };
+    Object.defineProperty(__returned__, "__isScriptSetup", { enumerable: false, value: true });
+    return __returned__;
+  }
+});
+import { createElementVNode as _createElementVNode, toDisplayString as _toDisplayString, createVNode as _createVNode, openBlock as _openBlock, createElementBlock as _createElementBlock, Fragment as _Fragment, normalizeClass as _normalizeClass } from "/@fs/D:/Workspaces/git/my/time-genie/node_modules/.vite/deps/vue.js?v=27b48170";
+const _hoisted_1 = { class: "global-timer-copy" };
+const _hoisted_2 = { class: "global-timer-actions" };
+const _hoisted_3 = ["disabled"];
+const _hoisted_4 = ["disabled"];
+const _hoisted_5 = ["disabled"];
+const _hoisted_6 = ["disabled"];
+function _sfc_render(_ctx, _cache, $props, $setup, $data, $options) {
+  return _openBlock(), _createElementBlock(
+    "section",
+    {
+      class: _normalizeClass(["global-timer-bar topbar-quick-timer", $setup.store.runningEntry?.state ?? "idle"])
+    },
+    [
+      $setup.store.runningEntry ? (_openBlock(), _createElementBlock(
+        _Fragment,
+        { key: 0 },
+        [
+          _createElementVNode("button", {
+            class: "global-timer-main",
+            type: "button",
+            title: "打开计时页面",
+            onClick: _cache[0] || (_cache[0] = ($event) => $setup.emit("open"))
+          }, [
+            _cache[5] || (_cache[5] = _createElementVNode(
+              "span",
+              {
+                class: "global-timer-indicator",
+                "aria-hidden": "true"
+              },
+              null,
+              -1
+              /* CACHED */
+            )),
+            _createElementVNode("span", _hoisted_1, [
+              _createElementVNode(
+                "small",
+                null,
+                _toDisplayString($setup.store.runningEntry.state === "paused" ? "已暂停" : "正在计时"),
+                1
+                /* TEXT */
+              ),
+              _createElementVNode(
+                "strong",
+                null,
+                _toDisplayString($setup.store.timeEntryLabel($setup.store.runningEntry)),
+                1
+                /* TEXT */
+              )
+            ]),
+            _createElementVNode(
+              "time",
+              null,
+              _toDisplayString($setup.clockText),
+              1
+              /* TEXT */
+            )
+          ]),
+          _createElementVNode("div", _hoisted_2, [
+            $setup.store.runningEntry.state === "running" ? (_openBlock(), _createElementBlock("button", {
+              key: 0,
+              class: "icon-button",
+              type: "button",
+              title: "暂停",
+              disabled: $setup.busy,
+              onClick: _cache[1] || (_cache[1] = ($event) => $setup.runTimerAction($setup.store.pauseTimer, "暂停计时失败"))
+            }, [
+              _createVNode($setup["Pause"], {
+                size: 14,
+                fill: "currentColor"
+              })
+            ], 8, _hoisted_3)) : (_openBlock(), _createElementBlock("button", {
+              key: 1,
+              class: "icon-button",
+              type: "button",
+              title: "继续",
+              disabled: $setup.busy,
+              onClick: _cache[2] || (_cache[2] = ($event) => $setup.runTimerAction($setup.store.resumeTimer, "继续计时失败"))
+            }, [
+              _createVNode($setup["Play"], {
+                size: 14,
+                fill: "currentColor"
+              })
+            ], 8, _hoisted_4)),
+            _createElementVNode("button", {
+              class: "icon-button stop",
+              type: "button",
+              title: "结束计时",
+              disabled: $setup.busy,
+              onClick: _cache[3] || (_cache[3] = ($event) => $setup.runTimerAction($setup.store.stopTimer, "结束计时失败"))
+            }, [
+              _createVNode($setup["Square"], {
+                size: 12,
+                fill: "currentColor"
+              })
+            ], 8, _hoisted_5)
+          ])
+        ],
+        64
+        /* STABLE_FRAGMENT */
+      )) : (_openBlock(), _createElementBlock(
+        _Fragment,
+        { key: 1 },
+        [
+          _createVNode($setup["TaskSelectControl"], {
+            ref: "taskControl",
+            modelValue: $setup.selectedTaskId,
+            "onUpdate:modelValue": _cache[4] || (_cache[4] = ($event) => $setup.selectedTaskId = $event),
+            variant: "compact",
+            placeholder: "事项（可选）",
+            "aria-label": "快速计时事项"
+          }, null, 8, ["modelValue"]),
+          _createElementVNode("button", {
+            class: "quick-timer-start",
+            type: "button",
+            title: "开始计时",
+            disabled: $setup.busy,
+            onClick: $setup.startSelectedTimer
+          }, [
+            _createVNode($setup["Play"], {
+              size: 15,
+              fill: "currentColor"
+            })
+          ], 8, _hoisted_6)
+        ],
+        64
+        /* STABLE_FRAGMENT */
+      ))
+    ],
+    2
+    /* CLASS */
+  );
+}
+_sfc_main.__hmrId = "e447879f";
+typeof __VUE_HMR_RUNTIME__ !== "undefined" && __VUE_HMR_RUNTIME__.createRecord(_sfc_main.__hmrId, _sfc_main);
+import.meta.hot.on("file-changed", ({ file }) => {
+  __VUE_HMR_RUNTIME__.CHANGED_FILE = file;
+});
+import.meta.hot.accept((mod) => {
+  if (!mod) return;
+  const { default: updated, _rerender_only } = mod;
+  if (_rerender_only) {
+    __VUE_HMR_RUNTIME__.rerender(updated.__hmrId, updated.render);
+  } else {
+    __VUE_HMR_RUNTIME__.reload(updated.__hmrId, updated);
+  }
+});
+import _export_sfc from "/@id/__x00__plugin-vue:export-helper";
+export default /* @__PURE__ */ _export_sfc(_sfc_main, [["render", _sfc_render], ["__file", "D:/Workspaces/git/my/time-genie/src-ui/src/components/GlobalTimerBar.vue"]]);
+
+//# sourceMappingURL=data:application/json;base64,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VTtBQUFBLGNBQU8sU0FBSyxzQ0FBRSxzQkFBZSxhQUFNLFlBQVU7QUFBQTtjQUFhLGFBQXdDO0FBQUEsZ0JBQWhDLE1BQU07QUFBQSxnQkFBSSxNQUFLO0FBQUE7Z0RBQy9MLG9CQUFrTDtBQUFBO2NBQW5LLE9BQU07QUFBQSxjQUFjLE1BQUs7QUFBQSxjQUFTLE9BQU07QUFBQSxjQUFNLFVBQVU7QUFBQSxjQUFPLFNBQUssc0NBQUUsc0JBQWUsYUFBTSxhQUFXO0FBQUE7Y0FBYSxhQUF1QztBQUFBLGdCQUFoQyxNQUFNO0FBQUEsZ0JBQUksTUFBSztBQUFBOztZQUN4SixvQkFBa0w7QUFBQSxjQUExSyxPQUFNO0FBQUEsY0FBbUIsTUFBSztBQUFBLGNBQVMsT0FBTTtBQUFBLGNBQVEsVUFBVTtBQUFBLGNBQU8sU0FBSyxzQ0FBRSxzQkFBZSxhQUFNLFdBQVM7QUFBQTtjQUFhLGFBQXlDO0FBQUEsZ0JBQWhDLE1BQU07QUFBQSxnQkFBSSxNQUFLO0FBQUE7Ozs7OzswQkFJNUo7QUFBQSxRQVNXO0FBQUE7QUFBQTtBQUFBLFVBUlQsYUFNRTtBQUFBLFlBTEEsS0FBSTtBQUFBLHdCQUNLO0FBQUEsaUdBQWM7QUFBQSxZQUN2QixTQUFRO0FBQUEsWUFDUixhQUFZO0FBQUEsWUFDWixjQUFXO0FBQUE7VUFFYixvQkFBMEo7QUFBQSxZQUFsSixPQUFNO0FBQUEsWUFBb0IsTUFBSztBQUFBLFlBQVMsT0FBTTtBQUFBLFlBQVEsVUFBVTtBQUFBLFlBQU8sU0FBTztBQUFBO1lBQW9CLGFBQXVDO0FBQUEsY0FBaEMsTUFBTTtBQUFBLGNBQUksTUFBSztBQUFBIiwibmFtZXMiOltdLCJpZ25vcmVMaXN0IjpbXSwic291cmNlcyI6WyJHbG9iYWxUaW1lckJhci52dWUiXSwic291cmNlc0NvbnRlbnQiOlsiPHNjcmlwdCBzZXR1cCBsYW5nPVwidHNcIj5cclxuaW1wb3J0IHsgY29tcHV0ZWQsIHJlZiB9IGZyb20gXCJ2dWVcIjtcclxuaW1wb3J0IHsgUGF1c2UsIFBsYXksIFNxdWFyZSB9IGZyb20gXCJsdWNpZGUtdnVlLW5leHRcIjtcclxuaW1wb3J0IHsgRWxNZXNzYWdlIH0gZnJvbSBcImVsZW1lbnQtcGx1c1wiO1xyXG5pbXBvcnQgeyB1c2VXb3JrZGF5U3RvcmUgfSBmcm9tIFwiLi4vc3RvcmVcIjtcclxuaW1wb3J0IFRhc2tTZWxlY3RDb250cm9sIGZyb20gXCIuL1Rhc2tTZWxlY3RDb250cm9sLnZ1ZVwiO1xyXG5cclxudHlwZSBUYXNrU2VsZWN0Q29udHJvbEluc3RhbmNlID0geyBjb21taXQ6ICgpID0+IHN0cmluZyB8IHVuZGVmaW5lZCB9O1xyXG5cclxuY29uc3QgZW1pdCA9IGRlZmluZUVtaXRzPHsgb3BlbjogW10gfT4oKTtcclxuY29uc3Qgc3RvcmUgPSB1c2VXb3JrZGF5U3RvcmUoKTtcclxuY29uc3Qgc2VsZWN0ZWRUYXNrSWQgPSByZWYoc3RvcmUuc2VsZWN0ZWRUYXNrSWQpO1xyXG5jb25zdCB0YXNrQ29udHJvbCA9IHJlZjxUYXNrU2VsZWN0Q29udHJvbEluc3RhbmNlPigpO1xyXG5jb25zdCBidXN5ID0gcmVmKGZhbHNlKTtcclxuXHJcbmNvbnN0IGVsYXBzZWRTZWNvbmRzID0gY29tcHV0ZWQoKCkgPT4ge1xyXG4gIGNvbnN0IGVudHJ5ID0gc3RvcmUucnVubmluZ0VudHJ5O1xyXG4gIHJldHVybiBlbnRyeSA/IHN0b3JlLmVudHJ5RHVyYXRpb25TZWNvbmRzKGVudHJ5KSA6IDA7XHJcbn0pO1xyXG5cclxuY29uc3QgY2xvY2tUZXh0ID0gY29tcHV0ZWQoKCkgPT4ge1xyXG4gIGNvbnN0IHNlY29uZHMgPSBlbGFwc2VkU2Vjb25kcy52YWx1ZTtcclxuICBjb25zdCBob3VycyA9IE1hdGguZmxvb3Ioc2Vjb25kcyAvIDNfNjAwKTtcclxuICBjb25zdCBtaW51dGVzID0gTWF0aC5mbG9vcigoc2Vjb25kcyAlIDNfNjAwKSAvIDYwKTtcclxuICBjb25zdCByZXN0ID0gc2Vjb25kcyAlIDYwO1xyXG4gIHJldHVybiBbaG91cnMsIG1pbnV0ZXMsIHJlc3RdLm1hcCgodmFsdWUpID0+IFN0cmluZyh2YWx1ZSkucGFkU3RhcnQoMiwgXCIwXCIpKS5qb2luKFwiOlwiKTtcclxufSk7XHJcblxyXG5hc3luYyBmdW5jdGlvbiBzdGFydFNlbGVjdGVkVGltZXIoKSB7XHJcbiAgY29uc3QgdGFza0lkID0gdGFza0NvbnRyb2wudmFsdWU/LmNvbW1pdCgpID8/IHNlbGVjdGVkVGFza0lkLnZhbHVlO1xyXG4gIGJ1c3kudmFsdWUgPSB0cnVlO1xyXG4gIHRyeSB7XHJcbiAgICBhd2FpdCBzdG9yZS5zdGFydFRpbWVyKHRhc2tJZCk7XHJcbiAgfSBjYXRjaCAoZXJyb3IpIHtcclxuICAgIEVsTWVzc2FnZS5lcnJvcihlcnJvclRleHQoZXJyb3IsIFwi5byA5aeL6K6h5pe25aSx6LSlXCIpKTtcclxuICB9IGZpbmFsbHkge1xyXG4gICAgYnVzeS52YWx1ZSA9IGZhbHNlO1xyXG4gIH1cclxufVxyXG5cclxuYXN5bmMgZnVuY3Rpb24gcnVuVGltZXJBY3Rpb24oYWN0aW9uOiAoKSA9PiBQcm9taXNlPHVua25vd24+LCBmYWxsYmFjazogc3RyaW5nKSB7XHJcbiAgYnVzeS52YWx1ZSA9IHRydWU7XHJcbiAgdHJ5IHtcclxuICAgIGF3YWl0IGFjdGlvbigpO1xyXG4gIH0gY2F0Y2ggKGVycm9yKSB7XHJcbiAgICBFbE1lc3NhZ2UuZXJyb3IoZXJyb3JUZXh0KGVycm9yLCBmYWxsYmFjaykpO1xyXG4gIH0gZmluYWxseSB7XHJcbiAgICBidXN5LnZhbHVlID0gZmFsc2U7XHJcbiAgfVxyXG59XHJcblxyXG5mdW5jdGlvbiBlcnJvclRleHQoZXJyb3I6IHVua25vd24sIGZhbGxiYWNrOiBzdHJpbmcpIHtcclxuICBpZiAodHlwZW9mIGVycm9yID09PSBcInN0cmluZ1wiICYmIGVycm9yLnRyaW0oKSkgcmV0dXJuIGVycm9yO1xyXG4gIHJldHVybiBlcnJvciBpbnN0YW5jZW9mIEVycm9yID8gZXJyb3IubWVzc2FnZSA6IGZhbGxiYWNrO1xyXG59XHJcbjwvc2NyaXB0PlxyXG5cclxuPHRlbXBsYXRlPlxyXG4gIDxzZWN0aW9uIGNsYXNzPVwiZ2xvYmFsLXRpbWVyLWJhciB0b3BiYXItcXVpY2stdGltZXJcIiA6Y2xhc3M9XCJzdG9yZS5ydW5uaW5nRW50cnk/LnN0YXRlID8/ICdpZGxlJ1wiPlxyXG4gICAgPHRlbXBsYXRlIHYtaWY9XCJzdG9yZS5ydW5uaW5nRW50cnlcIj5cclxuICAgICAgPGJ1dHRvbiBjbGFzcz1cImdsb2JhbC10aW1lci1tYWluXCIgdHlwZT1cImJ1dHRvblwiIHRpdGxlPVwi5omT5byA6K6h5pe26aG16Z2iXCIgQGNsaWNrPVwiZW1pdCgnb3BlbicpXCI+XHJcbiAgICAgICAgPHNwYW4gY2xhc3M9XCJnbG9iYWwtdGltZXItaW5kaWNhdG9yXCIgYXJpYS1oaWRkZW49XCJ0cnVlXCI+PC9zcGFuPlxyXG4gICAgICAgIDxzcGFuIGNsYXNzPVwiZ2xvYmFsLXRpbWVyLWNvcHlcIj5cclxuICAgICAgICAgIDxzbWFsbD57eyBzdG9yZS5ydW5uaW5nRW50cnkuc3RhdGUgPT09ICdwYXVzZWQnID8gJ+W3suaaguWBnCcgOiAn5q2j5Zyo6K6h5pe2JyB9fTwvc21hbGw+XHJcbiAgICAgICAgICA8c3Ryb25nPnt7IHN0b3JlLnRpbWVFbnRyeUxhYmVsKHN0b3JlLnJ1bm5pbmdFbnRyeSkgfX08L3N0cm9uZz5cclxuICAgICAgICA8L3NwYW4+XHJcbiAgICAgICAgPHRpbWU+e3sgY2xvY2tUZXh0IH19PC90aW1lPlxyXG4gICAgICA8L2J1dHRvbj5cclxuICAgICAgPGRpdiBjbGFzcz1cImdsb2JhbC10aW1lci1hY3Rpb25zXCI+XHJcbiAgICAgICAgPGJ1dHRvbiB2LWlmPVwic3RvcmUucnVubmluZ0VudHJ5LnN0YXRlID09PSAncnVubmluZydcIiBjbGFzcz1cImljb24tYnV0dG9uXCIgdHlwZT1cImJ1dHRvblwiIHRpdGxlPVwi5pqC5YGcXCIgOmRpc2FibGVkPVwiYnVzeVwiIEBjbGljaz1cInJ1blRpbWVyQWN0aW9uKHN0b3JlLnBhdXNlVGltZXIsICfmmoLlgZzorqHml7blpLHotKUnKVwiPjxQYXVzZSA6c2l6ZT1cIjE0XCIgZmlsbD1cImN1cnJlbnRDb2xvclwiIC8+PC9idXR0b24+XHJcbiAgICAgICAgPGJ1dHRvbiB2LWVsc2UgY2xhc3M9XCJpY29uLWJ1dHRvblwiIHR5cGU9XCJidXR0b25cIiB0aXRsZT1cIue7p+e7rVwiIDpkaXNhYmxlZD1cImJ1c3lcIiBAY2xpY2s9XCJydW5UaW1lckFjdGlvbihzdG9yZS5yZXN1bWVUaW1lciwgJ+e7p+e7reiuoeaXtuWksei0pScpXCI+PFBsYXkgOnNpemU9XCIxNFwiIGZpbGw9XCJjdXJyZW50Q29sb3JcIiAvPjwvYnV0dG9uPlxyXG4gICAgICAgIDxidXR0b24gY2xhc3M9XCJpY29uLWJ1dHRvbiBzdG9wXCIgdHlwZT1cImJ1dHRvblwiIHRpdGxlPVwi57uT5p2f6K6h5pe2XCIgOmRpc2FibGVkPVwiYnVzeVwiIEBjbGljaz1cInJ1blRpbWVyQWN0aW9uKHN0b3JlLnN0b3BUaW1lciwgJ+e7k+adn+iuoeaXtuWksei0pScpXCI+PFNxdWFyZSA6c2l6ZT1cIjEyXCIgZmlsbD1cImN1cnJlbnRDb2xvclwiIC8+PC9idXR0b24+XHJcbiAgICAgIDwvZGl2PlxyXG4gICAgPC90ZW1wbGF0ZT5cclxuXHJcbiAgICA8dGVtcGxhdGUgdi1lbHNlPlxyXG4gICAgICA8VGFza1NlbGVjdENvbnRyb2xcclxuICAgICAgICByZWY9XCJ0YXNrQ29udHJvbFwiXHJcbiAgICAgICAgdi1tb2RlbD1cInNlbGVjdGVkVGFza0lkXCJcclxuICAgICAgICB2YXJpYW50PVwiY29tcGFjdFwiXHJcbiAgICAgICAgcGxhY2Vob2xkZXI9XCLkuovpobnvvIjlj6/pgInvvIlcIlxyXG4gICAgICAgIGFyaWEtbGFiZWw9XCLlv6vpgJ/orqHml7bkuovpoblcIlxyXG4gICAgICAvPlxyXG4gICAgICA8YnV0dG9uIGNsYXNzPVwicXVpY2stdGltZXItc3RhcnRcIiB0eXBlPVwiYnV0dG9uXCIgdGl0bGU9XCLlvIDlp4vorqHml7ZcIiA6ZGlzYWJsZWQ9XCJidXN5XCIgQGNsaWNrPVwic3RhcnRTZWxlY3RlZFRpbWVyXCI+PFBsYXkgOnNpemU9XCIxNVwiIGZpbGw9XCJjdXJyZW50Q29sb3JcIiAvPjwvYnV0dG9uPlxyXG4gICAgPC90ZW1wbGF0ZT5cclxuICA8L3NlY3Rpb24+XHJcbjwvdGVtcGxhdGU+XHJcbiJdLCJmaWxlIjoiRDovV29ya3NwYWNlcy9naXQvbXkvdGltZS1nZW5pZS9zcmMtdWkvc3JjL2NvbXBvbmVudHMvR2xvYmFsVGltZXJCYXIudnVlIn0=

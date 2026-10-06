@@ -14,6 +14,7 @@ const cloudSyncPatchFile = path.join(repoRoot, "supabase", "20261004_timegenie_c
 const sessionRevocationPatchFile = path.join(repoRoot, "supabase", "20261004d_timegenie_session_revocation_patch.sql");
 const timerSyncPatchFile = path.join(repoRoot, "supabase", "20261005_timegenie_timer_sync_coordination_patch.sql");
 const taskPlanningPatchFile = path.join(repoRoot, "supabase", "20261005_timegenie_cloud_task_planning_patch.sql");
+const eventDrivenSyncPatchFile = path.join(repoRoot, "supabase", "20261005b_timegenie_event_driven_sync_patch.sql");
 const freshPlanningTestFile = path.join(repoRoot, "supabase", "schema_fresh_planning_test.sql");
 const schemaTestFile = path.join(repoRoot, "supabase", "schema_integration_test.sql");
 
@@ -79,6 +80,8 @@ function verifyStaticSchemaInvariants() {
   const sessionRevocationPatch = fs.readFileSync(sessionRevocationPatchFile, "utf8");
   const timerSyncPatch = fs.readFileSync(timerSyncPatchFile, "utf8");
   const taskPlanningPatch = fs.readFileSync(taskPlanningPatchFile, "utf8");
+  const eventDrivenSyncPatch = fs.readFileSync(eventDrivenSyncPatchFile, "utf8");
+  const schemaIntegrationTest = fs.readFileSync(schemaTestFile, "utf8");
   const importStart = schema.indexOf("create or replace function timegenie.migration_import_snapshot");
   const applyPatchStart = schema.indexOf("create or replace function timegenie.cloud_apply_patch");
   if (importStart < 0 || applyPatchStart < 0 || applyPatchStart <= importStart) {
@@ -130,6 +133,46 @@ function verifyStaticSchemaInvariants() {
   }
   if (!taskPlanningPatch.includes("cloud_apply_task_planning_patch")) {
     throw new Error("The cloud task planning patch must define its planning apply helper.");
+  }
+  for (const expected of [
+    "create or replace function timegenie.cloud_incremental_entity_get",
+    "create or replace function timegenie.cloud_incremental_pull",
+    "'covered_change_seq'",
+    "'latest_change_seq'",
+    "'has_more'",
+    "'reset_required'",
+    "jsonb_build_object('change_seq'",
+    "when 'unassigned_sessions' then",
+    "grant execute on function timegenie.cloud_incremental_pull(uuid,uuid,bigint,integer) to authenticated",
+  ]) {
+    const compactExpected = expected.replaceAll(" ", "").toLowerCase();
+    if (!schema.replaceAll(" ", "").toLowerCase().includes(compactExpected)
+        || !eventDrivenSyncPatch.replaceAll(" ", "").toLowerCase().includes(compactExpected)) {
+      throw new Error("The schema and event-driven sync patch must include: " + expected);
+    }
+  }
+  if (!schema.includes("revoke execute on all functions in schema timegenie from anon")
+      || !eventDrivenSyncPatch.replaceAll(" ", "").toLowerCase().includes("revokeexecuteonfunctiontimegenie.cloud_incremental_pull(uuid,uuid,bigint,integer)fromanon")) {
+    throw new Error("Anonymous clients must not execute cloud_incremental_pull.");
+  }
+  if (!schema.replaceAll(" ", "").toLowerCase().includes("revokeexecuteonfunctiontimegenie.cloud_incremental_entity_get(uuid,text,text)fromauthenticated")
+      || !eventDrivenSyncPatch.replaceAll(" ", "").toLowerCase().includes("revokeexecuteonfunctiontimegenie.cloud_incremental_entity_get(uuid,text,text)frompublic,anon,authenticated")) {
+    throw new Error("Clients must not execute the internal incremental entity helper.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261005b_timegenie_event_driven_sync_patch\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the event-driven sync patch is idempotent.");
+  }
+  for (const expected of [
+    "incremental first page metadata is invalid",
+    "incremental repeated changes were not folded",
+    "incremental delete did not return an explicit tombstone",
+    "revoked device read incremental changes",
+    "incremental RPC exposed another user workspace",
+    "incremental RPC has no applicable representation",
+  ]) {
+    if (!schemaIntegrationTest.includes(expected)) {
+      throw new Error("The schema integration test is missing incremental coverage: " + expected);
+    }
   }
   if (!taskPlanningPatch.replaceAll(" ", "").includes("grantexecuteonfunctiontimegenie.cloud_apply_patch(uuid,uuid,uuid,text,text,text,bigint,jsonb)toauthenticated")) {
     throw new Error("The cloud task planning patch must grant the compatibility apply RPC to authenticated clients.");

@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
 import { AlertTriangle, CalendarDays, CheckCircle2, Clock3, Copy, Database, FileText, Home, LoaderCircle, Minus, Pencil, Plus, RefreshCw, Settings, Square, UserRound, X } from "lucide-vue-next";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useWorkdayStore, type Task } from "../store";
-import { checkAppUpdate, closeMainWindow, confirmObsidianPlan, configureCloud, downloadAndInstallUpdate, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listCloudSyncConflicts, listCloudSyncQueue, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onTrayCheckUpdate, previewObsidianPlan, previewSeaTableTaskSync, previewStorageMigration, pushCloudSync, refreshCloudSync, registerCloudDevice, resetLocalCacheFromCloud, resolveAllCloudSyncConflicts, restartApp, resumeCloudSyncAfterReauth, retryFailedSeaTableSync, revokeCloudDevice, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudSessionSnapshot, type CloudSyncConflict, type CloudSyncQueueItem, type PlanImportPreviewResult, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
+import { checkAppUpdate, closeMainWindow, confirmObsidianPlan, configureCloud, downloadAndInstallUpdate, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listCloudSyncConflicts, listCloudSyncQueue, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onTrayCheckUpdate, previewObsidianPlan, previewSeaTableTaskSync, previewStorageMigration, refreshCloudSync, registerCloudDevice, resetLocalCacheFromCloud, resolveAllCloudSyncConflicts, restartApp, resumeCloudSyncAfterReauth, retryFailedSeaTableSync, revokeCloudDevice, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudSessionSnapshot, type CloudSyncConflict, type CloudSyncQueueItem, type PlanImportPreviewResult, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
 import PlanListEditor from "../components/PlanListEditor.vue";
 import GlobalTimerBar from "../components/GlobalTimerBar.vue";
 import UnassignedTimeIndicator from "../components/UnassignedTimeIndicator.vue";
@@ -14,7 +14,7 @@ import ReportWorkspace from "../components/ReportWorkspace.vue";
 import AutomationHooksSettings from "../components/AutomationHooksSettings.vue";
 import TimerStopConfirmationDialog from "../components/TimerStopConfirmationDialog.vue";
 import appIconUrl from "../../../src-tauri/icons/icon.svg";
-import { cloudSyncPresentation, cloudSyncRetryFeedback } from "../services/cloudSyncPresentation";
+import { cloudSyncPresentation } from "../services/cloudSyncPresentation";
 import { cloudSessionLabel, cloudSessionNeedsPassword } from "../services/cloudSessionPresentation";
 import { cloudDeviceActionDisabled, cloudDeviceActionLabel, cloudDeviceKind, runConfirmedCloudAction } from "../services/cloudDevicePresentation";
 import { isCompletionFeedbackEnabled, playCompletionFeedback, setCompletionFeedbackEnabled, setCompletionFeedbackSoundEnabled } from "../services/completionFeedback";
@@ -145,9 +145,6 @@ let unlistenNavigatePage: (() => void) | undefined;
 let unlistenCloudSyncState: (() => void) | undefined;
 let unlistenTrayCheckUpdate: (() => void) | undefined;
 let unlistenAppUpdateEvent: (() => void) | undefined;
-let cloudSyncStatusClock: number | undefined;
-const cloudAutoSyncIntervalSeconds = 15;
-const cloudAutoSyncCountdown = ref(cloudAutoSyncIntervalSeconds);
 const completingTaskIds = new Set<string>();
 const recentCompletedTaskId = ref("");
 let recentCompletedTimer: number | undefined;
@@ -182,22 +179,14 @@ const cloudDockSyncTitle = computed(() => {
   if (!cloudSession.value?.signedIn) return "前往数据存储设置登录";
   if (storageState.value.conflictCount > 0) return "前往数据存储设置处理同步冲突";
   if (!storageState.value.online || storageState.value.authBlocked || storageState.value.lastError) return "前往数据存储设置处理同步异常";
-  return cloudSyncWorking.value ? "正在同步" : "手动同步云端数据";
+  return "实时同步正常，无需手动操作";
 });
 const cloudDockSyncLabel = computed(() => {
   if (storageState.value?.mode !== "cloud" || !cloudSession.value?.signedIn) return "设置";
   if (storageState.value.conflictCount) return "处理冲突";
   if (!storageState.value.online || storageState.value.authBlocked || storageState.value.lastError) return "处理异常";
-  return "同步";
+  return "实时";
 });
-const cloudAutoSyncVisible = computed(() => (
-  storageState.value?.mode === "cloud"
-  && storageState.value.online
-  && !cloudSyncWorking.value
-  && !storageState.value.authBlocked
-  && !storageState.value.conflictCount
-  && Boolean(cloudSession.value?.signedIn)
-));
 const cloudBusinessEntities = new Set([
   "tasks",
   "task_daily_estimates",
@@ -536,24 +525,21 @@ async function logoutSupabase() {
   }
 }
 
-async function runCloudSync(silent: boolean) {
+async function wakeCloudSync(showFeedback: boolean) {
   if (storageState.value?.mode !== "cloud" || cloudSyncWorking.value) return;
   cloudSyncWorking.value = true;
   try {
-    storageState.value = await refreshCloudSync();
-    if (!storageState.value.pendingOperations && !storageState.value.conflictCount) {
-      await Promise.all([store.loadWorkspaceData(), store.loadTimeData(), store.loadReports(), store.loadUnassignedState()]);
-    }
+    await refreshCloudSync();
+    if (showFeedback) ElMessage.success("已唤醒后台重试，可继续使用应用");
   } catch (error) {
-    if (!silent) ElMessage.error(error instanceof Error ? error.message : String(error));
+    if (showFeedback) ElMessage.error(error instanceof Error ? error.message : String(error));
   } finally {
     cloudSyncWorking.value = false;
-    cloudAutoSyncCountdown.value = cloudAutoSyncIntervalSeconds;
   }
 }
 
 async function refreshCloudSyncStatus() {
-  await runCloudSync(false);
+  storageState.value = await getCloudSyncStatus();
 }
 
 async function retryCloudSync() {
@@ -562,17 +548,10 @@ async function retryCloudSync() {
     await openCloudConflicts();
     return;
   }
-  cloudSyncWorking.value = true;
   try {
-    const result = await pushCloudSync();
-    storageState.value = await getCloudSyncStatus();
-    const feedback = cloudSyncRetryFeedback(result, storageState.value);
-    if (feedback.level === "warning") ElMessage.warning(feedback.message);
-    else ElMessage.success(feedback.message);
-    if (result.conflicts > 0 || storageState.value.conflictCount > 0) {
+    await wakeCloudSync(true);
+    if (storageState.value.conflictCount > 0) {
       await openCloudConflicts();
-    } else if (!storageState.value.pendingOperations) {
-      await Promise.all([store.loadWorkspaceData(), store.loadTimeData(), store.loadReports(), store.loadUnassignedState()]);
     }
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : String(error));
@@ -617,21 +596,11 @@ async function openCloudSyncQueue() {
 
 async function syncAllCloudQueue() {
   if (cloudSyncWorking.value) return;
-  cloudSyncWorking.value = true;
   try {
-    const result = await pushCloudSync();
-    storageState.value = await getCloudSyncStatus();
+    await wakeCloudSync(true);
     cloudQueueItems.value = await listCloudSyncQueue();
-    const feedback = cloudSyncRetryFeedback(result, storageState.value);
-    if (feedback.level === "warning") ElMessage.warning(feedback.message);
-    else ElMessage.success(feedback.message);
-    if (!storageState.value.pendingOperations && !storageState.value.conflictCount) {
-      await Promise.all([store.loadWorkspaceData(), store.loadTimeData(), store.loadReports(), store.loadUnassignedState()]);
-    }
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : String(error));
-  } finally {
-    cloudSyncWorking.value = false;
   }
 }
 
@@ -649,7 +618,7 @@ async function handleCloudDockSync() {
     await openCloudAccountSettings();
     return;
   }
-  await refreshCloudSyncStatus();
+  return;
 }
 
 async function resolveAllConflicts(strategy: "use_cloud" | "keep_local") {
@@ -888,15 +857,6 @@ onMounted(async () => {
     storageState.value = state;
     void refreshOpenCloudSyncQueue();
   });
-  cloudSyncStatusClock = window.setInterval(async () => {
-    if (!cloudAutoSyncVisible.value || cloudSyncWorking.value) {
-      cloudAutoSyncCountdown.value = cloudAutoSyncIntervalSeconds;
-      return;
-    }
-    cloudAutoSyncCountdown.value -= 1;
-    if (cloudAutoSyncCountdown.value > 0) return;
-    await runCloudSync(true);
-  }, 1_000);
   unlistenTrayCheckUpdate = await onTrayCheckUpdate(() => {
     void handleCheckUpdate();
   });
@@ -909,7 +869,6 @@ onUnmounted(() => {
   unlistenCloudSyncState?.();
   unlistenTrayCheckUpdate?.();
   unlistenAppUpdateEvent?.();
-  if (cloudSyncStatusClock) window.clearInterval(cloudSyncStatusClock);
   if (recentCompletedTimer) window.clearTimeout(recentCompletedTimer);
 });
 
@@ -1330,7 +1289,7 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           </div>
           <p v-if="cloudSyncDetail" class="cloud-sync-detail">{{ cloudSyncDetail }}</p>
           <div v-if="storageState?.mode === 'cloud'" class="cloud-sync-actions storage-status-actions">
-            <button class="secondary-button compact" type="button" :disabled="cloudSyncWorking" @click="refreshCloudSyncStatus">刷新状态</button>
+            <button v-if="cloudSyncNeedsAttention" class="secondary-button compact" type="button" :disabled="cloudSyncWorking" @click="refreshCloudSyncStatus">刷新状态</button>
             <button v-if="storageState.pendingOperations && !storageState.conflictCount" class="secondary-button compact" type="button" :disabled="cloudSyncWorking || !storageState.online" @click="retryCloudSync">重试同步</button>
             <button v-if="storageState.conflictCount" class="danger-button compact" type="button" :disabled="cloudSyncWorking" @click="openCloudConflicts">处理冲突</button>
           </div>
@@ -1432,12 +1391,11 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           </button>
           <small class="sync-status-detail" :title="cloudDockDetail">{{ cloudDockDetail }}</small>
         </div>
-        <button class="sync-dock-button" :class="{ running: cloudSyncWorking, 'has-conflict': storageState?.conflictCount }" type="button" :disabled="cloudDockSyncDisabled" :title="cloudDockSyncTitle" @click="handleCloudDockSync">
+        <button v-if="cloudDockRequiresStorageAttention" class="sync-dock-button" :class="{ running: cloudSyncWorking, 'has-conflict': storageState?.conflictCount }" type="button" :disabled="cloudDockSyncDisabled" :title="cloudDockSyncTitle" @click="handleCloudDockSync">
           <LoaderCircle v-if="cloudSyncWorking" class="sync-spin" :size="14" />
           <AlertTriangle v-else-if="storageState?.conflictCount" :size="14" />
           <RefreshCw v-else :size="14" />
           <span class="sync-dock-label">{{ cloudSyncWorking ? '同步中' : cloudDockSyncLabel }}</span>
-          <span v-if="cloudAutoSyncVisible" class="sync-auto-countdown" :title="`将在 ${cloudAutoSyncCountdown} 秒后自动同步`" :aria-label="`将在 ${cloudAutoSyncCountdown} 秒后自动同步`">{{ cloudAutoSyncCountdown }}</span>
         </button>
       </footer>
     </section>

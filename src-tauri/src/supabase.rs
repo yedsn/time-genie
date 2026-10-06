@@ -436,6 +436,7 @@ pub fn sign_in_password(
     };
     save_session(database, &session)?;
     let _ = workspace_bootstrap_with_session(database, &client, &session)?;
+    crate::cloud_sync::wake_after_connection_ready();
     Ok(session_snapshot(&session))
 }
 
@@ -952,6 +953,7 @@ pub fn resume_pending_sync(database: &Database) -> Result<StorageModeSnapshot, S
             value: json!("cloud"),
         },
     )?;
+    crate::cloud_sync::wake_after_connection_ready();
     storage_mode(database)
 }
 
@@ -1177,6 +1179,7 @@ pub fn migration_execute(
             &storage_mode(database)?.device_id,
         )?;
         crate::cloud_sync::pull_snapshot(database)?;
+        crate::cloud_sync::wake_after_connection_ready();
     } else if request.direction == "cloud_to_local_snapshot" {
         let workspace = workspace_bootstrap(database)?;
         let connection = database.open()?;
@@ -1214,6 +1217,7 @@ pub fn migration_execute(
         )?;
         initialize_sync_state(database, &workspace.id, &storage_mode(database)?.device_id)?;
         crate::cloud_sync::pull_snapshot(database)?;
+        crate::cloud_sync::wake_after_connection_ready();
     }
     storage_mode(database)
 }
@@ -1417,7 +1421,128 @@ pub(crate) fn client(database: &Database) -> Result<SupabaseClient, String> {
 }
 
 pub(crate) fn current_session(database: &Database) -> Result<CloudSession, String> {
+    #[cfg(debug_assertions)]
+    if let Some(session) = dev_cloud_session_from_env() {
+        return Ok(session);
+    }
     current_session_with_refresh(database, false, true)
+}
+
+#[cfg(debug_assertions)]
+fn dev_cloud_session_from_env() -> Option<CloudSession> {
+    if std::env::var_os("TG_DEV_CLOUD_SESSION").is_none() {
+        return None;
+    }
+    let user_id = std::env::var("TG_DEV_CLOUD_USER_ID").ok()?;
+    let access_token =
+        std::env::var("TG_DEV_CLOUD_ACCESS_TOKEN").unwrap_or_else(|_| format!("access-{user_id}"));
+    Some(CloudSession {
+        user_id: user_id.clone(),
+        email: Some(format!("{user_id}@timegenie.test")),
+        access_token,
+        refresh_token: format!("refresh-{user_id}"),
+        expires_at: Some(now_seconds() + 24 * 60 * 60),
+    })
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn configure_dev_cloud_from_env(database: &Database) -> Result<(), String> {
+    if std::env::var_os("TG_DEV_CLOUD_SESSION").is_none() {
+        return Ok(());
+    }
+    let project_url = std::env::var("TG_DEV_CLOUD_URL")
+        .map_err(|_| "TG_DEV_CLOUD_URL is required".to_string())?;
+    let anon_key =
+        std::env::var("TG_DEV_CLOUD_ANON_KEY").unwrap_or_else(|_| "dev-anon-key".to_string());
+    let workspace_id = std::env::var("TG_DEV_CLOUD_WORKSPACE_ID")
+        .map_err(|_| "TG_DEV_CLOUD_WORKSPACE_ID is required".to_string())?;
+    let subject_id = std::env::var("TG_DEV_CLOUD_SUBJECT_ID")
+        .map_err(|_| "TG_DEV_CLOUD_SUBJECT_ID is required".to_string())?;
+    let template_prefix = std::env::var("TG_DEV_CLOUD_TEMPLATE_PREFIX")
+        .unwrap_or_else(|_| "91000000-0000-0000-0000-00000000000".to_string());
+    let mut connection = database.open()?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let local_workspace_id: String = transaction
+        .query_row(
+            "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let now = chrono::Utc::now().timestamp_millis();
+    if std::env::var_os("TG_DEV_CLOUD_RESET_DATA").is_some() {
+        for table in [
+            "report_tasks",
+            "reports",
+            "time_allocations",
+            "time_segments",
+            "time_entries",
+            "unassigned_segments",
+            "unassigned_sessions",
+            "task_occurrences",
+            "task_recurrence_rules",
+            "task_daily_estimates",
+            "task_status_events",
+            "tasks",
+            "external_bindings",
+            "subjects",
+            "report_templates",
+        ] {
+            transaction
+                .execute(
+                    &format!("DELETE FROM {table} WHERE workspace_id = ?1"),
+                    [&local_workspace_id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction
+            .execute(
+                "INSERT INTO subjects(id,workspace_id,name,sort_order,created_at,updated_at,version) VALUES (?1,?2,'验收主体',10,?3,?3,1)",
+                params![subject_id, local_workspace_id, now],
+            )
+            .map_err(|error| error.to_string())?;
+        for (suffix, report_type, content) in [
+            ("1", "daily", "# {{日期}}\n\n{{今日事项}}\n"),
+            ("2", "weekly", "# {{日期范围}}\n\n{{每日情况}}\n"),
+            ("3", "monthly", "# {{日期范围}}\n\n{{每日情况}}\n"),
+        ] {
+            transaction
+                .execute(
+                    "INSERT INTO report_templates(id,workspace_id,report_type,subject_id,content,is_builtin,created_at,updated_at,version) VALUES (?1,?2,?3,NULL,?4,1,?5,?5,1)",
+                    params![format!("{template_prefix}{suffix}"), local_workspace_id, report_type, content, now],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    for (key, value) in [
+        ("supabase_project_url", json!(project_url)),
+        ("supabase_anon_key", json!(anon_key)),
+        ("cloud_workspace_id", json!(workspace_id)),
+        ("storage_mode", json!("cloud")),
+    ] {
+        transaction
+            .execute(
+                "INSERT INTO device_settings(key,value_json,updated_at) VALUES (?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+                params![key, value.to_string(), now],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    let device_id: String = transaction
+        .query_row(
+            "SELECT id FROM devices WHERE workspace_id=?1 AND revoked_at IS NULL ORDER BY created_at LIMIT 1",
+            [&local_workspace_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO local_sync_state(workspace_id,device_id,last_change_seq,last_error,auth_blocked) VALUES (?1,?2,0,NULL,0) ON CONFLICT(workspace_id) DO UPDATE SET device_id=excluded.device_id,last_error=NULL,auth_blocked=0,auth_blocked_reason=NULL,auth_blocked_at=NULL",
+            params![workspace_id, device_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 fn local_workspace_id(database: &Database) -> Result<String, String> {
@@ -2223,6 +2348,7 @@ pub fn storage_mode_set_local(
             value: json!("local"),
         },
     )?;
+    crate::cloud_sync::disable_cloud_sync();
     storage_mode(&database)
 }
 
@@ -2254,6 +2380,7 @@ pub fn cloud_sign_out(database: tauri::State<'_, Database>) -> Result<StorageMod
             value: json!("local"),
         },
     )?;
+    crate::cloud_sync::disable_cloud_sync();
     storage_mode(&database)
 }
 
@@ -2270,6 +2397,7 @@ pub fn cloud_sign_out_all(
             value: json!("local"),
         },
     )?;
+    crate::cloud_sync::disable_cloud_sync();
     storage_mode(&database)
 }
 

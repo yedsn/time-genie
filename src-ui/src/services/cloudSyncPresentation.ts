@@ -88,10 +88,10 @@ export function cloudSyncPresentation(
   }
 
   return {
-    label: "已同步",
+    label: "实时同步",
     detail: state.lastSyncedAt
-      ? `最近同步 ${formatSyncTime(state.lastSyncedAt)}`
-      : "本机缓存已准备好，尚无云端同步记录",
+      ? `已实时同步 · 最近更新 ${formatSyncTime(state.lastSyncedAt)}`
+      : "实时同步已连接，云端变化会自动更新",
     needsAttention: false,
     attentionLevel: "",
   };

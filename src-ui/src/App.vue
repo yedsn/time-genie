@@ -6,6 +6,7 @@ import { hideHoverAfterKeyboardClose, closeMainWindow, getSettings, isCurrentWin
 import { useWorkdayStore } from "./store";
 import { stopCompletionFeedback } from "./services/completionFeedback";
 import { applyAppTheme, getCachedAppTheme, isAppTheme } from "./services/theme";
+import { workDataRefreshPlan } from "./services/workDataRefresh";
 
 applyAppTheme(getCachedAppTheme());
 
@@ -18,6 +19,10 @@ let unmounted = false;
 let mainWindowFocused = false;
 let activationCheckArmed = true;
 let activationSequence = 0;
+const pendingRefreshDomains = new Set<string>();
+let pendingTimerStoppedEntryId = "";
+let refreshTimer: number | undefined;
+let refreshRunning = false;
 
 function onKeydown(event: KeyboardEvent) {
   if (event.key !== "Escape" || event.repeat) return;
@@ -48,6 +53,41 @@ function handleMainWindowFocus(focused: boolean) {
   void promptPendingUnassignedTimeOnce(activationSequence);
 }
 
+function scheduleDomainRefresh(domains: string[], timerStoppedEntryId?: string) {
+  domains.forEach((domain) => pendingRefreshDomains.add(domain));
+  if (timerStoppedEntryId) pendingTimerStoppedEntryId = timerStoppedEntryId;
+  if (refreshTimer || refreshRunning) return;
+  refreshTimer = window.setTimeout(() => {
+    refreshTimer = undefined;
+    void flushDomainRefresh();
+  }, 80);
+}
+
+async function flushDomainRefresh() {
+  if (refreshRunning) return;
+  refreshRunning = true;
+  try {
+    while (pendingRefreshDomains.size || pendingTimerStoppedEntryId) {
+      const domains = new Set(pendingRefreshDomains);
+      const timerStoppedEntryId = pendingTimerStoppedEntryId;
+      pendingRefreshDomains.clear();
+      pendingTimerStoppedEntryId = "";
+      const plan = workDataRefreshPlan(domains, view.value === "main");
+      const loads: Promise<unknown>[] = [];
+      if (plan.workspace) loads.push(store.loadWorkspaceData());
+      if (plan.time) loads.push(store.loadTimeData());
+      if (plan.reports) loads.push(store.loadReports());
+      if (plan.unassigned) loads.push(store.loadUnassignedState());
+      await Promise.all(loads);
+      if (plan.todayOverview) await store.loadTodayOverview();
+      if (view.value === "main" && timerStoppedEntryId) await store.openTimerStopConfirmation(timerStoppedEntryId);
+    }
+  } finally {
+    refreshRunning = false;
+    if (pendingRefreshDomains.size || pendingTimerStoppedEntryId) scheduleDomainRefresh([]);
+  }
+}
+
 onMounted(() => {
   document.body.dataset.view = view.value;
   void getSettings().then((settings) => {
@@ -56,14 +96,7 @@ onMounted(() => {
   }).catch(() => undefined);
   store.startClock(view.value === "main");
   void onWorkDataChanged((payload) => {
-    const refresh = view.value === "main"
-      ? Promise.all([store.loadWorkspaceData(), store.loadTimeData(), store.loadReports(), store.loadUnassignedState()]).then(() => store.loadTodayOverview())
-      : Promise.all([store.loadWorkspaceData(), store.loadTimeData(), store.loadUnassignedState()]);
-    void refresh.then(() => {
-      if (view.value === "main" && payload.timerStoppedEntryId) {
-        void store.openTimerStopConfirmation(payload.timerStoppedEntryId);
-      }
-    });
+    scheduleDomainRefresh(payload.domains, payload.timerStoppedEntryId);
   }).then((unlisten) => {
     if (unmounted) unlisten();
     else unlistenWorkDataChanged = unlisten;
@@ -84,6 +117,7 @@ onUnmounted(() => {
   unmounted = true;
   unlistenWindowFocus?.();
   unlistenWorkDataChanged?.();
+  if (refreshTimer) window.clearTimeout(refreshTimer);
   store.stopClock();
   window.removeEventListener("keydown", onKeydown);
   stopCompletionFeedback();

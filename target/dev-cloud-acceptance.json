@@ -1,0 +1,483 @@
+{
+  "latestChangeSeq": 19,
+  "changes": [
+    {
+      "change_seq": 1,
+      "workspace_id": "20000000-0000-0000-0000-000000000001",
+      "entity_type": "tasks",
+      "entity_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+      "operation": "update",
+      "entity_version": 1,
+      "changed_at": "2026-10-05T19:13:09.424Z"
+    },
+    {
+      "change_seq": 2,
+      "workspace_id": "20000000-0000-0000-0000-000000000001",
+      "entity_type": "task_daily_estimates",
+      "entity_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2|2026-10-06",
+      "operation": "update",
+      "entity_version": 1,
+      "changed_at": "2026-10-05T19:21:42.359Z"
+    },
+    {
+      "change_seq": 3,
+      "workspace_id": "20000000-0000-0000-0000-000000000001",
+      "entity_type": "task_recurrence_rules",
+      "entity_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+      "operation": "update",
+      "entity_version": 1,
+      "changed_at": "2026-10-05T19:21:43.042Z"
+    },
+    {
+      "change_seq": 4,
+      "workspace_id": "20000000-0000-0000-0000-000000000001",
+      "entity_type": "tasks",
+      "entity_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+      "operation": "update",
+      "entity_version": 2,
+      "changed_at": "2026-10-05T19:21:43.045Z"
+    },
+    {
+      "change_seq": 5,
+      "workspace_id": "20000000-0000-0000-0000-000000000001",
+      "entity_type": "task_occurrences",
+      "entity_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2|2026-10-06",
+      "operation": "update",
+      "entity_version": 2,
+      "changed_at": "2026-10-05T19:21:43.724Z"
+    },
+    {
+      "change_seq": 6,
+      "workspace_id": "20000000-0000-0000-0000-000000000001",
+      "entity_type": "task_occurrences",
+      "entity_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2|2026-10-06",
+      "operation": "update",
+      "entity_version": 3,
+      "changed_at": "2026-10-05T19:21:44.340Z"
+    },
+    {
+      "change_seq": 7,
+      "workspace_id": "20000000-0000-0000-0000-000000000001",
+      "entity_type": "time_entries",
+      "entity_id": "01a10d83-d046-77af-aec3-7948499d0c61",
+      "operation": "update",
+      "entity_version": 1,
+      "changed_at": "2026-10-05T19:21:44.873Z"
+    },
+    {
+      "change_seq": 8,
+      "workspace_id": "20000000-0000-0000-0000-000000000001",
+      "entity_type": "reports",
+      "entity_id": "01a10d83-d1af-70cd-a87f-1908fd9a2ee2",
+      "operation": "update",
+      "entity_version": 1,
+      "changed_at": "2026-10-05T19:21:45.354Z"
+    },
+    {
+      "change_seq": 9,
+      "workspace_id": "20000000-0000-0000-0000-000000000001",
+      "entity_type": "tasks",
+      "entity_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+      "operation": "update",
+      "entity_version": 3,
+      "changed_at": "2026-10-05T19:23:15.780Z"
+    },
+    {
+      "change_seq": 10,
+      "workspace_id": "20000000-0000-0000-0000-000000000001",
+      "entity_type": "task_daily_estimates",
+      "entity_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2|2026-10-06",
+      "operation": "update",
+      "entity_version": 2,
+      "changed_at": "2026-10-05T19:23:15.798Z"
+    },
+    {
+      "change_seq": 11,
+      "workspace_id": "20000000-0000-0000-0000-000000000001",
+      "entity_type": "time_entries",
+      "entity_id": "01a10d85-33b1-75c0-a7d3-0cb72668499e",
+      "operation": "update",
+      "entity_version": 1,
+      "changed_at": "2026-10-05T19:23:15.815Z"
+    },
+    {
+      "change_seq": 12,
+      "workspace_id": "20000000-0000-0000-0000-000000000001",
+      "entity_type": "tasks",
+      "entity_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+      "operation": "update",
+      "entity_version": 4,
+      "changed_at": "2026-10-05T19:25:50.975Z"
+    },
+    {
+      "change_seq": 13,
+      "workspace_id": "20000000-0000-0000-0000-000000000001",
+      "entity_type": "tasks",
+      "entity_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+      "operation": "update",
+      "entity_version": 5,
+      "changed_at": "2026-10-05T19:33:00.252Z"
+    },
+    {
+      "change_seq": 14,
+      "workspace_id": "20000000-0000-0000-0000-000000000001",
+      "entity_type": "tasks",
+      "entity_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+      "operation": "update",
+      "entity_version": 6,
+      "changed_at": "2026-10-05T19:34:27.038Z"
+    },
+    {
+      "change_seq": 15,
+      "workspace_id": "20000000-0000-0000-0000-000000000001",
+      "entity_type": "tasks",
+      "entity_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+      "operation": "update",
+      "entity_version": 7,
+      "changed_at": "2026-10-05T19:35:35.596Z"
+    },
+    {
+      "change_seq": 16,
+      "workspace_id": "20000000-0000-0000-0000-000000000001",
+      "entity_type": "tasks",
+      "entity_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+      "operation": "update",
+      "entity_version": 8,
+      "changed_at": "2026-10-05T19:35:35.903Z"
+    },
+    {
+      "change_seq": 17,
+      "workspace_id": "20000000-0000-0000-0000-000000000001",
+      "entity_type": "time_entries",
+      "entity_id": "01a10d90-faeb-776d-a2d0-1ffeaaf931d9",
+      "operation": "update",
+      "entity_version": 1,
+      "changed_at": "2026-10-05T19:36:07.773Z"
+    },
+    {
+      "change_seq": 18,
+      "workspace_id": "20000000-0000-0000-0000-000000000001",
+      "entity_type": "tasks",
+      "entity_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+      "operation": "update",
+      "entity_version": 9,
+      "changed_at": "2026-10-05T19:36:07.787Z"
+    },
+    {
+      "change_seq": 19,
+      "workspace_id": "20000000-0000-0000-0000-000000000001",
+      "entity_type": "tasks",
+      "entity_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+      "operation": "update",
+      "entity_version": 10,
+      "changed_at": "2026-10-05T19:37:14.731Z"
+    }
+  ],
+  "entities": {
+    "subjects": {
+      "60000000-0000-0000-0000-000000000001": {
+        "id": "60000000-0000-0000-0000-000000000001",
+        "name": "验收主体",
+        "sort_order": 10,
+        "created_at": 1791226952455,
+        "updated_at": 1791226952455,
+        "version": 1,
+        "deleted_at": null
+      }
+    },
+    "tasks": {
+      "01a10d7b-f2c5-71da-9b52-0c927bd20ed2": {
+        "completed_at": null,
+        "created_at": 1791227589317,
+        "created_by_device_id": null,
+        "deleted_at": null,
+        "estimate_minutes": null,
+        "id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+        "note": "暂停恢复自动补齐验收",
+        "parent_id": null,
+        "planned_date": null,
+        "planned_time": null,
+        "project_name": null,
+        "solution_name": null,
+        "sort_order": 10,
+        "source_ref": null,
+        "source_type": "manual",
+        "status": "open",
+        "status_events": [],
+        "subject_id": "60000000-0000-0000-0000-000000000001",
+        "title": "不同实体并行验收",
+        "updated_at": 1791229034594,
+        "updated_by_device_id": null,
+        "version": 10,
+        "workspace_id": "01a10d75-26c2-7633-8c64-3f151f160403"
+      }
+    },
+    "task_status_events": {},
+    "task_daily_estimates": {
+      "01a10d7b-f2c5-71da-9b52-0c927bd20ed2|2026-10-06": {
+        "created_at": 1791228102228,
+        "estimate_minutes": 55,
+        "task_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+        "updated_at": 1791228195703,
+        "version": 2,
+        "work_date": "2026-10-06"
+      }
+    },
+    "task_recurrence_rules": {
+      "01a10d7b-f2c5-71da-9b52-0c927bd20ed2": {
+        "action": "save",
+        "effective_start": "2026-10-06",
+        "frequency": "daily",
+        "rule_expected_version": null,
+        "rule_id": "01a10d83-c8f8-7109-a1b2-5bfbc7511168",
+        "rules": [
+          {
+            "created_at": 1791228102904,
+            "effective_end": null,
+            "effective_start": "2026-10-06",
+            "frequency": "daily",
+            "id": "01a10d83-c8f8-7109-a1b2-5bfbc7511168",
+            "task_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+            "updated_at": 1791228102904,
+            "version": 1,
+            "weekdays_mask": null
+          }
+        ],
+        "task_expected_version": 1,
+        "task_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+        "task_version": 2,
+        "version": 1,
+        "weekdays_mask": null
+      }
+    },
+    "task_occurrences": {
+      "01a10d7b-f2c5-71da-9b52-0c927bd20ed2|2026-10-06": {
+        "completed_at": null,
+        "created_at": 1791228103579,
+        "occurrence_date": "2026-10-06",
+        "origin": "scheduled",
+        "status": "open",
+        "task_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+        "updated_at": 1791228104201,
+        "version": 3,
+        "workspace_id": "01a10d75-26c2-7633-8c64-3f151f160403"
+      }
+    },
+    "work_days": {},
+    "time_entries": {
+      "01a10d83-d046-77af-aec3-7948499d0c61": {
+        "allocations": [
+          {
+            "created_at": 1791228104774,
+            "entry_id": "01a10d83-d046-77af-aec3-7948499d0c61",
+            "id": "01a10d83-d047-7210-8a58-13dd590e6a64",
+            "minutes": 30,
+            "note": null,
+            "task_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+            "updated_at": 1791228104774,
+            "version": 1,
+            "workspace_id": "01a10d75-26c2-7633-8c64-3f151f160403"
+          }
+        ],
+        "created_at": 1791228104774,
+        "created_by_device_id": "01a10d75-26c2-7633-8c64-3f16265b221f",
+        "default_task_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+        "deleted_at": null,
+        "duration_seconds": 1800,
+        "ended_at": 1791228104768,
+        "id": "01a10d83-d046-77af-aec3-7948499d0c61",
+        "kind": "work",
+        "label_snapshot": "在线实时传播验收",
+        "note": "桌面双设备验收",
+        "origin_unassigned_session_id": null,
+        "segments": [
+          {
+            "duration_seconds": 1800,
+            "ended_at": 1791228104768,
+            "entry_id": "01a10d83-d046-77af-aec3-7948499d0c61",
+            "id": "01a10d83-d047-7210-8a58-13dc2e3423f3",
+            "sequence_no": 1,
+            "started_at": 1791226304768,
+            "workspace_id": "01a10d75-26c2-7633-8c64-3f151f160403"
+          }
+        ],
+        "source_type": "manual",
+        "started_at": 1791226304768,
+        "state": "ended",
+        "updated_at": 1791228104774,
+        "updated_by_device_id": "01a10d75-26c2-7633-8c64-3f16265b221f",
+        "version": 1,
+        "work_date": "2026-10-06",
+        "work_day": null,
+        "workspace_id": "01a10d75-26c2-7633-8c64-3f151f160403"
+      },
+      "01a10d85-33b1-75c0-a7d3-0cb72668499e": {
+        "allocations": [
+          {
+            "created_at": 1791228195761,
+            "entry_id": "01a10d85-33b1-75c0-a7d3-0cb72668499e",
+            "id": "01a10d85-33b2-7200-afa7-6f066e7f96e9",
+            "minutes": 12,
+            "note": null,
+            "task_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+            "updated_at": 1791228195761,
+            "version": 1,
+            "workspace_id": "01a10d75-26c2-7633-8c64-3f151f160403"
+          }
+        ],
+        "created_at": 1791228195761,
+        "created_by_device_id": "01a10d75-26c2-7633-8c64-3f16265b221f",
+        "default_task_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+        "deleted_at": null,
+        "duration_seconds": 720,
+        "ended_at": 1791228195756,
+        "id": "01a10d85-33b1-75c0-a7d3-0cb72668499e",
+        "kind": "work",
+        "label_snapshot": "离线自动补齐验收",
+        "note": "离线期间新增工时",
+        "origin_unassigned_session_id": null,
+        "segments": [
+          {
+            "duration_seconds": 720,
+            "ended_at": 1791228195756,
+            "entry_id": "01a10d85-33b1-75c0-a7d3-0cb72668499e",
+            "id": "01a10d85-33b2-7200-afa7-6f05bd8a9e40",
+            "sequence_no": 1,
+            "started_at": 1791227475756,
+            "workspace_id": "01a10d75-26c2-7633-8c64-3f151f160403"
+          }
+        ],
+        "source_type": "manual",
+        "started_at": 1791227475756,
+        "state": "ended",
+        "updated_at": 1791228195761,
+        "updated_by_device_id": "01a10d75-26c2-7633-8c64-3f16265b221f",
+        "version": 1,
+        "work_date": "2026-10-06",
+        "work_day": null,
+        "workspace_id": "01a10d75-26c2-7633-8c64-3f151f160403"
+      },
+      "01a10d90-faeb-776d-a2d0-1ffeaaf931d9": {
+        "allocations": [
+          {
+            "created_at": 1791228967659,
+            "entry_id": "01a10d90-faeb-776d-a2d0-1ffeaaf931d9",
+            "id": "01a10d90-faec-7336-bd32-64d85954e2dc",
+            "minutes": 7,
+            "note": null,
+            "task_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+            "updated_at": 1791228967659,
+            "version": 1,
+            "workspace_id": "01a10d75-2315-701c-9665-21c37877b8b7"
+          }
+        ],
+        "created_at": 1791228967659,
+        "created_by_device_id": "01a10d75-2315-701c-9665-21c473d13be9",
+        "default_task_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+        "deleted_at": null,
+        "duration_seconds": 420,
+        "ended_at": 1791228967654,
+        "id": "01a10d90-faeb-776d-a2d0-1ffeaaf931d9",
+        "kind": "work",
+        "label_snapshot": "离线自动补齐验收",
+        "note": "不同实体并行工时",
+        "origin_unassigned_session_id": null,
+        "segments": [
+          {
+            "duration_seconds": 420,
+            "ended_at": 1791228967654,
+            "entry_id": "01a10d90-faeb-776d-a2d0-1ffeaaf931d9",
+            "id": "01a10d90-faeb-776d-a2d0-1fffd389efa1",
+            "sequence_no": 1,
+            "started_at": 1791228547654,
+            "workspace_id": "01a10d75-2315-701c-9665-21c37877b8b7"
+          }
+        ],
+        "source_type": "manual",
+        "started_at": 1791228547654,
+        "state": "ended",
+        "updated_at": 1791228967659,
+        "updated_by_device_id": "01a10d75-2315-701c-9665-21c473d13be9",
+        "version": 1,
+        "work_date": "2026-10-06",
+        "work_day": null,
+        "workspace_id": "01a10d75-2315-701c-9665-21c37877b8b7"
+      }
+    },
+    "report_templates": {
+      "91000000-0000-0000-0000-000000000001": {
+        "id": "91000000-0000-0000-0000-000000000001",
+        "report_type": "daily",
+        "subject_id": null,
+        "content": "# {{日期}}\n\n{{今日事项}}\n",
+        "is_builtin": true,
+        "created_at": 1791226952455,
+        "updated_at": 1791226952455,
+        "version": 1,
+        "deleted_at": null
+      },
+      "91000000-0000-0000-0000-000000000002": {
+        "id": "91000000-0000-0000-0000-000000000002",
+        "report_type": "weekly",
+        "subject_id": null,
+        "content": "# {{日期范围}}\n\n{{每日情况}}\n",
+        "is_builtin": true,
+        "created_at": 1791226952455,
+        "updated_at": 1791226952455,
+        "version": 1,
+        "deleted_at": null
+      },
+      "91000000-0000-0000-0000-000000000003": {
+        "id": "91000000-0000-0000-0000-000000000003",
+        "report_type": "monthly",
+        "subject_id": null,
+        "content": "# {{日期范围}}\n\n{{每日情况}}\n",
+        "is_builtin": true,
+        "created_at": 1791226952455,
+        "updated_at": 1791226952455,
+        "version": 1,
+        "deleted_at": null
+      }
+    },
+    "reports": {
+      "01a10d83-d1af-70cd-a87f-1908fd9a2ee2": {
+        "content_source": "generated",
+        "created_at": 1791228105135,
+        "created_by_device_id": "01a10d75-26c2-7633-8c64-3f16265b221f",
+        "deleted_at": null,
+        "generated_at": 1791228105135,
+        "generation_count": 1,
+        "id": "01a10d83-d1af-70cd-a87f-1908fd9a2ee2",
+        "input_revision_hash": null,
+        "markdown_content": "# 2026-10-06\n\n1. 🔴 在线实时传播验收 <预计：45min 实际：30min>\n",
+        "period_end": "2026-10-06",
+        "period_start": "2026-10-06",
+        "reference_date": "2026-10-06",
+        "report_tasks": [
+          {
+            "path_snapshot": "在线实时传播验收",
+            "report_id": "01a10d83-d1af-70cd-a87f-1908fd9a2ee2",
+            "sort_order": 10,
+            "task_id": "01a10d7b-f2c5-71da-9b52-0c927bd20ed2",
+            "title_snapshot": "在线实时传播验收",
+            "workspace_id": "01a10d75-26c2-7633-8c64-3f151f160403"
+          }
+        ],
+        "report_type": "daily",
+        "subject_id": "60000000-0000-0000-0000-000000000001",
+        "template_id": "91000000-0000-0000-0000-000000000001",
+        "updated_at": 1791228105135,
+        "updated_by_device_id": "01a10d75-26c2-7633-8c64-3f16265b221f",
+        "version": 1,
+        "workspace_id": "01a10d75-26c2-7633-8c64-3f151f160403"
+      }
+    },
+    "app_settings": {},
+    "integration_configs": {},
+    "external_bindings": {}
+  },
+  "control": {
+    "delayMs": 0,
+    "failNext": 0
+  }
+}

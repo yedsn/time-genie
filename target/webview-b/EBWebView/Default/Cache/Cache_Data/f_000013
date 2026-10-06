@@ -1,0 +1,721 @@
+import { createHotContext as __vite__createHotContext } from "/@vite/client";import.meta.hot = __vite__createHotContext("/src/components/TodayOverviewWorkspace.vue");import { defineComponent as _defineComponent } from "/@fs/D:/Workspaces/git/my/time-genie/node_modules/.vite/deps/vue.js?v=27b48170";
+import { computed } from "/@fs/D:/Workspaces/git/my/time-genie/node_modules/.vite/deps/vue.js?v=27b48170";
+import { AlertCircle, Clock3, ListTodo, Play, RefreshCw } from "/@fs/D:/Workspaces/git/my/time-genie/node_modules/.vite/deps/lucide-vue-next.js?v=27b48170";
+import { useWorkdayStore } from "/src/store.ts";
+const _sfc_main = /* @__PURE__ */ _defineComponent({
+  __name: "TodayOverviewWorkspace",
+  emits: ["startTimer", "openTimer", "openPlan", "resolveUnassigned"],
+  setup(__props, { expose: __expose, emit: __emit }) {
+    __expose();
+    const emit = __emit;
+    const store = useWorkdayStore();
+    const overview = computed(() => store.todayOverview);
+    const summary = computed(() => overview.value?.summary ?? {
+      actualMinutes: 0,
+      estimatedMinutes: 0,
+      completedCount: 0,
+      activeCount: 0,
+      notStartedCount: 0,
+      unassignedMinutes: 0,
+      completionRate: 0
+    });
+    const subjectOptions = computed(() => [{ id: "", name: "全部主体" }, ...store.subjects.map((subject) => ({ id: subject.id, name: subject.name }))]);
+    const trendDays = computed(() => (overview.value?.days ?? []).slice(-14));
+    const heatmapDays = computed(() => overview.value?.days ?? []);
+    const timelineItems = computed(() => overview.value?.timeline ?? []);
+    const overviewTasks = computed(() => overview.value?.tasks ?? []);
+    const completionPercent = computed(() => Math.round(summary.value.completionRate * 100));
+    const allSubjectScope = computed(() => !store.todayOverviewSubjectId);
+    const maxTrendMinutes = computed(() => Math.max(1, ...trendDays.value.map((day) => day.actualMinutes)));
+    const trendPoints = computed(() => {
+      const days = trendDays.value;
+      if (!days.length) return "";
+      const width = 280;
+      const baseline = 91;
+      const plotHeight = 68;
+      const xStep = days.length > 1 ? width / (days.length - 1) : width;
+      return days.map((day, index) => {
+        const x = Math.round(index * xStep);
+        const y = Math.round(baseline - day.actualMinutes / maxTrendMinutes.value * plotHeight);
+        return `${x},${y}`;
+      }).join(" ");
+    });
+    const hasOverviewData = computed(() => {
+      const totals = summary.value.actualMinutes + summary.value.estimatedMinutes + summary.value.unassignedMinutes;
+      return totals > 0 || overviewTasks.value.length > 0 || timelineItems.value.length > 0 || heatmapDays.value.some((day) => day.actualMinutes > 0);
+    });
+    function formatMinutes(minutes) {
+      const value = Math.max(0, Math.round(minutes));
+      if (value < 60) return `${value}min`;
+      const hours = Math.floor(value / 60);
+      const rest = value % 60;
+      return rest ? `${hours}h${rest}min` : `${hours}h`;
+    }
+    function formatShortDate(date) {
+      return date.slice(5).replace("-", "/");
+    }
+    function formatWeekday(date) {
+      const parsed = /* @__PURE__ */ new Date(`${date}T00:00:00`);
+      return ["日", "一", "二", "三", "四", "五", "六"][parsed.getDay()] ?? "";
+    }
+    function formatTime(timestamp) {
+      if (!timestamp) return "--:--";
+      const date = new Date(timestamp);
+      return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+    }
+    function isToday(date) {
+      return overview.value?.scope.todayDate === date;
+    }
+    function heatLevel(day) {
+      if (day.actualMinutes <= 0) return 0;
+      if (day.actualMinutes <= 30) return 1;
+      if (day.actualMinutes <= 120) return 2;
+      if (day.actualMinutes <= 240) return 3;
+      return 4;
+    }
+    function statusLabel(status) {
+      if (status === "done") return "已完成";
+      if (status === "active" || status === "running") return "进行中";
+      if (status === "started") return "已开始";
+      return "未开始";
+    }
+    function statusClass(status) {
+      if (status === "done") return "done";
+      if (status === "active" || status === "running" || status === "started") return "active";
+      return "idle";
+    }
+    function timelineClass(item) {
+      return [
+        `kind-${item.itemType}`,
+        item.state ? `state-${item.state}` : ""
+      ];
+    }
+    function timelineLabel(item) {
+      if (item.itemType === "break") return "休息";
+      if (item.itemType === "unassigned") return "未归属";
+      return item.taskTitle || "工作";
+    }
+    function timelineStateLabel(item) {
+      if (item.state === "running" || item.state === "collecting") return "进行中";
+      if (item.state === "paused") return "已暂停";
+      return item.itemType === "unassigned" ? "待处理" : "已结束";
+    }
+    function timelineStyle(item) {
+      const current = Date.now();
+      const day = overview.value?.scope.todayDate ?? "";
+      const dayStart = (/* @__PURE__ */ new Date(`${day}T00:00:00`)).getTime();
+      const dayEnd = dayStart + 24 * 60 * 60 * 1e3;
+      const startedAt = Math.min(Math.max(item.startedAt, dayStart), dayEnd);
+      const endedAt = item.endedAt ?? (item.state === "running" || item.state === "collecting" ? current : item.startedAt + item.minutes * 6e4);
+      const safeEndedAt = Math.min(Math.max(endedAt, startedAt + 6e4), dayEnd);
+      const left = (startedAt - dayStart) / (dayEnd - dayStart) * 100;
+      const width = Math.max(1.6, (safeEndedAt - startedAt) / (dayEnd - dayStart) * 100);
+      return { left: `${left}%`, width: `${Math.min(width, 100 - left)}%` };
+    }
+    function taskEstimateLabel(task) {
+      if (task.todayEstimateMinutes) return `今日预计 ${formatMinutes(task.todayEstimateMinutes)}`;
+      if (task.estimateMinutes) return `整体预计 ${formatMinutes(task.estimateMinutes)}`;
+      return "未设置预计";
+    }
+    function taskTitle(task) {
+      if (!allSubjectScope.value) return task.pathLabel || task.title;
+      return `${task.subjectName} / ${task.pathLabel || task.title}`;
+    }
+    const __returned__ = { emit, store, overview, summary, subjectOptions, trendDays, heatmapDays, timelineItems, overviewTasks, completionPercent, allSubjectScope, maxTrendMinutes, trendPoints, hasOverviewData, formatMinutes, formatShortDate, formatWeekday, formatTime, isToday, heatLevel, statusLabel, statusClass, timelineClass, timelineLabel, timelineStateLabel, timelineStyle, taskEstimateLabel, taskTitle, get AlertCircle() {
+      return AlertCircle;
+    }, get Clock3() {
+      return Clock3;
+    }, get ListTodo() {
+      return ListTodo;
+    }, get Play() {
+      return Play;
+    }, get RefreshCw() {
+      return RefreshCw;
+    } };
+    Object.defineProperty(__returned__, "__isScriptSetup", { enumerable: false, value: true });
+    return __returned__;
+  }
+});
+import { renderList as _renderList, Fragment as _Fragment, openBlock as _openBlock, createElementBlock as _createElementBlock, toDisplayString as _toDisplayString, normalizeClass as _normalizeClass, createElementVNode as _createElementVNode, createVNode as _createVNode, createTextVNode as _createTextVNode, createCommentVNode as _createCommentVNode, normalizeStyle as _normalizeStyle } from "/@fs/D:/Workspaces/git/my/time-genie/node_modules/.vite/deps/vue.js?v=27b48170";
+const _hoisted_1 = { class: "today-overview-workspace" };
+const _hoisted_2 = { class: "today-overview-head" };
+const _hoisted_3 = {
+  class: "today-subject-tabs",
+  role: "tablist",
+  "aria-label": "今日概览主体"
+};
+const _hoisted_4 = ["aria-selected", "onClick"];
+const _hoisted_5 = { class: "today-overview-actions" };
+const _hoisted_6 = ["disabled"];
+const _hoisted_7 = { class: "today-summary-grid" };
+const _hoisted_8 = { class: "today-summary-item emphasis" };
+const _hoisted_9 = { class: "today-summary-item" };
+const _hoisted_10 = { class: "today-summary-item" };
+const _hoisted_11 = ["disabled"];
+const _hoisted_12 = {
+  key: 0,
+  class: "today-empty-state"
+};
+const _hoisted_13 = {
+  key: 1,
+  class: "today-visual-grid"
+};
+const _hoisted_14 = { class: "today-panel timeline-panel" };
+const _hoisted_15 = { class: "today-panel-head" };
+const _hoisted_16 = {
+  key: 0,
+  class: "today-timeline"
+};
+const _hoisted_17 = { class: "timeline-copy" };
+const _hoisted_18 = { class: "timeline-track" };
+const _hoisted_19 = {
+  key: 1,
+  class: "today-muted-empty"
+};
+const _hoisted_20 = { class: "today-panel execution-panel" };
+const _hoisted_21 = { class: "today-panel-head" };
+const _hoisted_22 = {
+  key: 0,
+  class: "today-task-summary-list"
+};
+const _hoisted_23 = { class: "today-task-main" };
+const _hoisted_24 = { class: "today-task-state" };
+const _hoisted_25 = ["disabled", "title", "onClick"];
+const _hoisted_26 = {
+  key: 1,
+  class: "today-muted-empty"
+};
+const _hoisted_27 = { class: "today-panel activity-panel" };
+const _hoisted_28 = { class: "today-panel-head" };
+const _hoisted_29 = {
+  class: "today-heatmap",
+  "aria-label": "近 30 天投入点阵"
+};
+const _hoisted_30 = ["title"];
+const _hoisted_31 = { class: "today-panel trend-panel" };
+const _hoisted_32 = { class: "today-panel-head" };
+const _hoisted_33 = { class: "today-trend-chart" };
+const _hoisted_34 = {
+  viewBox: "0 0 280 100",
+  role: "img",
+  "aria-label": "近 14 天实际用时趋势"
+};
+const _hoisted_35 = ["points"];
+const _hoisted_36 = ["cx", "cy"];
+const _hoisted_37 = { class: "today-trend-labels" };
+function _sfc_render(_ctx, _cache, $props, $setup, $data, $options) {
+  return _openBlock(), _createElementBlock("section", _hoisted_1, [
+    _createElementVNode("header", _hoisted_2, [
+      _createElementVNode("div", _hoisted_3, [
+        (_openBlock(true), _createElementBlock(
+          _Fragment,
+          null,
+          _renderList($setup.subjectOptions, (subject) => {
+            return _openBlock(), _createElementBlock("button", {
+              key: subject.id || "all",
+              type: "button",
+              role: "tab",
+              "aria-selected": $setup.store.todayOverviewSubjectId === subject.id,
+              class: _normalizeClass({ active: $setup.store.todayOverviewSubjectId === subject.id }),
+              onClick: ($event) => $setup.store.selectTodayOverviewSubject(subject.id)
+            }, _toDisplayString(subject.name), 11, _hoisted_4);
+          }),
+          128
+          /* KEYED_FRAGMENT */
+        ))
+      ]),
+      _createElementVNode("div", _hoisted_5, [
+        _createElementVNode("button", {
+          class: "secondary-button compact",
+          type: "button",
+          disabled: $setup.store.todayOverviewLoading,
+          onClick: _cache[0] || (_cache[0] = ($event) => $setup.store.loadTodayOverview())
+        }, [
+          _createVNode($setup["RefreshCw"], { size: 14 }),
+          _cache[6] || (_cache[6] = _createTextVNode(
+            "刷新",
+            -1
+            /* CACHED */
+          ))
+        ], 8, _hoisted_6),
+        _createElementVNode("button", {
+          class: "secondary-button compact",
+          type: "button",
+          onClick: _cache[1] || (_cache[1] = ($event) => $setup.emit("openPlan"))
+        }, [
+          _createVNode($setup["ListTodo"], { size: 14 }),
+          _cache[7] || (_cache[7] = _createTextVNode(
+            "待办",
+            -1
+            /* CACHED */
+          ))
+        ]),
+        _createElementVNode("button", {
+          class: "primary-button compact",
+          type: "button",
+          onClick: _cache[2] || (_cache[2] = ($event) => $setup.emit("openTimer"))
+        }, [
+          _createVNode($setup["Clock3"], { size: 14 }),
+          _cache[8] || (_cache[8] = _createTextVNode(
+            "计时",
+            -1
+            /* CACHED */
+          ))
+        ])
+      ])
+    ]),
+    _createElementVNode("div", _hoisted_7, [
+      _createElementVNode("div", _hoisted_8, [
+        _cache[9] || (_cache[9] = _createElementVNode(
+          "span",
+          null,
+          "今日投入",
+          -1
+          /* CACHED */
+        )),
+        _createElementVNode(
+          "strong",
+          null,
+          _toDisplayString($setup.formatMinutes($setup.summary.actualMinutes)),
+          1
+          /* TEXT */
+        ),
+        _createElementVNode(
+          "small",
+          null,
+          _toDisplayString($setup.overview?.scope.subjectName ?? "全部主体"),
+          1
+          /* TEXT */
+        )
+      ]),
+      _createElementVNode("div", _hoisted_9, [
+        _cache[10] || (_cache[10] = _createElementVNode(
+          "span",
+          null,
+          "今日预计",
+          -1
+          /* CACHED */
+        )),
+        _createElementVNode(
+          "strong",
+          null,
+          _toDisplayString($setup.formatMinutes($setup.summary.estimatedMinutes)),
+          1
+          /* TEXT */
+        ),
+        _createElementVNode(
+          "small",
+          null,
+          _toDisplayString($setup.summary.estimatedMinutes ? "按今日预计优先" : "暂无预计"),
+          1
+          /* TEXT */
+        )
+      ]),
+      _createElementVNode("div", _hoisted_10, [
+        _cache[11] || (_cache[11] = _createElementVNode(
+          "span",
+          null,
+          "完成率",
+          -1
+          /* CACHED */
+        )),
+        _createElementVNode(
+          "strong",
+          null,
+          _toDisplayString($setup.completionPercent) + "%",
+          1
+          /* TEXT */
+        ),
+        _createElementVNode(
+          "small",
+          null,
+          _toDisplayString($setup.summary.completedCount) + " 完成 · " + _toDisplayString($setup.summary.activeCount) + " 已开始 · " + _toDisplayString($setup.summary.notStartedCount) + " 未开始",
+          1
+          /* TEXT */
+        )
+      ]),
+      _createElementVNode("button", {
+        class: "today-summary-item action",
+        type: "button",
+        disabled: $setup.summary.unassignedMinutes <= 0,
+        onClick: _cache[3] || (_cache[3] = ($event) => $setup.emit("resolveUnassigned"))
+      }, [
+        _createElementVNode(
+          "span",
+          null,
+          _toDisplayString($setup.allSubjectScope ? "未归属" : "未归属（全局）"),
+          1
+          /* TEXT */
+        ),
+        _createElementVNode(
+          "strong",
+          null,
+          _toDisplayString($setup.formatMinutes($setup.summary.unassignedMinutes)),
+          1
+          /* TEXT */
+        ),
+        _createElementVNode(
+          "small",
+          null,
+          _toDisplayString($setup.summary.unassignedMinutes ? "点击处理" : "无待处理时间"),
+          1
+          /* TEXT */
+        )
+      ], 8, _hoisted_11)
+    ]),
+    !$setup.hasOverviewData && !$setup.store.todayOverviewLoading ? (_openBlock(), _createElementBlock("div", _hoisted_12, [
+      _createVNode($setup["AlertCircle"], { size: 22 }),
+      _cache[12] || (_cache[12] = _createElementVNode(
+        "strong",
+        null,
+        "今天还没有工作数据",
+        -1
+        /* CACHED */
+      )),
+      _cache[13] || (_cache[13] = _createElementVNode(
+        "span",
+        null,
+        "可以先添加待办，或从计时开始。",
+        -1
+        /* CACHED */
+      )),
+      _createElementVNode("div", null, [
+        _createElementVNode("button", {
+          class: "secondary-button compact",
+          type: "button",
+          onClick: _cache[4] || (_cache[4] = ($event) => $setup.emit("openPlan"))
+        }, "进入待办"),
+        _createElementVNode("button", {
+          class: "primary-button compact",
+          type: "button",
+          onClick: _cache[5] || (_cache[5] = ($event) => $setup.emit("openTimer"))
+        }, "开始计时")
+      ])
+    ])) : (_openBlock(), _createElementBlock("div", _hoisted_13, [
+      _createElementVNode("section", _hoisted_14, [
+        _createElementVNode("div", _hoisted_15, [
+          _cache[14] || (_cache[14] = _createElementVNode(
+            "h2",
+            null,
+            "今日时间分布",
+            -1
+            /* CACHED */
+          )),
+          _createElementVNode(
+            "span",
+            null,
+            _toDisplayString($setup.timelineItems.length) + " 段",
+            1
+            /* TEXT */
+          )
+        ]),
+        $setup.timelineItems.length ? (_openBlock(), _createElementBlock("div", _hoisted_16, [
+          _cache[15] || (_cache[15] = _createElementVNode(
+            "div",
+            { class: "today-timeline-scale" },
+            [
+              _createElementVNode("span", null, "00:00"),
+              _createElementVNode("span", null, "06:00"),
+              _createElementVNode("span", null, "12:00"),
+              _createElementVNode("span", null, "18:00"),
+              _createElementVNode("span", null, "24:00")
+            ],
+            -1
+            /* CACHED */
+          )),
+          (_openBlock(true), _createElementBlock(
+            _Fragment,
+            null,
+            _renderList($setup.timelineItems, (item) => {
+              return _openBlock(), _createElementBlock(
+                "div",
+                {
+                  key: item.id,
+                  class: _normalizeClass(["today-timeline-row", $setup.timelineClass(item)])
+                },
+                [
+                  _createElementVNode("div", _hoisted_17, [
+                    _createElementVNode(
+                      "strong",
+                      null,
+                      _toDisplayString($setup.timelineLabel(item)),
+                      1
+                      /* TEXT */
+                    ),
+                    _createElementVNode("small", null, [
+                      _createTextVNode(
+                        _toDisplayString($setup.formatTime(item.startedAt)) + " - " + _toDisplayString(item.endedAt ? $setup.formatTime(item.endedAt) : "现在") + " · " + _toDisplayString($setup.formatMinutes(item.minutes)) + " · " + _toDisplayString($setup.timelineStateLabel(item)),
+                        1
+                        /* TEXT */
+                      ),
+                      $setup.allSubjectScope && item.subjectName ? (_openBlock(), _createElementBlock(
+                        _Fragment,
+                        { key: 0 },
+                        [
+                          _createTextVNode(
+                            " · " + _toDisplayString(item.subjectName),
+                            1
+                            /* TEXT */
+                          )
+                        ],
+                        64
+                        /* STABLE_FRAGMENT */
+                      )) : _createCommentVNode("v-if", true)
+                    ])
+                  ]),
+                  _createElementVNode("div", _hoisted_18, [
+                    _createElementVNode(
+                      "i",
+                      {
+                        style: _normalizeStyle($setup.timelineStyle(item))
+                      },
+                      null,
+                      4
+                      /* STYLE */
+                    )
+                  ])
+                ],
+                2
+                /* CLASS */
+              );
+            }),
+            128
+            /* KEYED_FRAGMENT */
+          ))
+        ])) : (_openBlock(), _createElementBlock("p", _hoisted_19, "今天还没有时间段。"))
+      ]),
+      _createElementVNode("section", _hoisted_20, [
+        _createElementVNode("div", _hoisted_21, [
+          _cache[16] || (_cache[16] = _createElementVNode(
+            "h2",
+            null,
+            "执行摘要",
+            -1
+            /* CACHED */
+          )),
+          _createElementVNode(
+            "span",
+            null,
+            _toDisplayString($setup.overviewTasks.length) + " 项",
+            1
+            /* TEXT */
+          )
+        ]),
+        $setup.overviewTasks.length ? (_openBlock(), _createElementBlock("div", _hoisted_22, [
+          (_openBlock(true), _createElementBlock(
+            _Fragment,
+            null,
+            _renderList($setup.overviewTasks, (task) => {
+              return _openBlock(), _createElementBlock(
+                "article",
+                {
+                  key: task.taskId,
+                  class: _normalizeClass(["today-task-summary-row", `status-${$setup.statusClass(task.status)}`])
+                },
+                [
+                  _createElementVNode("div", _hoisted_23, [
+                    _createElementVNode(
+                      "strong",
+                      null,
+                      _toDisplayString($setup.taskTitle(task)),
+                      1
+                      /* TEXT */
+                    ),
+                    _createElementVNode("small", null, [
+                      _createTextVNode(
+                        _toDisplayString($setup.taskEstimateLabel(task)) + " · 实际 " + _toDisplayString($setup.formatMinutes(task.actualMinutes)),
+                        1
+                        /* TEXT */
+                      ),
+                      task.lastEntryAt ? (_openBlock(), _createElementBlock(
+                        _Fragment,
+                        { key: 0 },
+                        [
+                          _createTextVNode(
+                            " · 最近 " + _toDisplayString($setup.formatTime(task.lastEntryAt)),
+                            1
+                            /* TEXT */
+                          )
+                        ],
+                        64
+                        /* STABLE_FRAGMENT */
+                      )) : _createCommentVNode("v-if", true)
+                    ])
+                  ]),
+                  _createElementVNode(
+                    "span",
+                    _hoisted_24,
+                    _toDisplayString($setup.statusLabel(task.status)),
+                    1
+                    /* TEXT */
+                  ),
+                  _createElementVNode("button", {
+                    class: "secondary-button compact icon-button",
+                    type: "button",
+                    disabled: !task.selectable,
+                    title: task.selectable ? "继续计时" : "父事项不可直接计时",
+                    onClick: ($event) => $setup.emit("startTimer", task.taskId)
+                  }, [
+                    _createVNode($setup["Play"], {
+                      size: 13,
+                      fill: "currentColor"
+                    })
+                  ], 8, _hoisted_25)
+                ],
+                2
+                /* CLASS */
+              );
+            }),
+            128
+            /* KEYED_FRAGMENT */
+          ))
+        ])) : (_openBlock(), _createElementBlock("p", _hoisted_26, "今天没有相关事项。"))
+      ]),
+      _createElementVNode("section", _hoisted_27, [
+        _createElementVNode("div", _hoisted_28, [
+          _cache[17] || (_cache[17] = _createElementVNode(
+            "h2",
+            null,
+            "近 30 天",
+            -1
+            /* CACHED */
+          )),
+          _createElementVNode(
+            "span",
+            null,
+            _toDisplayString($setup.heatmapDays.filter((day) => day.actualMinutes > 0).length) + " 天有投入",
+            1
+            /* TEXT */
+          )
+        ]),
+        _createElementVNode("div", _hoisted_29, [
+          (_openBlock(true), _createElementBlock(
+            _Fragment,
+            null,
+            _renderList($setup.heatmapDays, (day) => {
+              return _openBlock(), _createElementBlock("span", {
+                key: day.date,
+                class: _normalizeClass([`level-${$setup.heatLevel(day)}`, { today: $setup.isToday(day.date) }]),
+                title: `${day.date} 实际 ${$setup.formatMinutes(day.actualMinutes)}，预计 ${$setup.formatMinutes(day.estimatedMinutes)}`
+              }, [
+                _cache[18] || (_cache[18] = _createElementVNode(
+                  "i",
+                  null,
+                  null,
+                  -1
+                  /* CACHED */
+                )),
+                _createElementVNode(
+                  "b",
+                  null,
+                  _toDisplayString($setup.formatShortDate(day.date)),
+                  1
+                  /* TEXT */
+                )
+              ], 10, _hoisted_30);
+            }),
+            128
+            /* KEYED_FRAGMENT */
+          ))
+        ])
+      ]),
+      _createElementVNode("section", _hoisted_31, [
+        _createElementVNode("div", _hoisted_32, [
+          _cache[19] || (_cache[19] = _createElementVNode(
+            "h2",
+            null,
+            "近 14 天趋势",
+            -1
+            /* CACHED */
+          )),
+          _createElementVNode(
+            "span",
+            null,
+            "最高 " + _toDisplayString($setup.formatMinutes($setup.maxTrendMinutes)),
+            1
+            /* TEXT */
+          )
+        ]),
+        _createElementVNode("div", _hoisted_33, [
+          (_openBlock(), _createElementBlock("svg", _hoisted_34, [
+            _cache[20] || (_cache[20] = _createElementVNode(
+              "line",
+              {
+                x1: "0",
+                y1: "91",
+                x2: "280",
+                y2: "91"
+              },
+              null,
+              -1
+              /* CACHED */
+            )),
+            $setup.trendPoints ? (_openBlock(), _createElementBlock("polyline", {
+              key: 0,
+              points: $setup.trendPoints
+            }, null, 8, _hoisted_35)) : _createCommentVNode("v-if", true),
+            (_openBlock(true), _createElementBlock(
+              _Fragment,
+              null,
+              _renderList($setup.trendDays, (day, index) => {
+                return _openBlock(), _createElementBlock("circle", {
+                  key: day.date,
+                  cx: $setup.trendDays.length > 1 ? index * (280 / ($setup.trendDays.length - 1)) : 280,
+                  cy: 91 - day.actualMinutes / $setup.maxTrendMinutes * 68,
+                  r: "3.2"
+                }, [
+                  _createElementVNode(
+                    "title",
+                    null,
+                    _toDisplayString(day.date) + " " + _toDisplayString($setup.formatMinutes(day.actualMinutes)),
+                    1
+                    /* TEXT */
+                  )
+                ], 8, _hoisted_36);
+              }),
+              128
+              /* KEYED_FRAGMENT */
+            ))
+          ])),
+          _createElementVNode("div", _hoisted_37, [
+            (_openBlock(true), _createElementBlock(
+              _Fragment,
+              null,
+              _renderList($setup.trendDays, (day) => {
+                return _openBlock(), _createElementBlock(
+                  "span",
+                  {
+                    key: day.date
+                  },
+                  _toDisplayString($setup.formatWeekday(day.date)),
+                  1
+                  /* TEXT */
+                );
+              }),
+              128
+              /* KEYED_FRAGMENT */
+            ))
+          ])
+        ])
+      ])
+    ]))
+  ]);
+}
+_sfc_main.__hmrId = "35aec3bc";
+typeof __VUE_HMR_RUNTIME__ !== "undefined" && __VUE_HMR_RUNTIME__.createRecord(_sfc_main.__hmrId, _sfc_main);
+import.meta.hot.on("file-changed", ({ file }) => {
+  __VUE_HMR_RUNTIME__.CHANGED_FILE = file;
+});
+import.meta.hot.accept((mod) => {
+  if (!mod) return;
+  const { default: updated, _rerender_only } = mod;
+  if (_rerender_only) {
+    __VUE_HMR_RUNTIME__.rerender(updated.__hmrId, updated.render);
+  } else {
+    __VUE_HMR_RUNTIME__.reload(updated.__hmrId, updated);
+  }
+});
+import _export_sfc from "/@id/__x00__plugin-vue:export-helper";
+export default /* @__PURE__ */ _export_sfc(_sfc_main, [["render", _sfc_render], ["__file", "D:/Workspaces/git/my/time-genie/src-ui/src/components/TodayOverviewWorkspace.vue"]]);
+
+//# sourceMappingURL=data:application/json;base64,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S0FBSyxJQUFJO0FBQUEsa0JBQU8sSUFBSSxpQkFBVSxTQUFNLElBQU8sU0FBSyxPQUFXLGlCQUFVLFNBQU07QUFBQSxrQkFBZSxJQUFFLEtBQVEsSUFBSSxnQkFBZ0IseUJBQWU7QUFBQSxrQkFBUSxHQUFFO0FBQUE7a0JBQU07QUFBQSxvQkFBb0U7QUFBQTtBQUFBLHFDQUExRCxJQUFJLElBQUksSUFBRyxNQUFDLGlCQUFHLHFCQUFjLElBQUksYUFBYTtBQUFBO0FBQUE7QUFBQTtBQUFBOzs7Ozs7VUFFNVAsb0JBQXlILE9BQXpILGFBQXlIO0FBQUEsK0JBQXpGO0FBQUEsY0FBbUY7QUFBQTtBQUFBLDBCQUEvRCxrQkFBUyxDQUFoQixRQUFHO3FDQUFoQjtBQUFBLGtCQUFtRjtBQUFBO0FBQUEsb0JBQW5ELEtBQUssSUFBSTtBQUFBO21DQUFTLHFCQUFjLElBQUksSUFBSTtBQUFBO0FBQUE7QUFBQTtBQUFBIiwibmFtZXMiOltdLCJpZ25vcmVMaXN0IjpbXSwic291cmNlcyI6WyJUb2RheU92ZXJ2aWV3V29ya3NwYWNlLnZ1ZSJdLCJzb3VyY2VzQ29udGVudCI6WyI8c2NyaXB0IHNldHVwIGxhbmc9XCJ0c1wiPlxyXG5pbXBvcnQgeyBjb21wdXRlZCB9IGZyb20gXCJ2dWVcIjtcclxuaW1wb3J0IHsgQWxlcnRDaXJjbGUsIENsb2NrMywgTGlzdFRvZG8sIFBsYXksIFJlZnJlc2hDdyB9IGZyb20gXCJsdWNpZGUtdnVlLW5leHRcIjtcclxuaW1wb3J0IHsgdXNlV29ya2RheVN0b3JlIH0gZnJvbSBcIi4uL3N0b3JlXCI7XHJcbmltcG9ydCB0eXBlIHsgVG9kYXlXb3JrT3ZlcnZpZXdEYXlSZWNvcmQsIFRvZGF5V29ya092ZXJ2aWV3VGFza1JlY29yZCwgVG9kYXlXb3JrT3ZlcnZpZXdUaW1lbGluZUl0ZW1SZWNvcmQgfSBmcm9tIFwiLi4vc2VydmljZXMvdGF1cmlcIjtcclxuXHJcbmNvbnN0IGVtaXQgPSBkZWZpbmVFbWl0czx7XHJcbiAgc3RhcnRUaW1lcjogW3Rhc2tJZDogc3RyaW5nXTtcclxuICBvcGVuVGltZXI6IFtdO1xyXG4gIG9wZW5QbGFuOiBbXTtcclxuICByZXNvbHZlVW5hc3NpZ25lZDogW107XHJcbn0+KCk7XHJcblxyXG5jb25zdCBzdG9yZSA9IHVzZVdvcmtkYXlTdG9yZSgpO1xyXG5cclxuY29uc3Qgb3ZlcnZpZXcgPSBjb21wdXRlZCgoKSA9PiBzdG9yZS50b2RheU92ZXJ2aWV3KTtcclxuY29uc3Qgc3VtbWFyeSA9IGNvbXB1dGVkKCgpID0+IG92ZXJ2aWV3LnZhbHVlPy5zdW1tYXJ5ID8/IHtcclxuICBhY3R1YWxNaW51dGVzOiAwLFxyXG4gIGVzdGltYXRlZE1pbnV0ZXM6IDAsXHJcbiAgY29tcGxldGVkQ291bnQ6IDAsXHJcbiAgYWN0aXZlQ291bnQ6IDAsXHJcbiAgbm90U3RhcnRlZENvdW50OiAwLFxyXG4gIHVuYXNzaWduZWRNaW51dGVzOiAwLFxyXG4gIGNvbXBsZXRpb25SYXRlOiAwLFxyXG59KTtcclxuY29uc3Qgc3ViamVjdE9wdGlvbnMgPSBjb21wdXRlZCgoKSA9PiBbeyBpZDogXCJcIiwgbmFtZTogXCLlhajpg6jkuLvkvZNcIiB9LCAuLi5zdG9yZS5zdWJqZWN0cy5tYXAoKHN1YmplY3QpID0+ICh7IGlkOiBzdWJqZWN0LmlkLCBuYW1lOiBzdWJqZWN0Lm5hbWUgfSkpXSk7XHJcbmNvbnN0IHRyZW5kRGF5cyA9IGNvbXB1dGVkKCgpID0+IChvdmVydmlldy52YWx1ZT8uZGF5cyA/PyBbXSkuc2xpY2UoLTE0KSk7XHJcbmNvbnN0IGhlYXRtYXBEYXlzID0gY29tcHV0ZWQoKCkgPT4gb3ZlcnZpZXcudmFsdWU/LmRheXMgPz8gW10pO1xyXG5jb25zdCB0aW1lbGluZUl0ZW1zID0gY29tcHV0ZWQoKCkgPT4gb3ZlcnZpZXcudmFsdWU/LnRpbWVsaW5lID8/IFtdKTtcclxuY29uc3Qgb3ZlcnZpZXdUYXNrcyA9IGNvbXB1dGVkKCgpID0+IG92ZXJ2aWV3LnZhbHVlPy50YXNrcyA/PyBbXSk7XHJcbmNvbnN0IGNvbXBsZXRpb25QZXJjZW50ID0gY29tcHV0ZWQoKCkgPT4gTWF0aC5yb3VuZChzdW1tYXJ5LnZhbHVlLmNvbXBsZXRpb25SYXRlICogMTAwKSk7XHJcbmNvbnN0IGFsbFN1YmplY3RTY29wZSA9IGNvbXB1dGVkKCgpID0+ICFzdG9yZS50b2RheU92ZXJ2aWV3U3ViamVjdElkKTtcclxuY29uc3QgbWF4VHJlbmRNaW51dGVzID0gY29tcHV0ZWQoKCkgPT4gTWF0aC5tYXgoMSwgLi4udHJlbmREYXlzLnZhbHVlLm1hcCgoZGF5KSA9PiBkYXkuYWN0dWFsTWludXRlcykpKTtcclxuY29uc3QgdHJlbmRQb2ludHMgPSBjb21wdXRlZCgoKSA9PiB7XHJcbiAgY29uc3QgZGF5cyA9IHRyZW5kRGF5cy52YWx1ZTtcclxuICBpZiAoIWRheXMubGVuZ3RoKSByZXR1cm4gXCJcIjtcclxuICBjb25zdCB3aWR0aCA9IDI4MDtcclxuICBjb25zdCBiYXNlbGluZSA9IDkxO1xyXG4gIGNvbnN0IHBsb3RIZWlnaHQgPSA2ODtcclxuICBjb25zdCB4U3RlcCA9IGRheXMubGVuZ3RoID4gMSA/IHdpZHRoIC8gKGRheXMubGVuZ3RoIC0gMSkgOiB3aWR0aDtcclxuICByZXR1cm4gZGF5cy5tYXAoKGRheSwgaW5kZXgpID0+IHtcclxuICAgIGNvbnN0IHggPSBNYXRoLnJvdW5kKGluZGV4ICogeFN0ZXApO1xyXG4gICAgY29uc3QgeSA9IE1hdGgucm91bmQoYmFzZWxpbmUgLSAoZGF5LmFjdHVhbE1pbnV0ZXMgLyBtYXhUcmVuZE1pbnV0ZXMudmFsdWUpICogcGxvdEhlaWdodCk7XHJcbiAgICByZXR1cm4gYCR7eH0sJHt5fWA7XHJcbiAgfSkuam9pbihcIiBcIik7XHJcbn0pO1xyXG5jb25zdCBoYXNPdmVydmlld0RhdGEgPSBjb21wdXRlZCgoKSA9PiB7XHJcbiAgY29uc3QgdG90YWxzID0gc3VtbWFyeS52YWx1ZS5hY3R1YWxNaW51dGVzICsgc3VtbWFyeS52YWx1ZS5lc3RpbWF0ZWRNaW51dGVzICsgc3VtbWFyeS52YWx1ZS51bmFzc2lnbmVkTWludXRlcztcclxuICByZXR1cm4gdG90YWxzID4gMCB8fCBvdmVydmlld1Rhc2tzLnZhbHVlLmxlbmd0aCA+IDAgfHwgdGltZWxpbmVJdGVtcy52YWx1ZS5sZW5ndGggPiAwIHx8IGhlYXRtYXBEYXlzLnZhbHVlLnNvbWUoKGRheSkgPT4gZGF5LmFjdHVhbE1pbnV0ZXMgPiAwKTtcclxufSk7XHJcblxyXG5mdW5jdGlvbiBmb3JtYXRNaW51dGVzKG1pbnV0ZXM6IG51bWJlcikge1xyXG4gIGNvbnN0IHZhbHVlID0gTWF0aC5tYXgoMCwgTWF0aC5yb3VuZChtaW51dGVzKSk7XHJcbiAgaWYgKHZhbHVlIDwgNjApIHJldHVybiBgJHt2YWx1ZX1taW5gO1xyXG4gIGNvbnN0IGhvdXJzID0gTWF0aC5mbG9vcih2YWx1ZSAvIDYwKTtcclxuICBjb25zdCByZXN0ID0gdmFsdWUgJSA2MDtcclxuICByZXR1cm4gcmVzdCA/IGAke2hvdXJzfWgke3Jlc3R9bWluYCA6IGAke2hvdXJzfWhgO1xyXG59XHJcblxyXG5mdW5jdGlvbiBmb3JtYXRTaG9ydERhdGUoZGF0ZTogc3RyaW5nKSB7XHJcbiAgcmV0dXJuIGRhdGUuc2xpY2UoNSkucmVwbGFjZShcIi1cIiwgXCIvXCIpO1xyXG59XHJcblxyXG5mdW5jdGlvbiBmb3JtYXRXZWVrZGF5KGRhdGU6IHN0cmluZykge1xyXG4gIGNvbnN0IHBhcnNlZCA9IG5ldyBEYXRlKGAke2RhdGV9VDAwOjAwOjAwYCk7XHJcbiAgcmV0dXJuIFtcIuaXpVwiLCBcIuS4gFwiLCBcIuS6jFwiLCBcIuS4iVwiLCBcIuWbm1wiLCBcIuS6lFwiLCBcIuWFrVwiXVtwYXJzZWQuZ2V0RGF5KCldID8/IFwiXCI7XHJcbn1cclxuXHJcbmZ1bmN0aW9uIGZvcm1hdFRpbWUodGltZXN0YW1wPzogbnVtYmVyKSB7XHJcbiAgaWYgKCF0aW1lc3RhbXApIHJldHVybiBcIi0tOi0tXCI7XHJcbiAgY29uc3QgZGF0ZSA9IG5ldyBEYXRlKHRpbWVzdGFtcCk7XHJcbiAgcmV0dXJuIGAke1N0cmluZyhkYXRlLmdldEhvdXJzKCkpLnBhZFN0YXJ0KDIsIFwiMFwiKX06JHtTdHJpbmcoZGF0ZS5nZXRNaW51dGVzKCkpLnBhZFN0YXJ0KDIsIFwiMFwiKX1gO1xyXG59XHJcblxyXG5mdW5jdGlvbiBpc1RvZGF5KGRhdGU6IHN0cmluZykge1xyXG4gIHJldHVybiBvdmVydmlldy52YWx1ZT8uc2NvcGUudG9kYXlEYXRlID09PSBkYXRlO1xyXG59XHJcblxyXG5mdW5jdGlvbiBoZWF0TGV2ZWwoZGF5OiBUb2RheVdvcmtPdmVydmlld0RheVJlY29yZCkge1xyXG4gIGlmIChkYXkuYWN0dWFsTWludXRlcyA8PSAwKSByZXR1cm4gMDtcclxuICBpZiAoZGF5LmFjdHVhbE1pbnV0ZXMgPD0gMzApIHJldHVybiAxO1xyXG4gIGlmIChkYXkuYWN0dWFsTWludXRlcyA8PSAxMjApIHJldHVybiAyO1xyXG4gIGlmIChkYXkuYWN0dWFsTWludXRlcyA8PSAyNDApIHJldHVybiAzO1xyXG4gIHJldHVybiA0O1xyXG59XHJcblxyXG5mdW5jdGlvbiBzdGF0dXNMYWJlbChzdGF0dXM6IHN0cmluZykge1xyXG4gIGlmIChzdGF0dXMgPT09IFwiZG9uZVwiKSByZXR1cm4gXCLlt7LlrozmiJBcIjtcclxuICBpZiAoc3RhdHVzID09PSBcImFjdGl2ZVwiIHx8IHN0YXR1cyA9PT0gXCJydW5uaW5nXCIpIHJldHVybiBcIui/m+ihjOS4rVwiO1xyXG4gIGlmIChzdGF0dXMgPT09IFwic3RhcnRlZFwiKSByZXR1cm4gXCLlt7LlvIDlp4tcIjtcclxuICByZXR1cm4gXCLmnKrlvIDlp4tcIjtcclxufVxyXG5cclxuZnVuY3Rpb24gc3RhdHVzQ2xhc3Moc3RhdHVzOiBzdHJpbmcpIHtcclxuICBpZiAoc3RhdHVzID09PSBcImRvbmVcIikgcmV0dXJuIFwiZG9uZVwiO1xyXG4gIGlmIChzdGF0dXMgPT09IFwiYWN0aXZlXCIgfHwgc3RhdHVzID09PSBcInJ1bm5pbmdcIiB8fCBzdGF0dXMgPT09IFwic3RhcnRlZFwiKSByZXR1cm4gXCJhY3RpdmVcIjtcclxuICByZXR1cm4gXCJpZGxlXCI7XHJcbn1cclxuXHJcbmZ1bmN0aW9uIHRpbWVsaW5lQ2xhc3MoaXRlbTogVG9kYXlXb3JrT3ZlcnZpZXdUaW1lbGluZUl0ZW1SZWNvcmQpIHtcclxuICByZXR1cm4gW1xyXG4gICAgYGtpbmQtJHtpdGVtLml0ZW1UeXBlfWAsXHJcbiAgICBpdGVtLnN0YXRlID8gYHN0YXRlLSR7aXRlbS5zdGF0ZX1gIDogXCJcIixcclxuICBdO1xyXG59XHJcblxyXG5mdW5jdGlvbiB0aW1lbGluZUxhYmVsKGl0ZW06IFRvZGF5V29ya092ZXJ2aWV3VGltZWxpbmVJdGVtUmVjb3JkKSB7XHJcbiAgaWYgKGl0ZW0uaXRlbVR5cGUgPT09IFwiYnJlYWtcIikgcmV0dXJuIFwi5LyR5oGvXCI7XHJcbiAgaWYgKGl0ZW0uaXRlbVR5cGUgPT09IFwidW5hc3NpZ25lZFwiKSByZXR1cm4gXCLmnKrlvZLlsZ5cIjtcclxuICByZXR1cm4gaXRlbS50YXNrVGl0bGUgfHwgXCLlt6XkvZxcIjtcclxufVxyXG5cclxuZnVuY3Rpb24gdGltZWxpbmVTdGF0ZUxhYmVsKGl0ZW06IFRvZGF5V29ya092ZXJ2aWV3VGltZWxpbmVJdGVtUmVjb3JkKSB7XHJcbiAgaWYgKGl0ZW0uc3RhdGUgPT09IFwicnVubmluZ1wiIHx8IGl0ZW0uc3RhdGUgPT09IFwiY29sbGVjdGluZ1wiKSByZXR1cm4gXCLov5vooYzkuK1cIjtcclxuICBpZiAoaXRlbS5zdGF0ZSA9PT0gXCJwYXVzZWRcIikgcmV0dXJuIFwi5bey5pqC5YGcXCI7XHJcbiAgcmV0dXJuIGl0ZW0uaXRlbVR5cGUgPT09IFwidW5hc3NpZ25lZFwiID8gXCLlvoXlpITnkIZcIiA6IFwi5bey57uT5p2fXCI7XHJcbn1cclxuXHJcbmZ1bmN0aW9uIHRpbWVsaW5lU3R5bGUoaXRlbTogVG9kYXlXb3JrT3ZlcnZpZXdUaW1lbGluZUl0ZW1SZWNvcmQpIHtcclxuICBjb25zdCBjdXJyZW50ID0gRGF0ZS5ub3coKTtcclxuICBjb25zdCBkYXkgPSBvdmVydmlldy52YWx1ZT8uc2NvcGUudG9kYXlEYXRlID8/IFwiXCI7XHJcbiAgY29uc3QgZGF5U3RhcnQgPSBuZXcgRGF0ZShgJHtkYXl9VDAwOjAwOjAwYCkuZ2V0VGltZSgpO1xyXG4gIGNvbnN0IGRheUVuZCA9IGRheVN0YXJ0ICsgMjQgKiA2MCAqIDYwICogMTAwMDtcclxuICBjb25zdCBzdGFydGVkQXQgPSBNYXRoLm1pbihNYXRoLm1heChpdGVtLnN0YXJ0ZWRBdCwgZGF5U3RhcnQpLCBkYXlFbmQpO1xyXG4gIGNvbnN0IGVuZGVkQXQgPSBpdGVtLmVuZGVkQXQgPz8gKGl0ZW0uc3RhdGUgPT09IFwicnVubmluZ1wiIHx8IGl0ZW0uc3RhdGUgPT09IFwiY29sbGVjdGluZ1wiID8gY3VycmVudCA6IGl0ZW0uc3RhcnRlZEF0ICsgaXRlbS5taW51dGVzICogNjBfMDAwKTtcclxuICBjb25zdCBzYWZlRW5kZWRBdCA9IE1hdGgubWluKE1hdGgubWF4KGVuZGVkQXQsIHN0YXJ0ZWRBdCArIDYwXzAwMCksIGRheUVuZCk7XHJcbiAgY29uc3QgbGVmdCA9ICgoc3RhcnRlZEF0IC0gZGF5U3RhcnQpIC8gKGRheUVuZCAtIGRheVN0YXJ0KSkgKiAxMDA7XHJcbiAgY29uc3Qgd2lkdGggPSBNYXRoLm1heCgxLjYsICgoc2FmZUVuZGVkQXQgLSBzdGFydGVkQXQpIC8gKGRheUVuZCAtIGRheVN0YXJ0KSkgKiAxMDApO1xyXG4gIHJldHVybiB7IGxlZnQ6IGAke2xlZnR9JWAsIHdpZHRoOiBgJHtNYXRoLm1pbih3aWR0aCwgMTAwIC0gbGVmdCl9JWAgfTtcclxufVxyXG5cclxuZnVuY3Rpb24gdGFza0VzdGltYXRlTGFiZWwodGFzazogVG9kYXlXb3JrT3ZlcnZpZXdUYXNrUmVjb3JkKSB7XHJcbiAgaWYgKHRhc2sudG9kYXlFc3RpbWF0ZU1pbnV0ZXMpIHJldHVybiBg5LuK5pel6aKE6K6hICR7Zm9ybWF0TWludXRlcyh0YXNrLnRvZGF5RXN0aW1hdGVNaW51dGVzKX1gO1xyXG4gIGlmICh0YXNrLmVzdGltYXRlTWludXRlcykgcmV0dXJuIGDmlbTkvZPpooTorqEgJHtmb3JtYXRNaW51dGVzKHRhc2suZXN0aW1hdGVNaW51dGVzKX1gO1xyXG4gIHJldHVybiBcIuacquiuvue9rumihOiuoVwiO1xyXG59XHJcblxyXG5mdW5jdGlvbiB0YXNrVGl0bGUodGFzazogVG9kYXlXb3JrT3ZlcnZpZXdUYXNrUmVjb3JkKSB7XHJcbiAgaWYgKCFhbGxTdWJqZWN0U2NvcGUudmFsdWUpIHJldHVybiB0YXNrLnBhdGhMYWJlbCB8fCB0YXNrLnRpdGxlO1xyXG4gIHJldHVybiBgJHt0YXNrLnN1YmplY3ROYW1lfSAvICR7dGFzay5wYXRoTGFiZWwgfHwgdGFzay50aXRsZX1gO1xyXG59XHJcbjwvc2NyaXB0PlxyXG5cclxuPHRlbXBsYXRlPlxyXG4gIDxzZWN0aW9uIGNsYXNzPVwidG9kYXktb3ZlcnZpZXctd29ya3NwYWNlXCI+XHJcbiAgICA8aGVhZGVyIGNsYXNzPVwidG9kYXktb3ZlcnZpZXctaGVhZFwiPlxyXG4gICAgICA8ZGl2IGNsYXNzPVwidG9kYXktc3ViamVjdC10YWJzXCIgcm9sZT1cInRhYmxpc3RcIiBhcmlhLWxhYmVsPVwi5LuK5pel5qaC6KeI5Li75L2TXCI+XHJcbiAgICAgICAgPGJ1dHRvblxyXG4gICAgICAgICAgdi1mb3I9XCJzdWJqZWN0IGluIHN1YmplY3RPcHRpb25zXCJcclxuICAgICAgICAgIDprZXk9XCJzdWJqZWN0LmlkIHx8ICdhbGwnXCJcclxuICAgICAgICAgIHR5cGU9XCJidXR0b25cIlxyXG4gICAgICAgICAgcm9sZT1cInRhYlwiXHJcbiAgICAgICAgICA6YXJpYS1zZWxlY3RlZD1cInN0b3JlLnRvZGF5T3ZlcnZpZXdTdWJqZWN0SWQgPT09IHN1YmplY3QuaWRcIlxyXG4gICAgICAgICAgOmNsYXNzPVwieyBhY3RpdmU6IHN0b3JlLnRvZGF5T3ZlcnZpZXdTdWJqZWN0SWQgPT09IHN1YmplY3QuaWQgfVwiXHJcbiAgICAgICAgICBAY2xpY2s9XCJzdG9yZS5zZWxlY3RUb2RheU92ZXJ2aWV3U3ViamVjdChzdWJqZWN0LmlkKVwiXHJcbiAgICAgICAgPlxyXG4gICAgICAgICAge3sgc3ViamVjdC5uYW1lIH19XHJcbiAgICAgICAgPC9idXR0b24+XHJcbiAgICAgIDwvZGl2PlxyXG4gICAgICA8ZGl2IGNsYXNzPVwidG9kYXktb3ZlcnZpZXctYWN0aW9uc1wiPlxyXG4gICAgICAgIDxidXR0b24gY2xhc3M9XCJzZWNvbmRhcnktYnV0dG9uIGNvbXBhY3RcIiB0eXBlPVwiYnV0dG9uXCIgOmRpc2FibGVkPVwic3RvcmUudG9kYXlPdmVydmlld0xvYWRpbmdcIiBAY2xpY2s9XCJzdG9yZS5sb2FkVG9kYXlPdmVydmlldygpXCI+PFJlZnJlc2hDdyA6c2l6ZT1cIjE0XCIgLz7liLfmlrA8L2J1dHRvbj5cclxuICAgICAgICA8YnV0dG9uIGNsYXNzPVwic2Vjb25kYXJ5LWJ1dHRvbiBjb21wYWN0XCIgdHlwZT1cImJ1dHRvblwiIEBjbGljaz1cImVtaXQoJ29wZW5QbGFuJylcIj48TGlzdFRvZG8gOnNpemU9XCIxNFwiIC8+5b6F5YqePC9idXR0b24+XHJcbiAgICAgICAgPGJ1dHRvbiBjbGFzcz1cInByaW1hcnktYnV0dG9uIGNvbXBhY3RcIiB0eXBlPVwiYnV0dG9uXCIgQGNsaWNrPVwiZW1pdCgnb3BlblRpbWVyJylcIj48Q2xvY2szIDpzaXplPVwiMTRcIiAvPuiuoeaXtjwvYnV0dG9uPlxyXG4gICAgICA8L2Rpdj5cclxuICAgIDwvaGVhZGVyPlxyXG5cclxuICAgIDxkaXYgY2xhc3M9XCJ0b2RheS1zdW1tYXJ5LWdyaWRcIj5cclxuICAgICAgPGRpdiBjbGFzcz1cInRvZGF5LXN1bW1hcnktaXRlbSBlbXBoYXNpc1wiPjxzcGFuPuS7iuaXpeaKleWFpTwvc3Bhbj48c3Ryb25nPnt7IGZvcm1hdE1pbnV0ZXMoc3VtbWFyeS5hY3R1YWxNaW51dGVzKSB9fTwvc3Ryb25nPjxzbWFsbD57eyBvdmVydmlldz8uc2NvcGUuc3ViamVjdE5hbWUgPz8gJ+WFqOmDqOS4u+S9kycgfX08L3NtYWxsPjwvZGl2PlxyXG4gICAgICA8ZGl2IGNsYXNzPVwidG9kYXktc3VtbWFyeS1pdGVtXCI+PHNwYW4+5LuK5pel6aKE6K6hPC9zcGFuPjxzdHJvbmc+e3sgZm9ybWF0TWludXRlcyhzdW1tYXJ5LmVzdGltYXRlZE1pbnV0ZXMpIH19PC9zdHJvbmc+PHNtYWxsPnt7IHN1bW1hcnkuZXN0aW1hdGVkTWludXRlcyA/ICfmjInku4rml6XpooTorqHkvJjlhYgnIDogJ+aaguaXoOmihOiuoScgfX08L3NtYWxsPjwvZGl2PlxyXG4gICAgICA8ZGl2IGNsYXNzPVwidG9kYXktc3VtbWFyeS1pdGVtXCI+PHNwYW4+5a6M5oiQ546HPC9zcGFuPjxzdHJvbmc+e3sgY29tcGxldGlvblBlcmNlbnQgfX0lPC9zdHJvbmc+PHNtYWxsPnt7IHN1bW1hcnkuY29tcGxldGVkQ291bnQgfX0g5a6M5oiQIMK3IHt7IHN1bW1hcnkuYWN0aXZlQ291bnQgfX0g5bey5byA5aeLIMK3IHt7IHN1bW1hcnkubm90U3RhcnRlZENvdW50IH19IOacquW8gOWnizwvc21hbGw+PC9kaXY+XHJcbiAgICAgIDxidXR0b24gY2xhc3M9XCJ0b2RheS1zdW1tYXJ5LWl0ZW0gYWN0aW9uXCIgdHlwZT1cImJ1dHRvblwiIDpkaXNhYmxlZD1cInN1bW1hcnkudW5hc3NpZ25lZE1pbnV0ZXMgPD0gMFwiIEBjbGljaz1cImVtaXQoJ3Jlc29sdmVVbmFzc2lnbmVkJylcIj5cclxuICAgICAgICA8c3Bhbj57eyBhbGxTdWJqZWN0U2NvcGUgPyAn5pyq5b2S5bGeJyA6ICfmnKrlvZLlsZ7vvIjlhajlsYDvvIknIH19PC9zcGFuPjxzdHJvbmc+e3sgZm9ybWF0TWludXRlcyhzdW1tYXJ5LnVuYXNzaWduZWRNaW51dGVzKSB9fTwvc3Ryb25nPjxzbWFsbD57eyBzdW1tYXJ5LnVuYXNzaWduZWRNaW51dGVzID8gJ+eCueWHu+WkhOeQhicgOiAn5peg5b6F5aSE55CG5pe26Ze0JyB9fTwvc21hbGw+XHJcbiAgICAgIDwvYnV0dG9uPlxyXG4gICAgPC9kaXY+XHJcblxyXG4gICAgPGRpdiB2LWlmPVwiIWhhc092ZXJ2aWV3RGF0YSAmJiAhc3RvcmUudG9kYXlPdmVydmlld0xvYWRpbmdcIiBjbGFzcz1cInRvZGF5LWVtcHR5LXN0YXRlXCI+XHJcbiAgICAgIDxBbGVydENpcmNsZSA6c2l6ZT1cIjIyXCIgLz5cclxuICAgICAgPHN0cm9uZz7ku4rlpKnov5jmsqHmnInlt6XkvZzmlbDmja48L3N0cm9uZz5cclxuICAgICAgPHNwYW4+5Y+v5Lul5YWI5re75Yqg5b6F5Yqe77yM5oiW5LuO6K6h5pe25byA5aeL44CCPC9zcGFuPlxyXG4gICAgICA8ZGl2PjxidXR0b24gY2xhc3M9XCJzZWNvbmRhcnktYnV0dG9uIGNvbXBhY3RcIiB0eXBlPVwiYnV0dG9uXCIgQGNsaWNrPVwiZW1pdCgnb3BlblBsYW4nKVwiPui/m+WFpeW+heWKnjwvYnV0dG9uPjxidXR0b24gY2xhc3M9XCJwcmltYXJ5LWJ1dHRvbiBjb21wYWN0XCIgdHlwZT1cImJ1dHRvblwiIEBjbGljaz1cImVtaXQoJ29wZW5UaW1lcicpXCI+5byA5aeL6K6h5pe2PC9idXR0b24+PC9kaXY+XHJcbiAgICA8L2Rpdj5cclxuXHJcbiAgICA8ZGl2IHYtZWxzZSBjbGFzcz1cInRvZGF5LXZpc3VhbC1ncmlkXCI+XHJcbiAgICAgIDxzZWN0aW9uIGNsYXNzPVwidG9kYXktcGFuZWwgdGltZWxpbmUtcGFuZWxcIj5cclxuICAgICAgICA8ZGl2IGNsYXNzPVwidG9kYXktcGFuZWwtaGVhZFwiPjxoMj7ku4rml6Xml7bpl7TliIbluIM8L2gyPjxzcGFuPnt7IHRpbWVsaW5lSXRlbXMubGVuZ3RoIH19IOautTwvc3Bhbj48L2Rpdj5cclxuICAgICAgICA8ZGl2IHYtaWY9XCJ0aW1lbGluZUl0ZW1zLmxlbmd0aFwiIGNsYXNzPVwidG9kYXktdGltZWxpbmVcIj5cclxuICAgICAgICAgIDxkaXYgY2xhc3M9XCJ0b2RheS10aW1lbGluZS1zY2FsZVwiPjxzcGFuPjAwOjAwPC9zcGFuPjxzcGFuPjA2OjAwPC9zcGFuPjxzcGFuPjEyOjAwPC9zcGFuPjxzcGFuPjE4OjAwPC9zcGFuPjxzcGFuPjI0OjAwPC9zcGFuPjwvZGl2PlxyXG4gICAgICAgICAgPGRpdiB2LWZvcj1cIml0ZW0gaW4gdGltZWxpbmVJdGVtc1wiIDprZXk9XCJpdGVtLmlkXCIgY2xhc3M9XCJ0b2RheS10aW1lbGluZS1yb3dcIiA6Y2xhc3M9XCJ0aW1lbGluZUNsYXNzKGl0ZW0pXCI+XHJcbiAgICAgICAgICAgIDxkaXYgY2xhc3M9XCJ0aW1lbGluZS1jb3B5XCI+XHJcbiAgICAgICAgICAgICAgPHN0cm9uZz57eyB0aW1lbGluZUxhYmVsKGl0ZW0pIH19PC9zdHJvbmc+XHJcbiAgICAgICAgICAgICAgPHNtYWxsPnt7IGZvcm1hdFRpbWUoaXRlbS5zdGFydGVkQXQpIH19IC0ge3sgaXRlbS5lbmRlZEF0ID8gZm9ybWF0VGltZShpdGVtLmVuZGVkQXQpIDogJ+eOsOWcqCcgfX0gwrcge3sgZm9ybWF0TWludXRlcyhpdGVtLm1pbnV0ZXMpIH19IMK3IHt7IHRpbWVsaW5lU3RhdGVMYWJlbChpdGVtKSB9fTx0ZW1wbGF0ZSB2LWlmPVwiYWxsU3ViamVjdFNjb3BlICYmIGl0ZW0uc3ViamVjdE5hbWVcIj4gwrcge3sgaXRlbS5zdWJqZWN0TmFtZSB9fTwvdGVtcGxhdGU+PC9zbWFsbD5cclxuICAgICAgICAgICAgPC9kaXY+XHJcbiAgICAgICAgICAgIDxkaXYgY2xhc3M9XCJ0aW1lbGluZS10cmFja1wiPjxpIDpzdHlsZT1cInRpbWVsaW5lU3R5bGUoaXRlbSlcIj48L2k+PC9kaXY+XHJcbiAgICAgICAgICA8L2Rpdj5cclxuICAgICAgICA8L2Rpdj5cclxuICAgICAgICA8cCB2LWVsc2UgY2xhc3M9XCJ0b2RheS1tdXRlZC1lbXB0eVwiPuS7iuWkqei/mOayoeacieaXtumXtOauteOAgjwvcD5cclxuICAgICAgPC9zZWN0aW9uPlxyXG5cclxuICAgICAgPHNlY3Rpb24gY2xhc3M9XCJ0b2RheS1wYW5lbCBleGVjdXRpb24tcGFuZWxcIj5cclxuICAgICAgICA8ZGl2IGNsYXNzPVwidG9kYXktcGFuZWwtaGVhZFwiPjxoMj7miafooYzmkZjopoE8L2gyPjxzcGFuPnt7IG92ZXJ2aWV3VGFza3MubGVuZ3RoIH19IOmhuTwvc3Bhbj48L2Rpdj5cclxuICAgICAgICA8ZGl2IHYtaWY9XCJvdmVydmlld1Rhc2tzLmxlbmd0aFwiIGNsYXNzPVwidG9kYXktdGFzay1zdW1tYXJ5LWxpc3RcIj5cclxuICAgICAgICAgIDxhcnRpY2xlIHYtZm9yPVwidGFzayBpbiBvdmVydmlld1Rhc2tzXCIgOmtleT1cInRhc2sudGFza0lkXCIgY2xhc3M9XCJ0b2RheS10YXNrLXN1bW1hcnktcm93XCIgOmNsYXNzPVwiYHN0YXR1cy0ke3N0YXR1c0NsYXNzKHRhc2suc3RhdHVzKX1gXCI+XHJcbiAgICAgICAgICAgIDxkaXYgY2xhc3M9XCJ0b2RheS10YXNrLW1haW5cIj5cclxuICAgICAgICAgICAgICA8c3Ryb25nPnt7IHRhc2tUaXRsZSh0YXNrKSB9fTwvc3Ryb25nPlxyXG4gICAgICAgICAgICAgIDxzbWFsbD57eyB0YXNrRXN0aW1hdGVMYWJlbCh0YXNrKSB9fSDCtyDlrp7pmYUge3sgZm9ybWF0TWludXRlcyh0YXNrLmFjdHVhbE1pbnV0ZXMpIH19PHRlbXBsYXRlIHYtaWY9XCJ0YXNrLmxhc3RFbnRyeUF0XCI+IMK3IOacgOi/kSB7eyBmb3JtYXRUaW1lKHRhc2subGFzdEVudHJ5QXQpIH19PC90ZW1wbGF0ZT48L3NtYWxsPlxyXG4gICAgICAgICAgICA8L2Rpdj5cclxuICAgICAgICAgICAgPHNwYW4gY2xhc3M9XCJ0b2RheS10YXNrLXN0YXRlXCI+e3sgc3RhdHVzTGFiZWwodGFzay5zdGF0dXMpIH19PC9zcGFuPlxyXG4gICAgICAgICAgICA8YnV0dG9uIGNsYXNzPVwic2Vjb25kYXJ5LWJ1dHRvbiBjb21wYWN0IGljb24tYnV0dG9uXCIgdHlwZT1cImJ1dHRvblwiIDpkaXNhYmxlZD1cIiF0YXNrLnNlbGVjdGFibGVcIiA6dGl0bGU9XCJ0YXNrLnNlbGVjdGFibGUgPyAn57un57ut6K6h5pe2JyA6ICfniLbkuovpobnkuI3lj6/nm7TmjqXorqHml7YnXCIgQGNsaWNrPVwiZW1pdCgnc3RhcnRUaW1lcicsIHRhc2sudGFza0lkKVwiPjxQbGF5IDpzaXplPVwiMTNcIiBmaWxsPVwiY3VycmVudENvbG9yXCIgLz48L2J1dHRvbj5cclxuICAgICAgICAgIDwvYXJ0aWNsZT5cclxuICAgICAgICA8L2Rpdj5cclxuICAgICAgICA8cCB2LWVsc2UgY2xhc3M9XCJ0b2RheS1tdXRlZC1lbXB0eVwiPuS7iuWkqeayoeacieebuOWFs+S6i+mhueOAgjwvcD5cclxuICAgICAgPC9zZWN0aW9uPlxyXG5cclxuICAgICAgPHNlY3Rpb24gY2xhc3M9XCJ0b2RheS1wYW5lbCBhY3Rpdml0eS1wYW5lbFwiPlxyXG4gICAgICAgIDxkaXYgY2xhc3M9XCJ0b2RheS1wYW5lbC1oZWFkXCI+PGgyPui/kSAzMCDlpKk8L2gyPjxzcGFuPnt7IGhlYXRtYXBEYXlzLmZpbHRlcigoZGF5KSA9PiBkYXkuYWN0dWFsTWludXRlcyA+IDApLmxlbmd0aCB9fSDlpKnmnInmipXlhaU8L3NwYW4+PC9kaXY+XHJcbiAgICAgICAgPGRpdiBjbGFzcz1cInRvZGF5LWhlYXRtYXBcIiBhcmlhLWxhYmVsPVwi6L+RIDMwIOWkqeaKleWFpeeCuemYtVwiPlxyXG4gICAgICAgICAgPHNwYW5cclxuICAgICAgICAgICAgdi1mb3I9XCJkYXkgaW4gaGVhdG1hcERheXNcIlxyXG4gICAgICAgICAgICA6a2V5PVwiZGF5LmRhdGVcIlxyXG4gICAgICAgICAgICA6Y2xhc3M9XCJbYGxldmVsLSR7aGVhdExldmVsKGRheSl9YCwgeyB0b2RheTogaXNUb2RheShkYXkuZGF0ZSkgfV1cIlxyXG4gICAgICAgICAgICA6dGl0bGU9XCJgJHtkYXkuZGF0ZX0g5a6e6ZmFICR7Zm9ybWF0TWludXRlcyhkYXkuYWN0dWFsTWludXRlcyl977yM6aKE6K6hICR7Zm9ybWF0TWludXRlcyhkYXkuZXN0aW1hdGVkTWludXRlcyl9YFwiXHJcbiAgICAgICAgICA+XHJcbiAgICAgICAgICAgIDxpPjwvaT48Yj57eyBmb3JtYXRTaG9ydERhdGUoZGF5LmRhdGUpIH19PC9iPlxyXG4gICAgICAgICAgPC9zcGFuPlxyXG4gICAgICAgIDwvZGl2PlxyXG4gICAgICA8L3NlY3Rpb24+XHJcblxyXG4gICAgICA8c2VjdGlvbiBjbGFzcz1cInRvZGF5LXBhbmVsIHRyZW5kLXBhbmVsXCI+XHJcbiAgICAgICAgPGRpdiBjbGFzcz1cInRvZGF5LXBhbmVsLWhlYWRcIj48aDI+6L+RIDE0IOWkqei2i+WKvzwvaDI+PHNwYW4+5pyA6auYIHt7IGZvcm1hdE1pbnV0ZXMobWF4VHJlbmRNaW51dGVzKSB9fTwvc3Bhbj48L2Rpdj5cclxuICAgICAgICA8ZGl2IGNsYXNzPVwidG9kYXktdHJlbmQtY2hhcnRcIj5cclxuICAgICAgICAgIDxzdmcgdmlld0JveD1cIjAgMCAyODAgMTAwXCIgcm9sZT1cImltZ1wiIGFyaWEtbGFiZWw9XCLov5EgMTQg5aSp5a6e6ZmF55So5pe26LaL5Yq/XCI+XHJcbiAgICAgICAgICAgIDxsaW5lIHgxPVwiMFwiIHkxPVwiOTFcIiB4Mj1cIjI4MFwiIHkyPVwiOTFcIiAvPlxyXG4gICAgICAgICAgICA8cG9seWxpbmUgdi1pZj1cInRyZW5kUG9pbnRzXCIgOnBvaW50cz1cInRyZW5kUG9pbnRzXCIgLz5cclxuICAgICAgICAgICAgPGNpcmNsZSB2LWZvcj1cIihkYXksIGluZGV4KSBpbiB0cmVuZERheXNcIiA6a2V5PVwiZGF5LmRhdGVcIiA6Y3g9XCJ0cmVuZERheXMubGVuZ3RoID4gMSA/IGluZGV4ICogKDI4MCAvICh0cmVuZERheXMubGVuZ3RoIC0gMSkpIDogMjgwXCIgOmN5PVwiOTEgLSAoZGF5LmFjdHVhbE1pbnV0ZXMgLyBtYXhUcmVuZE1pbnV0ZXMpICogNjhcIiByPVwiMy4yXCI+PHRpdGxlPnt7IGRheS5kYXRlIH19IHt7IGZvcm1hdE1pbnV0ZXMoZGF5LmFjdHVhbE1pbnV0ZXMpIH19PC90aXRsZT48L2NpcmNsZT5cclxuICAgICAgICAgIDwvc3ZnPlxyXG4gICAgICAgICAgPGRpdiBjbGFzcz1cInRvZGF5LXRyZW5kLWxhYmVsc1wiPjxzcGFuIHYtZm9yPVwiZGF5IGluIHRyZW5kRGF5c1wiIDprZXk9XCJkYXkuZGF0ZVwiPnt7IGZvcm1hdFdlZWtkYXkoZGF5LmRhdGUpIH19PC9zcGFuPjwvZGl2PlxyXG4gICAgICAgIDwvZGl2PlxyXG4gICAgICA8L3NlY3Rpb24+XHJcbiAgICA8L2Rpdj5cclxuICA8L3NlY3Rpb24+XHJcbjwvdGVtcGxhdGU+XHJcbiJdLCJmaWxlIjoiRDovV29ya3NwYWNlcy9naXQvbXkvdGltZS1nZW5pZS9zcmMtdWkvc3JjL2NvbXBvbmVudHMvVG9kYXlPdmVydmlld1dvcmtzcGFjZS52dWUifQ==

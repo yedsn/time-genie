@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -20,17 +21,33 @@ use crate::supabase::{
 
 const REALTIME_HEARTBEAT_SECONDS: u64 = 25;
 const REALTIME_RECONNECT_SECONDS: u64 = 5;
+const REALTIME_RECONNECT_MAX_SECONDS: u64 = 60;
 const OUTBOX_SENDING_STALE_AFTER_MILLIS: i64 = 5 * 60 * 1000;
 const OUTBOX_RETRY_MAX_BACKOFF_MILLIS: i64 = 60 * 1000;
+const SYNC_SIGNAL_LOCAL_DIRTY: u8 = 1;
+const SYNC_SIGNAL_REMOTE_HINT: u8 = 1 << 1;
+const SYNC_SIGNAL_CONNECTION_READY: u8 = 1 << 2;
+const SYNC_SIGNAL_MANUAL_RETRY: u8 = 1 << 3;
 static TRACKING_LEASE_TOKEN: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static CLOUD_SYNC_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CLOUD_SYNC_WAKEUP: OnceLock<Arc<Notify>> = OnceLock::new();
-static CLOUD_SYNC_APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
+static CLOUD_MODE_WAKEUP: OnceLock<Arc<Notify>> = OnceLock::new();
+static CLOUD_SYNC_SIGNALS: AtomicU8 = AtomicU8::new(0);
+static CLOUD_SYNC_OBSERVED_REMOTE_SEQ: AtomicI64 = AtomicI64::new(0);
+static CLOUD_SYNC_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static CLOUD_SYNC_TEST_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub fn spawn_background_services(database: Database, app: AppHandle) {
-    let _ = CLOUD_SYNC_APP_HANDLE.set(app.clone());
-    spawn_background_lease(database.clone(), app.clone());
-    spawn_realtime_listener(database, app);
+    spawn_sync_coordinator(database.clone(), app.clone());
+    spawn_tracking_lease_maintainer(database.clone(), app.clone());
+    spawn_realtime_listener(database.clone(), app);
+    if storage_mode(&database).is_ok_and(|state| state.mode == "cloud") {
+        wake_after_connection_ready();
+    } else {
+        disable_cloud_sync();
+    }
 }
 
 fn cloud_sync_wakeup() -> Arc<Notify> {
@@ -39,67 +56,121 @@ fn cloud_sync_wakeup() -> Arc<Notify> {
         .clone()
 }
 
-fn spawn_background_lease(database: Database, app: AppHandle) {
+fn cloud_mode_wakeup() -> Arc<Notify> {
+    CLOUD_MODE_WAKEUP
+        .get_or_init(|| Arc::new(Notify::new()))
+        .clone()
+}
+
+fn signal_cloud_sync(signal: u8, observed_change_seq: Option<i64>) {
+    CLOUD_SYNC_SIGNALS.fetch_or(signal, Ordering::Release);
+    if let Some(observed_change_seq) = observed_change_seq {
+        CLOUD_SYNC_OBSERVED_REMOTE_SEQ.fetch_max(observed_change_seq, Ordering::AcqRel);
+    }
+    cloud_sync_wakeup().notify_one();
+}
+
+pub(crate) fn wake_after_connection_ready() {
+    CLOUD_SYNC_ENABLED.store(true, Ordering::Release);
+    cloud_mode_wakeup().notify_waiters();
+    signal_cloud_sync(SYNC_SIGNAL_CONNECTION_READY, None);
+}
+
+pub(crate) fn disable_cloud_sync() {
+    CLOUD_SYNC_ENABLED.store(false, Ordering::Release);
+    CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
+    CLOUD_SYNC_OBSERVED_REMOTE_SEQ.store(0, Ordering::Release);
+    clear_tracking_lease_token();
+    cloud_mode_wakeup().notify_waiters();
+}
+
+fn spawn_sync_coordinator(database: Database, app: AppHandle) {
     let wakeup = cloud_sync_wakeup();
     tauri::async_runtime::spawn(async move {
+        let mut retry_after = None::<Duration>;
         loop {
+            if let Some(delay) = retry_after.take() {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {
+                        CLOUD_SYNC_SIGNALS.fetch_or(SYNC_SIGNAL_LOCAL_DIRTY, Ordering::Release);
+                    }
+                    _ = wakeup.notified() => {}
+                }
+            } else {
+                wakeup.notified().await;
+            }
+            let signals = CLOUD_SYNC_SIGNALS.swap(0, Ordering::AcqRel);
+            if signals == 0 {
+                continue;
+            }
+            let database_for_round = database.clone();
+            let observed_remote_seq = CLOUD_SYNC_OBSERVED_REMOTE_SEQ.swap(0, Ordering::AcqRel);
+            let round = tauri::async_runtime::spawn_blocking(move || {
+                run_sync_coordinator_round(&database_for_round, signals, observed_remote_seq)
+            })
+            .await;
+            match round {
+                Ok(Ok(result)) => {
+                    if !result.domains.is_empty() {
+                        emit_cloud_refresh_domains(
+                            &app,
+                            &database,
+                            &result.source,
+                            result.last_change_seq,
+                            &result.domains,
+                        );
+                    } else if let Ok(status) = sync_status(&database) {
+                        let _ = app.emit("cloud-sync-state-changed", &status);
+                    }
+                    retry_after = result.retry_after;
+                }
+                Ok(Err(error)) => {
+                    emit_cloud_error(&app, &database, &error);
+                    retry_after = next_outbox_retry_delay(&database).ok().flatten();
+                }
+                Err(error) => {
+                    emit_cloud_error(
+                        &app,
+                        &database,
+                        &format!("SYNC_WORKER_ERROR: 后台同步任务异常: {error}"),
+                    );
+                }
+            }
+            if CLOUD_SYNC_SIGNALS.load(Ordering::Acquire) != 0 {
+                cloud_sync_wakeup().notify_one();
+            }
+        }
+    });
+}
+
+fn spawn_tracking_lease_maintainer(database: Database, app: AppHandle) {
+    let mode_wakeup = cloud_mode_wakeup();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            while !CLOUD_SYNC_ENABLED.load(Ordering::Acquire) {
+                mode_wakeup.notified().await;
+            }
             tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
-                _ = wakeup.notified() => {}
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                _ = mode_wakeup.notified() => {
+                    continue;
+                }
             }
-            let Ok(state) = storage_mode(&database) else {
-                clear_tracking_lease_token();
-                continue;
-            };
-            if state.mode != "cloud" {
-                clear_tracking_lease_token();
+            if !CLOUD_SYNC_ENABLED.load(Ordering::Acquire) {
                 continue;
             }
-            if let Err(error) =
-                recover_interrupted_sending_operations(&database, &state.workspace_id)
-            {
+            let database_for_lease = database.clone();
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                let state = storage_mode(&database_for_lease)?;
+                if state.mode != "cloud" || !state.online {
+                    clear_tracking_lease_token();
+                    return Ok(());
+                }
+                acquire_or_renew_tracking_lease(&database_for_lease).map(|_| ())
+            })
+            .await;
+            if let Ok(Err(error)) = result {
                 emit_cloud_error(&app, &database, &error);
-                continue;
-            }
-            if !state.online {
-                clear_tracking_lease_token();
-                if let Ok(status) = sync_status(&database) {
-                    let _ = app.emit("cloud-sync-state-changed", &status);
-                }
-                continue;
-            }
-            match push_outbox(&database) {
-                Ok(push) => {
-                    if push.pending > 0 || push.conflicts > 0 {
-                        emit_cloud_refresh(&app, &database, "outbox-state");
-                    }
-                    if push.pending == 0 && push.conflicts == 0 {
-                        if push.pushed > 0 {
-                            emit_cloud_refresh(&app, &database, "outbox");
-                        } else {
-                            match pull(
-                                &database,
-                                CloudSyncPullRequest {
-                                    after_change_seq: None,
-                                    limit: None,
-                                },
-                            ) {
-                                Ok(result) if !result.changes.is_empty() => {
-                                    emit_cloud_refresh(&app, &database, "poll");
-                                }
-                                Ok(_) => {}
-                                Err(error)
-                                    if should_defer_snapshot_refresh_after_local_race(&error) => {}
-                                Err(error) => emit_cloud_error(&app, &database, &error),
-                            }
-                        }
-                    }
-                }
-                Err(error) => emit_cloud_error(&app, &database, &error),
-            }
-            let _ = acquire_or_renew_tracking_lease(&database);
-            if let Ok(status) = sync_status(&database) {
-                let _ = app.emit("cloud-sync-state-changed", &status);
             }
         }
     });
@@ -162,27 +233,48 @@ fn clear_tracking_lease_token() {
 }
 
 fn spawn_realtime_listener(database: Database, app: AppHandle) {
+    let mode_wakeup = cloud_mode_wakeup();
     tauri::async_runtime::spawn(async move {
+        let mut reconnect_attempt = 0_u32;
         loop {
-            let state = match storage_mode(&database) {
-                Ok(state) if state.mode == "cloud" && state.online => state,
-                _ => {
+            while !CLOUD_SYNC_ENABLED.load(Ordering::Acquire) {
+                mode_wakeup.notified().await;
+            }
+            let config_database = database.clone();
+            let config = tauri::async_runtime::spawn_blocking(move || {
+                let state = storage_mode(&config_database)?;
+                if state.mode != "cloud" || !state.online {
+                    return Ok(None);
+                }
+                let api = client(&config_database)?;
+                let session = current_session(&config_database)?;
+                let anon_key = api.anon_key().to_string();
+                Ok::<_, String>(Some((
+                    state.workspace_id,
+                    api.project_url,
+                    anon_key,
+                    session.access_token,
+                )))
+            })
+            .await;
+            let (workspace_id, project_url, anon_key, access_token) = match config {
+                Ok(Ok(Some(config))) => config,
+                Ok(Ok(None)) => {
                     tokio::time::sleep(Duration::from_secs(REALTIME_RECONNECT_SECONDS)).await;
+                    reconnect_attempt = 0;
                     continue;
                 }
-            };
-            let api = match client(&database) {
-                Ok(api) => api,
-                Err(error) => {
+                Ok(Err(error)) => {
                     emit_cloud_error(&app, &database, &error);
                     tokio::time::sleep(Duration::from_secs(REALTIME_RECONNECT_SECONDS)).await;
                     continue;
                 }
-            };
-            let session = match current_session(&database) {
-                Ok(session) => session,
                 Err(error) => {
-                    emit_cloud_error(&app, &database, &error);
+                    emit_cloud_error(
+                        &app,
+                        &database,
+                        &format!("SYNC_WORKER_ERROR: Realtime 配置读取失败: {error}"),
+                    );
                     tokio::time::sleep(Duration::from_secs(REALTIME_RECONNECT_SECONDS)).await;
                     continue;
                 }
@@ -190,23 +282,46 @@ fn spawn_realtime_listener(database: Database, app: AppHandle) {
             if let Err(error) = run_realtime_connection(
                 &database,
                 &app,
-                &state.workspace_id,
-                &api.project_url,
-                api.anon_key(),
-                &session.access_token,
+                &workspace_id,
+                &project_url,
+                &anon_key,
+                &access_token,
             )
             .await
             {
-                emit_cloud_error(&app, &database, &error);
+                if CLOUD_SYNC_ENABLED.load(Ordering::Acquire) {
+                    emit_cloud_error(&app, &database, &error);
+                }
             }
-            tokio::time::sleep(Duration::from_secs(REALTIME_RECONNECT_SECONDS)).await;
+            if !CLOUD_SYNC_ENABLED.load(Ordering::Acquire) {
+                reconnect_attempt = 0;
+                continue;
+            }
+            let delay = realtime_reconnect_delay(reconnect_attempt, now_millis() as u64);
+            reconnect_attempt = reconnect_attempt.saturating_add(1);
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = mode_wakeup.notified() => {}
+            }
         }
     });
 }
 
+fn realtime_reconnect_delay(attempt: u32, jitter_seed: u64) -> Duration {
+    let exponent = attempt.min(4);
+    let base_millis = REALTIME_RECONNECT_SECONDS
+        .saturating_mul(1_u64 << exponent)
+        .saturating_mul(1_000)
+        .min(REALTIME_RECONNECT_MAX_SECONDS * 1_000);
+    let jitter_window = (base_millis / 5).max(1);
+    Duration::from_millis(
+        (base_millis + jitter_seed % jitter_window).min(REALTIME_RECONNECT_MAX_SECONDS * 1_000),
+    )
+}
+
 async fn run_realtime_connection(
     database: &Database,
-    app: &AppHandle,
+    _app: &AppHandle,
     workspace_id: &str,
     project_url: &str,
     anon_key: &str,
@@ -249,10 +364,20 @@ async fn run_realtime_connection(
     let mut heartbeat = tokio::time::interval(Duration::from_secs(REALTIME_HEARTBEAT_SECONDS));
     heartbeat.tick().await;
     let mut heartbeat_ref = 2_u64;
+    let mode_wakeup = cloud_mode_wakeup();
     loop {
         tokio::select! {
+            _ = mode_wakeup.notified() => {
+                if !CLOUD_SYNC_ENABLED.load(Ordering::Acquire) {
+                    let _ = writer.send(Message::Close(None)).await;
+                    return Ok(());
+                }
+            }
             _ = heartbeat.tick() => {
-                let current_state = storage_mode(database)?;
+                let heartbeat_database = database.clone();
+                let current_state = tauri::async_runtime::spawn_blocking(move || storage_mode(&heartbeat_database))
+                    .await
+                    .map_err(|error| format!("SYNC_WORKER_ERROR: Realtime 状态读取失败: {error}"))??;
                 if current_state.mode != "cloud" || current_state.workspace_id != workspace_id {
                     let _ = writer.send(Message::Close(None)).await;
                     return Ok(());
@@ -281,13 +406,16 @@ async fn run_realtime_connection(
                                 .and_then(Value::as_str)
                                 .unwrap_or("频道订阅被拒绝");
                             return Err(format!("CLOUD_REQUEST_FAILED: Supabase Realtime {reason}"));
+                        } else if event == "phx_reply"
+                            && message.get("ref").and_then(Value::as_str) == Some("1")
+                            && message.pointer("/payload/status").and_then(Value::as_str) == Some("ok")
+                        {
+                            signal_cloud_sync(SYNC_SIGNAL_CONNECTION_READY, None);
                         } else if event == "postgres_changes" {
-                            match pull(database, CloudSyncPullRequest { after_change_seq: None, limit: None }) {
-                                Ok(result) if !result.changes.is_empty() => emit_cloud_refresh(app, database, "realtime"),
-                                Ok(_) => {}
-                                Err(error) if should_defer_snapshot_refresh_after_local_race(&error) => {}
-                                Err(error) => emit_cloud_error(app, database, &error),
-                            }
+                            signal_cloud_sync(
+                                SYNC_SIGNAL_REMOTE_HINT,
+                                realtime_change_seq(&message),
+                            );
                         } else if event == "phx_error" || event == "phx_close" {
                             return Err("NETWORK_ERROR: Supabase Realtime 频道已断开".to_string());
                         }
@@ -309,6 +437,14 @@ async fn run_realtime_connection(
     }
 }
 
+fn realtime_change_seq(message: &Value) -> Option<i64> {
+    message
+        .pointer("/payload/data/record/change_seq")
+        .or_else(|| message.pointer("/payload/record/change_seq"))
+        .or_else(|| message.pointer("/payload/data/new/change_seq"))
+        .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+}
+
 fn realtime_url(project_url: &str, anon_key: &str) -> Result<Url, String> {
     let mut url = Url::parse(project_url)
         .map_err(|_| "CLOUD_NOT_CONFIGURED: Supabase Project URL 无效".to_string())?;
@@ -327,16 +463,18 @@ fn realtime_url(project_url: &str, anon_key: &str) -> Result<Url, String> {
     Ok(url)
 }
 
-fn emit_cloud_refresh(app: &AppHandle, database: &Database, source: &str) {
+fn emit_cloud_refresh_domains(
+    app: &AppHandle,
+    database: &Database,
+    source: &str,
+    revision: i64,
+    domains: &[String],
+) {
     if let Ok(status) = sync_status(database) {
         let _ = app.emit("cloud-sync-state-changed", &status);
         let _ = app.emit(
             "work-data-changed",
-            json!({
-                "revision": status.last_change_seq,
-                "domains": ["subjects", "tasks", "time", "unassigned", "reports", "settings"],
-                "source": source
-            }),
+            json!({ "revision": revision, "domains": domains, "source": source }),
         );
     }
 }
@@ -418,6 +556,44 @@ pub struct CloudSyncPullResult {
     pub changes: Vec<WorkspaceChange>,
     pub last_change_seq: i64,
     pub has_more: bool,
+    pub domains: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IncrementalPullResponse {
+    #[serde(default)]
+    changes: Vec<WorkspaceChange>,
+    #[serde(default)]
+    entities: Vec<IncrementalEntity>,
+    #[serde(default, alias = "coveredChangeSeq")]
+    covered_change_seq: i64,
+    #[serde(default, alias = "latestChangeSeq")]
+    latest_change_seq: i64,
+    #[serde(default, alias = "hasMore")]
+    has_more: bool,
+    #[serde(default, alias = "resetRequired")]
+    reset_required: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IncrementalEntity {
+    #[serde(alias = "entityType")]
+    entity_type: String,
+    #[serde(alias = "sourceEntityType")]
+    source_entity_type: String,
+    #[serde(alias = "entityId")]
+    entity_id: String,
+    #[serde(alias = "changeSeq")]
+    change_seq: i64,
+    deleted: bool,
+    data: Option<Value>,
+}
+
+struct SyncCoordinatorRoundResult {
+    domains: Vec<String>,
+    last_change_seq: i64,
+    source: String,
+    retry_after: Option<Duration>,
 }
 
 #[derive(Debug, Serialize)]
@@ -596,6 +772,167 @@ pub fn sync_status(database: &Database) -> Result<CloudSyncStatus, String> {
     })
 }
 
+fn run_sync_coordinator_round(
+    database: &Database,
+    signals: u8,
+    observed_remote_seq: i64,
+) -> Result<SyncCoordinatorRoundResult, String> {
+    let state = storage_mode(database)?;
+    if state.mode != "cloud" {
+        CLOUD_SYNC_ENABLED.store(false, Ordering::Release);
+        clear_tracking_lease_token();
+        return Ok(SyncCoordinatorRoundResult {
+            domains: Vec::new(),
+            last_change_seq: state.last_change_seq,
+            source: "local-mode".to_string(),
+            retry_after: None,
+        });
+    }
+    CLOUD_SYNC_ENABLED.store(true, Ordering::Release);
+    if !state.online {
+        return Ok(SyncCoordinatorRoundResult {
+            domains: Vec::new(),
+            last_change_seq: state.last_change_seq,
+            source: "offline".to_string(),
+            retry_after: next_outbox_retry_delay(database)?,
+        });
+    }
+    clear_stale_deferred_workspaces(database, &state.workspace_id)?;
+    let only_remote_hint = signals
+        & (SYNC_SIGNAL_LOCAL_DIRTY | SYNC_SIGNAL_CONNECTION_READY | SYNC_SIGNAL_MANUAL_RETRY)
+        == 0;
+    if only_remote_hint
+        && observed_remote_seq > 0
+        && observed_remote_seq <= state.last_change_seq
+        && state.pending_operations == 0
+        && state.conflict_count == 0
+    {
+        return Ok(SyncCoordinatorRoundResult {
+            domains: Vec::new(),
+            last_change_seq: state.last_change_seq,
+            source: "realtime-duplicate".to_string(),
+            retry_after: None,
+        });
+    }
+    recover_interrupted_sending_operations(database, &state.workspace_id)?;
+    let push =
+        push_outbox_with_retry_mode(database, signals & SYNC_SIGNAL_MANUAL_RETRY != 0, true)?;
+    let mut domains = HashSet::<String>::new();
+    rewind_for_ready_deferred_entities(database, &state.workspace_id)?;
+    let mut last_change_seq = storage_mode(database)?.last_change_seq;
+    if push.conflicts == 0 {
+        loop {
+            let pulled = pull(
+                database,
+                CloudSyncPullRequest {
+                    after_change_seq: Some(last_change_seq),
+                    limit: Some(200),
+                },
+            )?;
+            let previous_seq = last_change_seq;
+            last_change_seq = pulled.last_change_seq.max(last_change_seq);
+            domains.extend(pulled.domains);
+            if !pulled.has_more || last_change_seq <= previous_seq {
+                break;
+            }
+            std::thread::yield_now();
+        }
+    }
+    let source = if signals & SYNC_SIGNAL_MANUAL_RETRY != 0 {
+        "manual-retry"
+    } else if signals & SYNC_SIGNAL_REMOTE_HINT != 0 || observed_remote_seq > state.last_change_seq
+    {
+        "realtime"
+    } else if signals & SYNC_SIGNAL_CONNECTION_READY != 0 {
+        "catch-up"
+    } else {
+        "outbox"
+    };
+    let mut domains = domains.into_iter().collect::<Vec<_>>();
+    domains.sort();
+    Ok(SyncCoordinatorRoundResult {
+        domains,
+        last_change_seq,
+        source: source.to_string(),
+        retry_after: if push.pending > 0 {
+            next_outbox_retry_delay(database)?
+        } else {
+            None
+        },
+    })
+}
+
+fn clear_stale_deferred_workspaces(
+    database: &Database,
+    current_workspace_id: &str,
+) -> Result<(), String> {
+    database
+        .open()?
+        .execute(
+            "DELETE FROM cloud_deferred_entities WHERE workspace_id <> ?1",
+            [current_workspace_id],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn next_outbox_retry_delay(database: &Database) -> Result<Option<Duration>, String> {
+    let state = storage_mode(database)?;
+    if state.mode != "cloud" {
+        return Ok(None);
+    }
+    let connection = database.open()?;
+    let mut statement = connection.prepare("SELECT last_attempt_at, attempt_count FROM sync_outbox WHERE workspace_id=?1 AND state IN ('pending','failed')").map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([state.workspace_id], |row| {
+            Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    let now = now_millis();
+    let mut minimum = None::<i64>;
+    for row in rows {
+        let (last_attempt_at, attempt_count) = row.map_err(|error| error.to_string())?;
+        let ready_at = retry_ready_at(last_attempt_at, attempt_count).unwrap_or(now);
+        minimum = Some(minimum.map_or(ready_at, |value| value.min(ready_at)));
+    }
+    Ok(minimum
+        .map(|ready_at| Duration::from_millis(ready_at.saturating_sub(now).max(1_000) as u64)))
+}
+
+fn rewind_for_ready_deferred_entities(
+    database: &Database,
+    cloud_workspace_id: &str,
+) -> Result<(), String> {
+    let connection = database.open()?;
+    let rewind_to = connection.query_row(
+        "SELECT MIN(deferred.observed_change_seq - 1) FROM cloud_deferred_entities deferred
+         WHERE deferred.workspace_id=?1 AND NOT EXISTS(
+           SELECT 1 FROM sync_outbox outbox
+           WHERE outbox.workspace_id=deferred.workspace_id
+             AND outbox.entity_id=deferred.entity_id
+             AND outbox.entity_type=CASE deferred.entity_type
+               WHEN 'subjects' THEN 'subject' WHEN 'tasks' THEN 'task'
+               WHEN 'task_daily_estimates' THEN 'task_daily_estimate'
+               WHEN 'task_recurrence_rules' THEN 'task_recurrence_rule'
+               WHEN 'task_occurrences' THEN 'task_occurrence'
+               WHEN 'time_entries' THEN 'time_entry'
+               WHEN 'report_templates' THEN 'report_template' WHEN 'reports' THEN 'report'
+               WHEN 'app_settings' THEN 'app_setting' WHEN 'integration_configs' THEN 'integration_config'
+               WHEN 'external_bindings' THEN 'external_binding' ELSE deferred.entity_type END
+             AND outbox.state IN ('pending','sending','failed','conflict')
+         )",
+        [cloud_workspace_id],
+        |row| row.get::<_, Option<i64>>(0),
+    ).map_err(|error| error.to_string())?;
+    if let Some(rewind_to) = rewind_to {
+        connection.execute(
+            "UPDATE local_sync_state SET last_change_seq=MIN(last_change_seq, ?2) WHERE workspace_id=?1",
+            params![cloud_workspace_id, rewind_to.max(0)],
+        ).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 pub fn pull(
     database: &Database,
     request: CloudSyncPullRequest,
@@ -604,45 +941,699 @@ pub fn pull(
     if state.mode != "cloud" {
         return Err("OFFLINE_RESTRICTED: 只有云端模式可以拉取 Supabase 增量".to_string());
     }
-    ensure_no_dirty_outbox(database, &state.workspace_id)?;
     let session = current_session(database)?;
-    let api = client(database)?;
     let after = request
         .after_change_seq
         .unwrap_or(state.last_change_seq)
         .max(0);
     let limit = request.limit.unwrap_or(500).clamp(1, 1000);
-    let response = api.request_for_database(
+    let response = client(database)?.rpc_for_database(
         database,
-        api.get(format!(
-            "{}/rest/v1/workspace_changes?workspace_id=eq.{}&change_seq=gt.{}&select=change_seq,workspace_id,entity_type,entity_id,operation,entity_version,changed_at&order=change_seq.asc&limit={}",
-            api.project_url, state.workspace_id, after, limit
-        )),
+        "cloud_incremental_pull",
+        json!({
+            "p_workspace_id": state.workspace_id,
+            "p_device_id": state.device_id,
+            "p_after_change_seq": after,
+            "p_limit": limit
+        }),
         &session,
     )?;
-    let changes: Vec<WorkspaceChange> = response
-        .json()
+    let batch: IncrementalPullResponse = serde_json::from_value(response)
         .map_err(|error| format!("NETWORK_ERROR: 云端增量响应无效: {error}"))?;
-    let last_change_seq = changes
-        .last()
-        .map(|change| change.change_seq)
-        .unwrap_or(after);
-    if !changes.is_empty() {
-        pull_snapshot(database)?;
-    } else {
-        update_sync_state(
-            database,
-            &state.workspace_id,
-            &state.device_id,
+    if batch.reset_required {
+        let last_change_seq = pull_snapshot(database)?;
+        return Ok(CloudSyncPullResult {
+            changes: batch.changes,
             last_change_seq,
-            None,
-        )?;
+            has_more: false,
+            domains: vec!["subjects", "tasks", "time", "reports", "settings"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        });
     }
-    Ok(CloudSyncPullResult {
-        has_more: changes.len() as i64 == limit,
-        changes,
+    let last_change_seq = batch.covered_change_seq.max(after);
+    let domains = apply_incremental_entities(
+        database,
+        &state.workspace_id,
+        &state.device_id,
         last_change_seq,
+        &batch.entities,
+    )?;
+    Ok(CloudSyncPullResult {
+        has_more: batch.has_more || last_change_seq < batch.latest_change_seq,
+        changes: batch.changes,
+        last_change_seq,
+        domains,
     })
+}
+
+fn local_cache_workspace_id(database: &Database) -> Result<String, String> {
+    database
+        .open()?
+        .query_row(
+            "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn incremental_outbox_identity(entity: &IncrementalEntity) -> (&str, &str) {
+    match entity.entity_type.as_str() {
+        "subjects" => ("subject", entity.entity_id.as_str()),
+        "tasks" => ("task", entity.entity_id.as_str()),
+        "task_daily_estimates" => ("task_daily_estimate", entity.entity_id.as_str()),
+        "task_recurrence_rules" => ("task_recurrence_rule", entity.entity_id.as_str()),
+        "task_occurrences" => ("task_occurrence", entity.entity_id.as_str()),
+        "unassigned_sessions" => ("unassigned_session", entity.entity_id.as_str()),
+        "time_entries" => ("time_entry", entity.entity_id.as_str()),
+        "report_templates" => ("report_template", entity.entity_id.as_str()),
+        "reports" => ("report", entity.entity_id.as_str()),
+        "app_settings" => ("app_setting", entity.entity_id.as_str()),
+        "integration_configs" => ("integration_config", entity.entity_id.as_str()),
+        "external_bindings" => ("external_binding", entity.entity_id.as_str()),
+        other => (other, entity.entity_id.as_str()),
+    }
+}
+
+fn expected_incremental_entity_type(source_entity_type: &str) -> Option<&str> {
+    match source_entity_type {
+        "time_segments" | "time_allocations" => Some("time_entries"),
+        "report_tasks" => Some("reports"),
+        "subjects"
+        | "work_days"
+        | "app_settings"
+        | "tasks"
+        | "task_status_events"
+        | "task_daily_estimates"
+        | "task_recurrence_rules"
+        | "task_occurrences"
+        | "unassigned_sessions"
+        | "time_entries"
+        | "report_templates"
+        | "reports"
+        | "integration_configs"
+        | "external_bindings" => Some(source_entity_type),
+        _ => None,
+    }
+}
+
+fn incremental_domain(entity_type: &str) -> Result<&'static str, String> {
+    match entity_type {
+        "subjects" => Ok("subjects"),
+        "tasks"
+        | "task_status_events"
+        | "task_daily_estimates"
+        | "task_recurrence_rules"
+        | "task_occurrences" => Ok("tasks"),
+        "work_days" | "time_entries" => Ok("time"),
+        "unassigned_sessions" => Ok("unassigned"),
+        "report_templates" | "reports" => Ok("reports"),
+        "app_settings" | "integration_configs" | "external_bindings" => Ok("settings"),
+        other => Err(format!("VALIDATION_ERROR: 不支持的云端增量实体 {other}")),
+    }
+}
+
+fn entity_has_dirty_outbox(
+    transaction: &Transaction<'_>,
+    cloud_workspace_id: &str,
+    entity: &IncrementalEntity,
+) -> Result<bool, String> {
+    let (entity_type, entity_id) = incremental_outbox_identity(entity);
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM sync_outbox
+               WHERE workspace_id = ?1 AND entity_type = ?2 AND entity_id = ?3
+                 AND state IN ('pending','sending','failed','conflict')
+             )",
+            params![cloud_workspace_id, entity_type, entity_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn defer_incremental_entity(
+    transaction: &Transaction<'_>,
+    cloud_workspace_id: &str,
+    entity: &IncrementalEntity,
+) -> Result<(), String> {
+    let version = entity
+        .data
+        .as_ref()
+        .and_then(|value| value.get("version"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    transaction
+        .execute(
+            "INSERT INTO cloud_deferred_entities(workspace_id, entity_type, entity_id, observed_version, observed_change_seq, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(workspace_id, entity_type, entity_id) DO UPDATE SET
+               observed_version = MAX(observed_version, excluded.observed_version),
+               observed_change_seq = MAX(observed_change_seq, excluded.observed_change_seq),
+               updated_at = excluded.updated_at",
+            params![
+                cloud_workspace_id,
+                entity.entity_type,
+                entity.entity_id,
+                version,
+                entity.change_seq,
+                now_millis()
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn clear_deferred_entity(
+    transaction: &Transaction<'_>,
+    cloud_workspace_id: &str,
+    entity: &IncrementalEntity,
+) -> Result<(), String> {
+    transaction
+        .execute(
+            "DELETE FROM cloud_deferred_entities WHERE workspace_id = ?1 AND entity_type = ?2 AND entity_id = ?3",
+            params![cloud_workspace_id, entity.entity_type, entity.entity_id],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn deferred_entity_exists(
+    transaction: &Transaction<'_>,
+    cloud_workspace_id: &str,
+    entity: &IncrementalEntity,
+) -> Result<bool, String> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM cloud_deferred_entities
+             WHERE workspace_id=?1 AND entity_type=?2 AND entity_id=?3)",
+            params![cloud_workspace_id, entity.entity_type, entity.entity_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn apply_incremental_entities(
+    database: &Database,
+    cloud_workspace_id: &str,
+    device_id: &str,
+    covered_change_seq: i64,
+    entities: &[IncrementalEntity],
+) -> Result<Vec<String>, String> {
+    let local_workspace_id = local_cache_workspace_id(database)?;
+    let mut connection = database.open()?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let mut domains = HashSet::<String>::new();
+    let mut applied_task_parents = Vec::<(String, Option<String>)>::new();
+    for entity in entities {
+        validate_incremental_identity(entity)?;
+        let domain = incremental_domain(&entity.entity_type)?;
+        if entity_has_dirty_outbox(&transaction, cloud_workspace_id, entity)? {
+            defer_incremental_entity(&transaction, cloud_workspace_id, entity)?;
+            continue;
+        }
+        let was_deferred = deferred_entity_exists(&transaction, cloud_workspace_id, entity)?;
+        if !was_deferred
+            && !incremental_entity_needs_apply(&transaction, &local_workspace_id, entity)?
+        {
+            clear_deferred_entity(&transaction, cloud_workspace_id, entity)?;
+            continue;
+        }
+        apply_incremental_entity(&transaction, &local_workspace_id, entity)?;
+        if entity.entity_type == "tasks" && !entity.deleted {
+            let data = entity.data.as_ref().expect("validated task payload");
+            applied_task_parents.push((text(data, "id"), optional_text(data, "parent_id")));
+        }
+        clear_deferred_entity(&transaction, cloud_workspace_id, entity)?;
+        domains.insert(domain.to_string());
+    }
+    for (task_id, parent_id) in applied_task_parents {
+        transaction
+            .execute(
+                "UPDATE tasks SET parent_id = ?1 WHERE workspace_id = ?2 AND id = ?3",
+                params![parent_id, local_workspace_id, task_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    if !domains.is_empty() {
+        transaction
+            .execute(
+                "UPDATE app_metadata SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'global_revision'",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction
+        .execute(
+            "INSERT INTO local_sync_state(workspace_id, device_id, last_change_seq, last_full_sync_at, last_error)
+             VALUES (?1, ?2, ?3, ?4, NULL)
+             ON CONFLICT(workspace_id) DO UPDATE SET device_id = excluded.device_id,
+               last_change_seq = MAX(local_sync_state.last_change_seq, excluded.last_change_seq),
+               last_full_sync_at = excluded.last_full_sync_at, last_error = NULL",
+            params![cloud_workspace_id, device_id, covered_change_seq, now_millis()],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    let mut domains = domains.into_iter().collect::<Vec<_>>();
+    domains.sort();
+    Ok(domains)
+}
+
+fn incremental_entity_needs_apply(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    entity: &IncrementalEntity,
+) -> Result<bool, String> {
+    let exists = |sql: &str, values: &[&dyn rusqlite::ToSql]| -> Result<bool, String> {
+        transaction
+            .query_row(sql, values, |row| row.get(0))
+            .map_err(|error| error.to_string())
+    };
+    if entity.deleted {
+        return match entity.entity_type.as_str() {
+            "task_daily_estimates" | "task_occurrences" => {
+                let (left, right) = entity.entity_id.split_once('|').expect("validated composite key");
+                let table = if entity.entity_type == "task_daily_estimates" { "task_daily_estimates" } else { "task_occurrences" };
+                exists(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE workspace_id=?1 AND task_id=?2 AND {}=?3)", if table == "task_daily_estimates" { "work_date" } else { "occurrence_date" }), &[&workspace_id, &left, &right])
+            }
+            "work_days" | "app_settings" | "integration_configs" => {
+                let (table, key) = match entity.entity_type.as_str() { "work_days" => ("work_days", "work_date"), "app_settings" => ("app_settings", "key"), _ => ("integration_configs", "provider") };
+                exists(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE workspace_id=?1 AND {key}=?2)"), &[&workspace_id, &entity.entity_id])
+            }
+            "task_recurrence_rules" => exists("SELECT EXISTS(SELECT 1 FROM task_recurrence_rules WHERE workspace_id=?1 AND task_id=?2)", &[&workspace_id, &entity.entity_id]),
+            "external_bindings" => {
+                let parts = entity.entity_id.split('|').collect::<Vec<_>>();
+                exists("SELECT EXISTS(SELECT 1 FROM external_bindings WHERE workspace_id=?1 AND provider=?2 AND entity_type=?3 AND entity_id=?4)", &[&workspace_id, &parts[0], &parts[1], &parts[2]])
+            }
+            other => {
+                let table = other;
+                exists(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE workspace_id=?1 AND id=?2)"), &[&workspace_id, &entity.entity_id])
+            }
+        };
+    }
+    let data = entity.data.as_ref().expect("validated incremental data");
+    let incoming_version = data.get("version").and_then(Value::as_i64);
+    let current_version: Option<i64> = match entity.entity_type.as_str() {
+        "work_days" => transaction.query_row("SELECT version FROM work_days WHERE workspace_id=?1 AND work_date=?2", params![workspace_id,entity.entity_id], |row| row.get(0)).optional(),
+        "app_settings" => transaction.query_row("SELECT version FROM app_settings WHERE workspace_id=?1 AND key=?2", params![workspace_id,entity.entity_id], |row| row.get(0)).optional(),
+        "integration_configs" => transaction.query_row("SELECT version FROM integration_configs WHERE workspace_id=?1 AND provider=?2", params![workspace_id,entity.entity_id], |row| row.get(0)).optional(),
+        "task_daily_estimates" | "task_occurrences" => {
+            let (left,right)=entity.entity_id.split_once('|').expect("validated composite key");
+            if entity.entity_type == "task_daily_estimates" { transaction.query_row("SELECT version FROM task_daily_estimates WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3",params![workspace_id,left,right],|row|row.get(0)).optional() } else { transaction.query_row("SELECT version FROM task_occurrences WHERE workspace_id=?1 AND task_id=?2 AND occurrence_date=?3",params![workspace_id,left,right],|row|row.get(0)).optional() }
+        }
+        "task_recurrence_rules" => {
+            return recurrence_rules_differ(
+                transaction,
+                workspace_id,
+                &entity.entity_id,
+                data,
+            );
+        }
+        "task_status_events" => return exists("SELECT NOT EXISTS(SELECT 1 FROM task_status_events WHERE workspace_id=?1 AND id=?2)", &[&workspace_id,&entity.entity_id]),
+        "external_bindings" => {
+            return external_binding_differs(transaction, workspace_id, data);
+        }
+        "unassigned_sessions" => return Ok(true),
+        other => transaction.query_row(&format!("SELECT version FROM {other} WHERE workspace_id=?1 AND id=?2"),params![workspace_id,entity.entity_id],|row|row.get(0)).optional(),
+    }.map_err(|error| error.to_string())?;
+    Ok(incoming_version
+        .is_none_or(|incoming| current_version.is_none_or(|current| current < incoming)))
+}
+
+fn recurrence_rules_differ(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    task_id: &str,
+    data: &Value,
+) -> Result<bool, String> {
+    let incoming_rules = data
+        .get("rules")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let local_count = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM task_recurrence_rules WHERE workspace_id=?1 AND task_id=?2",
+            params![workspace_id, task_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if local_count != incoming_rules.len() as i64 {
+        return Ok(true);
+    }
+    for rule in incoming_rules {
+        let differs = transaction
+            .query_row(
+                "SELECT frequency <> ?3
+                     OR COALESCE(weekdays_mask, -1) <> COALESCE(?4, -1)
+                     OR effective_start <> ?5
+                     OR COALESCE(effective_end, '') <> COALESCE(?6, '')
+                     OR created_at <> ?7
+                     OR updated_at <> ?8
+                     OR version <> ?9
+                 FROM task_recurrence_rules
+                 WHERE workspace_id=?1 AND task_id=?2 AND id=?10",
+                params![
+                    workspace_id,
+                    task_id,
+                    text(rule, "frequency"),
+                    optional_integer(rule, "weekdays_mask"),
+                    text(rule, "effective_start"),
+                    optional_text(rule, "effective_end"),
+                    millis(rule, "created_at"),
+                    millis(rule, "updated_at"),
+                    integer(rule, "version"),
+                    text(rule, "id"),
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if differs != Some(false) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn external_binding_differs(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    data: &Value,
+) -> Result<bool, String> {
+    let differs = transaction
+        .query_row(
+            "SELECT external_id <> ?5
+                 OR COALESCE(external_revision, '') <> COALESCE(?6, '')
+                 OR COALESCE(last_synced_hash, '') <> COALESCE(?7, '')
+                 OR COALESCE(last_synced_at, -1) <> COALESCE(?8, -1)
+             FROM external_bindings
+             WHERE workspace_id=?1 AND provider=?2 AND entity_type=?3 AND entity_id=?4",
+            params![
+                workspace_id,
+                text(data, "provider"),
+                text(data, "entity_type"),
+                text(data, "entity_id"),
+                text(data, "external_id"),
+                optional_text(data, "external_revision"),
+                optional_text(data, "last_synced_hash"),
+                optional_millis(data, "last_synced_at"),
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    Ok(differs != Some(false))
+}
+
+fn apply_incremental_entity(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    entity: &IncrementalEntity,
+) -> Result<(), String> {
+    if entity.deleted {
+        return delete_incremental_entity(transaction, workspace_id, entity);
+    }
+    let data = entity
+        .data
+        .as_ref()
+        .ok_or_else(|| "VALIDATION_ERROR: 非删除增量缺少实体内容".to_string())?;
+    match entity.entity_type.as_str() {
+        "subjects" => transaction.execute("INSERT INTO subjects(id,workspace_id,name,sort_order,created_at,updated_at,version,created_by_device_id,updated_by_device_id,deleted_at) VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8) ON CONFLICT(id) DO UPDATE SET name=excluded.name,sort_order=excluded.sort_order,updated_at=excluded.updated_at,version=excluded.version,deleted_at=excluded.deleted_at", params![text(data,"id"),workspace_id,text(data,"name"),integer(data,"sort_order"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version"),optional_millis(data,"deleted_at")]),
+        "work_days" => transaction.execute("INSERT INTO work_days(workspace_id,work_date,timezone,work_period_text,note,settled_at,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(workspace_id,work_date) DO UPDATE SET timezone=excluded.timezone,work_period_text=excluded.work_period_text,note=excluded.note,settled_at=excluded.settled_at,updated_at=excluded.updated_at,version=excluded.version", params![workspace_id,text(data,"work_date"),text(data,"timezone"),optional_text(data,"work_period_text"),optional_text(data,"note"),optional_millis(data,"settled_at"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version")]),
+        "app_settings" => transaction.execute("INSERT INTO app_settings(workspace_id,key,value_json,updated_at,version) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(workspace_id,key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at,version=excluded.version", params![workspace_id,text(data,"key"),data.get("value_json").cloned().unwrap_or(Value::Null).to_string(),millis(data,"updated_at"),integer(data,"version")]),
+        "tasks" => {
+            let changed = transaction.execute("INSERT INTO tasks(id,workspace_id,subject_id,parent_id,title,status,planned_date,planned_time,estimate_minutes,note,project_name,solution_name,source_type,source_ref,sort_order,completed_at,created_at,updated_at,version,deleted_at) VALUES (?1,?2,?3,NULL,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19) ON CONFLICT(id) DO UPDATE SET subject_id=excluded.subject_id,parent_id=NULL,title=excluded.title,status=excluded.status,planned_date=excluded.planned_date,planned_time=excluded.planned_time,estimate_minutes=excluded.estimate_minutes,note=excluded.note,project_name=excluded.project_name,solution_name=excluded.solution_name,source_type=excluded.source_type,source_ref=excluded.source_ref,sort_order=excluded.sort_order,completed_at=excluded.completed_at,updated_at=excluded.updated_at,version=excluded.version,deleted_at=excluded.deleted_at", params![text(data,"id"),workspace_id,text(data,"subject_id"),text(data,"title"),text(data,"status"),optional_text(data,"planned_date"),optional_time(data,"planned_time"),optional_integer(data,"estimate_minutes"),optional_text(data,"note"),optional_text(data,"project_name"),optional_text(data,"solution_name"),text(data,"source_type"),optional_text(data,"source_ref"),integer(data,"sort_order"),optional_millis(data,"completed_at"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version"),optional_millis(data,"deleted_at")]).map_err(|error| error.to_string())?;
+            Ok(changed)
+        }
+        "task_status_events" => transaction.execute("INSERT INTO task_status_events(id,workspace_id,task_id,status,occurred_at,source_type,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET status=excluded.status,occurred_at=excluded.occurred_at,source_type=excluded.source_type", params![text(data,"id"),workspace_id,text(data,"task_id"),text(data,"status"),millis(data,"occurred_at"),text(data,"source_type"),millis(data,"created_at")]),
+        "task_daily_estimates" => transaction.execute("INSERT INTO task_daily_estimates(workspace_id,task_id,work_date,estimate_minutes,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(task_id,work_date) DO UPDATE SET estimate_minutes=excluded.estimate_minutes,updated_at=excluded.updated_at,version=excluded.version", params![workspace_id,text(data,"task_id"),text(data,"work_date"),integer(data,"estimate_minutes"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version")]),
+        "task_recurrence_rules" => {
+            transaction.execute("DELETE FROM task_recurrence_rules WHERE workspace_id=?1 AND task_id=?2", params![workspace_id,entity.entity_id]).map_err(|error| error.to_string())?;
+            for rule in data.get("rules").and_then(Value::as_array).cloned().unwrap_or_default() {
+                transaction.execute("INSERT INTO task_recurrence_rules(id,workspace_id,task_id,frequency,weekdays_mask,effective_start,effective_end,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![text(&rule,"id"),workspace_id,text(&rule,"task_id"),text(&rule,"frequency"),optional_integer(&rule,"weekdays_mask"),text(&rule,"effective_start"),optional_text(&rule,"effective_end"),millis(&rule,"created_at"),millis(&rule,"updated_at"),integer(&rule,"version")]).map_err(|error| error.to_string())?;
+            }
+            Ok(0)
+        }
+        "task_occurrences" => transaction.execute("INSERT INTO task_occurrences(workspace_id,task_id,occurrence_date,origin,status,completed_at,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(task_id,occurrence_date) DO UPDATE SET origin=excluded.origin,status=excluded.status,completed_at=excluded.completed_at,updated_at=excluded.updated_at,version=excluded.version", params![workspace_id,text(data,"task_id"),text(data,"occurrence_date"),text(data,"origin"),text(data,"status"),optional_millis(data,"completed_at"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version")]),
+        "unassigned_sessions" => Ok(0),
+        "time_entries" => apply_incremental_time_entry(transaction, workspace_id, data),
+        "report_templates" => transaction.execute("INSERT INTO report_templates(id,workspace_id,report_type,subject_id,content,is_builtin,created_at,updated_at,version,deleted_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(id) DO UPDATE SET report_type=excluded.report_type,subject_id=excluded.subject_id,content=excluded.content,is_builtin=excluded.is_builtin,updated_at=excluded.updated_at,version=excluded.version,deleted_at=excluded.deleted_at", params![text(data,"id"),workspace_id,text(data,"report_type"),optional_text(data,"subject_id"),text(data,"content"),boolean(data,"is_builtin") as i64,millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version"),optional_millis(data,"deleted_at")]),
+        "reports" => apply_incremental_report(transaction, workspace_id, data),
+        "integration_configs" => transaction.execute("INSERT INTO integration_configs(workspace_id,provider,enabled,config_json,secret_ref,updated_at,version) VALUES (?1,?2,?3,?4,COALESCE((SELECT secret_ref FROM integration_configs WHERE workspace_id=?1 AND provider=?2),NULL),?5,?6) ON CONFLICT(workspace_id,provider) DO UPDATE SET enabled=excluded.enabled,config_json=excluded.config_json,updated_at=excluded.updated_at,version=excluded.version", params![workspace_id,text(data,"provider"),boolean(data,"enabled") as i64,data.get("config_json").cloned().unwrap_or_else(|| json!({})).to_string(),millis(data,"updated_at"),integer(data,"version")]),
+        "external_bindings" => transaction.execute("INSERT INTO external_bindings(id,workspace_id,provider,entity_type,entity_id,external_id,external_revision,last_synced_hash,last_synced_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(workspace_id,provider,entity_type,entity_id) DO UPDATE SET external_id=excluded.external_id,external_revision=excluded.external_revision,last_synced_hash=excluded.last_synced_hash,last_synced_at=excluded.last_synced_at", params![text(data,"id"),workspace_id,text(data,"provider"),text(data,"entity_type"),text(data,"entity_id"),text(data,"external_id"),optional_text(data,"external_revision"),optional_text(data,"last_synced_hash"),optional_millis(data,"last_synced_at")]),
+        other => return Err(format!("VALIDATION_ERROR: 不支持的云端增量实体 {other}")),
+    }
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn validate_incremental_identity(entity: &IncrementalEntity) -> Result<(), String> {
+    let expected_type =
+        expected_incremental_entity_type(&entity.source_entity_type).ok_or_else(|| {
+            format!(
+                "VALIDATION_ERROR: 不支持的云端增量来源 {}",
+                entity.source_entity_type
+            )
+        })?;
+    if expected_type != entity.entity_type {
+        return Err(format!(
+            "VALIDATION_ERROR: 云端增量聚合类型不匹配 {} -> {}",
+            entity.source_entity_type, entity.entity_type
+        ));
+    }
+    validate_incremental_entity_key(&entity.entity_type, &entity.entity_id)?;
+    if entity.deleted {
+        if entity.data.is_some() {
+            return Err("VALIDATION_ERROR: 删除增量不得携带实体内容".to_string());
+        }
+        return Ok(());
+    }
+    let data = entity.data.as_ref();
+    let matches = match entity.entity_type.as_str() {
+        "subjects" | "tasks" | "task_status_events" | "time_entries" | "report_templates"
+        | "reports" => {
+            data.and_then(|row| row.get("id")).and_then(Value::as_str)
+                == Some(entity.entity_id.as_str())
+        }
+        "work_days" => {
+            data.and_then(|row| row.get("work_date"))
+                .and_then(Value::as_str)
+                == Some(entity.entity_id.as_str())
+        }
+        "app_settings" => {
+            data.and_then(|row| row.get("key")).and_then(Value::as_str)
+                == Some(entity.entity_id.as_str())
+        }
+        "integration_configs" => {
+            data.and_then(|row| row.get("provider"))
+                .and_then(Value::as_str)
+                == Some(entity.entity_id.as_str())
+        }
+        "unassigned_sessions" => {
+            data.and_then(|row| row.get("id")).and_then(Value::as_str)
+                == Some(entity.entity_id.as_str())
+        }
+        "task_recurrence_rules" => {
+            data.and_then(|row| row.get("task_id"))
+                .and_then(Value::as_str)
+                == Some(entity.entity_id.as_str())
+        }
+        "task_daily_estimates" => data.is_some_and(|row| {
+            format!("{}|{}", text(row, "task_id"), text(row, "work_date")) == entity.entity_id
+        }),
+        "task_occurrences" => data.is_some_and(|row| {
+            format!("{}|{}", text(row, "task_id"), text(row, "occurrence_date")) == entity.entity_id
+        }),
+        "external_bindings" => data.is_some_and(|row| {
+            format!(
+                "{}|{}|{}",
+                text(row, "provider"),
+                text(row, "entity_type"),
+                text(row, "entity_id")
+            ) == entity.entity_id
+        }),
+        _ => false,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(format!(
+            "VALIDATION_ERROR: 云端增量实体身份不匹配 {}:{}",
+            entity.entity_type, entity.entity_id
+        ))
+    }
+}
+
+fn validate_incremental_entity_key(entity_type: &str, entity_id: &str) -> Result<(), String> {
+    let parts = entity_id.split('|').collect::<Vec<_>>();
+    let valid_date = |value: &str| chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok();
+    let valid = match entity_type {
+        "task_daily_estimates" | "task_occurrences" => {
+            parts.len() == 2 && Uuid::parse_str(parts[0]).is_ok() && valid_date(parts[1])
+        }
+        "external_bindings" => {
+            parts.len() == 3
+                && !parts[0].is_empty()
+                && !parts[1].is_empty()
+                && Uuid::parse_str(parts[2]).is_ok()
+        }
+        "work_days" => parts.len() == 1 && valid_date(entity_id),
+        "app_settings" | "integration_configs" => parts.len() == 1 && !entity_id.trim().is_empty(),
+        "subjects"
+        | "tasks"
+        | "task_status_events"
+        | "task_recurrence_rules"
+        | "unassigned_sessions"
+        | "time_entries"
+        | "report_templates"
+        | "reports" => parts.len() == 1 && Uuid::parse_str(entity_id).is_ok(),
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "VALIDATION_ERROR: 云端增量实体键无效 {entity_type}:{entity_id}"
+        ))
+    }
+}
+
+fn apply_incremental_time_entry(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    data: &Value,
+) -> rusqlite::Result<usize> {
+    let entry_id = text(data, "id");
+    transaction.execute(
+        "DELETE FROM time_segments WHERE workspace_id=?1 AND entry_id=?2",
+        params![workspace_id, entry_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM time_allocations WHERE workspace_id=?1 AND entry_id=?2",
+        params![workspace_id, entry_id],
+    )?;
+    let changed = transaction.execute("INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,default_task_id,label_snapshot,started_at,ended_at,duration_seconds,note,origin_unassigned_session_id,created_at,updated_at,version,deleted_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) ON CONFLICT(id) DO UPDATE SET work_date=excluded.work_date,kind=excluded.kind,source_type=excluded.source_type,state=excluded.state,default_task_id=excluded.default_task_id,label_snapshot=excluded.label_snapshot,started_at=excluded.started_at,ended_at=excluded.ended_at,duration_seconds=excluded.duration_seconds,note=excluded.note,origin_unassigned_session_id=excluded.origin_unassigned_session_id,updated_at=excluded.updated_at,version=excluded.version,deleted_at=excluded.deleted_at", params![entry_id,workspace_id,text(data,"work_date"),text(data,"kind"),text(data,"source_type"),text(data,"state"),optional_text(data,"default_task_id"),text(data,"label_snapshot"),millis(data,"started_at"),optional_millis(data,"ended_at"),integer(data,"duration_seconds"),optional_text(data,"note"),optional_text(data,"origin_unassigned_session_id"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version"),optional_millis(data,"deleted_at")])?;
+    for row in data
+        .get("segments")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        transaction.execute("INSERT INTO time_segments(id,workspace_id,entry_id,sequence_no,started_at,ended_at,duration_seconds) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![text(&row,"id"),workspace_id,entry_id,integer(&row,"sequence_no"),millis(&row,"started_at"),optional_millis(&row,"ended_at"),integer(&row,"duration_seconds")])?;
+    }
+    for row in data
+        .get("allocations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        transaction.execute("INSERT INTO time_allocations(id,workspace_id,entry_id,task_id,minutes,note,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![text(&row,"id"),workspace_id,entry_id,text(&row,"task_id"),integer(&row,"minutes"),optional_text(&row,"note"),millis(&row,"created_at"),millis(&row,"updated_at"),integer(&row,"version")])?;
+    }
+    Ok(changed)
+}
+
+fn apply_incremental_report(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    data: &Value,
+) -> rusqlite::Result<usize> {
+    let report_id = text(data, "id");
+    transaction.execute(
+        "DELETE FROM report_tasks WHERE workspace_id=?1 AND report_id=?2",
+        params![workspace_id, report_id],
+    )?;
+    let changed = transaction.execute("INSERT INTO reports(id,workspace_id,report_type,subject_id,period_start,period_end,reference_date,template_id,markdown_content,content_source,generation_count,input_revision_hash,generated_at,created_at,updated_at,version,deleted_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) ON CONFLICT(id) DO UPDATE SET report_type=excluded.report_type,subject_id=excluded.subject_id,period_start=excluded.period_start,period_end=excluded.period_end,reference_date=excluded.reference_date,template_id=excluded.template_id,markdown_content=excluded.markdown_content,content_source=excluded.content_source,generation_count=excluded.generation_count,input_revision_hash=excluded.input_revision_hash,generated_at=excluded.generated_at,updated_at=excluded.updated_at,version=excluded.version,deleted_at=excluded.deleted_at", params![report_id,workspace_id,text(data,"report_type"),text(data,"subject_id"),text(data,"period_start"),text(data,"period_end"),text(data,"reference_date"),optional_text(data,"template_id"),text(data,"markdown_content"),text(data,"content_source"),integer(data,"generation_count"),optional_text(data,"input_revision_hash"),optional_millis(data,"generated_at"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version"),optional_millis(data,"deleted_at")])?;
+    for row in data
+        .get("report_tasks")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        transaction.execute("INSERT INTO report_tasks(report_id,task_id,workspace_id,sort_order,title_snapshot,path_snapshot) VALUES (?1,?2,?3,?4,?5,?6)", params![report_id,text(&row,"task_id"),workspace_id,integer(&row,"sort_order"),text(&row,"title_snapshot"),text(&row,"path_snapshot")])?;
+    }
+    Ok(changed)
+}
+
+fn delete_incremental_entity(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    entity: &IncrementalEntity,
+) -> Result<(), String> {
+    let changed = match entity.entity_type.as_str() {
+        "subjects" => transaction.execute(
+            "DELETE FROM subjects WHERE workspace_id=?1 AND id=?2",
+            params![workspace_id, entity.entity_id],
+        ),
+        "work_days" => transaction.execute(
+            "DELETE FROM work_days WHERE workspace_id=?1 AND work_date=?2",
+            params![workspace_id, entity.entity_id],
+        ),
+        "app_settings" => transaction.execute(
+            "DELETE FROM app_settings WHERE workspace_id=?1 AND key=?2",
+            params![workspace_id, entity.entity_id],
+        ),
+        "tasks" => transaction.execute(
+            "DELETE FROM tasks WHERE workspace_id=?1 AND id=?2",
+            params![workspace_id, entity.entity_id],
+        ),
+        "task_status_events" => transaction.execute(
+            "DELETE FROM task_status_events WHERE workspace_id=?1 AND id=?2",
+            params![workspace_id, entity.entity_id],
+        ),
+        "task_daily_estimates" => {
+            let key = entity
+                .entity_id
+                .split_once('|')
+                .ok_or_else(|| "VALIDATION_ERROR: 按日预估增量键无效".to_string())?;
+            transaction.execute("DELETE FROM task_daily_estimates WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3", params![workspace_id,key.0,key.1])
+        }
+        "task_recurrence_rules" => transaction.execute(
+            "DELETE FROM task_recurrence_rules WHERE workspace_id=?1 AND task_id=?2",
+            params![workspace_id, entity.entity_id],
+        ),
+        "task_occurrences" => {
+            let key = entity
+                .entity_id
+                .split_once('|')
+                .ok_or_else(|| "VALIDATION_ERROR: 重复轮次增量键无效".to_string())?;
+            transaction.execute("DELETE FROM task_occurrences WHERE workspace_id=?1 AND task_id=?2 AND occurrence_date=?3", params![workspace_id,key.0,key.1])
+        }
+        "unassigned_sessions" => Ok(0),
+        "time_entries" => transaction.execute(
+            "DELETE FROM time_entries WHERE workspace_id=?1 AND id=?2",
+            params![workspace_id, entity.entity_id],
+        ),
+        "report_templates" => transaction.execute(
+            "DELETE FROM report_templates WHERE workspace_id=?1 AND id=?2",
+            params![workspace_id, entity.entity_id],
+        ),
+        "reports" => transaction.execute(
+            "DELETE FROM reports WHERE workspace_id=?1 AND id=?2",
+            params![workspace_id, entity.entity_id],
+        ),
+        "integration_configs" => transaction.execute(
+            "DELETE FROM integration_configs WHERE workspace_id=?1 AND provider=?2",
+            params![workspace_id, entity.entity_id],
+        ),
+        "external_bindings" => {
+            let parts = entity.entity_id.split('|').collect::<Vec<_>>();
+            if parts.len() != 3 {
+                return Err("VALIDATION_ERROR: 外部绑定增量键无效".to_string());
+            }
+            transaction.execute("DELETE FROM external_bindings WHERE workspace_id=?1 AND provider=?2 AND entity_type=?3 AND entity_id=?4", params![workspace_id,parts[0],parts[1],parts[2]])
+        }
+        other => {
+            return Err(format!(
+                "VALIDATION_ERROR: 不支持删除的云端增量实体 {other}"
+            ))
+        }
+    };
+    changed.map(|_| ()).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -1011,20 +2002,16 @@ fn ensure_supported_cloud_entity_type(entity_type: &str) -> Result<(), String> {
     }
 }
 
-pub fn flush_if_online(database: &Database) -> Result<(), String> {
-    if let (Some(app), Ok(status)) = (CLOUD_SYNC_APP_HANDLE.get(), sync_status(database)) {
-        let _ = app.emit("cloud-sync-state-changed", &status);
+pub fn flush_if_online(_database: &Database) -> Result<(), String> {
+    if CLOUD_SYNC_ENABLED.load(Ordering::Acquire) {
+        signal_cloud_sync(SYNC_SIGNAL_LOCAL_DIRTY, None);
     }
-    cloud_sync_wakeup().notify_one();
     Ok(())
 }
 
+#[cfg(test)]
 pub fn push_outbox(database: &Database) -> Result<CloudSyncPushResult, String> {
     push_outbox_with_retry_mode(database, false, false)
-}
-
-fn push_outbox_now(database: &Database) -> Result<CloudSyncPushResult, String> {
-    push_outbox_with_retry_mode(database, true, true)
 }
 
 fn push_outbox_with_retry_mode(
@@ -1114,29 +2101,12 @@ fn push_outbox_locked(
             break;
         }
     }
-    let (mut pending, mut conflicts) = outbox_counts(database, &state.workspace_id)?;
-    if should_pull_snapshot_after_push(pushed, pending, conflicts) {
-        match pull_snapshot(database) {
-            Ok(_) => {}
-            Err(error) if should_defer_snapshot_refresh_after_local_race(&error) => {
-                (pending, conflicts) = outbox_counts(database, &state.workspace_id)?;
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    let (pending, conflicts) = outbox_counts(database, &state.workspace_id)?;
     Ok(CloudSyncPushResult {
         pushed,
         pending,
         conflicts,
     })
-}
-
-fn should_pull_snapshot_after_push(pushed: i64, pending: i64, conflicts: i64) -> bool {
-    pushed > 0 && pending == 0 && conflicts == 0
-}
-
-fn should_defer_snapshot_refresh_after_local_race(error: &str) -> bool {
-    error.starts_with("SYNC_PENDING:") || error.starts_with("SYNC_RETRY:")
 }
 
 pub fn list_conflicts(database: &Database) -> Result<Vec<CloudSyncConflict>, String> {
@@ -1233,15 +2203,7 @@ pub fn resolve_conflict(
     let state = require_cloud(database)?;
     let conflict = load_conflict(database, &state.workspace_id, &request.operation_id)?;
     resolve_loaded_conflict(database, &state, &conflict, &request.strategy, None)?;
-
-    let result = push_outbox_now(database)?;
-    if result.pending == 0 && result.conflicts == 0 {
-        match pull_snapshot(database) {
-            Ok(_) => {}
-            Err(error) if should_defer_snapshot_refresh_after_local_race(&error) => {}
-            Err(error) => return Err(error),
-        }
-    }
+    signal_cloud_sync(SYNC_SIGNAL_MANUAL_RETRY | SYNC_SIGNAL_REMOTE_HINT, None);
     sync_status(database)
 }
 
@@ -1261,18 +2223,8 @@ pub fn resolve_all_conflicts(
             &mut attempts_by_operation,
         )?;
         if resolved == 0 {
-            let push = push_outbox_now(database)?;
-            if push.conflicts == 0 {
-                if push.pending == 0 {
-                    match pull_snapshot(database) {
-                        Ok(_) => {}
-                        Err(error) if should_defer_snapshot_refresh_after_local_race(&error) => {}
-                        Err(error) => return Err(error),
-                    }
-                }
-                return sync_status(database);
-            }
-            continue;
+            signal_cloud_sync(SYNC_SIGNAL_MANUAL_RETRY | SYNC_SIGNAL_REMOTE_HINT, None);
+            return sync_status(database);
         }
     }
 }
@@ -1340,6 +2292,7 @@ fn resolve_loaded_conflict(
     match strategy {
         "use_cloud" => {
             delete_outbox_entity_chain(database, &state.workspace_id, &conflict)?;
+            mark_conflict_entity_for_cloud_reconciliation(database, state, conflict)?;
         }
         "keep_local" => {
             let latest_local =
@@ -1419,6 +2372,57 @@ fn resolve_loaded_conflict(
         _ => return validate_conflict_strategy(strategy),
     }
     Ok(())
+}
+
+fn incremental_entity_type_for_outbox(entity_type: &str) -> Option<&'static str> {
+    match entity_type {
+        "subject" => Some("subjects"),
+        "task" => Some("tasks"),
+        "task_occurrence" => Some("task_occurrences"),
+        "task_daily_estimate" => Some("task_daily_estimates"),
+        "task_recurrence_rule" => Some("task_recurrence_rules"),
+        "time_entry" => Some("time_entries"),
+        "report" => Some("reports"),
+        "report_template" => Some("report_templates"),
+        "app_setting" => Some("app_settings"),
+        "integration_config" => Some("integration_configs"),
+        "external_binding" => Some("external_bindings"),
+        _ => None,
+    }
+}
+
+fn mark_conflict_entity_for_cloud_reconciliation(
+    database: &Database,
+    state: &crate::supabase::StorageModeSnapshot,
+    conflict: &OutboxOperation,
+) -> Result<(), String> {
+    let Some(entity_type) = incremental_entity_type_for_outbox(&conflict.entity_type) else {
+        return Ok(());
+    };
+    let Some(entity_id) = conflict.entity_id.as_deref() else {
+        return Ok(());
+    };
+    database
+        .open()?
+        .execute(
+            "INSERT INTO cloud_deferred_entities(
+               workspace_id,entity_type,entity_id,observed_version,observed_change_seq,updated_at
+             ) VALUES (?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(workspace_id,entity_type,entity_id) DO UPDATE SET
+               observed_version=MAX(observed_version,excluded.observed_version),
+               observed_change_seq=MIN(observed_change_seq,excluded.observed_change_seq),
+               updated_at=excluded.updated_at",
+            params![
+                state.workspace_id,
+                entity_type,
+                entity_id,
+                conflict.base_version.unwrap_or_default(),
+                state.last_change_seq.saturating_add(1),
+                now_millis(),
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn latest_outbox_entity_operation(
@@ -3671,31 +4675,9 @@ pub fn cloud_sync_queue(
 }
 
 #[tauri::command]
-pub fn cloud_sync_pull(
-    database: tauri::State<'_, Database>,
-    request: CloudSyncPullRequest,
-) -> Result<CloudSyncPullResult, String> {
-    pull(&database, request)
-}
-
-#[tauri::command]
-pub fn cloud_sync_push(
-    database: tauri::State<'_, Database>,
-) -> Result<CloudSyncPushResult, String> {
-    push_outbox_now(&database)
-}
-
-#[tauri::command]
-pub fn cloud_sync_refresh(database: tauri::State<'_, Database>) -> Result<CloudSyncStatus, String> {
-    let push = push_outbox_now(&database)?;
-    if should_pull_snapshot_after_manual_refresh(push.pending, push.conflicts) {
-        match pull_snapshot(&database) {
-            Ok(_) => {}
-            Err(error) if should_defer_snapshot_refresh_after_local_race(&error) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    sync_status(&database)
+pub fn cloud_sync_refresh(_database: tauri::State<'_, Database>) -> Result<(), String> {
+    signal_cloud_sync(SYNC_SIGNAL_MANUAL_RETRY, None);
+    Ok(())
 }
 
 #[tauri::command]
@@ -3705,10 +4687,6 @@ pub fn cloud_sync_reset_local_cache(
     reset_local_cache_from_cloud(&database)
 }
 
-fn should_pull_snapshot_after_manual_refresh(pending: i64, conflicts: i64) -> bool {
-    pending == 0 && conflicts == 0
-}
-
 pub fn refresh_unassigned_state_for_cloud_mode(
     database: &Database,
 ) -> Result<Option<crate::unassigned::UnassignedStateDto>, String> {
@@ -3716,24 +4694,8 @@ pub fn refresh_unassigned_state_for_cloud_mode(
     if state.mode != "cloud" {
         return crate::unassigned::get_state(database);
     }
-    match acquire_or_renew_tracking_lease(database) {
-        Ok(_) => match pull_snapshot(database) {
-            Ok(_) => {}
-            Err(error) if should_use_local_unassigned_state_after_cloud_refresh_error(&error) => {}
-            Err(error) => return Err(error),
-        },
-        Err(error) if should_use_local_unassigned_state_after_cloud_refresh_error(&error) => {}
-        Err(error) => return Err(error),
-    }
+    signal_cloud_sync(SYNC_SIGNAL_CONNECTION_READY, None);
     crate::unassigned::get_state(database)
-}
-
-fn should_use_local_unassigned_state_after_cloud_refresh_error(error: &str) -> bool {
-    error.starts_with("NETWORK_ERROR:")
-        || error.starts_with("AUTH_REQUIRED:")
-        || error.starts_with("CLOUD_NOT_CONFIGURED:")
-        || error.starts_with("SYNC_PENDING:")
-        || error.starts_with("SYNC_RETRY:")
 }
 
 #[tauri::command]
@@ -3924,6 +4886,763 @@ mod tests {
         let local_url = realtime_url("http://127.0.0.1:54321", "local-key").unwrap();
         assert_eq!(local_url.scheme(), "ws");
         assert_eq!(local_url.host_str(), Some("127.0.0.1"));
+    }
+
+    fn incremental_entity(
+        entity_type: &str,
+        source_entity_type: &str,
+        entity_id: impl Into<String>,
+        deleted: bool,
+        data: Option<Value>,
+    ) -> IncrementalEntity {
+        IncrementalEntity {
+            entity_type: entity_type.to_string(),
+            source_entity_type: source_entity_type.to_string(),
+            entity_id: entity_id.into(),
+            change_seq: 1,
+            deleted,
+            data,
+        }
+    }
+
+    fn cloud_database_for_incremental_test(
+        file_name: &str,
+    ) -> (tempfile::TempDir, Database, String, String, String) {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(directory.path().join(file_name)).unwrap();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id.clone()),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let local_workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        (
+            directory,
+            database,
+            cloud_workspace_id,
+            local_workspace_id,
+            subject_id,
+        )
+    }
+
+    #[test]
+    fn incremental_protocol_rejects_unknown_sources_invalid_keys_and_incomplete_tombstones() {
+        let id = Uuid::now_v7().to_string();
+        assert!(validate_incremental_identity(&incremental_entity(
+            "unknown_entities",
+            "unknown_entities",
+            id.clone(),
+            true,
+            None,
+        ))
+        .unwrap_err()
+        .starts_with("VALIDATION_ERROR:"));
+        assert!(validate_incremental_identity(&incremental_entity(
+            "task_daily_estimates",
+            "task_daily_estimates",
+            format!("{id}|2026-02-30"),
+            true,
+            None,
+        ))
+        .is_err());
+        assert!(validate_incremental_identity(&incremental_entity(
+            "time_entries",
+            "time_segments",
+            id.clone(),
+            true,
+            Some(json!({ "id": id })),
+        ))
+        .unwrap_err()
+        .contains("删除增量"));
+        let missing_deleted = serde_json::from_value::<IncrementalEntity>(json!({
+            "entity_type": "tasks",
+            "source_entity_type": "tasks",
+            "entity_id": id,
+            "data": null
+        }));
+        assert!(missing_deleted.is_err());
+    }
+
+    #[test]
+    fn incremental_domains_cover_planning_time_and_reports() {
+        assert_eq!(incremental_domain("task_daily_estimates").unwrap(), "tasks");
+        assert_eq!(
+            incremental_domain("task_recurrence_rules").unwrap(),
+            "tasks"
+        );
+        assert_eq!(incremental_domain("task_occurrences").unwrap(), "tasks");
+        assert_eq!(incremental_domain("time_entries").unwrap(), "time");
+        assert_eq!(incremental_domain("reports").unwrap(), "reports");
+    }
+
+    #[test]
+    fn incremental_batch_defers_dirty_entity_but_applies_other_entities_and_advances_cursor() {
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, subject_id) =
+            cloud_database_for_incremental_test("incremental-dirty.sqlite3");
+        let device_id = storage_mode(&database).unwrap().device_id;
+        let dirty_task_id = Uuid::now_v7().to_string();
+        let clean_task_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        database.open().unwrap().execute(
+            "INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,payload_json,state,attempt_count,created_at) VALUES (?1,?2,?3,'task.update','task',?4,'{}','pending',0,?5)",
+            params![Uuid::now_v7().to_string(), cloud_workspace_id, device_id, dirty_task_id, now],
+        ).unwrap();
+        let task_data = |id: &str, title: &str| {
+            json!({
+                "id": id, "subject_id": subject_id, "parent_id": null, "title": title,
+                "status": "open", "planned_date": null, "planned_time": null,
+                "estimate_minutes": null, "note": null, "project_name": null,
+                "solution_name": null, "source_type": "manual", "source_ref": null,
+                "sort_order": 20, "completed_at": null, "created_at": now,
+                "updated_at": now, "version": 2, "deleted_at": null
+            })
+        };
+        let mut dirty_entity = incremental_entity(
+            "tasks",
+            "tasks",
+            dirty_task_id.clone(),
+            false,
+            Some(task_data(&dirty_task_id, "本机待同步")),
+        );
+        dirty_entity.change_seq = 37;
+        let entities = vec![
+            dirty_entity,
+            incremental_entity(
+                "tasks",
+                "tasks",
+                clean_task_id.clone(),
+                false,
+                Some(task_data(&clean_task_id, "远端可应用")),
+            ),
+        ];
+
+        let domains =
+            apply_incremental_entities(&database, &cloud_workspace_id, &device_id, 42, &entities)
+                .unwrap();
+        let connection = database.open().unwrap();
+        assert_eq!(domains, vec!["tasks"]);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE id=?1",
+                    [&dirty_task_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT title FROM tasks WHERE id=?1",
+                    [&clean_task_id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "远端可应用"
+        );
+        assert_eq!(connection.query_row("SELECT observed_change_seq FROM cloud_deferred_entities WHERE workspace_id=?1 AND entity_type='tasks' AND entity_id=?2", params![cloud_workspace_id, dirty_task_id], |row| row.get::<_, i64>(0)).unwrap(), 37);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT last_change_seq FROM local_sync_state WHERE workspace_id=?1",
+                    [&cloud_workspace_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn incremental_task_parent_is_restored_after_child_before_parent_batch() {
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, subject_id) =
+            cloud_database_for_incremental_test("incremental-parent-order.sqlite3");
+        let device_id = storage_mode(&database).unwrap().device_id;
+        let parent_id = Uuid::now_v7().to_string();
+        let child_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        let task_data = |id: &str, parent: Option<&str>, title: &str| {
+            json!({
+                "id": id, "subject_id": subject_id, "parent_id": parent, "title": title,
+                "status": "open", "planned_date": null, "planned_time": null,
+                "estimate_minutes": null, "note": null, "project_name": null,
+                "solution_name": null, "source_type": "manual", "source_ref": null,
+                "sort_order": 20, "completed_at": null, "created_at": now,
+                "updated_at": now, "version": 1, "deleted_at": null
+            })
+        };
+        apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &device_id,
+            7,
+            &[
+                incremental_entity(
+                    "tasks",
+                    "tasks",
+                    child_id.clone(),
+                    false,
+                    Some(task_data(&child_id, Some(&parent_id), "子事项")),
+                ),
+                incremental_entity(
+                    "tasks",
+                    "tasks",
+                    parent_id.clone(),
+                    false,
+                    Some(task_data(&parent_id, None, "父事项")),
+                ),
+            ],
+        )
+        .unwrap();
+        let saved_parent: Option<String> = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT parent_id FROM tasks WHERE id=?1",
+                [&child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved_parent.as_deref(), Some(parent_id.as_str()));
+    }
+
+    #[test]
+    fn duplicate_incremental_entity_advances_cursor_without_frontend_domain_or_revision() {
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, subject_id) =
+            cloud_database_for_incremental_test("incremental-idempotent.sqlite3");
+        let device_id = storage_mode(&database).unwrap().device_id;
+        let task_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        let task = json!({"id":task_id,"subject_id":subject_id,"parent_id":null,"title":"幂等事项","status":"open","planned_date":null,"planned_time":null,"estimate_minutes":null,"note":null,"project_name":null,"solution_name":null,"source_type":"manual","source_ref":null,"sort_order":1,"completed_at":null,"created_at":now,"updated_at":now,"version":1,"deleted_at":null});
+        let entity = incremental_entity("tasks", "tasks", task_id, false, Some(task));
+        assert_eq!(
+            apply_incremental_entities(
+                &database,
+                &cloud_workspace_id,
+                &device_id,
+                1,
+                std::slice::from_ref(&entity)
+            )
+            .unwrap(),
+            vec!["tasks"]
+        );
+        let revision_before = local_revision(&database).unwrap();
+        assert!(apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &device_id,
+            2,
+            &[entity]
+        )
+        .unwrap()
+        .is_empty());
+        assert_eq!(local_revision(&database).unwrap(), revision_before);
+        assert_eq!(storage_mode(&database).unwrap().last_change_seq, 2);
+    }
+
+    #[test]
+    fn realtime_change_seq_accepts_supabase_payload_shapes() {
+        assert_eq!(
+            realtime_change_seq(
+                &json!({ "payload": { "data": { "record": { "change_seq": 42 } } } })
+            ),
+            Some(42)
+        );
+        assert_eq!(
+            realtime_change_seq(&json!({ "payload": { "record": { "change_seq": "43" } } })),
+            Some(43)
+        );
+        assert_eq!(realtime_change_seq(&json!({ "payload": {} })), None);
+    }
+
+    #[test]
+    fn realtime_reconnect_backoff_is_jittered_and_bounded() {
+        let first = realtime_reconnect_delay(0, 123);
+        let later = realtime_reconnect_delay(4, 456);
+        assert!(first >= Duration::from_secs(REALTIME_RECONNECT_SECONDS));
+        assert!(later > first);
+        assert!(later <= Duration::from_secs(REALTIME_RECONNECT_MAX_SECONDS));
+        assert_ne!(
+            realtime_reconnect_delay(1, 1),
+            realtime_reconnect_delay(1, 2)
+        );
+    }
+
+    #[test]
+    fn sync_signals_merge_without_queue_growth() {
+        let _guard = CLOUD_SYNC_TEST_STATE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
+        CLOUD_SYNC_OBSERVED_REMOTE_SEQ.store(0, Ordering::Release);
+        signal_cloud_sync(SYNC_SIGNAL_LOCAL_DIRTY, None);
+        signal_cloud_sync(SYNC_SIGNAL_REMOTE_HINT, Some(7));
+        signal_cloud_sync(SYNC_SIGNAL_REMOTE_HINT, Some(5));
+        signal_cloud_sync(SYNC_SIGNAL_MANUAL_RETRY, None);
+        let signals = CLOUD_SYNC_SIGNALS.swap(0, Ordering::AcqRel);
+        assert_eq!(signals & SYNC_SIGNAL_LOCAL_DIRTY, SYNC_SIGNAL_LOCAL_DIRTY);
+        assert_eq!(signals & SYNC_SIGNAL_REMOTE_HINT, SYNC_SIGNAL_REMOTE_HINT);
+        assert_eq!(signals & SYNC_SIGNAL_MANUAL_RETRY, SYNC_SIGNAL_MANUAL_RETRY);
+        assert_eq!(CLOUD_SYNC_OBSERVED_REMOTE_SEQ.load(Ordering::Acquire), 7);
+    }
+
+    #[test]
+    fn concurrent_signal_storm_is_coalesced_without_losing_late_work() {
+        use std::sync::atomic::AtomicUsize;
+        use std::thread;
+
+        let _guard = CLOUD_SYNC_TEST_STATE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
+        CLOUD_SYNC_OBSERVED_REMOTE_SEQ.store(0, Ordering::Release);
+        let producer_count = 8;
+        let done = Arc::new(AtomicUsize::new(0));
+        let mut producers = Vec::new();
+        for producer in 0..producer_count {
+            let done = Arc::clone(&done);
+            producers.push(thread::spawn(move || {
+                for index in 0..1_000 {
+                    let signal = match index % 4 {
+                        0 => SYNC_SIGNAL_LOCAL_DIRTY,
+                        1 => SYNC_SIGNAL_REMOTE_HINT,
+                        2 => SYNC_SIGNAL_CONNECTION_READY,
+                        _ => SYNC_SIGNAL_MANUAL_RETRY,
+                    };
+                    let observed = (signal == SYNC_SIGNAL_REMOTE_HINT)
+                        .then_some((producer * 1_000 + index + 1) as i64);
+                    signal_cloud_sync(signal, observed);
+                }
+                done.fetch_add(1, Ordering::Release);
+            }));
+        }
+
+        let mut observed_signals = 0_u8;
+        let mut observed_remote_seq = 0_i64;
+        while done.load(Ordering::Acquire) < producer_count
+            || CLOUD_SYNC_SIGNALS.load(Ordering::Acquire) != 0
+        {
+            observed_signals |= CLOUD_SYNC_SIGNALS.swap(0, Ordering::AcqRel);
+            observed_remote_seq =
+                observed_remote_seq.max(CLOUD_SYNC_OBSERVED_REMOTE_SEQ.swap(0, Ordering::AcqRel));
+            thread::yield_now();
+        }
+        for producer in producers {
+            producer.join().unwrap();
+        }
+        observed_signals |= CLOUD_SYNC_SIGNALS.swap(0, Ordering::AcqRel);
+        observed_remote_seq =
+            observed_remote_seq.max(CLOUD_SYNC_OBSERVED_REMOTE_SEQ.swap(0, Ordering::AcqRel));
+
+        assert_eq!(
+            observed_signals,
+            SYNC_SIGNAL_LOCAL_DIRTY
+                | SYNC_SIGNAL_REMOTE_HINT
+                | SYNC_SIGNAL_CONNECTION_READY
+                | SYNC_SIGNAL_MANUAL_RETRY
+        );
+        assert_eq!(observed_remote_seq, 7_998);
+        assert_eq!(CLOUD_SYNC_SIGNALS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn deferred_entity_rewinds_cursor_after_matching_outbox_is_removed() {
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, _subject_id) =
+            cloud_database_for_incremental_test("deferred-rewind.sqlite3");
+        let state = storage_mode(&database).unwrap();
+        let entity_id = Uuid::now_v7().to_string();
+        let connection = database.open().unwrap();
+        connection.execute(
+            "INSERT INTO local_sync_state(workspace_id,device_id,last_change_seq,last_full_sync_at) VALUES (?1,?2,20,1) ON CONFLICT(workspace_id) DO UPDATE SET last_change_seq=20",
+            params![cloud_workspace_id, state.device_id],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO cloud_deferred_entities(workspace_id,entity_type,entity_id,observed_version,observed_change_seq,updated_at) VALUES (?1,'tasks',?2,3,12,1)",
+            params![cloud_workspace_id, entity_id],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,payload_json,state,attempt_count,created_at) VALUES (?1,?2,?3,'task.update','task',?4,'{}','pending',0,1)",
+            params![Uuid::now_v7().to_string(), cloud_workspace_id, state.device_id, entity_id],
+        ).unwrap();
+        drop(connection);
+
+        rewind_for_ready_deferred_entities(&database, &cloud_workspace_id).unwrap();
+        assert_eq!(storage_mode(&database).unwrap().last_change_seq, 20);
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "DELETE FROM sync_outbox WHERE workspace_id=?1",
+                [&cloud_workspace_id],
+            )
+            .unwrap();
+        rewind_for_ready_deferred_entities(&database, &cloud_workspace_id).unwrap();
+        assert_eq!(storage_mode(&database).unwrap().last_change_seq, 11);
+    }
+
+    #[test]
+    fn workspace_switch_removes_stale_deferred_entities() {
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, _subject_id) =
+            cloud_database_for_incremental_test("deferred-workspace-switch.sqlite3");
+        database.open().unwrap().execute(
+            "INSERT INTO cloud_deferred_entities(workspace_id,entity_type,entity_id,observed_version,observed_change_seq,updated_at) VALUES ('old-workspace','tasks',?1,1,2,3), (?2,'tasks',?3,1,2,3)",
+            params![Uuid::now_v7().to_string(), cloud_workspace_id, Uuid::now_v7().to_string()],
+        ).unwrap();
+        clear_stale_deferred_workspaces(&database, &cloud_workspace_id).unwrap();
+        let rows: Vec<String> = database
+            .open()
+            .unwrap()
+            .prepare("SELECT workspace_id FROM cloud_deferred_entities")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![cloud_workspace_id]);
+    }
+
+    #[test]
+    fn outbox_retry_delay_is_one_shot_and_bounded() {
+        let (_directory, database, cloud_workspace_id) =
+            cloud_database_with_outbox_state("one-shot-retry.sqlite3", "pending");
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE sync_outbox SET attempt_count=6,last_attempt_at=?1 WHERE workspace_id=?2",
+                params![now_millis(), cloud_workspace_id],
+            )
+            .unwrap();
+        let delay = next_outbox_retry_delay(&database).unwrap().unwrap();
+        assert!(delay <= Duration::from_millis(OUTBOX_RETRY_MAX_BACKOFF_MILLIS as u64));
+        assert!(delay > Duration::from_millis(1));
+    }
+
+    #[test]
+    fn foreground_sync_wakeup_does_not_open_database_or_wait_for_network() {
+        let _guard = CLOUD_SYNC_TEST_STATE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        CLOUD_SYNC_ENABLED.store(true, Ordering::Release);
+        CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("foreground-wakeup.sqlite3")).unwrap();
+        std::fs::remove_file(directory.path().join("foreground-wakeup.sqlite3")).unwrap();
+        let started = std::time::Instant::now();
+        flush_if_online(&database).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert_ne!(
+            CLOUD_SYNC_SIGNALS.load(Ordering::Acquire) & SYNC_SIGNAL_LOCAL_DIRTY,
+            0
+        );
+        CLOUD_SYNC_ENABLED.store(false, Ordering::Release);
+        CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
+    }
+
+    #[test]
+    fn local_mode_business_wakeup_does_not_start_cloud_coordination() {
+        let _guard = CLOUD_SYNC_TEST_STATE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        disable_cloud_sync();
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("local-wakeup.sqlite3")).unwrap();
+        flush_if_online(&database).unwrap();
+        assert_eq!(CLOUD_SYNC_SIGNALS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn incremental_planning_entities_apply_estimate_recurrence_and_occurrence() {
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, subject_id) =
+            cloud_database_for_incremental_test("incremental-planning.sqlite3");
+        let device_id = storage_mode(&database).unwrap().device_id;
+        let task_id = Uuid::now_v7().to_string();
+        let rule_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        let task = json!({
+            "id":task_id,"subject_id":subject_id,"parent_id":null,"title":"重复事项","status":"open",
+            "planned_date":null,"planned_time":null,"estimate_minutes":null,"note":null,"project_name":null,
+            "solution_name":null,"source_type":"manual","source_ref":null,"sort_order":1,"completed_at":null,
+            "created_at":now,"updated_at":now,"version":1,"deleted_at":null
+        });
+        let estimate = json!({"task_id":task_id,"work_date":"2026-10-06","estimate_minutes":45,"created_at":now,"updated_at":now,"version":1});
+        let recurrence = json!({"task_id":task_id,"rules":[{"id":rule_id,"task_id":task_id,"frequency":"weekly","weekdays_mask":2,"effective_start":"2026-10-06","effective_end":null,"created_at":now,"updated_at":now,"version":1}]});
+        let occurrence = json!({"task_id":task_id,"occurrence_date":"2026-10-06","origin":"scheduled","status":"done","completed_at":now,"created_at":now,"updated_at":now,"version":1});
+        apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &device_id,
+            10,
+            &[
+                incremental_entity("tasks", "tasks", task_id.clone(), false, Some(task)),
+                incremental_entity(
+                    "task_daily_estimates",
+                    "task_daily_estimates",
+                    format!("{task_id}|2026-10-06"),
+                    false,
+                    Some(estimate),
+                ),
+                incremental_entity(
+                    "task_recurrence_rules",
+                    "task_recurrence_rules",
+                    task_id.clone(),
+                    false,
+                    Some(recurrence),
+                ),
+                incremental_entity(
+                    "task_occurrences",
+                    "task_occurrences",
+                    format!("{task_id}|2026-10-06"),
+                    false,
+                    Some(occurrence),
+                ),
+            ],
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        assert_eq!(connection.query_row("SELECT estimate_minutes FROM task_daily_estimates WHERE task_id=?1 AND work_date='2026-10-06'",[&task_id],|r|r.get::<_,i64>(0)).unwrap(),45);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT frequency FROM task_recurrence_rules WHERE task_id=?1",
+                    [&task_id],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "weekly"
+        );
+        assert_eq!(connection.query_row("SELECT status FROM task_occurrences WHERE task_id=?1 AND occurrence_date='2026-10-06'",[&task_id],|r|r.get::<_,String>(0)).unwrap(),"done");
+    }
+
+    #[test]
+    fn incremental_planning_tombstones_and_empty_recurrence_remove_local_rows() {
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, subject_id) =
+            cloud_database_for_incremental_test("incremental-planning-delete.sqlite3");
+        let device_id = storage_mode(&database).unwrap().device_id;
+        let task_id = Uuid::now_v7().to_string();
+        let rule_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        let task = json!({
+            "id":task_id,"subject_id":subject_id,"parent_id":null,"title":"待清理规划","status":"open",
+            "planned_date":null,"planned_time":null,"estimate_minutes":null,"note":null,"project_name":null,
+            "solution_name":null,"source_type":"manual","source_ref":null,"sort_order":1,"completed_at":null,
+            "created_at":now,"updated_at":now,"version":1,"deleted_at":null
+        });
+        let estimate = json!({"task_id":task_id,"work_date":"2026-10-06","estimate_minutes":45,"created_at":now,"updated_at":now,"version":1});
+        let recurrence = json!({"task_id":task_id,"rules":[{"id":rule_id,"task_id":task_id,"frequency":"daily","weekdays_mask":null,"effective_start":"2026-10-06","effective_end":null,"created_at":now,"updated_at":now,"version":1}]});
+        let occurrence = json!({"task_id":task_id,"occurrence_date":"2026-10-06","origin":"scheduled","status":"open","completed_at":null,"created_at":now,"updated_at":now,"version":1});
+        apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &device_id,
+            10,
+            &[
+                incremental_entity("tasks", "tasks", task_id.clone(), false, Some(task)),
+                incremental_entity(
+                    "task_daily_estimates",
+                    "task_daily_estimates",
+                    format!("{task_id}|2026-10-06"),
+                    false,
+                    Some(estimate),
+                ),
+                incremental_entity(
+                    "task_recurrence_rules",
+                    "task_recurrence_rules",
+                    task_id.clone(),
+                    false,
+                    Some(recurrence),
+                ),
+                incremental_entity(
+                    "task_occurrences",
+                    "task_occurrences",
+                    format!("{task_id}|2026-10-06"),
+                    false,
+                    Some(occurrence),
+                ),
+            ],
+        )
+        .unwrap();
+        let domains = apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &device_id,
+            13,
+            &[
+                incremental_entity(
+                    "task_daily_estimates",
+                    "task_daily_estimates",
+                    format!("{task_id}|2026-10-06"),
+                    true,
+                    None,
+                ),
+                incremental_entity(
+                    "task_recurrence_rules",
+                    "task_recurrence_rules",
+                    task_id.clone(),
+                    false,
+                    Some(json!({"task_id":task_id,"rules":[]})),
+                ),
+                incremental_entity(
+                    "task_occurrences",
+                    "task_occurrences",
+                    format!("{task_id}|2026-10-06"),
+                    true,
+                    None,
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(domains, vec!["tasks"]);
+        let connection = database.open().unwrap();
+        let counts: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM task_daily_estimates WHERE task_id=?1),
+                   (SELECT COUNT(*) FROM task_recurrence_rules WHERE task_id=?1),
+                   (SELECT COUNT(*) FROM task_occurrences WHERE task_id=?1)",
+                [&task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 0, 0));
+    }
+
+    #[test]
+    fn unassigned_change_is_accepted_without_overwriting_device_local_session() {
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, _subject_id) =
+            cloud_database_for_incremental_test("incremental-unassigned-hint.sqlite3");
+        let device_id = storage_mode(&database).unwrap().device_id;
+        let local_state = crate::unassigned::get_state(&database).unwrap().unwrap();
+        let remote_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        let domains = apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &device_id,
+            14,
+            &[incremental_entity(
+                "unassigned_sessions",
+                "unassigned_sessions",
+                remote_id.clone(),
+                false,
+                Some(json!({
+                    "id":remote_id,"work_date":"2026-10-06","state":"collecting",
+                    "threshold_seconds":300,"duration_seconds":1,"first_started_at":now,
+                    "last_ended_at":null,"prompted_at":null,"resolution_type":null,
+                    "generated_entry_id":null,"resolved_at":null,"created_at":now,
+                    "updated_at":now,"version":1
+                })),
+            )],
+        )
+        .unwrap();
+        assert_eq!(domains, vec!["unassigned"]);
+        assert_eq!(
+            crate::unassigned::get_state(&database)
+                .unwrap()
+                .unwrap()
+                .session_id,
+            local_state.session_id
+        );
+        assert_eq!(storage_mode(&database).unwrap().last_change_seq, 14);
+    }
+
+    #[test]
+    fn incremental_time_and_report_aggregates_replace_children_atomically() {
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, subject_id) =
+            cloud_database_for_incremental_test("incremental-aggregates.sqlite3");
+        let device_id = storage_mode(&database).unwrap().device_id;
+        let task_id = Uuid::now_v7().to_string();
+        let entry_id = Uuid::now_v7().to_string();
+        let segment_id = Uuid::now_v7().to_string();
+        let allocation_id = Uuid::now_v7().to_string();
+        let report_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        database.open().unwrap().execute("INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version) SELECT ?1,id,?2,'关联事项','open','manual',1,?3,?3,1 FROM workspaces LIMIT 1",params![task_id,subject_id,now]).unwrap();
+        let entry = json!({"id":entry_id,"work_date":"2026-10-06","kind":"work","source_type":"manual","state":"ended","default_task_id":task_id,"label_snapshot":"聚合工时","started_at":now,"ended_at":now+3600000,"duration_seconds":3600,"note":null,"origin_unassigned_session_id":null,"created_at":now,"updated_at":now,"version":1,"deleted_at":null,"segments":[{"id":segment_id,"sequence_no":1,"started_at":now,"ended_at":now+3600000,"duration_seconds":3600}],"allocations":[{"id":allocation_id,"task_id":task_id,"minutes":60,"note":null,"created_at":now,"updated_at":now,"version":1}]});
+        let report = json!({"id":report_id,"report_type":"daily","subject_id":subject_id,"period_start":"2026-10-06","period_end":"2026-10-06","reference_date":"2026-10-06","template_id":null,"markdown_content":"日报内容","content_source":"edited","generation_count":1,"input_revision_hash":null,"generated_at":now,"created_at":now,"updated_at":now,"version":1,"deleted_at":null,"report_tasks":[{"task_id":task_id,"sort_order":1,"title_snapshot":"关联事项","path_snapshot":"默认 / 关联事项"}]});
+        let domains = apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &device_id,
+            11,
+            &[
+                incremental_entity(
+                    "time_entries",
+                    "time_segments",
+                    entry_id.clone(),
+                    false,
+                    Some(entry),
+                ),
+                incremental_entity(
+                    "reports",
+                    "report_tasks",
+                    report_id.clone(),
+                    false,
+                    Some(report),
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(domains, vec!["reports", "time"]);
+        let connection = database.open().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM time_segments WHERE entry_id=?1",
+                    [&entry_id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT minutes FROM time_allocations WHERE entry_id=?1",
+                    [&entry_id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            60
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM report_tasks WHERE report_id=?1",
+                    [&report_id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -4126,27 +5845,6 @@ mod tests {
     }
 
     #[test]
-    fn cloud_unassigned_refresh_keeps_local_cache_while_snapshot_is_deferred() {
-        assert!(should_use_local_unassigned_state_after_cloud_refresh_error(
-            "SYNC_PENDING: 本机还有待同步操作"
-        ));
-        assert!(should_use_local_unassigned_state_after_cloud_refresh_error(
-            "SYNC_RETRY: 快照导入期间本机又发生修改"
-        ));
-        assert!(should_use_local_unassigned_state_after_cloud_refresh_error(
-            "NETWORK_ERROR: Supabase 暂时不可用"
-        ));
-        assert!(should_use_local_unassigned_state_after_cloud_refresh_error(
-            "AUTH_REQUIRED: 云端会话暂时不可用"
-        ));
-        assert!(
-            !should_use_local_unassigned_state_after_cloud_refresh_error(
-                "VERSION_CONFLICT: 未归属会话版本已变化"
-            )
-        );
-    }
-
-    #[test]
     fn direct_snapshot_refresh_is_blocked_by_all_dirty_outbox_states() {
         for dirty_state in ["pending", "failed", "sending", "conflict"] {
             let (_directory, database, _) = cloud_database_with_outbox_state(
@@ -4163,7 +5861,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_pull_is_blocked_by_all_dirty_outbox_states_before_network() {
+    fn incremental_pull_is_not_globally_blocked_by_dirty_outbox_states() {
         for dirty_state in ["pending", "failed", "sending", "conflict"] {
             let (_directory, database, _) = cloud_database_with_outbox_state(
                 &format!("cloud-pull-dirty-{dirty_state}.sqlite3"),
@@ -4179,8 +5877,8 @@ mod tests {
             )
             .unwrap_err();
             assert!(
-                error.starts_with("SYNC_PENDING:"),
-                "dirty outbox state {dirty_state} should block incremental pull before network, got {error}"
+                !error.starts_with("SYNC_PENDING:"),
+                "dirty outbox state {dirty_state} must be handled per entity, got {error}"
             );
         }
     }
@@ -5749,35 +7447,6 @@ mod tests {
             cloud_entity_version(&snapshot, "task", Some("missing"), &Value::Null),
             None
         );
-    }
-
-    #[test]
-    fn outbox_only_refreshes_snapshot_after_the_queue_is_clean() {
-        assert!(should_pull_snapshot_after_push(1, 0, 0));
-        assert!(!should_pull_snapshot_after_push(0, 0, 0));
-        assert!(!should_pull_snapshot_after_push(1, 1, 0));
-        assert!(!should_pull_snapshot_after_push(1, 0, 1));
-    }
-
-    #[test]
-    fn manual_refresh_only_pulls_snapshot_after_the_queue_is_clean() {
-        assert!(should_pull_snapshot_after_manual_refresh(0, 0));
-        assert!(!should_pull_snapshot_after_manual_refresh(1, 0));
-        assert!(!should_pull_snapshot_after_manual_refresh(0, 1));
-        assert!(!should_pull_snapshot_after_manual_refresh(2, 3));
-    }
-
-    #[test]
-    fn snapshot_refresh_races_are_deferred_without_becoming_sync_errors() {
-        assert!(should_defer_snapshot_refresh_after_local_race(
-            "SYNC_PENDING: 本机产生了新的待同步操作"
-        ));
-        assert!(should_defer_snapshot_refresh_after_local_race(
-            "SYNC_RETRY: 拉取期间本地数据发生变化"
-        ));
-        assert!(!should_defer_snapshot_refresh_after_local_race(
-            "NETWORK_ERROR: 云端不可用"
-        ));
     }
 
     #[test]

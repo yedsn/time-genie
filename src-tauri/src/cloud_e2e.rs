@@ -18,6 +18,7 @@ use crate::cloud_sync::{
 };
 use crate::database::Database;
 use crate::recurring::{self, RecurrenceSaveRequest};
+use crate::reports::{self, ReportCreateRequest, ReportListRequest};
 use crate::subjects;
 use crate::supabase::{
     self, CloudConfigureRequest, CloudDeviceRegisterRequest, CloudSignInRequest,
@@ -26,7 +27,7 @@ use crate::supabase::{
 use crate::tasks::{
     self, TaskCreateRequest, TaskDailyEstimateSetRequest, TaskListRequest, TaskUpdateRequest,
 };
-use crate::time_tracking::{self, TimeEntryListRequest};
+use crate::time_tracking::{self, ManualEntryRequest, TimeEntryListRequest};
 use crate::unassigned::{self, ResolveWorkRequest, UnassignedAllocationInput};
 
 struct TestConfig {
@@ -246,13 +247,21 @@ struct PlanningCloudState {
     occurrences: HashMap<String, Value>,
     daily_estimates: HashMap<String, Value>,
     recurrence_rules: HashMap<String, Vec<Value>>,
+    time_entries: HashMap<String, Value>,
+    report_templates: HashMap<String, Value>,
+    reports: HashMap<String, Value>,
     changes: Vec<Value>,
+    incremental_pull_count: usize,
+    snapshot_get_count: usize,
+    force_reset_required_once: bool,
 }
 
 struct PlanningCloudServer {
     base_url: String,
     state: Arc<Mutex<PlanningCloudState>>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    apply_patch_delay_millis: Arc<std::sync::atomic::AtomicU64>,
+    apply_patch_started: Arc<std::sync::atomic::AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -263,14 +272,23 @@ impl PlanningCloudServer {
         let address = listener.local_addr().unwrap();
         let state = Arc::new(Mutex::new(PlanningCloudState::default()));
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let apply_patch_delay_millis = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let apply_patch_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_state = Arc::clone(&state);
         let thread_shutdown = Arc::clone(&shutdown);
+        let thread_apply_patch_delay_millis = Arc::clone(&apply_patch_delay_millis);
+        let thread_apply_patch_started = Arc::clone(&apply_patch_started);
         let handle = thread::spawn(move || {
             while !thread_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         stream.set_nonblocking(false).unwrap();
-                        handle_planning_cloud_request(stream, &thread_state);
+                        handle_planning_cloud_request(
+                            stream,
+                            &thread_state,
+                            &thread_apply_patch_delay_millis,
+                            &thread_apply_patch_started,
+                        );
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -283,11 +301,13 @@ impl PlanningCloudServer {
             base_url: format!("http://{address}"),
             state,
             shutdown,
+            apply_patch_delay_millis,
+            apply_patch_started,
             handle: Some(handle),
         }
     }
 
-    fn seed(&self, subject: &subjects::SubjectDto, task: &tasks::TaskDto) {
+    fn seed(&self, database: &Database, subject: &subjects::SubjectDto, task: &tasks::TaskDto) {
         let now = chrono::Utc::now().timestamp_millis();
         let mut state = self.state.lock().unwrap();
         state.subjects.insert(
@@ -303,6 +323,66 @@ impl PlanningCloudServer {
             }),
         );
         state.tasks.insert(task.id.clone(), task_payload(task));
+        let connection = database.open().unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT id,report_type,subject_id,content,is_builtin,created_at,updated_at,version,deleted_at FROM report_templates",
+            )
+            .unwrap();
+        let templates = statement
+            .query_map([], |row| {
+                Ok(json!({
+                    "id": row.get::<_, String>(0)?,
+                    "report_type": row.get::<_, String>(1)?,
+                    "subject_id": row.get::<_, Option<String>>(2)?,
+                    "content": row.get::<_, String>(3)?,
+                    "is_builtin": row.get::<_, i64>(4)? == 1,
+                    "created_at": row.get::<_, i64>(5)?,
+                    "updated_at": row.get::<_, i64>(6)?,
+                    "version": row.get::<_, i64>(7)?,
+                    "deleted_at": row.get::<_, Option<i64>>(8)?,
+                }))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for template in templates {
+            state
+                .report_templates
+                .insert(template["id"].as_str().unwrap().to_string(), template);
+        }
+    }
+
+    fn request_counts(&self) -> (usize, usize) {
+        let state = self.state.lock().unwrap();
+        (state.incremental_pull_count, state.snapshot_get_count)
+    }
+
+    fn require_snapshot_reset_once(&self) {
+        self.state.lock().unwrap().force_reset_required_once = true;
+    }
+
+    fn delay_next_apply_patch(&self, delay: Duration) {
+        self.apply_patch_started
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.apply_patch_delay_millis.store(
+            delay.as_millis() as u64,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    fn wait_for_delayed_apply_patch(&self) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !self
+            .apply_patch_started
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "慢网测试没有观察到上传请求"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 
@@ -419,21 +499,140 @@ fn planning_snapshot(state: &PlanningCloudState) -> Value {
         "task_daily_estimates": state.daily_estimates.values().cloned().collect::<Vec<_>>(),
         "task_recurrence_rules": state.recurrence_rules.values().flatten().cloned().collect::<Vec<_>>(),
         "task_occurrences": state.occurrences.values().cloned().collect::<Vec<_>>(),
-        "work_days": [], "time_entries": [], "time_segments": [], "time_allocations": [],
-        "unassigned_sessions": [], "unassigned_segments": [], "report_templates": [],
-        "reports": [], "report_tasks": [], "app_settings": [], "integration_configs": [],
+        "work_days": [], "time_entries": state.time_entries.values().cloned().collect::<Vec<_>>(), "time_segments": [], "time_allocations": [],
+        "unassigned_sessions": [], "unassigned_segments": [], "report_templates": state.report_templates.values().cloned().collect::<Vec<_>>(),
+        "reports": state.reports.values().cloned().collect::<Vec<_>>(), "report_tasks": [], "app_settings": [], "integration_configs": [],
         "external_bindings": []
     })
 }
 
-fn handle_planning_cloud_request(mut stream: TcpStream, state: &Arc<Mutex<PlanningCloudState>>) {
+fn planning_incremental_entity(
+    state: &PlanningCloudState,
+    source_entity_type: &str,
+    entity_id: &str,
+    change_seq: i64,
+) -> Value {
+    let (entity_type, data) = match source_entity_type {
+        "subjects" => ("subjects", state.subjects.get(entity_id).cloned()),
+        "tasks" => ("tasks", state.tasks.get(entity_id).cloned()),
+        "task_daily_estimates" => (
+            "task_daily_estimates",
+            state.daily_estimates.get(entity_id).cloned(),
+        ),
+        "task_recurrence_rules" => (
+            "task_recurrence_rules",
+            Some(json!({
+                "task_id": entity_id,
+                "rules": state
+                    .recurrence_rules
+                    .get(entity_id)
+                    .cloned()
+                    .unwrap_or_default()
+            })),
+        ),
+        "task_occurrences" => (
+            "task_occurrences",
+            state.occurrences.get(entity_id).cloned(),
+        ),
+        "time_entries" | "time_segments" | "time_allocations" => {
+            ("time_entries", state.time_entries.get(entity_id).cloned())
+        }
+        "reports" | "report_tasks" => ("reports", state.reports.get(entity_id).cloned()),
+        "report_templates" => (
+            "report_templates",
+            state.report_templates.get(entity_id).cloned(),
+        ),
+        other => (other, None),
+    };
+    json!({
+        "entity_type": entity_type,
+        "source_entity_type": source_entity_type,
+        "entity_id": entity_id,
+        "change_seq": change_seq,
+        "deleted": data.is_none(),
+        "data": data
+    })
+}
+
+fn planning_incremental_pull(state: &PlanningCloudState, body: &Value) -> Value {
+    let after = body["p_after_change_seq"]
+        .as_i64()
+        .unwrap_or_default()
+        .max(0);
+    let limit = body["p_limit"].as_i64().unwrap_or(200).clamp(1, 1_000) as usize;
+    let changes = state
+        .changes
+        .iter()
+        .filter(|change| change["change_seq"].as_i64().unwrap_or_default() > after)
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    let covered_change_seq = changes
+        .last()
+        .and_then(|change| change["change_seq"].as_i64())
+        .unwrap_or(after);
+    let mut latest_entities = HashMap::<(String, String), Value>::new();
+    for change in &changes {
+        let source_entity_type = change["entity_type"].as_str().unwrap().to_string();
+        let entity_id = change["entity_id"].as_str().unwrap().to_string();
+        latest_entities.insert((source_entity_type, entity_id), change.clone());
+    }
+    let mut latest_entities = latest_entities.into_values().collect::<Vec<_>>();
+    latest_entities.sort_by_key(|change| change["change_seq"].as_i64().unwrap_or_default());
+    let entities = latest_entities
+        .iter()
+        .map(|change| {
+            planning_incremental_entity(
+                state,
+                change["entity_type"].as_str().unwrap(),
+                change["entity_id"].as_str().unwrap(),
+                change["change_seq"].as_i64().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "changes": changes,
+        "entities": entities,
+        "covered_change_seq": covered_change_seq,
+        "latest_change_seq": state.latest_change_seq,
+        "has_more": covered_change_seq < state.latest_change_seq,
+        "reset_required": false
+    })
+}
+
+fn handle_planning_cloud_request(
+    mut stream: TcpStream,
+    state: &Arc<Mutex<PlanningCloudState>>,
+    apply_patch_delay_millis: &std::sync::atomic::AtomicU64,
+    apply_patch_started: &std::sync::atomic::AtomicBool,
+) {
     let (request_line, body) = read_http_request(&mut stream);
     let mut state = state.lock().unwrap();
     if request_line.contains("/rest/v1/rpc/device_authorization_get") {
         return write_http_json(&mut stream, 200, json!({ "authorized": true }));
     }
     if request_line.contains("/rest/v1/rpc/cloud_snapshot_get") {
+        state.snapshot_get_count += 1;
         return write_http_json(&mut stream, 200, planning_snapshot(&state));
+    }
+    if request_line.contains("/rest/v1/rpc/cloud_incremental_pull") {
+        state.incremental_pull_count += 1;
+        if state.force_reset_required_once {
+            state.force_reset_required_once = false;
+            return write_http_json(
+                &mut stream,
+                200,
+                json!({
+                    "changes": [],
+                    "entities": [],
+                    "covered_change_seq": body["p_after_change_seq"].as_i64().unwrap_or_default(),
+                    "latest_change_seq": state.latest_change_seq,
+                    "has_more": false,
+                    "reset_required": true
+                }),
+            );
+        }
+        return write_http_json(&mut stream, 200, planning_incremental_pull(&state, &body));
     }
     if request_line.contains("/rest/v1/workspace_changes?") {
         let after = request_line
@@ -457,12 +656,86 @@ fn handle_planning_cloud_request(mut stream: TcpStream, state: &Arc<Mutex<Planni
             json!({ "message": format!("unexpected request: {request_line}") }),
         );
     }
+    apply_patch_started.store(true, std::sync::atomic::Ordering::Release);
+    let delay = apply_patch_delay_millis.swap(0, std::sync::atomic::Ordering::AcqRel);
+    if delay > 0 {
+        thread::sleep(Duration::from_millis(delay));
+    }
     let workspace_id = body["p_workspace_id"].as_str().unwrap();
     let entity_type = body["p_entity_type"].as_str().unwrap();
     let entity_id = body["p_entity_id"].as_str().unwrap();
     let base_version = body["p_base_version"].as_i64();
     let payload = body["p_payload"].clone();
     match entity_type {
+        "task" => {
+            let current = state
+                .tasks
+                .get(entity_id)
+                .and_then(|row| row["version"].as_i64());
+            if current != base_version {
+                return write_http_json(
+                    &mut stream,
+                    409,
+                    json!({ "message": "SYNC_CONFLICT: task version changed" }),
+                );
+            }
+            let version = payload["version"].as_i64().unwrap_or(1);
+            state.tasks.insert(entity_id.to_string(), payload);
+            record_change(
+                &mut state,
+                workspace_id,
+                "tasks",
+                entity_id,
+                "update",
+                version,
+            );
+        }
+        "time_entry" => {
+            let current = state
+                .time_entries
+                .get(entity_id)
+                .and_then(|row| row["version"].as_i64());
+            if current != base_version {
+                return write_http_json(
+                    &mut stream,
+                    409,
+                    json!({ "message": "SYNC_CONFLICT: time entry version changed" }),
+                );
+            }
+            let version = payload["version"].as_i64().unwrap_or(1);
+            state.time_entries.insert(entity_id.to_string(), payload);
+            record_change(
+                &mut state,
+                workspace_id,
+                "time_entries",
+                entity_id,
+                "update",
+                version,
+            );
+        }
+        "report" => {
+            let current = state
+                .reports
+                .get(entity_id)
+                .and_then(|row| row["version"].as_i64());
+            if current != base_version {
+                return write_http_json(
+                    &mut stream,
+                    409,
+                    json!({ "message": "SYNC_CONFLICT: report version changed" }),
+                );
+            }
+            let version = payload["version"].as_i64().unwrap_or(1);
+            state.reports.insert(entity_id.to_string(), payload);
+            record_change(
+                &mut state,
+                workspace_id,
+                "reports",
+                entity_id,
+                "update",
+                version,
+            );
+        }
         "task_occurrence" => {
             let current = state
                 .occurrences
@@ -729,8 +1002,9 @@ fn isolated_supabase_planning_two_device_flow() {
     );
     let subject = subjects::list_subjects(&device_a).unwrap().remove(0);
     let task = create_task(&device_a, &subject.id, "隔离 Supabase 规划事项");
-    cloud.seed(&subject, &task);
+    cloud.seed(&device_a, &subject, &task);
     cloud_sync::pull_snapshot(&device_b).unwrap();
+    let (_, snapshots_after_initialization) = cloud.request_counts();
 
     let today = chrono::Local::now().date_naive();
     let today_text = today.format("%Y-%m-%d").to_string();
@@ -742,6 +1016,150 @@ fn isolated_supabase_planning_two_device_flow() {
         .unwrap()
         .format("%Y-%m-%d")
         .to_string();
+
+    // Keep a local dirty task on device B while device A publishes that same
+    // task plus unrelated time/report aggregates. The dirty task must be
+    // deferred without blocking the other two entities in the same catch-up.
+    let task_on_a = update_task_title(&device_a, &task, "设备 A 云端标题");
+    cloud_sync::enqueue_entity(
+        &device_a,
+        "task_update",
+        "task",
+        Some(&task_on_a.id),
+        Some(task.version),
+        None,
+    )
+    .unwrap();
+    let task_on_b = update_task_title(&device_b, &task, "设备 B 本地待同步标题");
+    cloud_sync::enqueue_entity_deferred(
+        &device_b,
+        "task_update",
+        "task",
+        Some(&task_on_b.id),
+        Some(task.version),
+        Some(&Uuid::now_v7().to_string()),
+    )
+    .unwrap();
+    let time_entry = time_tracking::create_manual_entry(
+        &device_a,
+        ManualEntryRequest {
+            task_id: Some(task.id.clone()),
+            work_date: today_text.clone(),
+            started_at: None,
+            ended_at: None,
+            minutes: Some(30),
+            note: Some("隔离双设备工时".to_string()),
+            complete_task: false,
+            task_expected_version: None,
+            client_request_id: Uuid::now_v7().to_string(),
+        },
+    )
+    .unwrap();
+    cloud_sync::enqueue_entity(
+        &device_a,
+        "time_entry_create_manual",
+        "time_entry",
+        Some(&time_entry.id),
+        None,
+        None,
+    )
+    .unwrap();
+    let report = reports::create_report(
+        &device_a,
+        ReportCreateRequest {
+            report_type: "daily".to_string(),
+            reference_date: today_text.clone(),
+            subject_id: subject.id.clone(),
+            task_ids: vec![task.id.clone()],
+            client_request_id: Uuid::now_v7().to_string(),
+        },
+    )
+    .unwrap();
+    cloud_sync::enqueue_entity(
+        &device_a,
+        "report_create",
+        "report",
+        Some(&report.id),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        list_tasks(&device_b)
+            .into_iter()
+            .find(|candidate| candidate.id == task.id)
+            .map(|candidate| candidate.title),
+        Some("设备 B 本地待同步标题".to_string())
+    );
+    assert!(
+        today_entries(&device_b)
+            .entries
+            .iter()
+            .any(|entry| entry.id == time_entry.id),
+        "dirty 事项阻塞了无关工时聚合"
+    );
+    assert!(
+        reports::list_reports(
+            &device_b,
+            ReportListRequest {
+                report_type: None,
+                subject_id: None,
+                query: None,
+            },
+        )
+        .unwrap()
+        .reports
+        .iter()
+        .any(|candidate| candidate.id == report.id),
+        "dirty 事项阻塞了无关报告聚合"
+    );
+    assert_eq!(
+        cloud.request_counts().1,
+        snapshots_after_initialization,
+        "普通事项、工时和报告增量不应进入完整快照"
+    );
+    assert_eq!(push_all(&device_b).conflicts, 1);
+    let task_conflict = cloud_sync::list_conflicts(&device_b)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.entity_type == "task")
+        .expect("普通事项同实体 dirty 冲突没有进入冲突列表");
+    cloud_sync::resolve_conflict(
+        &device_b,
+        CloudConflictResolveRequest {
+            operation_id: task_conflict.operation_id,
+            strategy: "use_cloud".to_string(),
+        },
+    )
+    .unwrap();
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            // The production coordinator rewinds to the earliest deferred
+            // change before this pull. The isolated test drives the pull
+            // directly, so make that rewind explicit here.
+            after_change_seq: Some(0),
+            limit: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        list_tasks(&device_b)
+            .into_iter()
+            .find(|candidate| candidate.id == task.id)
+            .map(|candidate| candidate.title),
+        Some("设备 A 云端标题".to_string())
+    );
+    let snapshots_after_business_incremental = cloud.request_counts().1;
 
     tasks::set_task_daily_estimate_for_cloud_test(
         &device_a,
@@ -770,6 +1188,12 @@ fn isolated_supabase_planning_two_device_flow() {
     .unwrap();
 
     assert_eq!(daily_estimate(&device_b, &task.id, &today_text), Some(45));
+    let (incremental_pulls, snapshots_after_incremental) = cloud.request_counts();
+    assert!(incremental_pulls > 0);
+    assert_eq!(
+        snapshots_after_incremental,
+        snapshots_after_business_incremental
+    );
 
     let rule = recurring::save_rule_for_cloud_test(
         &device_a,
@@ -852,6 +1276,14 @@ fn isolated_supabase_planning_two_device_flow() {
         },
     )
     .unwrap();
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: None,
+        },
+    )
+    .unwrap();
     assert_eq!(daily_estimate(&device_b, &task.id, &today_text), Some(60));
 
     tasks::set_task_daily_estimate_for_cloud_test(
@@ -876,8 +1308,42 @@ fn isolated_supabase_planning_two_device_flow() {
     .unwrap();
     assert_eq!(push_all(&device_a).conflicts, 0);
     assert_eq!(push_all(&device_b).conflicts, 0);
-    cloud_sync::pull_snapshot(&device_a).unwrap();
-    cloud_sync::pull_snapshot(&device_b).unwrap();
+    cloud_sync::pull(
+        &device_a,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: Some(1),
+        },
+    )
+    .unwrap();
+    while cloud_sync::pull(
+        &device_a,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: Some(1),
+        },
+    )
+    .unwrap()
+    .has_more
+    {}
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: Some(1),
+        },
+    )
+    .unwrap();
+    while cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: Some(1),
+        },
+    )
+    .unwrap()
+    .has_more
+    {}
     for database in [&device_a, &device_b] {
         assert_eq!(daily_estimate(database, &task.id, &tomorrow_text), Some(30));
         assert_eq!(daily_estimate(database, &task.id, &next_text), Some(20));
@@ -924,6 +1390,14 @@ fn isolated_supabase_planning_two_device_flow() {
         },
     )
     .unwrap();
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: None,
+        },
+    )
+    .unwrap();
     let local_workspace_id: String = device_b
         .open()
         .unwrap()
@@ -949,8 +1423,71 @@ fn isolated_supabase_planning_two_device_flow() {
     )
     .unwrap();
     assert_eq!(push_all(&device_a).conflicts, 0);
-    cloud_sync::pull_snapshot(&device_b).unwrap();
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: None,
+        },
+    )
+    .unwrap();
     assert_eq!(daily_estimate(&device_b, &task.id, &today_text), None);
+
+    let snapshots_before_reset = cloud.request_counts().1;
+    cloud.require_snapshot_reset_once();
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(cloud.request_counts().1, snapshots_before_reset + 1);
+}
+
+#[test]
+fn slow_cloud_upload_does_not_block_local_sqlite_reads_or_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::initialize_at(directory.path().join("slow-cloud.sqlite3")).unwrap();
+    let cloud = PlanningCloudServer::start();
+    let workspace_id = Uuid::now_v7().to_string();
+    configure_isolated_planning_device(
+        &database,
+        &cloud.base_url,
+        &workspace_id,
+        "slow-cloud-user",
+    );
+    let subject = subjects::list_subjects(&database).unwrap().remove(0);
+    let task = create_task(&database, &subject.id, "慢网上传事项");
+    cloud.seed(&database, &subject, &task);
+    let updated = update_task_title(&database, &task, "等待慢网提交");
+    cloud_sync::enqueue_entity_deferred(
+        &database,
+        "task_update",
+        "task",
+        Some(&updated.id),
+        Some(task.version),
+        None,
+    )
+    .unwrap();
+
+    cloud.delay_next_apply_patch(Duration::from_millis(700));
+    let upload_database = database.clone();
+    let upload = thread::spawn(move || cloud_sync::push_outbox(&upload_database).unwrap());
+    cloud.wait_for_delayed_apply_patch();
+
+    let started = std::time::Instant::now();
+    let local_task = create_task(&database, &subject.id, "慢网期间仍可本地写入");
+    assert!(list_tasks(&database)
+        .iter()
+        .any(|candidate| candidate.id == local_task.id));
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "云端请求等待期间，本地 SQLite 操作耗时 {:?}",
+        started.elapsed()
+    );
+    assert_eq!(upload.join().unwrap().conflicts, 0);
 }
 
 #[test]
@@ -1259,6 +1796,14 @@ fn real_supabase_two_device_flow() {
         },
     )
     .unwrap();
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: Some(0),
+            limit: None,
+        },
+    )
+    .unwrap();
     assert_eq!(
         daily_estimate(&device_b, &planning_task.id, &today_text),
         Some(60)
@@ -1356,6 +1901,14 @@ fn real_supabase_two_device_flow() {
         },
     )
     .unwrap();
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: Some(0),
+            limit: None,
+        },
+    )
+    .unwrap();
     assert_eq!(
         recurring::get_active_rule(
             &device_b.open().unwrap(),
@@ -1427,6 +1980,14 @@ fn real_supabase_two_device_flow() {
         CloudConflictResolveRequest {
             operation_id: conflicts[0].operation_id.clone(),
             strategy: "use_cloud".to_string(),
+        },
+    )
+    .unwrap();
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: Some(0),
+            limit: None,
         },
     )
     .unwrap();
