@@ -162,6 +162,7 @@ const cloudSaveView = computed(() => cloudSyncPresentation(visibleCloudSaveState
 const cloudSaveLabel = computed(() => cloudSaveStatusLabel(visibleCloudSaveState.value));
 const cloudSaveNeedsAttention = computed(() => cloudSaveView.value.needsAttention);
 const cloudSaveAttentionLevel = computed(() => cloudSaveView.value.attentionLevel);
+const cloudSyncIndicatorWorking = computed(() => cloudSyncWorking.value || Boolean(visibleCloudSaveState.value?.syncing));
 const cloudAccountLabel = computed(() => {
   if (storageState.value?.mode !== "cloud") return "本地模式";
   return cloudSessionLabel(cloudSession.value);
@@ -194,7 +195,7 @@ const cloudDockSyncLabel = computed(() => {
 const CLOUD_SAVE_PENDING_MIN_VISIBLE_MS = 650;
 
 function hasVisiblePendingSave(state: StorageModeSnapshot | undefined): boolean {
-  return Boolean(state?.mode === "cloud" && state.pendingOperations > 0 && state.conflictCount === 0);
+  return Boolean(state?.mode === "cloud" && (state.syncing || state.pendingOperations > 0) && state.conflictCount === 0);
 }
 
 function updateVisibleCloudSaveState(state: StorageModeSnapshot | undefined) {
@@ -1470,10 +1471,10 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
       </section>
       </div>
       <footer class="sync-status-dock" aria-label="保存状态">
-        <div class="sync-status-main" :class="[cloudSyncAttentionLevel, { working: cloudSyncWorking }]">
+        <div class="sync-status-main" :class="[cloudSyncAttentionLevel, { working: cloudSyncIndicatorWorking }]">
           <button class="sync-user-pill" type="button" :title="`${cloudAccountLabel}，点击管理账号`" @click="openCloudAccountSettings"><UserRound :size="14" /><strong>{{ cloudAccountLabel }}</strong></button>
           <button class="sync-state-pill" :class="[cloudSaveAttentionLevel, { synced: visibleCloudSaveState?.mode === 'cloud' && !cloudSaveNeedsAttention }]" type="button" :title="`${cloudSaveLabel}，点击查看待保存列表`" @click="openCloudSyncQueue">
-            <LoaderCircle v-if="cloudSyncWorking" class="sync-spin" :size="14" />
+            <LoaderCircle v-if="cloudSyncIndicatorWorking" class="sync-spin" :size="14" />
             <AlertTriangle v-else-if="cloudSaveNeedsAttention" :size="14" />
             <CheckCircle2 v-else :size="14" />
             <span>{{ cloudSaveLabel }}</span>

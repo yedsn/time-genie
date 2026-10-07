@@ -2,6 +2,7 @@ export type CloudSyncPresentationState = {
   mode: "local" | "cloud" | string;
   online: boolean;
   syncState: "synced" | "pending" | "conflict" | "error" | string;
+  syncing?: boolean;
   pendingOperations: number;
   conflictCount: number;
   lastSyncedAt?: number;
@@ -32,6 +33,9 @@ export function cloudSaveStatusLabel(state: CloudSyncPresentationState | undefin
   if (!state || state.mode !== "cloud") return "仅保存在本机";
 
   const pending = Math.max(0, state.pendingOperations) + Math.max(0, state.conflictCount);
+  if (state.syncing && state.online && !state.lastError && state.conflictCount === 0) {
+    return pending > 0 ? `正在同步 · 还有 ${pending} 项待保存` : "正在同步";
+  }
   if (pending > 0) return `还有 ${pending} 项待保存`;
   if (state.lastError || state.syncState === "error") return "保存失败";
   if (!state.online) return "云端连接不可用";
@@ -61,6 +65,17 @@ export function cloudSyncPresentation(
         : "本机修改已保存，需处理冲突后继续同步",
       needsAttention: true,
       attentionLevel: "critical",
+    };
+  }
+
+  if (state.syncing && state.online && !state.lastError && state.syncState !== "error") {
+    return {
+      label: state.pendingOperations > 0
+        ? `正在同步 · 还有 ${state.pendingOperations} 项待保存`
+        : "正在同步",
+      detail: "正在后台保存并补齐云端变化",
+      needsAttention: false,
+      attentionLevel: "",
     };
   }
 

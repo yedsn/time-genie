@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -24,6 +24,7 @@ const REALTIME_RECONNECT_SECONDS: u64 = 5;
 const REALTIME_RECONNECT_MAX_SECONDS: u64 = 60;
 const OUTBOX_SENDING_STALE_AFTER_MILLIS: i64 = 5 * 60 * 1000;
 const OUTBOX_RETRY_MAX_BACKOFF_MILLIS: i64 = 60 * 1000;
+const SYNC_SETTLE_GRACE_MILLIS: u64 = 1_500;
 const SYNC_SIGNAL_LOCAL_DIRTY: u8 = 1;
 const SYNC_SIGNAL_REMOTE_HINT: u8 = 1 << 1;
 const SYNC_SIGNAL_CONNECTION_READY: u8 = 1 << 2;
@@ -35,8 +36,8 @@ static CLOUD_MODE_WAKEUP: OnceLock<Arc<Notify>> = OnceLock::new();
 static CLOUD_SYNC_APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 static CLOUD_SYNC_SIGNALS: AtomicU8 = AtomicU8::new(0);
 static CLOUD_SYNC_OBSERVED_REMOTE_SEQ: AtomicI64 = AtomicI64::new(0);
-static CLOUD_SYNC_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static CLOUD_SYNC_ENABLED: AtomicBool = AtomicBool::new(false);
+static CLOUD_SYNC_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static CLOUD_SYNC_TEST_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -65,6 +66,7 @@ fn cloud_mode_wakeup() -> Arc<Notify> {
 }
 
 fn signal_cloud_sync(signal: u8, observed_change_seq: Option<i64>) {
+    CLOUD_SYNC_ACTIVE.store(true, Ordering::Release);
     CLOUD_SYNC_SIGNALS.fetch_or(signal, Ordering::Release);
     if let Some(observed_change_seq) = observed_change_seq {
         CLOUD_SYNC_OBSERVED_REMOTE_SEQ.fetch_max(observed_change_seq, Ordering::AcqRel);
@@ -80,6 +82,7 @@ pub(crate) fn wake_after_connection_ready() {
 
 pub(crate) fn disable_cloud_sync() {
     CLOUD_SYNC_ENABLED.store(false, Ordering::Release);
+    CLOUD_SYNC_ACTIVE.store(false, Ordering::Release);
     CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
     CLOUD_SYNC_OBSERVED_REMOTE_SEQ.store(0, Ordering::Release);
     clear_tracking_lease_token();
@@ -105,6 +108,10 @@ fn spawn_sync_coordinator(database: Database, app: AppHandle) {
             if signals == 0 {
                 continue;
             }
+            CLOUD_SYNC_ACTIVE.store(true, Ordering::Release);
+            if let Ok(status) = sync_status(&database) {
+                let _ = app.emit("cloud-sync-state-changed", &status);
+            }
             let database_for_round = database.clone();
             let observed_remote_seq = CLOUD_SYNC_OBSERVED_REMOTE_SEQ.swap(0, Ordering::AcqRel);
             let round = tauri::async_runtime::spawn_blocking(move || {
@@ -127,10 +134,12 @@ fn spawn_sync_coordinator(database: Database, app: AppHandle) {
                     retry_after = result.retry_after;
                 }
                 Ok(Err(error)) => {
+                    CLOUD_SYNC_ACTIVE.store(false, Ordering::Release);
                     emit_cloud_error(&app, &database, &error);
                     retry_after = next_outbox_retry_delay(&database).ok().flatten();
                 }
                 Err(error) => {
+                    CLOUD_SYNC_ACTIVE.store(false, Ordering::Release);
                     emit_cloud_error(
                         &app,
                         &database,
@@ -140,6 +149,27 @@ fn spawn_sync_coordinator(database: Database, app: AppHandle) {
             }
             if CLOUD_SYNC_SIGNALS.load(Ordering::Acquire) != 0 {
                 cloud_sync_wakeup().notify_one();
+            } else if retry_after.is_none() {
+                let interrupted = tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(SYNC_SETTLE_GRACE_MILLIS)) => false,
+                    _ = wakeup.notified() => true,
+                };
+                if interrupted || CLOUD_SYNC_SIGNALS.load(Ordering::Acquire) != 0 {
+                    cloud_sync_wakeup().notify_one();
+                    continue;
+                }
+                CLOUD_SYNC_ACTIVE.store(false, Ordering::Release);
+                if CLOUD_SYNC_SIGNALS.load(Ordering::Acquire) != 0 {
+                    CLOUD_SYNC_ACTIVE.store(true, Ordering::Release);
+                    cloud_sync_wakeup().notify_one();
+                } else if let Ok(status) = sync_status(&database) {
+                    let _ = app.emit("cloud-sync-state-changed", &status);
+                }
+            } else {
+                CLOUD_SYNC_ACTIVE.store(false, Ordering::Release);
+                if let Ok(status) = sync_status(&database) {
+                    let _ = app.emit("cloud-sync-state-changed", &status);
+                }
             }
         }
     });
@@ -501,6 +531,7 @@ fn emit_cloud_error(app: &AppHandle, database: &Database, error: &str) {
                 "deviceId": status.device_id,
                 "online": false,
                 "syncState": status.sync_state,
+                "syncing": false,
                 "lastChangeSeq": status.last_change_seq,
                 "lastSyncedAt": status.last_synced_at,
                 "lastError": status.last_error.as_deref().unwrap_or(error),
@@ -520,6 +551,7 @@ pub struct CloudSyncStatus {
     pub device_id: String,
     pub online: bool,
     pub sync_state: String,
+    pub syncing: bool,
     pub last_change_seq: i64,
     pub last_synced_at: Option<i64>,
     pub last_error: Option<String>,
@@ -879,6 +911,7 @@ pub fn sync_status(database: &Database) -> Result<CloudSyncStatus, String> {
         device_id: state.device_id,
         online: state.online,
         sync_state: state.sync_state,
+        syncing: CLOUD_SYNC_ACTIVE.load(Ordering::Acquire),
         last_change_seq: state.last_change_seq,
         last_synced_at: state.last_synced_at,
         last_error: state.last_error,
@@ -2623,12 +2656,12 @@ fn ensure_supported_cloud_entity_type(entity_type: &str) -> Result<(), String> {
 
 pub fn flush_if_online(database: &Database) -> Result<(), String> {
     if CLOUD_SYNC_ENABLED.load(Ordering::Acquire) {
+        signal_cloud_sync(SYNC_SIGNAL_LOCAL_DIRTY, None);
         if let Some(app) = CLOUD_SYNC_APP_HANDLE.get() {
             if let Ok(status) = sync_status(database) {
                 let _ = app.emit("cloud-sync-state-changed", &status);
             }
         }
-        signal_cloud_sync(SYNC_SIGNAL_LOCAL_DIRTY, None);
     }
     Ok(())
 }
@@ -5793,9 +5826,11 @@ pub fn refresh_unassigned_state_for_cloud_mode(
     if state.mode != "cloud" {
         return crate::unassigned::get_state(database);
     }
-    signal_cloud_sync(SYNC_SIGNAL_CONNECTION_READY, None);
-    let result = crate::unassigned::get_state_with_cloud_context(database, Some(&state))?;
-    flush_if_online(database)?;
+    let (result, sync_changed) =
+        crate::unassigned::get_state_with_cloud_context_and_sync_change(database, Some(&state))?;
+    if sync_changed {
+        flush_if_online(database)?;
+    }
     Ok(result)
 }
 
@@ -6385,6 +6420,7 @@ mod tests {
             .unwrap();
         CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
         CLOUD_SYNC_OBSERVED_REMOTE_SEQ.store(0, Ordering::Release);
+        CLOUD_SYNC_ACTIVE.store(false, Ordering::Release);
         signal_cloud_sync(SYNC_SIGNAL_LOCAL_DIRTY, None);
         signal_cloud_sync(SYNC_SIGNAL_REMOTE_HINT, Some(7));
         signal_cloud_sync(SYNC_SIGNAL_REMOTE_HINT, Some(5));
@@ -6394,6 +6430,8 @@ mod tests {
         assert_eq!(signals & SYNC_SIGNAL_REMOTE_HINT, SYNC_SIGNAL_REMOTE_HINT);
         assert_eq!(signals & SYNC_SIGNAL_MANUAL_RETRY, SYNC_SIGNAL_MANUAL_RETRY);
         assert_eq!(CLOUD_SYNC_OBSERVED_REMOTE_SEQ.load(Ordering::Acquire), 7);
+        assert!(CLOUD_SYNC_ACTIVE.load(Ordering::Acquire));
+        CLOUD_SYNC_ACTIVE.store(false, Ordering::Release);
     }
 
     #[test]
@@ -6407,6 +6445,7 @@ mod tests {
             .unwrap();
         CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
         CLOUD_SYNC_OBSERVED_REMOTE_SEQ.store(0, Ordering::Release);
+        CLOUD_SYNC_ACTIVE.store(false, Ordering::Release);
         let producer_count = 8;
         let done = Arc::new(AtomicUsize::new(0));
         let mut producers = Vec::new();
@@ -6454,6 +6493,7 @@ mod tests {
         );
         assert_eq!(observed_remote_seq, 7_998);
         assert_eq!(CLOUD_SYNC_SIGNALS.load(Ordering::Acquire), 0);
+        CLOUD_SYNC_ACTIVE.store(false, Ordering::Release);
     }
 
     #[test]
@@ -7845,6 +7885,13 @@ mod tests {
 
     #[test]
     fn cloud_unassigned_refresh_falls_back_to_local_cache_without_session() {
+        let _guard = CLOUD_SYNC_TEST_STATE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        CLOUD_SYNC_ENABLED.store(true, Ordering::Release);
+        CLOUD_SYNC_ACTIVE.store(false, Ordering::Release);
+        CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
         let directory = tempdir().unwrap();
         let database = Database::initialize_at(
             directory
@@ -7876,6 +7923,23 @@ mod tests {
             .unwrap()
             .expect("本地缓存应继续提供未归属状态");
         assert_eq!(state.state, "collecting");
+        assert_eq!(
+            CLOUD_SYNC_SIGNALS.load(Ordering::Acquire) & SYNC_SIGNAL_CONNECTION_READY,
+            0
+        );
+        assert_ne!(
+            CLOUD_SYNC_SIGNALS.load(Ordering::Acquire) & SYNC_SIGNAL_LOCAL_DIRTY,
+            0
+        );
+        CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
+        CLOUD_SYNC_ACTIVE.store(false, Ordering::Release);
+        let refreshed = refresh_unassigned_state_for_cloud_mode(&database)
+            .unwrap()
+            .expect("后续读取应继续返回本地缓存");
+        assert_eq!(refreshed.session_id, state.session_id);
+        assert_eq!(CLOUD_SYNC_SIGNALS.load(Ordering::Acquire), 0);
+        assert!(!CLOUD_SYNC_ACTIVE.load(Ordering::Acquire));
+        CLOUD_SYNC_ENABLED.store(false, Ordering::Release);
     }
 
     #[test]

@@ -106,6 +106,7 @@ export type StorageModeSnapshot = {
   deviceId: string;
   online: boolean;
   syncState: "synced" | "pending" | "conflict" | "error" | string;
+  syncing?: boolean;
   pendingOperations: number;
   conflictCount: number;
   lastChangeSeq: number;

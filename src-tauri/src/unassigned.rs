@@ -137,6 +137,13 @@ pub(crate) fn get_state_with_cloud_context(
     database: &Database,
     cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
 ) -> Result<Option<UnassignedStateDto>, String> {
+    Ok(get_state_with_cloud_context_and_sync_change(database, cloud_state)?.0)
+}
+
+pub(crate) fn get_state_with_cloud_context_and_sync_change(
+    database: &Database,
+    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+) -> Result<(Option<UnassignedStateDto>, bool), String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     let now = now_millis();
@@ -184,6 +191,7 @@ pub(crate) fn get_state_with_cloud_context(
     let result = session_id
         .map(|id| load_state(&transaction, &id, now, true))
         .transpose()?;
+    let mut sync_changed = false;
     if let (Some(state), Some(result)) = (cloud_state, result.as_ref()) {
         let migrated_candidate: bool = transaction
             .query_row(
@@ -217,7 +225,7 @@ pub(crate) fn get_state_with_cloud_context(
             || (migrated_candidate && !candidate_already_queued)
             || (!migrated_candidate && existing_version != Some(result.version))
         {
-            crate::cloud_sync::enqueue_entity_in_transaction(
+            sync_changed = crate::cloud_sync::enqueue_entity_in_transaction(
                 &transaction,
                 state,
                 if created || migrated_candidate {
@@ -233,11 +241,12 @@ pub(crate) fn get_state_with_cloud_context(
                     existing_version
                 },
                 None,
-            )?;
+            )?
+            .is_some();
         }
     }
     transaction.commit().map_err(|error| error.to_string())?;
-    Ok(result)
+    Ok((result, sync_changed))
 }
 
 pub(crate) fn coordinate_sessions(database: &Database, now: i64) -> Result<(), String> {
