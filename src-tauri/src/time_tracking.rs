@@ -346,11 +346,11 @@ fn start_timer_with_cloud_operation(
             now,
         )?;
     }
-    crate::unassigned::pause_for_timer(
+    crate::unassigned::clear_for_timer(
         &transaction,
         &workspace_id,
         now,
-        cloud_operation.map(|value| value.0),
+        cloud_operation.is_some(),
     )?;
     transaction
         .execute(
@@ -566,6 +566,19 @@ fn stop_timer_with_cloud_operation(
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
+    let already_stopped: Option<i64> = transaction
+        .query_row(
+            "SELECT version FROM time_entries
+             WHERE id=?1 AND workspace_id=?2 AND source_type='timer' AND state='ended'
+               AND version=?3+1 AND deleted_at IS NULL",
+            params![request.entry_id, workspace_id, request.expected_version],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if already_stopped.is_some() {
+        return load_entry(&transaction, &request.entry_id, now);
+    }
     let (entry_id, active_version) = resolve_active_timer_request(
         &transaction,
         &workspace_id,
@@ -653,11 +666,11 @@ fn stop_timer_with_cloud_operation(
             }
         }
     }
-    crate::unassigned::resume_after_timer(
+    crate::unassigned::start_after_timer(
         &transaction,
         &workspace_id,
         now,
-        cloud_operation.map(|value| value.0),
+        cloud_operation.is_some(),
     )?;
     bump_revision(&transaction)?;
     record_runtime_heartbeat(&transaction, &workspace_id, now)?;
@@ -2787,7 +2800,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert_eq!(outbox.len(), 2);
+        assert_eq!(outbox.len(), 1);
         let timer = outbox.iter().find(|row| row.2 == "time_entry").unwrap();
         assert_eq!(timer.0, start_operation_id);
         assert_eq!(timer.1, "timer_stop");
@@ -2800,14 +2813,7 @@ mod tests {
         assert_eq!(value["state"], "ended");
         assert_eq!(value["version"], resumed.version + 1);
         assert_eq!(value["segments"].as_array().map(Vec::len), Some(2));
-        let unassigned = outbox
-            .iter()
-            .find(|row| row.2 == "unassigned_session")
-            .unwrap();
-        assert!(matches!(
-            unassigned.1.as_str(),
-            "unassigned_session_create" | "unassigned_session_resume"
-        ));
+        assert!(outbox.iter().all(|row| row.2 != "unassigned_session"));
     }
 
     #[test]

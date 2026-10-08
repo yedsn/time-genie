@@ -1455,7 +1455,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert_eq!(queued.len(), 2);
+        assert_eq!(queued.len(), 1);
         let timer = queued.iter().find(|row| row.1 == "time_entry").unwrap();
         assert_eq!(timer.0, "timer_stop");
         assert_eq!(timer.2.as_deref(), stopped["id"].as_str());
@@ -1464,13 +1464,6 @@ mod tests {
         assert_eq!(timer.5, 2);
         let payload: serde_json::Value = serde_json::from_str(&timer.6).unwrap();
         assert_eq!(payload["state"], "ended");
-        let unassigned = queued
-            .iter()
-            .find(|row| row.1 == "unassigned_session")
-            .unwrap();
-        assert!(matches!(
-            unassigned.0.as_str(),
-            "unassigned_session_create" | "unassigned_session_resume"
-        ));
+        assert!(queued.iter().all(|row| row.1 != "unassigned_session"));
     }
 }

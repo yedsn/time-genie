@@ -162,7 +162,7 @@ const cloudSaveView = computed(() => cloudSyncPresentation(visibleCloudSaveState
 const cloudSaveLabel = computed(() => cloudSaveStatusLabel(visibleCloudSaveState.value));
 const cloudSaveNeedsAttention = computed(() => cloudSaveView.value.needsAttention);
 const cloudSaveAttentionLevel = computed(() => cloudSaveView.value.attentionLevel);
-const cloudSyncIndicatorWorking = computed(() => cloudSyncWorking.value || Boolean(visibleCloudSaveState.value?.syncing));
+const cloudSyncIndicatorWorking = computed(() => Boolean(visibleCloudSaveState.value?.saving));
 const cloudAccountLabel = computed(() => {
   if (storageState.value?.mode !== "cloud") return "本地模式";
   return cloudSessionLabel(cloudSession.value);
@@ -195,7 +195,7 @@ const cloudDockSyncLabel = computed(() => {
 const CLOUD_SAVE_PENDING_MIN_VISIBLE_MS = 650;
 
 function hasVisiblePendingSave(state: StorageModeSnapshot | undefined): boolean {
-  return Boolean(state?.mode === "cloud" && (state.syncing || state.pendingOperations > 0) && state.conflictCount === 0);
+  return Boolean(state?.mode === "cloud" && state.pendingOperations > 0 && state.conflictCount === 0);
 }
 
 function updateVisibleCloudSaveState(state: StorageModeSnapshot | undefined) {
@@ -302,13 +302,13 @@ function cloudConflictActionLabel(operationType: string) {
     task_recurrence_save: "保存重复规则",
     task_recurrence_close: "关闭重复规则",
     unassigned_session_create: "开始共享未归属计时",
-    unassigned_session_pause: "暂停共享未归属计时",
-    unassigned_session_resume: "继续共享未归属计时",
-    unassigned_session_awaiting_resolution: "标记未归属时间待处理",
+    unassigned_session_pause: "兼容旧版未归属状态",
+    unassigned_session_resume: "兼容旧版未归属状态",
+    unassigned_session_awaiting_resolution: "兼容旧版未归属状态",
     unassigned_resolve_work: "分配未归属时间",
     unassigned_resolve_break: "记为休息",
     unassigned_discard: "丢弃未归属时间",
-    unassigned_time_entry_create: "保存未归属处理结果",
+    unassigned_time_entry_create: "兼容旧版处理结果",
   };
   return labels[operationType] ?? operationType;
 }

@@ -28,7 +28,9 @@ use crate::tasks::{
     self, TaskCreateRequest, TaskDailyEstimateSetRequest, TaskListRequest, TaskUpdateRequest,
 };
 use crate::time_tracking::{self, ManualEntryRequest, TimeEntryListRequest};
-use crate::unassigned::{self, ResolveWorkRequest, UnassignedAllocationInput};
+use crate::unassigned::{
+    self, ResolveSessionRequest, ResolveWorkRequest, UnassignedAllocationInput,
+};
 
 struct TestConfig {
     project_url: String,
@@ -233,10 +235,156 @@ fn push_all(database: &Database) -> cloud_sync::CloudSyncPushResult {
         }
         assert!(
             result.pushed > 0,
-            "同步队列仍有待处理操作，但本轮没有取得进展"
+            "同步队列仍有待处理操作，但本轮没有取得进展: {}",
+            database
+                .open()
+                .unwrap()
+                .prepare(
+                    "SELECT operation_type||':'||entity_type||':'||state||':'||
+                            COALESCE(depends_on_operation_id,'-')||':'||COALESCE(error_json,'-')
+                     FROM sync_outbox ORDER BY created_at,rowid",
+                )
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join(" | ")
         );
     }
     panic!("同步队列在 20 轮后仍未排空")
+}
+
+fn pull_all(database: &Database) -> cloud_sync::CloudSyncPullResult {
+    let mut combined = cloud_sync::CloudSyncPullResult {
+        changes: Vec::new(),
+        last_change_seq: 0,
+        has_more: false,
+        domains: Vec::new(),
+    };
+    for _ in 0..20 {
+        let result = cloud_sync::pull(
+            database,
+            CloudSyncPullRequest {
+                after_change_seq: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+        combined.changes.extend(result.changes);
+        combined.last_change_seq = result.last_change_seq;
+        combined.has_more = result.has_more;
+        for domain in result.domains {
+            if !combined.domains.contains(&domain) {
+                combined.domains.push(domain);
+            }
+        }
+        if !combined.has_more {
+            return combined;
+        }
+    }
+    panic!("Supabase 增量拉取在 20 轮后仍未完成")
+}
+
+fn reset_shared_unassigned_anchor(database: &Database, resumed_at_millis: i64) -> Value {
+    let local = unassigned::get_state(database)
+        .unwrap()
+        .expect("重置共享未归属锚点前不存在活动会话");
+    let storage = supabase::storage_mode(database).unwrap();
+    let session = supabase::current_session(database).unwrap();
+    let value = supabase::client(database)
+        .unwrap()
+        .rpc_for_database(
+            database,
+            "unassigned_anchor_reset",
+            json!({
+                "p_workspace_id": storage.workspace_id,
+                "p_device_id": storage.device_id,
+                "p_operation_id": Uuid::now_v7().to_string(),
+                "p_session_id": local.session_id,
+                "p_expected_version": local.version,
+                "p_resumed_at_millis": resumed_at_millis,
+            }),
+            &session,
+        )
+        .unwrap();
+    assert_eq!(value["accepted"], true, "共享未归属锚点重置未被接受");
+    cloud_sync::apply_remote_unassigned_session_for_test(database, &value["session"]).unwrap();
+    value
+}
+
+fn remote_unassigned_state(database: &Database) -> Value {
+    let storage = supabase::storage_mode(database).unwrap();
+    let session = supabase::current_session(database).unwrap();
+    supabase::client(database)
+        .unwrap()
+        .rpc_for_database(
+            database,
+            "unassigned_get_state",
+            json!({ "p_workspace_id": storage.workspace_id }),
+            &session,
+        )
+        .unwrap()
+}
+
+fn outbox_debug(database: &Database) -> Vec<String> {
+    database
+        .open()
+        .unwrap()
+        .prepare(
+            "SELECT operation_type||':'||entity_type||':'||COALESCE(entity_id,'-')||':'||state
+             FROM sync_outbox ORDER BY created_at,rowid",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn generated_entries_for_session(database: &Database, session_id: &str) -> Vec<(String, String)> {
+    database
+        .open()
+        .unwrap()
+        .prepare(
+            "SELECT id,kind FROM time_entries
+             WHERE origin_unassigned_session_id=?1 ORDER BY id",
+        )
+        .unwrap()
+        .query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn unassigned_terminal_result(
+    database: &Database,
+    session_id: &str,
+) -> (String, String, Option<String>) {
+    database
+        .open()
+        .unwrap()
+        .query_row(
+            "SELECT state,COALESCE(resolution_type,''),generated_entry_id
+             FROM unassigned_sessions WHERE id=?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+}
+
+fn report_unassigned_e2e(
+    scenario: &str,
+    state: Option<&unassigned::UnassignedStateDto>,
+    pending: i64,
+    final_result: &str,
+) {
+    let anchor = state
+        .map(|item| format!("{}@{}", item.session_id, item.first_started_at))
+        .unwrap_or_else(|| "none".to_string());
+    eprintln!(
+        "[unassigned-e2e] scenario={scenario} anchor={anchor} pending={pending} final={final_result} result=PASS"
+    );
 }
 
 #[derive(Default)]
@@ -879,19 +1027,33 @@ fn today_entries(database: &Database) -> time_tracking::TimeEntryListResult {
     .unwrap()
 }
 
-async fn subscribe_to_workspace_changes(
-    database: &Database,
-    workspace_id: &str,
-) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+struct RealtimeTestConfig {
+    project_url: String,
+    anon_key: String,
+    access_token: String,
+}
+
+fn realtime_test_config(database: &Database) -> RealtimeTestConfig {
     let session = supabase::current_session(database).unwrap();
     let api = supabase::client(database).unwrap();
-    let mut url = Url::parse(&api.project_url).unwrap();
+    RealtimeTestConfig {
+        project_url: api.project_url.clone(),
+        anon_key: api.anon_key().to_string(),
+        access_token: session.access_token,
+    }
+}
+
+async fn subscribe_to_workspace_changes(
+    config: RealtimeTestConfig,
+    workspace_id: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let mut url = Url::parse(&config.project_url).unwrap();
     let websocket_scheme = if url.scheme() == "https" { "wss" } else { "ws" };
     url.set_scheme(websocket_scheme).unwrap();
     url.set_path("/realtime/v1/websocket");
     url.set_query(None);
     url.query_pairs_mut()
-        .append_pair("apikey", api.anon_key())
+        .append_pair("apikey", &config.anon_key)
         .append_pair("vsn", "1.0.0");
     let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
     let topic = format!(
@@ -915,7 +1077,7 @@ async fn subscribe_to_workspace_changes(
                         }],
                         "private": false
                     },
-                    "access_token": session.access_token
+                    "access_token": config.access_token
                 },
                 "ref": "1",
                 "join_ref": "1"
@@ -1744,6 +1906,515 @@ fn slow_cloud_upload_does_not_block_local_sqlite_reads_or_writes() {
 
 #[test]
 #[ignore = "需要专用 Supabase 测试账号和显式的工作空间清理授权"]
+fn real_supabase_unassigned_two_device_flow() {
+    use chrono::TimeZone;
+
+    let config = TestConfig::from_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let device_a =
+        Database::initialize_at(directory.path().join("unassigned-device-a.sqlite3")).unwrap();
+    let device_b =
+        Database::initialize_at(directory.path().join("unassigned-device-b.sqlite3")).unwrap();
+
+    configure_and_sign_in(&device_a, &config);
+    let _cleanup = CleanupGuard {
+        database: device_a.clone(),
+    };
+    reset_owned_workspaces(&device_a);
+    let workspace = supabase::workspace_bootstrap(&device_a).unwrap();
+    register_device(&device_a, "未归属 E2E 设备 A");
+    migrate(&device_a, "local_to_cloud");
+
+    configure_and_sign_in(&device_b, &config);
+    let workspace_b = supabase::workspace_bootstrap(&device_b).unwrap();
+    assert_eq!(workspace_b.id, workspace.id, "两台设备没有进入同一工作空间");
+    register_device(&device_b, "未归属 E2E 设备 B");
+    migrate(&device_b, "cloud_to_local_snapshot");
+
+    // Natural growth is derived locally from one shared anchor. It must not
+    // mutate versions or enqueue per-second writes.
+    let initial_a = unassigned::get_state(&device_a).unwrap().unwrap();
+    let initial_b = unassigned::get_state(&device_b).unwrap().unwrap();
+    assert_eq!(initial_a.session_id, initial_b.session_id);
+    assert_eq!(initial_a.first_started_at, initial_b.first_started_at);
+    let initial_version = initial_a.version;
+    let initial_elapsed = initial_a.elapsed_seconds;
+    thread::sleep(Duration::from_millis(1_100));
+    let grown_a = unassigned::get_state(&device_a).unwrap().unwrap();
+    assert_eq!(grown_a.session_id, initial_a.session_id);
+    assert_eq!(grown_a.version, initial_version);
+    assert!(grown_a.elapsed_seconds > initial_elapsed);
+    let status = cloud_sync::sync_status(&device_a).unwrap();
+    assert_eq!((status.pending_operations, status.conflict_count), (0, 0));
+    report_unassigned_e2e(
+        "natural-growth",
+        Some(&grown_a),
+        status.pending_operations,
+        "shared-anchor-unchanged",
+    );
+
+    let subject_id = subjects::list_subjects(&device_a).unwrap()[0].id.clone();
+    let task = create_task(&device_a, &subject_id, "未归属双设备验收事项");
+    cloud_sync::enqueue_entity(&device_a, "task_create", "task", Some(&task.id), None, None)
+        .unwrap();
+    pull_all(&device_b);
+
+    // Starting a task clears the current anchor without creating a hidden
+    // final time entry. The other device observes the same terminal result.
+    let cleared_session_id = grown_a.session_id.clone();
+    let timer = cloud_sync::legacy_cloud_timer_start_local_first(
+        &device_a,
+        CloudTimerStartRequest {
+            task_id: Some(task.id.clone()),
+            note: Some("开始事项清零未归属".to_string()),
+            operation_id: Uuid::now_v7().to_string(),
+        },
+    )
+    .unwrap();
+    assert!(unassigned::get_state(&device_a).unwrap().is_none());
+    let queued_start = cloud_sync::sync_status(&device_a).unwrap();
+    assert_eq!(queued_start.pending_operations, 1);
+    push_all(&device_a);
+    pull_all(&device_b);
+    assert!(unassigned::get_state(&device_b).unwrap().is_none());
+    for database in [&device_a, &device_b] {
+        let terminal = unassigned_terminal_result(database, &cleared_session_id);
+        assert_eq!(
+            (terminal.0.as_str(), terminal.1.as_str()),
+            ("discarded", "discard")
+        );
+        assert!(terminal.2.is_none());
+        assert!(generated_entries_for_session(database, &cleared_session_id).is_empty());
+    }
+    report_unassigned_e2e(
+        "timer-start-clears-anchor",
+        None,
+        cloud_sync::sync_status(&device_a)
+            .unwrap()
+            .pending_operations,
+        "discarded-without-entry",
+    );
+
+    // Stop from the other device and verify the server-authoritative stop
+    // boundary becomes the one shared anchor on both clients.
+    let stopped = cloud_sync::legacy_cloud_timer_stop_local_first(
+        &device_b,
+        CloudTimerVersionRequest {
+            entry_id: timer.id.clone(),
+            expected_version: timer.version,
+            operation_id: Uuid::now_v7().to_string(),
+        },
+    )
+    .unwrap();
+    push_all(&device_b);
+    pull_all(&device_a);
+    let stopped_anchor_a = unassigned::get_state(&device_a).unwrap().unwrap();
+    let stopped_anchor_b = unassigned::get_state(&device_b).unwrap().unwrap();
+    assert_eq!(stopped_anchor_a.session_id, stopped_anchor_b.session_id);
+    assert_eq!(
+        stopped_anchor_a.first_started_at,
+        stopped_anchor_b.first_started_at
+    );
+    assert_eq!(stopped_anchor_a.first_started_at, stopped.ended_at.unwrap());
+    report_unassigned_e2e(
+        "timer-stop-restarts-anchor",
+        Some(&stopped_anchor_a),
+        cloud_sync::sync_status(&device_b)
+            .unwrap()
+            .pending_operations,
+        "shared-stop-boundary",
+    );
+
+    // Work resolution. Move only the discrete anchor boundary backwards; no
+    // per-second writes are produced while its displayed duration grows.
+    let work_reset =
+        reset_shared_unassigned_anchor(&device_a, chrono::Utc::now().timestamp_millis() - 120_000);
+    cloud_sync::apply_remote_unassigned_session_for_test(&device_b, &work_reset["session"])
+        .unwrap();
+    let work_state = unassigned::get_state(&device_a).unwrap().unwrap();
+    let work_result = unassigned::resolve_work_for_sync(
+        &device_a,
+        ResolveWorkRequest {
+            session_id: work_state.session_id.clone(),
+            expected_version: work_state.version,
+            operation_id: Uuid::now_v7().to_string(),
+            allocations: vec![UnassignedAllocationInput {
+                task_id: task.id.clone(),
+                minutes: work_state.required_minutes,
+                complete_task: false,
+                task_expected_version: None,
+            }],
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        cloud_sync::sync_status(&device_a)
+            .unwrap()
+            .pending_operations,
+        1
+    );
+    push_all(&device_a);
+    pull_all(&device_b);
+    let work_entry_id = work_result.generated_entry_id.unwrap();
+    for database in [&device_a, &device_b] {
+        assert_eq!(
+            generated_entries_for_session(database, &work_state.session_id),
+            vec![(work_entry_id.clone(), "work".to_string())]
+        );
+    }
+    let after_work_a = unassigned::get_state(&device_a).unwrap().unwrap();
+    let after_work_b = unassigned::get_state(&device_b).unwrap().unwrap();
+    assert_eq!(after_work_a.session_id, after_work_b.session_id);
+    report_unassigned_e2e(
+        "resolve-work",
+        Some(&after_work_a),
+        cloud_sync::sync_status(&device_a)
+            .unwrap()
+            .pending_operations,
+        &format!("entry={work_entry_id}"),
+    );
+
+    // Break resolution.
+    let break_reset =
+        reset_shared_unassigned_anchor(&device_b, chrono::Utc::now().timestamp_millis() - 60_000);
+    cloud_sync::apply_remote_unassigned_session_for_test(&device_a, &break_reset["session"])
+        .unwrap();
+    let break_state = unassigned::get_state(&device_b).unwrap().unwrap();
+    let break_result = unassigned::resolve_break_for_sync(
+        &device_b,
+        ResolveSessionRequest {
+            session_id: break_state.session_id.clone(),
+            expected_version: break_state.version,
+            operation_id: Uuid::now_v7().to_string(),
+        },
+    )
+    .unwrap();
+    push_all(&device_b);
+    pull_all(&device_a);
+    let break_entry_id = break_result.generated_entry_id.unwrap();
+    for database in [&device_a, &device_b] {
+        assert_eq!(
+            generated_entries_for_session(database, &break_state.session_id),
+            vec![(break_entry_id.clone(), "break".to_string())]
+        );
+    }
+    let after_break = unassigned::get_state(&device_a).unwrap().unwrap();
+    report_unassigned_e2e(
+        "resolve-break",
+        Some(&after_break),
+        cloud_sync::sync_status(&device_b)
+            .unwrap()
+            .pending_operations,
+        &format!("entry={break_entry_id}"),
+    );
+
+    // Discard resolution is also one final invalid-time record and one next
+    // anchor, not a resumable lifecycle.
+    let discard_reset =
+        reset_shared_unassigned_anchor(&device_a, chrono::Utc::now().timestamp_millis() - 60_000);
+    cloud_sync::apply_remote_unassigned_session_for_test(&device_b, &discard_reset["session"])
+        .unwrap();
+    let discard_state = unassigned::get_state(&device_a).unwrap().unwrap();
+    let discard_result = unassigned::discard_for_sync(
+        &device_a,
+        ResolveSessionRequest {
+            session_id: discard_state.session_id.clone(),
+            expected_version: discard_state.version,
+            operation_id: Uuid::now_v7().to_string(),
+        },
+    )
+    .unwrap();
+    push_all(&device_a);
+    pull_all(&device_b);
+    let discard_entry_id = discard_result.generated_entry_id.unwrap();
+    for database in [&device_a, &device_b] {
+        assert_eq!(
+            unassigned_terminal_result(database, &discard_state.session_id).1,
+            "discard"
+        );
+        assert_eq!(
+            generated_entries_for_session(database, &discard_state.session_id),
+            vec![(discard_entry_id.clone(), "break".to_string())]
+        );
+    }
+    let after_discard = unassigned::get_state(&device_b).unwrap().unwrap();
+    report_unassigned_e2e(
+        "resolve-discard",
+        Some(&after_discard),
+        cloud_sync::sync_status(&device_a)
+            .unwrap()
+            .pending_operations,
+        &format!("entry={discard_entry_id}"),
+    );
+
+    // Both devices resolve the same version differently while offline. The
+    // first accepted action wins, and the losing optimistic entry is removed.
+    let race_reset =
+        reset_shared_unassigned_anchor(&device_a, chrono::Utc::now().timestamp_millis() - 120_000);
+    cloud_sync::apply_remote_unassigned_session_for_test(&device_b, &race_reset["session"])
+        .unwrap();
+    let race_state_a = unassigned::get_state(&device_a).unwrap().unwrap();
+    let race_state_b = unassigned::get_state(&device_b).unwrap().unwrap();
+    assert_eq!(race_state_a.session_id, race_state_b.session_id);
+    assert_eq!(race_state_a.version, race_state_b.version);
+    let winner = unassigned::resolve_work_for_sync(
+        &device_a,
+        ResolveWorkRequest {
+            session_id: race_state_a.session_id.clone(),
+            expected_version: race_state_a.version,
+            operation_id: Uuid::now_v7().to_string(),
+            allocations: vec![UnassignedAllocationInput {
+                task_id: task.id.clone(),
+                minutes: race_state_a.required_minutes,
+                complete_task: false,
+                task_expected_version: None,
+            }],
+        },
+    )
+    .unwrap();
+    let losing = unassigned::discard_for_sync(
+        &device_b,
+        ResolveSessionRequest {
+            session_id: race_state_b.session_id.clone(),
+            expected_version: race_state_b.version,
+            operation_id: Uuid::now_v7().to_string(),
+        },
+    )
+    .unwrap();
+    assert_ne!(winner.generated_entry_id, losing.generated_entry_id);
+    push_all(&device_a);
+    push_all(&device_b);
+    pull_all(&device_a);
+    pull_all(&device_b);
+    push_all(&device_a);
+    push_all(&device_b);
+    pull_all(&device_a);
+    pull_all(&device_b);
+    let winner_entry_id = winner.generated_entry_id.unwrap();
+    for database in [&device_a, &device_b] {
+        let terminal = unassigned_terminal_result(database, &race_state_a.session_id);
+        assert_eq!(
+            (terminal.0.as_str(), terminal.1.as_str()),
+            ("resolved", "work")
+        );
+        assert_eq!(terminal.2.as_deref(), Some(winner_entry_id.as_str()));
+        assert_eq!(
+            generated_entries_for_session(database, &race_state_a.session_id),
+            vec![(winner_entry_id.clone(), "work".to_string())]
+        );
+        let status = cloud_sync::sync_status(database).unwrap();
+        assert_eq!((status.pending_operations, status.conflict_count), (0, 0));
+    }
+    let race_anchor_a = unassigned::get_state(&device_a).unwrap().unwrap();
+    let race_anchor_b = unassigned::get_state(&device_b).unwrap().unwrap();
+    assert_eq!(race_anchor_a.session_id, race_anchor_b.session_id);
+    report_unassigned_e2e(
+        "concurrent-resolution",
+        Some(&race_anchor_a),
+        0,
+        &format!("winner={winner_entry_id}"),
+    );
+
+    // Queue an action, make the endpoint unreachable, then restore it. The
+    // pending item survives and converges after connectivity returns.
+    let offline_reset =
+        reset_shared_unassigned_anchor(&device_a, chrono::Utc::now().timestamp_millis() - 60_000);
+    cloud_sync::apply_remote_unassigned_session_for_test(&device_b, &offline_reset["session"])
+        .unwrap();
+    let offline_state = unassigned::get_state(&device_a).unwrap().unwrap();
+    let offline_result = unassigned::discard_for_sync(
+        &device_a,
+        ResolveSessionRequest {
+            session_id: offline_state.session_id.clone(),
+            expected_version: offline_state.version,
+            operation_id: Uuid::now_v7().to_string(),
+        },
+    )
+    .unwrap();
+    device_a
+        .open()
+        .unwrap()
+        .execute(
+            "UPDATE device_settings SET value_json=?1 WHERE key='supabase_project_url'",
+            [json!("http://127.0.0.1:9").to_string()],
+        )
+        .unwrap();
+    assert!(cloud_sync::push_outbox(&device_a).is_err());
+    assert_eq!(
+        cloud_sync::sync_status(&device_a)
+            .unwrap()
+            .pending_operations,
+        1
+    );
+    device_a
+        .open()
+        .unwrap()
+        .execute(
+            "UPDATE device_settings SET value_json=?1 WHERE key='supabase_project_url'",
+            [json!(config.project_url).to_string()],
+        )
+        .unwrap();
+    push_all(&device_a);
+    pull_all(&device_b);
+    let offline_entry_id = offline_result.generated_entry_id.unwrap();
+    assert_eq!(
+        generated_entries_for_session(&device_b, &offline_state.session_id),
+        vec![(offline_entry_id.clone(), "break".to_string())]
+    );
+    report_unassigned_e2e(
+        "offline-recovery",
+        unassigned::get_state(&device_b).unwrap().as_ref(),
+        cloud_sync::sync_status(&device_a)
+            .unwrap()
+            .pending_operations,
+        &format!("entry={offline_entry_id}"),
+    );
+
+    // A stale local continuity heartbeat resets the shared anchor exactly once
+    // after resume, without uploading heartbeat ticks.
+    pull_all(&device_a);
+    let before_resume = unassigned::get_state(&device_a).unwrap().unwrap();
+    let stale_at = chrono::Utc::now().timestamp_millis() - 180_000;
+    let workspace_id: String = device_a
+        .open()
+        .unwrap()
+        .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    device_a
+        .open()
+        .unwrap()
+        .execute(
+            "INSERT INTO tracking_runtime_state(workspace_id,last_heartbeat_at,updated_at)
+             VALUES (?1,?2,?2) ON CONFLICT(workspace_id) DO UPDATE SET
+             last_heartbeat_at=excluded.last_heartbeat_at,updated_at=excluded.updated_at",
+            rusqlite::params![workspace_id, stale_at],
+        )
+        .unwrap();
+    let resumed = cloud_sync::refresh_unassigned_state_for_cloud_mode(&device_a)
+        .unwrap()
+        .unwrap();
+    assert_eq!(resumed.session_id, before_resume.session_id);
+    assert_ne!(resumed.first_started_at, before_resume.first_started_at);
+    assert!(resumed.version > before_resume.version);
+    assert!(resumed.elapsed_seconds <= 1);
+    let resume_pending = cloud_sync::sync_status(&device_a)
+        .unwrap()
+        .pending_operations;
+    assert!(resume_pending > 0);
+    let resume_operation_types = device_a
+        .open()
+        .unwrap()
+        .prepare(
+            "SELECT operation_type FROM sync_outbox
+             WHERE state IN ('pending','sending','failed') ORDER BY created_at,rowid",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(resume_operation_types.iter().all(|operation| matches!(
+        operation.as_str(),
+        "unassigned_session_create" | "unassigned_anchor_reset"
+    )));
+    push_all(&device_a);
+    let remote_resumed = remote_unassigned_state(&device_a);
+    let pulled_a = pull_all(&device_a);
+    let pulled_b = pull_all(&device_b);
+    let resumed_a = unassigned::get_state(&device_a).unwrap().unwrap();
+    let resumed_b = unassigned::get_state(&device_b).unwrap().unwrap();
+    assert_eq!(resumed_a.session_id, resumed_b.session_id);
+    assert_eq!(
+        resumed_a.first_started_at,
+        resumed_b.first_started_at,
+        "休眠恢复未收敛: optimistic={} before={} remote={} a_version={} b_version={} a_seq={} b_seq={} a_changes={:?} b_changes={:?} a_outbox={:?} b_outbox={:?}",
+        resumed.first_started_at,
+        before_resume.first_started_at,
+        remote_resumed,
+        resumed_a.version,
+        resumed_b.version,
+        pulled_a.last_change_seq,
+        pulled_b.last_change_seq,
+        pulled_a.changes,
+        pulled_b.changes,
+        outbox_debug(&device_a),
+        outbox_debug(&device_b)
+    );
+    assert_eq!(
+        cloud_sync::sync_status(&device_a)
+            .unwrap()
+            .pending_operations,
+        0
+    );
+    assert_eq!(
+        cloud_sync::sync_status(&device_b)
+            .unwrap()
+            .pending_operations,
+        0
+    );
+    report_unassigned_e2e(
+        "sleep-resume-reset",
+        Some(&resumed_a),
+        cloud_sync::sync_status(&device_a)
+            .unwrap()
+            .pending_operations,
+        "offline-gap-excluded",
+    );
+
+    // Seed the shared anchor just before today's workspace midnight. Lease
+    // acquisition performs a real server tick; the old day closes and today's
+    // one shared anchor starts exactly at midnight.
+    let timezone: chrono_tz::Tz = workspace.timezone.parse().unwrap();
+    let now = chrono::Utc::now().with_timezone(&timezone);
+    let today_start = timezone
+        .from_local_datetime(&now.date_naive().and_hms_opt(0, 0, 0).unwrap())
+        .single()
+        .unwrap()
+        .timestamp_millis();
+    let cross_day_reset = reset_shared_unassigned_anchor(&device_a, today_start - 30_000);
+    cloud_sync::apply_remote_unassigned_session_for_test(&device_b, &cross_day_reset["session"])
+        .unwrap();
+    let old_cross_day_id = cross_day_reset["session"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let lease = cloud_sync::acquire_lease(&device_a).unwrap();
+    pull_all(&device_a);
+    pull_all(&device_b);
+    let today_anchor_a = unassigned::get_state(&device_a).unwrap().unwrap();
+    let today_anchor_b = unassigned::get_state(&device_b).unwrap().unwrap();
+    assert_eq!(today_anchor_a.session_id, today_anchor_b.session_id);
+    assert_eq!(today_anchor_a.first_started_at, today_start);
+    for database in [&device_a, &device_b] {
+        let snapshot = unassigned::get_state_snapshot(database).unwrap();
+        assert!(snapshot
+            .historical_pending
+            .iter()
+            .any(|state| state.session_id == old_cross_day_id));
+    }
+    cloud_sync::release_lease(
+        &device_a,
+        TrackingLeaseRequest {
+            lease_token: lease["leaseToken"].as_str().map(ToOwned::to_owned),
+        },
+    )
+    .unwrap();
+    report_unassigned_e2e(
+        "calendar-rollover",
+        Some(&today_anchor_a),
+        cloud_sync::sync_status(&device_a)
+            .unwrap()
+            .pending_operations,
+        &format!("previous={old_cross_day_id}:historical-pending"),
+    );
+
+    reset_owned_workspaces(&device_a);
+    let _ = supabase::sign_out(&device_a);
+    let _ = supabase::sign_out(&device_b);
+}
+
+#[test]
+#[ignore = "需要专用 Supabase 测试账号和显式的工作空间清理授权"]
 fn real_supabase_two_device_flow() {
     let config = TestConfig::from_environment();
     let directory = tempfile::tempdir().unwrap();
@@ -1757,6 +2428,9 @@ fn real_supabase_two_device_flow() {
         "应用重启模拟后没有从系统凭据恢复 Supabase 会话"
     );
     let access_before_refresh = supabase::current_session(&device_a).unwrap().access_token;
+    // GoTrue JWT claims use second precision. A refresh in the same second as
+    // sign-in can legitimately reproduce the same signed token.
+    thread::sleep(Duration::from_millis(1_100));
     supabase::force_cached_session_expiry_for_test(&device_a).unwrap();
     let access_after_refresh = supabase::current_session(&device_a).unwrap().access_token;
     assert_ne!(
@@ -1802,7 +2476,7 @@ fn real_supabase_two_device_flow() {
     assert_eq!(devices.len(), 2, "云端没有注册两台独立设备");
 
     let subject_id = subjects::list_subjects(&device_a).unwrap()[0].id.clone();
-    let realtime_database = device_b.clone();
+    let realtime_config = realtime_test_config(&device_b);
     let realtime_workspace_id = workspace.id.clone();
     let (realtime_ready_tx, realtime_ready_rx) = std::sync::mpsc::sync_channel(0);
     let realtime_listener = std::thread::spawn(move || {
@@ -1812,7 +2486,7 @@ fn real_supabase_two_device_flow() {
             .unwrap();
         runtime.block_on(async move {
             let mut socket =
-                subscribe_to_workspace_changes(&realtime_database, &realtime_workspace_id).await;
+                subscribe_to_workspace_changes(realtime_config, &realtime_workspace_id).await;
             realtime_ready_tx.send(()).unwrap();
             wait_for_postgres_change(&mut socket).await;
         });
@@ -2265,6 +2939,7 @@ fn real_supabase_two_device_flow() {
         },
     )
     .unwrap();
+    push_all(&device_a);
     cloud_sync::pull(
         &device_b,
         CloudSyncPullRequest {
@@ -2294,6 +2969,7 @@ fn real_supabase_two_device_flow() {
         },
     )
     .unwrap();
+    push_all(&device_b);
     cloud_sync::pull(
         &device_a,
         CloudSyncPullRequest {
@@ -2311,6 +2987,7 @@ fn real_supabase_two_device_flow() {
         },
     )
     .unwrap();
+    push_all(&device_a);
     cloud_sync::pull(
         &device_b,
         CloudSyncPullRequest {
@@ -2328,6 +3005,7 @@ fn real_supabase_two_device_flow() {
         },
     )
     .unwrap();
+    push_all(&device_b);
     assert_eq!(stopped.state, "ended");
     cloud_sync::pull(
         &device_a,
@@ -2362,15 +3040,9 @@ fn real_supabase_two_device_flow() {
         },
     )
     .unwrap();
-    let unassigned_state = unassigned::get_state(&device_a).unwrap().unwrap();
-    device_a
-        .open()
-        .unwrap()
-        .execute(
-            "UPDATE unassigned_segments SET started_at = started_at - 120000 WHERE session_id = ?1 AND ended_at IS NULL",
-            [&unassigned_state.session_id],
-        )
-        .unwrap();
+    let reset =
+        reset_shared_unassigned_anchor(&device_a, chrono::Utc::now().timestamp_millis() - 120_000);
+    cloud_sync::apply_remote_unassigned_session_for_test(&device_b, &reset["session"]).unwrap();
     let unassigned_state = unassigned::get_state(&device_a).unwrap().unwrap();
     let unassigned_result = unassigned::resolve_work_for_sync(
         &device_a,
@@ -2391,6 +3063,7 @@ fn real_supabase_two_device_flow() {
         .generated_entry_id
         .as_deref()
         .expect("未归属处理没有生成时间记录");
+    push_all(&device_a);
     cloud_sync::pull(
         &device_b,
         CloudSyncPullRequest {

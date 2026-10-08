@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -38,6 +38,7 @@ static CLOUD_SYNC_SIGNALS: AtomicU8 = AtomicU8::new(0);
 static CLOUD_SYNC_OBSERVED_REMOTE_SEQ: AtomicI64 = AtomicI64::new(0);
 static CLOUD_SYNC_ENABLED: AtomicBool = AtomicBool::new(false);
 static CLOUD_SYNC_ACTIVE: AtomicBool = AtomicBool::new(false);
+static CLOUD_SAVE_ACTIVITY: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static CLOUD_SYNC_TEST_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -74,6 +75,16 @@ fn signal_cloud_sync(signal: u8, observed_change_seq: Option<i64>) {
     cloud_sync_wakeup().notify_one();
 }
 
+fn begin_cloud_save_activity() {
+    CLOUD_SAVE_ACTIVITY.fetch_add(1, Ordering::AcqRel);
+}
+
+fn end_cloud_save_activity() {
+    let _ = CLOUD_SAVE_ACTIVITY.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        Some(value.saturating_sub(1))
+    });
+}
+
 pub(crate) fn wake_after_connection_ready() {
     CLOUD_SYNC_ENABLED.store(true, Ordering::Release);
     cloud_mode_wakeup().notify_waiters();
@@ -83,6 +94,7 @@ pub(crate) fn wake_after_connection_ready() {
 pub(crate) fn disable_cloud_sync() {
     CLOUD_SYNC_ENABLED.store(false, Ordering::Release);
     CLOUD_SYNC_ACTIVE.store(false, Ordering::Release);
+    CLOUD_SAVE_ACTIVITY.store(0, Ordering::Release);
     CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
     CLOUD_SYNC_OBSERVED_REMOTE_SEQ.store(0, Ordering::Release);
     clear_tracking_lease_token();
@@ -109,6 +121,12 @@ fn spawn_sync_coordinator(database: Database, app: AppHandle) {
                 continue;
             }
             CLOUD_SYNC_ACTIVE.store(true, Ordering::Release);
+            let pending_before_round = storage_mode(&database)
+                .map(|state| state.mode == "cloud" && state.pending_operations > 0)
+                .unwrap_or(false);
+            if pending_before_round {
+                begin_cloud_save_activity();
+            }
             if let Ok(status) = sync_status(&database) {
                 let _ = app.emit("cloud-sync-state-changed", &status);
             }
@@ -145,6 +163,12 @@ fn spawn_sync_coordinator(database: Database, app: AppHandle) {
                         &database,
                         &format!("SYNC_WORKER_ERROR: 后台同步任务异常: {error}"),
                     );
+                }
+            }
+            if pending_before_round {
+                end_cloud_save_activity();
+                if let Ok(status) = sync_status(&database) {
+                    let _ = app.emit("cloud-sync-state-changed", &status);
                 }
             }
             if CLOUD_SYNC_SIGNALS.load(Ordering::Acquire) != 0 {
@@ -532,6 +556,7 @@ fn emit_cloud_error(app: &AppHandle, database: &Database, error: &str) {
                 "online": false,
                 "syncState": status.sync_state,
                 "syncing": false,
+                "saving": false,
                 "lastChangeSeq": status.last_change_seq,
                 "lastSyncedAt": status.last_synced_at,
                 "lastError": status.last_error.as_deref().unwrap_or(error),
@@ -552,6 +577,7 @@ pub struct CloudSyncStatus {
     pub online: bool,
     pub sync_state: String,
     pub syncing: bool,
+    pub saving: bool,
     pub last_change_seq: i64,
     pub last_synced_at: Option<i64>,
     pub last_error: Option<String>,
@@ -912,6 +938,7 @@ pub fn sync_status(database: &Database) -> Result<CloudSyncStatus, String> {
         online: state.online,
         sync_state: state.sync_state,
         syncing: CLOUD_SYNC_ACTIVE.load(Ordering::Acquire),
+        saving: CLOUD_SAVE_ACTIVITY.load(Ordering::Acquire) > 0,
         last_change_seq: state.last_change_seq,
         last_synced_at: state.last_synced_at,
         last_error: state.last_error,
@@ -1222,6 +1249,31 @@ fn entity_has_dirty_outbox(
         .map_err(|error| error.to_string())
 }
 
+fn acknowledge_authoritative_unassigned_candidate(
+    transaction: &Transaction<'_>,
+    cloud_workspace_id: &str,
+    entity: &IncrementalEntity,
+) -> Result<(), String> {
+    if entity.entity_type != "unassigned_sessions" || entity.deleted {
+        return Ok(());
+    }
+    transaction
+        .execute(
+            "DELETE FROM sync_outbox
+             WHERE workspace_id=?1 AND entity_type='unassigned_session'
+               AND entity_id=?2 AND operation_type='unassigned_session_create'
+               AND state IN ('pending','sending','failed')
+               AND NOT EXISTS(
+                 SELECT 1 FROM sync_outbox dependent
+                 WHERE dependent.workspace_id=sync_outbox.workspace_id
+                   AND dependent.depends_on_operation_id=sync_outbox.operation_id
+               )",
+            params![cloud_workspace_id, entity.entity_id],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 fn defer_incremental_entity(
     transaction: &Transaction<'_>,
     cloud_workspace_id: &str,
@@ -1301,6 +1353,7 @@ fn apply_incremental_entities(
     for entity in entities {
         validate_incremental_identity(entity)?;
         let domain = incremental_domain(&entity.entity_type)?;
+        acknowledge_authoritative_unassigned_candidate(&transaction, cloud_workspace_id, entity)?;
         if entity_has_dirty_outbox(&transaction, cloud_workspace_id, entity)? {
             defer_incremental_entity(&transaction, cloud_workspace_id, entity)?;
             continue;
@@ -1847,6 +1900,40 @@ fn apply_incremental_time_entry(
             .or_else(|| optional_millis(data, "started_at"))
     });
     let origin_unassigned_session_id = optional_text(data, "origin_unassigned_session_id");
+    if let Some(session_id) = origin_unassigned_session_id.as_deref() {
+        // A losing device may have optimistically generated a different final
+        // entry for this session. Incremental entities can arrive before the
+        // terminal session row, so remove the local loser before inserting the
+        // authoritative entry and satisfying the one-result constraint.
+        let losing_entry_ids = transaction
+            .prepare(
+                "SELECT id FROM time_entries
+                 WHERE workspace_id=?1 AND origin_unassigned_session_id=?2 AND id<>?3",
+            )?
+            .query_map(params![workspace_id, session_id, entry_id], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for losing_entry_id in losing_entry_ids {
+            transaction.execute(
+                "UPDATE unassigned_sessions SET generated_entry_id=NULL
+                 WHERE workspace_id=?1 AND generated_entry_id=?2",
+                params![workspace_id, losing_entry_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM time_allocations WHERE workspace_id=?1 AND entry_id=?2",
+                params![workspace_id, losing_entry_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM time_segments WHERE workspace_id=?1 AND entry_id=?2",
+                params![workspace_id, losing_entry_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM time_entries WHERE workspace_id=?1 AND id=?2",
+                params![workspace_id, losing_entry_id],
+            )?;
+        }
+    }
     transaction.execute(
         "DELETE FROM time_segments WHERE workspace_id=?1 AND entry_id=?2",
         params![workspace_id, entry_id],
@@ -1890,11 +1977,24 @@ fn apply_incremental_unassigned_session(
     data: &Value,
 ) -> Result<usize, rusqlite::Error> {
     let session_id = text(data, "id");
-    let state = text(data, "state");
+    let incoming_state = text(data, "state");
+    let incoming_segments = data
+        .get("segments")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let incoming_active = incoming_state == "collecting"
+        || (incoming_state == "awaiting_resolution"
+            && incoming_segments
+                .iter()
+                .any(|segment| optional_millis(segment, "ended_at").is_none()));
+    let state = if incoming_active {
+        "collecting".to_string()
+    } else {
+        incoming_state.clone()
+    };
     let superseded_at =
         optional_millis(data, "resolved_at").unwrap_or_else(|| millis(data, "first_started_at"));
-    let preserved_predecessor =
-        matches!(state.as_str(), "resolved" | "discarded").then_some(session_id.as_str());
     let incoming_predecessor = optional_text(data, "predecessor_session_id");
     let generated_entry_id = optional_text(data, "generated_entry_id").filter(|entry_id| {
         transaction
@@ -1912,43 +2012,52 @@ fn apply_incremental_unassigned_session(
         .or_else(|| optional_millis(data, "last_ended_at"))
         .or_else(|| optional_millis(data, "updated_at"))
         .or_else(|| optional_millis(data, "first_started_at"));
-    transaction.execute(
-        "UPDATE unassigned_segments
-         SET ended_at=MAX(started_at,?1),
-             duration_seconds=MAX(0,(MAX(started_at,?1)-started_at)/1000)
-         WHERE workspace_id=?2 AND ended_at IS NULL
-           AND session_id IN (
-             SELECT id FROM unassigned_sessions
+    if incoming_active {
+        transaction.execute(
+            "UPDATE unassigned_sessions
+             SET state='discarded',resolution_type='discard',duration_seconds=0,
+                 resolved_at=COALESCE(resolved_at,?1),last_ended_at=COALESCE(last_ended_at,?1),
+                 updated_at=MAX(updated_at,?1),migration_state='superseded'
              WHERE workspace_id=?2 AND id<>?3
                AND state IN ('collecting','awaiting_resolution')
-               AND (?4 IS NULL OR predecessor_session_id IS NULL OR predecessor_session_id<>?4)
-           )",
-        params![
-            superseded_at,
-            workspace_id,
-            session_id,
-            preserved_predecessor
-        ],
-    )?;
-    transaction.execute(
-        "UPDATE unassigned_sessions
-         SET state='discarded', resolution_type='discard',
-             duration_seconds=COALESCE((
-               SELECT SUM(duration_seconds) FROM unassigned_segments
-               WHERE session_id=unassigned_sessions.id
-             ),duration_seconds),
-             resolved_at=COALESCE(resolved_at,?1), last_ended_at=COALESCE(last_ended_at,?1),
-             updated_at=MAX(updated_at,?1), migration_state='superseded'
-         WHERE workspace_id=?2 AND id<>?3
-           AND state IN ('collecting','awaiting_resolution')
-           AND (?4 IS NULL OR predecessor_session_id IS NULL OR predecessor_session_id<>?4)",
-        params![
-            superseded_at,
-            workspace_id,
-            session_id,
-            preserved_predecessor
-        ],
-    )?;
+               AND EXISTS(SELECT 1 FROM unassigned_segments segment
+                          WHERE segment.session_id=unassigned_sessions.id
+                            AND segment.ended_at IS NULL)",
+            params![superseded_at, workspace_id, session_id],
+        )?;
+        transaction.execute(
+            "UPDATE unassigned_segments
+             SET ended_at=MAX(started_at,?1),duration_seconds=0
+             WHERE workspace_id=?2 AND ended_at IS NULL AND session_id<>?3",
+            params![superseded_at, workspace_id, session_id],
+        )?;
+    } else if matches!(incoming_state.as_str(), "resolved" | "discarded") {
+        // A terminal shared result can arrive before the authoritative next
+        // anchor. Retire only local/migrated candidates here; an already
+        // adopted cloud anchor may belong to a newer boundary and must not be
+        // discarded by an out-of-order historical notification.
+        transaction.execute(
+            "UPDATE unassigned_sessions
+             SET state='discarded',resolution_type='discard',duration_seconds=0,
+                 resolved_at=COALESCE(resolved_at,?1),last_ended_at=COALESCE(last_ended_at,?1),
+                 updated_at=MAX(updated_at,?1),migration_state='superseded'
+             WHERE workspace_id=?2 AND id<>?3
+               AND state IN ('collecting','awaiting_resolution')
+               AND (shared_source<>'cloud' OR migration_state='candidate')
+               AND COALESCE(predecessor_session_id,'')<>?3",
+            params![superseded_at, workspace_id, session_id],
+        )?;
+        transaction.execute(
+            "UPDATE unassigned_segments
+             SET ended_at=MAX(started_at,?1),duration_seconds=0
+             WHERE workspace_id=?2 AND ended_at IS NULL
+               AND session_id IN (
+                 SELECT id FROM unassigned_sessions
+                 WHERE workspace_id=?2 AND id<>?3 AND migration_state='superseded'
+               )",
+            params![superseded_at, workspace_id, session_id],
+        )?;
+    }
     if matches!(state.as_str(), "collecting" | "awaiting_resolution") {
         if let Some(predecessor_session_id) = incoming_predecessor.as_deref() {
             transaction.execute(
@@ -2016,10 +2125,18 @@ fn apply_incremental_unassigned_session(
             text(data, "work_date"),
             state,
             integer(data, "threshold_seconds"),
-            integer(data, "duration_seconds"),
+            if incoming_active {
+                0
+            } else {
+                integer(data, "duration_seconds")
+            },
             millis(data, "first_started_at"),
             optional_millis(data, "last_ended_at"),
-            optional_millis(data, "prompted_at"),
+            if incoming_active {
+                None
+            } else {
+                optional_millis(data, "prompted_at")
+            },
             optional_text(data, "resolution_type"),
             generated_entry_id,
             optional_millis(data, "resolved_at"),
@@ -2035,12 +2152,26 @@ fn apply_incremental_unassigned_session(
         "DELETE FROM unassigned_segments WHERE workspace_id=?1 AND session_id=?2",
         params![workspace_id, session_id],
     )?;
-    for segment in data
-        .get("segments")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-    {
+    let segments = if incoming_active {
+        let started_at = incoming_segments
+            .iter()
+            .filter(|segment| optional_millis(segment, "ended_at").is_none())
+            .map(|segment| millis(segment, "started_at"))
+            .max()
+            .unwrap_or_else(|| millis(data, "first_started_at"));
+        vec![serde_json::json!({
+            "id": Uuid::now_v7().to_string(),
+            "session_id": session_id,
+            "sequence_no": 1,
+            "started_at": started_at,
+            "ended_at": Value::Null,
+            "duration_seconds": 0,
+            "lease_token": Value::Null
+        })]
+    } else {
+        incoming_segments
+    };
+    for segment in segments {
         transaction.execute(
             "INSERT INTO unassigned_segments(
                id,workspace_id,session_id,sequence_no,started_at,ended_at,duration_seconds,lease_token
@@ -2751,6 +2882,22 @@ fn push_outbox_locked(
                     }),
                     &session,
                 )
+            } else if operation.entity_type == "unassigned_session"
+                && operation.operation_type == "unassigned_anchor_reset"
+            {
+                api.rpc_for_database(
+                    database,
+                    "unassigned_anchor_reset",
+                    json!({
+                        "p_workspace_id": state.workspace_id,
+                        "p_device_id": state.device_id,
+                        "p_operation_id": operation.operation_id,
+                        "p_session_id": operation.entity_id,
+                        "p_expected_version": operation.base_version,
+                        "p_resumed_at_millis": operation.payload.get("first_started_at")
+                    }),
+                    &session,
+                )
             } else {
                 api.rpc_for_database(
                     database,
@@ -2778,6 +2925,15 @@ fn push_outbox_locked(
                     {
                         adopt_shared_unassigned_rpc_result(database, &value)?;
                     }
+                    if operation.entity_type == "unassigned_session"
+                        && operation.operation_type == "unassigned_anchor_reset"
+                    {
+                        if let Some(session) =
+                            value.get("session").filter(|session| !session.is_null())
+                        {
+                            adopt_shared_unassigned_rpc_result(database, session)?;
+                        }
+                    }
                     adopt_superseded_shared_unassigned_lifecycle_result(
                         database, operation, &value,
                     )?;
@@ -2793,6 +2949,12 @@ fn push_outbox_locked(
                     }
                     if operation.entity_type == "time_entry" {
                         adopt_authoritative_calendar_timer_result(database, operation, &value)?;
+                        if let Some(session) = value
+                            .get("unassignedSession")
+                            .filter(|session| !session.is_null())
+                        {
+                            adopt_shared_unassigned_rpc_result(database, session)?;
+                        }
                     }
                     delete_outbox(database, &operation.operation_id)?;
                     pushed += 1;
@@ -2988,6 +3150,22 @@ fn adopt_shared_unassigned_resolution_result(
     let session = value
         .get("session")
         .ok_or_else(|| "VALIDATION_ERROR: 共享未归属处理结果缺少会话".to_string())?;
+    if let Some(entry) = value.get("generatedEntry").filter(|entry| !entry.is_null()) {
+        let mut connection = database.open()?;
+        let local_workspace_id: String = connection
+            .query_row(
+                "SELECT id FROM workspaces WHERE storage_mode='local' AND deleted_at IS NULL ORDER BY created_at LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        apply_incremental_time_entry(&transaction, &local_workspace_id, entry)
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+    }
     adopt_shared_unassigned_rpc_result(database, session)?;
     if !accepted {
         let mut connection = database.open()?;
@@ -3064,7 +3242,14 @@ fn adopt_shared_unassigned_resolution_result(
         }
         transaction.commit().map_err(|error| error.to_string())?;
     }
-    queue_next_shared_unassigned_candidate(database, session)?;
+    if let Some(next_session) = value
+        .get("nextSession")
+        .filter(|session| !session.is_null())
+    {
+        adopt_shared_unassigned_rpc_result(database, next_session)?;
+    } else {
+        queue_next_shared_unassigned_candidate(database, session)?;
+    }
     Ok(())
 }
 
@@ -4248,6 +4433,40 @@ fn entity_payload_from_connection(
                 .as_object_mut()
                 .ok_or_else(|| "CACHE_ERROR: 未归属会话缓存不是对象".to_string())?
                 .insert("segments".to_string(), Value::Array(rows));
+            if let Some(entry_id) = value.get("generated_entry_id").and_then(Value::as_str) {
+                let mut entry = query_json_row(
+                    connection,
+                    "SELECT * FROM time_entries WHERE workspace_id = ?1 AND id = ?2",
+                    &local_workspace_id,
+                    entry_id,
+                )?;
+                for (key, sql) in [
+                    ("segments", "SELECT * FROM time_segments WHERE workspace_id = ?1 AND entry_id = ?2 ORDER BY sequence_no"),
+                    ("allocations", "SELECT * FROM time_allocations WHERE workspace_id = ?1 AND entry_id = ?2 ORDER BY created_at"),
+                ] {
+                    let mut statement = connection.prepare(sql).map_err(|error| error.to_string())?;
+                    let column_names = statement
+                        .column_names()
+                        .into_iter()
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>();
+                    let rows = statement
+                        .query_map(params![local_workspace_id, entry_id], |row| {
+                            row_to_json(row, &column_names)
+                        })
+                        .map_err(|error| error.to_string())?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| error.to_string())?;
+                    entry
+                        .as_object_mut()
+                        .ok_or_else(|| "CACHE_ERROR: 未归属生成记录缓存不是对象".to_string())?
+                        .insert(key.to_string(), Value::Array(rows));
+                }
+                value
+                    .as_object_mut()
+                    .expect("unassigned session payload is an object")
+                    .insert("generated_entry".to_string(), entry);
+            }
             return Ok(value);
         }
         "report_template" => ("SELECT * FROM report_templates WHERE workspace_id = ?1 AND id = ?2", entity_id),
@@ -5780,12 +5999,18 @@ pub async fn cloud_sync_save(
     app: AppHandle,
 ) -> Result<CloudSyncPushResult, String> {
     let database = database.inner().clone();
+    begin_cloud_save_activity();
+    if let Ok(status) = sync_status(&database) {
+        let _ = app.emit("cloud-sync-state-changed", &status);
+    }
     let database_for_sync = database.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
+    let worker_result = tauri::async_runtime::spawn_blocking(move || {
         push_outbox_with_retry_mode(&database_for_sync, true, true)
     })
-    .await
-    .map_err(|error| format!("SYNC_WORKER_ERROR: 手动保存任务异常: {error}"))?;
+    .await;
+    end_cloud_save_activity();
+    let result =
+        worker_result.map_err(|error| format!("SYNC_WORKER_ERROR: 手动保存任务异常: {error}"))?;
 
     match result {
         Ok(result) => {
@@ -6435,6 +6660,35 @@ mod tests {
     }
 
     #[test]
+    fn transport_activity_does_not_report_saving_without_an_outbox_push() {
+        let _guard = CLOUD_SYNC_TEST_STATE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("cloud-transport-vs-saving.sqlite3"))
+                .unwrap();
+        CLOUD_SYNC_ACTIVE.store(true, Ordering::Release);
+        CLOUD_SAVE_ACTIVITY.store(0, Ordering::Release);
+
+        let pulling = sync_status(&database).unwrap();
+        assert!(pulling.syncing);
+        assert!(!pulling.saving);
+
+        begin_cloud_save_activity();
+        let pushing = sync_status(&database).unwrap();
+        assert!(pushing.syncing);
+        assert!(pushing.saving);
+
+        end_cloud_save_activity();
+        CLOUD_SYNC_ACTIVE.store(false, Ordering::Release);
+        let settled = sync_status(&database).unwrap();
+        assert!(!settled.syncing);
+        assert!(!settled.saving);
+    }
+
+    #[test]
     fn concurrent_signal_storm_is_coalesced_without_losing_late_work() {
         use std::sync::atomic::AtomicUsize;
         use std::thread;
@@ -6813,6 +7067,201 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_unassigned_incremental_acknowledges_same_candidate_create() {
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, _subject_id) =
+            cloud_database_for_incremental_test("incremental-unassigned-candidate-ack.sqlite3");
+        let storage = storage_mode(&database).unwrap();
+        let local = crate::unassigned::get_state(&database).unwrap().unwrap();
+        let resumed_at = local.first_started_at + 2_000;
+        let operation_id = Uuid::now_v7().to_string();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "INSERT INTO sync_outbox(
+                   operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,
+                   payload_json,state,attempt_count,created_at
+                 ) VALUES (?1,?2,?3,'unassigned_session_create','unassigned_session',?4,?5,'pending',0,?6)",
+                params![
+                    operation_id,
+                    cloud_workspace_id,
+                    storage.device_id,
+                    local.session_id,
+                    json!({"id":local.session_id}).to_string(),
+                    now_millis()
+                ],
+            )
+            .unwrap();
+
+        apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &storage.device_id,
+            15,
+            &[incremental_entity(
+                "unassigned_sessions",
+                "unassigned_sessions",
+                local.session_id.clone(),
+                false,
+                Some(json!({
+                    "id":local.session_id,"work_date":local.work_date,"state":"collecting",
+                    "threshold_seconds":300,"duration_seconds":0,
+                    "first_started_at":resumed_at,"last_ended_at":null,
+                    "prompted_at":null,"resolution_type":null,
+                    "generated_entry_id":null,"resolved_at":null,
+                    "created_at":local.first_started_at,"updated_at":resumed_at,
+                    "version":local.version+1,"segments":[{
+                        "id":Uuid::now_v7().to_string(),"session_id":local.session_id,
+                        "sequence_no":1,"started_at":resumed_at,"ended_at":null,
+                        "duration_seconds":0,"lease_token":null
+                    }]
+                })),
+            )],
+        )
+        .unwrap();
+
+        let adopted = crate::unassigned::get_state(&database).unwrap().unwrap();
+        assert_eq!(adopted.first_started_at, resumed_at);
+        assert_eq!(adopted.version, local.version + 1);
+        assert_eq!(
+            sync_status(&database).unwrap().pending_operations,
+            0,
+            "服务端已经确认同 ID 锚点后，不应继续保留候选创建操作"
+        );
+    }
+
+    #[test]
+    fn active_anchor_payload_is_normalized_without_discarding_historical_pending() {
+        let (_directory, database, cloud_workspace_id, local_workspace_id, _subject_id) =
+            cloud_database_for_incremental_test("incremental-unassigned-anchor-normalize.sqlite3");
+        let device_id = storage_mode(&database).unwrap().device_id;
+        let current = crate::unassigned::get_state(&database).unwrap().unwrap();
+        let now = now_millis();
+        let historical_id = Uuid::now_v7().to_string();
+        let historical_segment_id = Uuid::now_v7().to_string();
+        let connection = database.open().unwrap();
+        connection.execute(
+            "INSERT INTO unassigned_sessions(
+               id,workspace_id,work_date,state,threshold_seconds,duration_seconds,first_started_at,
+               last_ended_at,created_at,updated_at,version,shared_source,migration_state,last_continuous_at
+             ) VALUES (?1,?2,'2026-10-04','awaiting_resolution',300,600,?3,?4,?3,?4,2,'cloud','adopted',?4)",
+            params![historical_id, local_workspace_id, now - 700_000, now - 100_000],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO unassigned_segments(id,workspace_id,session_id,sequence_no,started_at,ended_at,duration_seconds)
+             VALUES (?1,?2,?3,1,?4,?5,600)",
+            params![historical_segment_id, local_workspace_id, historical_id, now - 700_000, now - 100_000],
+        ).unwrap();
+        drop(connection);
+
+        let remote_id = Uuid::now_v7().to_string();
+        apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &device_id,
+            15,
+            &[incremental_entity(
+                "unassigned_sessions",
+                "unassigned_sessions",
+                remote_id.clone(),
+                false,
+                Some(json!({
+                    "id":remote_id,"work_date":current.work_date,"state":"awaiting_resolution",
+                    "threshold_seconds":300,"duration_seconds":999,"first_started_at":now-60_000,
+                    "last_ended_at":null,"prompted_at":now,"resolution_type":null,
+                    "generated_entry_id":null,"resolved_at":null,"created_at":now-60_000,
+                    "updated_at":now,"version":8,"segments":[
+                        {"id":Uuid::now_v7().to_string(),"session_id":remote_id,"sequence_no":1,"started_at":now-120_000,"ended_at":now-60_000,"duration_seconds":60},
+                        {"id":Uuid::now_v7().to_string(),"session_id":remote_id,"sequence_no":2,"started_at":now-60_000,"ended_at":null,"duration_seconds":999}
+                    ]
+                })),
+            )],
+        ).unwrap();
+
+        let connection = database.open().unwrap();
+        let historical: (String, i64, i64) = connection.query_row(
+            "SELECT state,duration_seconds,(SELECT COUNT(*) FROM unassigned_segments WHERE session_id=?1)
+             FROM unassigned_sessions WHERE id=?1",
+            [&historical_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(historical, ("awaiting_resolution".to_string(), 600, 1));
+        let active: (String, i64, Option<i64>, i64) = connection.query_row(
+            "SELECT state,duration_seconds,prompted_at,
+                    (SELECT COUNT(*) FROM unassigned_segments WHERE session_id=?1 AND ended_at IS NULL)
+             FROM unassigned_sessions WHERE id=?1",
+            [&remote_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(active, ("collecting".to_string(), 0, None, 1));
+        let segment: (i64, i64, Option<i64>, i64) = connection.query_row(
+            "SELECT sequence_no,started_at,ended_at,duration_seconds FROM unassigned_segments WHERE session_id=?1",
+            [&remote_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(segment, (1, now - 60_000, None, 0));
+    }
+
+    #[test]
+    fn closed_awaiting_resolution_incremental_stays_historical_pending() {
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, _subject_id) =
+            cloud_database_for_incremental_test("incremental-unassigned-closed-history.sqlite3");
+        let device_id = storage_mode(&database).unwrap().device_id;
+        let today = crate::unassigned::get_state(&database).unwrap().unwrap();
+        let historical_id = Uuid::now_v7().to_string();
+        let started_at = today.first_started_at - 120_000;
+        let ended_at = today.first_started_at - 60_000;
+
+        apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &device_id,
+            16,
+            &[incremental_entity(
+                "unassigned_sessions",
+                "unassigned_sessions",
+                historical_id.clone(),
+                false,
+                Some(json!({
+                    "id":historical_id,"work_date":"2026-10-07",
+                    "state":"awaiting_resolution","threshold_seconds":300,
+                    "duration_seconds":60,"first_started_at":started_at,
+                    "last_ended_at":ended_at,"prompted_at":null,
+                    "resolution_type":null,"generated_entry_id":null,
+                    "resolved_at":null,"created_at":started_at,
+                    "updated_at":ended_at,"version":2,"segments":[{
+                        "id":Uuid::now_v7().to_string(),"session_id":historical_id,
+                        "sequence_no":1,"started_at":started_at,
+                        "ended_at":ended_at,"duration_seconds":60,
+                        "lease_token":null
+                    }]
+                })),
+            )],
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let historical: (String, i64, i64) = connection
+            .query_row(
+                "SELECT state,duration_seconds,
+                        (SELECT COUNT(*) FROM unassigned_segments
+                         WHERE session_id=?1 AND ended_at IS NULL)
+                 FROM unassigned_sessions WHERE id=?1",
+                [&historical_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(historical, ("awaiting_resolution".to_string(), 60, 0));
+        assert_eq!(
+            crate::unassigned::get_state(&database)
+                .unwrap()
+                .unwrap()
+                .session_id,
+            today.session_id
+        );
+    }
+
+    #[test]
     fn shared_unassigned_payload_parses_complete_aggregate_and_rejects_invalid_identity() {
         let session_id = Uuid::now_v7().to_string();
         let segment_id = Uuid::now_v7().to_string();
@@ -7028,6 +7477,76 @@ mod tests {
             )
             .unwrap();
         assert_eq!(linked_entry, entry_id);
+    }
+
+    #[test]
+    fn authoritative_unassigned_entry_replaces_optimistic_loser_before_session_incremental() {
+        let (_directory, database, cloud_workspace_id, local_workspace_id, _subject_id) =
+            cloud_database_for_incremental_test(
+                "incremental-authoritative-unassigned-entry-first.sqlite3",
+            );
+        let device_id = storage_mode(&database).unwrap().device_id;
+        let session = crate::unassigned::get_state(&database).unwrap().unwrap();
+        let losing_entry_id = Uuid::now_v7().to_string();
+        let winner_entry_id = Uuid::now_v7().to_string();
+        let ended_at = now_millis();
+        let connection = database.open().unwrap();
+        connection.execute(
+            "INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,label_snapshot,started_at,ended_at,duration_seconds,origin_unassigned_session_id,created_at,updated_at,version)
+             VALUES (?1,?2,?3,'break','unassigned','ended','本机乐观输家',?4,?5,60,?6,?4,?5,1)",
+            params![losing_entry_id,local_workspace_id,session.work_date,ended_at-60_000,ended_at,session.session_id],
+        ).unwrap();
+        connection
+            .execute(
+                "UPDATE unassigned_sessions SET state='discarded',resolution_type='discard',
+             generated_entry_id=?1,resolved_at=?2,last_ended_at=?2,version=version+1 WHERE id=?3",
+                params![losing_entry_id, ended_at, session.session_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &device_id,
+            33,
+            &[incremental_entity(
+                "time_entries",
+                "time_entries",
+                winner_entry_id.clone(),
+                false,
+                Some(json!({
+                    "id":winner_entry_id,"work_date":session.work_date,"kind":"work",
+                    "source_type":"unassigned","state":"ended","default_task_id":null,
+                    "label_snapshot":"云端权威胜者","started_at":ended_at-60_000,
+                    "ended_at":ended_at,"duration_seconds":60,"note":null,
+                    "origin_unassigned_session_id":session.session_id,"created_at":ended_at,
+                    "updated_at":ended_at,"version":1,"deleted_at":null,
+                    "segments":[],"allocations":[]
+                })),
+            )],
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let entries = connection
+            .prepare(
+                "SELECT id FROM time_entries WHERE origin_unassigned_session_id=?1 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([&session.session_id], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries, vec![winner_entry_id.clone()]);
+        let linked: Option<String> = connection
+            .query_row(
+                "SELECT generated_entry_id FROM unassigned_sessions WHERE id=?1",
+                [&session.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked.as_deref(), Some(winner_entry_id.as_str()));
     }
 
     #[test]
@@ -8271,7 +8790,7 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(outbox.len(), 2);
+        assert_eq!(outbox.len(), 1);
         let timer = outbox.iter().find(|row| row.2 == "time_entry").unwrap();
         assert_eq!(timer.0, start_operation_id);
         assert_eq!(timer.1, "timer_stop");
@@ -8282,14 +8801,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&timer.7).unwrap();
         assert_eq!(payload["state"], "ended");
         assert_eq!(payload["version"], stopped.version);
-        let unassigned = outbox
-            .iter()
-            .find(|row| row.2 == "unassigned_session")
-            .unwrap();
-        assert!(matches!(
-            unassigned.1.as_str(),
-            "unassigned_session_create" | "unassigned_session_resume"
-        ));
+        assert!(outbox.iter().all(|row| row.2 != "unassigned_session"));
     }
 
     #[test]
@@ -8382,27 +8894,21 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert_eq!(outbox.len(), 4);
+        assert_eq!(outbox.len(), 2);
         assert_eq!(outbox[0].0, break_operation_id);
         assert_eq!(outbox[0].1, "unassigned_resolve_break");
         assert_eq!(outbox[0].2, "unassigned_session");
-        assert_eq!(outbox[1].1, "unassigned_time_entry_create");
-        assert_eq!(outbox[1].2, "time_entry");
+        assert_eq!(
+            outbox[0].3.as_deref(),
+            Some(break_result.session_id.as_str())
+        );
+        assert_eq!(outbox[1].0, discard_operation_id);
+        assert_eq!(outbox[1].1, "unassigned_discard");
+        assert_eq!(outbox[1].2, "unassigned_session");
         assert_eq!(
             outbox[1].3.as_deref(),
-            break_result.generated_entry_id.as_deref()
+            Some(discard_result.session_id.as_str())
         );
-        assert_eq!(outbox[1].4, None);
-        assert_eq!(outbox[2].0, discard_operation_id);
-        assert_eq!(outbox[2].1, "unassigned_discard");
-        assert_eq!(outbox[2].2, "unassigned_session");
-        assert_eq!(outbox[3].1, "unassigned_time_entry_create");
-        assert_eq!(outbox[3].2, "time_entry");
-        assert_eq!(
-            outbox[3].3.as_deref(),
-            discard_result.generated_entry_id.as_deref()
-        );
-        assert_eq!(outbox[3].4, None);
     }
 
     #[test]

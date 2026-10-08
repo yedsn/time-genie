@@ -65,6 +65,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "calendar_day_time_accounting",
         sql: include_str!("../migrations/0010_calendar_day_time_accounting.sql"),
     },
+    Migration {
+        version: 11,
+        name: "simplified_unassigned_anchor",
+        sql: include_str!("../migrations/0011_simplified_unassigned_anchor.sql"),
+    },
+    Migration {
+        version: 12,
+        name: "repair_unassigned_active_index",
+        sql: include_str!("../migrations/0012_repair_unassigned_active_index.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -495,7 +505,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let database = Database::initialize_at(directory.path().join("test.sqlite3")).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 10);
+        assert_eq!(status.schema_version, 12);
         for table in REQUIRED_TABLES {
             assert!(
                 status.tables.iter().any(|value| value == table),
@@ -535,7 +545,7 @@ mod tests {
         let workspace_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migration_count, 10);
+        assert_eq!(migration_count, 12);
         assert_eq!(workspace_count, 1);
     }
 
@@ -622,7 +632,7 @@ mod tests {
         assert_eq!(task_title, "升级前事项");
         assert_eq!(queued, 1);
         assert_eq!(deferred_table, 6);
-        assert_eq!(database.status().unwrap().schema_version, 10);
+        assert_eq!(database.status().unwrap().schema_version, 12);
     }
 
     #[test]
@@ -899,6 +909,285 @@ mod tests {
             allocation,
             ("history".to_string(), "calendar-task".to_string(), 1)
         );
+    }
+
+    #[test]
+    fn simplified_anchor_migration_preserves_history_and_collapses_legacy_lifecycle() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("simplified-anchor-upgrade.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                   version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        for migration in &MIGRATIONS[..10] {
+            let transaction = connection.transaction().unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version,name,applied_at) VALUES (?1,?2,?3)",
+                    params![migration.version, migration.name, now_millis()],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        connection.execute_batch(
+            "INSERT INTO workspaces(id,name,timezone,storage_mode,created_at,updated_at,version)
+               VALUES ('anchor-workspace','锚点升级','America/Los_Angeles','cloud',1,1,1),
+                      ('timer-workspace','计时升级','Pacific/Auckland','cloud',1,1,1);
+             INSERT INTO devices(id,workspace_id,device_name,platform,app_version,last_seen_at,created_at)
+               VALUES ('anchor-device','anchor-workspace','设备 A','test','1',1,1),
+                      ('timer-device','timer-workspace','设备 B','test','1',1,1);
+             INSERT INTO subjects(id,workspace_id,name,sort_order,created_at,updated_at,version)
+               VALUES ('anchor-subject','anchor-workspace','默认',10,1,1,1);
+             INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version)
+               VALUES ('anchor-task','anchor-workspace','anchor-subject','历史事项','open','manual',10,1,1,1);
+             INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,label_snapshot,started_at,ended_at,duration_seconds,created_at,updated_at,version)
+               VALUES ('history-entry','anchor-workspace','2026-10-04','work','unassigned','ended','历史工时',1000,61000,60,1000,61000,1);
+             INSERT INTO time_allocations(id,workspace_id,entry_id,task_id,minutes,created_at,updated_at,version)
+               VALUES ('history-allocation','anchor-workspace','history-entry','anchor-task',1,1000,61000,1);
+             INSERT INTO unassigned_sessions(id,workspace_id,work_date,state,threshold_seconds,duration_seconds,first_started_at,last_ended_at,resolution_type,generated_entry_id,resolved_at,created_at,updated_at,version,shared_source,migration_state,last_continuous_at)
+               VALUES ('resolved-session','anchor-workspace','2026-10-04','resolved',300,60,1000,61000,'work','history-entry',61000,1000,61000,3,'cloud','ready',61000),
+                      ('historical-pending','anchor-workspace','2026-10-05','awaiting_resolution',300,600,100000,700000,NULL,NULL,NULL,100000,700000,2,'cloud','ready',700000),
+                      ('active-anchor','anchor-workspace','2026-10-06','collecting',300,900,800000,900000,NULL,NULL,NULL,800000,950000,4,'cloud','ready',950000),
+                      ('timer-cleared','timer-workspace','2026-10-07','awaiting_resolution',300,300,1000000,1300000,NULL,NULL,NULL,1000000,1300000,5,'cloud','ready',1300000);
+             INSERT INTO unassigned_segments(id,workspace_id,session_id,sequence_no,started_at,ended_at,duration_seconds)
+               VALUES ('historical-segment','anchor-workspace','historical-pending',1,100000,700000,600),
+                      ('old-closed-segment','anchor-workspace','active-anchor',1,800000,900000,100),
+                      ('active-open-segment','anchor-workspace','active-anchor',2,900000,NULL,800);
+             INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,label_snapshot,started_at,duration_seconds,created_at,updated_at,version,timer_chain_id,last_continuous_at)
+               VALUES ('running-timer','timer-workspace','2026-10-07','work','timer','running','活动事项',1400000,0,1400000,1400000,1,'running-timer',1400000);
+             INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,base_version,payload_json,state,attempt_count,created_at,payload_version,coalesced_count)
+               VALUES ('pause-op','anchor-workspace','anchor-device','unassigned_session_pause','unassigned_session','active-anchor',1,'{}','pending',0,1,2,1),
+                      ('resume-op','anchor-workspace','anchor-device','unassigned_session_resume','unassigned_session','active-anchor',2,'{}','failed',1,2,3,1),
+                      ('await-op','anchor-workspace','anchor-device','unassigned_session_awaiting_resolution','unassigned_session','active-anchor',3,'{}','conflict',1,3,4,1),
+                      ('sending-op','anchor-workspace','anchor-device','unassigned_session_pause','unassigned_session','active-anchor',4,'{}','sending',1,4,5,1),
+                      ('keep-op','anchor-workspace','anchor-device','task.update','task','anchor-task',1,'{}','pending',0,5,2,1);"
+        ).unwrap();
+        drop(connection);
+
+        let mut upgrade_connection = Connection::open(&path).unwrap();
+        configure_connection(&upgrade_connection).unwrap();
+        apply_migrations(&mut upgrade_connection).unwrap();
+        drop(upgrade_connection);
+        let database = Database { path };
+        let connection = database.open().unwrap();
+
+        let resolved: (String, i64, Option<String>) = connection.query_row(
+            "SELECT state,duration_seconds,generated_entry_id FROM unassigned_sessions WHERE id='resolved-session'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            resolved,
+            (
+                "resolved".to_string(),
+                60,
+                Some("history-entry".to_string())
+            )
+        );
+        let history_entry: (i64, i64) = connection
+            .query_row(
+                "SELECT duration_seconds,ended_at FROM time_entries WHERE id='history-entry'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(history_entry, (60, 61000));
+        let history_allocation: i64 = connection
+            .query_row(
+                "SELECT minutes FROM time_allocations WHERE id='history-allocation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(history_allocation, 1);
+
+        let historical: (String, i64) = connection.query_row(
+            "SELECT state,duration_seconds FROM unassigned_sessions WHERE id='historical-pending'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(historical, ("awaiting_resolution".to_string(), 600));
+        let historical_segments: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM unassigned_segments WHERE session_id='historical-pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(historical_segments, 1);
+
+        let active: (String, i64, i64, i64, Option<i64>) = connection.query_row(
+            "SELECT state,duration_seconds,first_started_at,version,last_ended_at FROM unassigned_sessions WHERE id='active-anchor'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap();
+        assert_eq!(active, ("collecting".to_string(), 0, 900000, 4, None));
+        let active_segments: Vec<(i64, i64, Option<i64>, i64)> = connection.prepare(
+            "SELECT sequence_no,started_at,ended_at,duration_seconds FROM unassigned_segments WHERE session_id='active-anchor' ORDER BY sequence_no",
+        ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(active_segments, vec![(1, 900000, None, 0)]);
+
+        let cleared: (String, Option<String>, i64, String) = connection.query_row(
+            "SELECT state,resolution_type,duration_seconds,migration_state FROM unassigned_sessions WHERE id='timer-cleared'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(
+            cleared,
+            (
+                "discarded".to_string(),
+                Some("discard".to_string()),
+                0,
+                "superseded".to_string()
+            )
+        );
+
+        let outbox_operations = collect_strings(
+            &connection,
+            "SELECT operation_id FROM sync_outbox ORDER BY operation_id",
+        )
+        .unwrap();
+        assert_eq!(outbox_operations, vec!["keep-op", "sending-op"]);
+        assert_eq!(database.status().unwrap().schema_version, 12);
+
+        // Deployment rollback keeps the migrated database in place. Rehearse
+        // the previous client's read path against that database and verify
+        // that final work and its allocation remain intact while the old
+        // lifecycle operations stay retired.
+        let previous_client_entry: (String, i64, i64) = connection
+            .query_row(
+                "SELECT state,duration_seconds,ended_at FROM time_entries WHERE id='history-entry'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(previous_client_entry, ("ended".to_string(), 60, 61000));
+        let previous_client_allocation: i64 = connection
+            .query_row(
+                "SELECT minutes FROM time_allocations WHERE entry_id='history-entry'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(previous_client_allocation, 1);
+        let retired_lifecycle_operations: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox
+                 WHERE operation_type IN (
+                   'unassigned_session_pause',
+                   'unassigned_session_resume',
+                   'unassigned_session_awaiting_resolution'
+                 ) AND state IN ('pending','failed','conflict')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retired_lifecycle_operations, 0);
+    }
+
+    #[test]
+    fn repair_unassigned_active_index_removes_stale_workspace_constraint() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("repair-unassigned-index.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                   version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        for migration in &MIGRATIONS[..11] {
+            let transaction = connection.transaction().unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version,name,applied_at) VALUES (?1,?2,?3)",
+                    params![migration.version, migration.name, now_millis()],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        connection
+            .execute_batch(
+                "DROP INDEX IF EXISTS uq_unassigned_sessions_active_date;
+                 CREATE UNIQUE INDEX uq_unassigned_sessions_active
+                   ON unassigned_sessions(workspace_id)
+                   WHERE state IN ('collecting', 'awaiting_resolution');
+                 INSERT INTO workspaces(
+                   id,name,timezone,storage_mode,created_at,updated_at,version
+                 ) VALUES (
+                   'repair-workspace','索引修复','Asia/Shanghai','local',1,1,1
+                 );
+                 INSERT INTO unassigned_sessions(
+                   id,workspace_id,work_date,state,threshold_seconds,duration_seconds,
+                   first_started_at,created_at,updated_at,version
+                 ) VALUES (
+                   'old-day','repair-workspace','2000-01-01','awaiting_resolution',
+                   300,60,1,1,60001,1
+                 );
+                 INSERT INTO app_metadata(key,value)
+                   VALUES ('initial_demo_tasks_seeded','1');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::initialize_at(path).unwrap();
+        assert_eq!(database.status().unwrap().schema_version, 12);
+        let connection = database.open().unwrap();
+
+        let stale_index_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index' AND name='uq_unassigned_sessions_active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let date_index_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index' AND name='uq_unassigned_sessions_active_date'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_index_count, 0);
+        assert_eq!(date_index_count, 1);
+
+        connection
+            .execute(
+                "INSERT INTO unassigned_sessions(
+                   id,workspace_id,work_date,state,threshold_seconds,duration_seconds,
+                   first_started_at,created_at,updated_at,version
+                 ) VALUES (
+                   'new-day','repair-workspace','2000-01-02','collecting',
+                   300,0,70000,70000,70000,1
+                 )",
+                [],
+            )
+            .unwrap();
+        let duplicate_result = connection.execute(
+            "INSERT INTO unassigned_sessions(
+               id,workspace_id,work_date,state,threshold_seconds,duration_seconds,
+               first_started_at,created_at,updated_at,version
+             ) VALUES (
+               'same-day','repair-workspace','2000-01-02','awaiting_resolution',
+               300,10,80000,80000,90000,1
+             )",
+            [],
+        );
+        assert!(duplicate_result.is_err());
     }
 
     #[test]
@@ -1204,7 +1493,7 @@ mod tests {
 
         let database = Database::initialize_at(path).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 10);
+        assert_eq!(status.schema_version, 12);
         assert!(status.tables.iter().any(|table| table == "device_hooks"));
         assert!(status
             .tables

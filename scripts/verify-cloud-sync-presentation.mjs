@@ -37,14 +37,22 @@ assert.equal(cloudSaveStatusLabel({ ...cloud, pendingOperations: 2, conflictCoun
 assert.equal(cloudSaveStatusLabel({ ...cloud, lastError: "网络失败" }), "保存失败");
 assert.equal(cloudSaveStatusLabel({ ...cloud, online: false }), "云端连接不可用");
 assert.equal(cloudSaveStatusLabel(cloud), "所有更改均已保存");
-assert.equal(cloudSaveStatusLabel({ ...cloud, syncing: true }), "正在同步");
-assert.equal(cloudSaveStatusLabel({ ...cloud, syncing: true, pendingOperations: 3 }), "正在同步 · 还有 3 项待保存");
+assert.equal(cloudSaveStatusLabel({ ...cloud, syncing: true }), "所有更改均已保存");
+assert.equal(cloudSaveStatusLabel({ ...cloud, syncing: true, pendingOperations: 3 }), "还有 3 项待保存");
 
 const syncing = cloudSyncPresentation({ ...cloud, syncing: true, pendingOperations: 3 }, formatSyncTime);
-assert.equal(syncing.label, "正在同步 · 还有 3 项待保存");
-assert.equal(syncing.detail, "正在后台保存并补齐云端变化");
+assert.equal(syncing.label, "还有 3 项待保存");
+assert.equal(syncing.detail, "本机更改将在后台自动保存");
 assert.equal(syncing.needsAttention, false);
 assert.equal(syncing.attentionLevel, "");
+
+const saving = cloudSyncPresentation({ ...cloud, syncing: true, saving: true, pendingOperations: 3 }, formatSyncTime);
+assert.equal(saving.label, "还有 3 项待保存");
+assert.equal(saving.detail, "正在后台保存本机更改");
+
+const pulling = cloudSyncPresentation({ ...cloud, syncing: true, saving: false }, formatSyncTime);
+assert.equal(pulling.label, "实时同步");
+assert.match(pulling.detail, /实时同步已连接/);
 
 const conflict = cloudSyncPresentation({ ...cloud, online: false, lastError: "网络失败", pendingOperations: 3, conflictCount: 2 }, formatSyncTime);
 assert.equal(conflict.label, "2 项冲突，3 项待处理");

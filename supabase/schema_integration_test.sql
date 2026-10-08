@@ -46,6 +46,8 @@ end $$;
 \ir 20261006b_timegenie_calendar_day_accounting_patch.sql
 \ir 20261007_timegenie_unassigned_segment_boundary_fix.sql
 \ir 20261007_timegenie_unassigned_segment_boundary_fix.sql
+\ir 20261008_timegenie_simplified_unassigned_anchor.sql
+\ir 20261008_timegenie_simplified_unassigned_anchor.sql
 
 do $$
 begin
@@ -1951,12 +1953,12 @@ begin
   end if;
 end $$;
 
--- Expired leases close the old open segment at the last confirmed boundary; a
--- replacement lease starts a new segment at reacquire time and does not backfill.
+-- An expired lease discards the interrupted anchor at the last confirmed
+-- boundary. Reacquiring creates one fresh anchor and never counts the gap.
 set local role authenticated;
 select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
 do $$
-declare first_lease jsonb; second_lease jsonb; old_end timestamptz; new_start timestamptz; confirmed timestamptz;
+declare first_lease jsonb; second_lease jsonb; new_anchor jsonb; confirmed timestamptz;
 begin
   first_lease:=timegenie.tracking_lease_acquire('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001','94000000-0000-0000-0000-000000000001');
   reset role;
@@ -1979,24 +1981,46 @@ begin
   perform set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
   second_lease:=timegenie.tracking_lease_acquire('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002','94000000-0000-0000-0000-000000000002');
   reset role;
-  select max(ended_at) into old_end from timegenie.unassigned_segments where lease_token='94000000-0000-0000-0000-000000000001';
-  select min(started_at) into new_start from timegenie.unassigned_segments where lease_token='94000000-0000-0000-0000-000000000002';
-  if old_end is null or abs(extract(epoch from (old_end-confirmed)))>0.01 then
-    raise exception 'expired lease counted beyond its last confirmed boundary: end %, confirmed %',old_end,confirmed;
+  if not coalesce((second_lease->>'acquired')::boolean,false) then
+    raise exception 'replacement device did not acquire the expired lease';
   end if;
-  if new_start is null or new_start<=old_end then raise exception 'replacement lease did not restart after the disconnected gap'; end if;
+  if not exists(
+    select 1 from timegenie.unassigned_sessions
+    where id='95000000-0000-0000-0000-000000000001'
+      and state='discarded' and resolution_type='discard' and duration_seconds=0
+      and abs(extract(epoch from (resolved_at-confirmed)))<0.01
+  ) then
+    raise exception 'expired lease did not discard the interrupted anchor at its last confirmed boundary';
+  end if;
+  new_anchor:=timegenie.timegenie_unassigned_active_anchor('20000000-0000-0000-0000-000000000001',null);
+  if new_anchor is null
+     or new_anchor->>'id'='95000000-0000-0000-0000-000000000001'
+     or (new_anchor->>'duration_seconds')::bigint<>0
+     or jsonb_array_length(new_anchor->'segments')<>1
+     or new_anchor->'segments'->0->>'ended_at' is not null
+     or (new_anchor->'segments'->0->>'started_at')::timestamptz<=confirmed then
+    raise exception 'replacement lease did not create one fresh zero-duration anchor after the disconnected gap: %',new_anchor;
+  end if;
 end $$;
 reset role;
 
 -- Shared unassigned time has one root per workspace. Repeated create calls
 -- adopt the same root, only the first concurrent resolution wins, and retrying
 -- the winning operation is idempotent.
+reset role;
+insert into timegenie.subjects(id,workspace_id,name,sort_order)
+values('52000000-0000-0000-0000-000000000001','20000000-0000-0000-0000-000000000002','未归属处理',1)
+on conflict do nothing;
+insert into timegenie.tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,version)
+values('62000000-0000-0000-0000-000000000001','20000000-0000-0000-0000-000000000002','52000000-0000-0000-0000-000000000001','未归属处理事项','open','manual',1,1)
+on conflict do nothing;
 set local role authenticated;
 select set_config('request.jwt.claim.sub', '10000000-0000-0000-0000-000000000002', true);
 
 do $$
-declare first_session jsonb; second_session jsonb; first_result jsonb; retry_result jsonb; loser_result jsonb;
-declare session_id uuid; session_version bigint;
+declare first_session jsonb; second_session jsonb; next_session jsonb; first_result jsonb; retry_result jsonb; loser_result jsonb;
+declare reset_result jsonb; reset_retry jsonb; reset_loser jsonb; reset_millis bigint;
+declare session_id uuid; session_version bigint; original_started timestamptz; original_updated timestamptz;
 begin
   first_session := timegenie.unassigned_get_or_create_shared(
     '20000000-0000-0000-0000-000000000002',
@@ -2019,8 +2043,17 @@ begin
   if first_session->>'id' is distinct from second_session->>'id' then
     raise exception 'parallel shared unassigned create returned different roots';
   end if;
+  if first_session->>'state'<>'collecting'
+     or (first_session->>'duration_seconds')::bigint<>0
+     or jsonb_array_length(first_session->'segments')<>1
+     or first_session->'segments'->0->>'ended_at' is not null
+     or second_session->>'first_started_at' is distinct from first_session->>'first_started_at' then
+    raise exception 'shared create did not preserve one immutable zero-duration anchor: %, %',first_session,second_session;
+  end if;
   session_id := (first_session->>'id')::uuid;
   session_version := (first_session->>'version')::bigint;
+  original_started := (first_session->>'first_started_at')::timestamptz;
+  original_updated := (first_session->>'updated_at')::timestamptz;
   retry_result := timegenie.cloud_apply_patch(
     '20000000-0000-0000-0000-000000000002',
     '30000000-0000-0000-0000-000000000003',
@@ -2036,8 +2069,12 @@ begin
       'segments','[]'::jsonb
     )
   );
-  if retry_result->>'version' is distinct from (session_version+1)::text then
-    raise exception 'first shared unassigned lifecycle update was not accepted';
+  if not coalesce((retry_result->>'superseded')::boolean,false)
+     or retry_result->'session'->>'state'<>'collecting'
+     or (retry_result->'session'->>'version')::bigint<>session_version
+     or (retry_result->'session'->>'duration_seconds')::bigint<>0
+     or (retry_result->'session'->>'first_started_at')::timestamptz<>original_started then
+    raise exception 'legacy awaiting-resolution update changed the simplified anchor: %',retry_result;
   end if;
   retry_result := timegenie.cloud_apply_patch(
     '20000000-0000-0000-0000-000000000002',
@@ -2055,19 +2092,51 @@ begin
     )
   );
   if not coalesce((retry_result->>'superseded')::boolean,false)
-     or retry_result->'session'->>'state' <> 'awaiting_resolution' then
-    raise exception 'duplicate shared unassigned lifecycle did not adopt current session';
+     or retry_result->'session'->>'state'<>'collecting'
+     or (retry_result->'session'->>'version')::bigint<>session_version
+     or (retry_result->'session'->>'updated_at')::timestamptz<>original_updated then
+    raise exception 'duplicate legacy lifecycle update mutated the current anchor';
   end if;
-  session_version := (retry_result->'session'->>'version')::bigint;
+  reset_millis:=floor(extract(epoch from clock_timestamp())*1000)::bigint-60000;
+  reset_result:=timegenie.unassigned_anchor_reset(
+    '20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000003',
+    '42000000-0000-0000-0000-000000000006',session_id,session_version,reset_millis
+  );
+  reset_retry:=timegenie.unassigned_anchor_reset(
+    '20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000003',
+    '42000000-0000-0000-0000-000000000006',session_id,session_version,reset_millis
+  );
+  reset_loser:=timegenie.unassigned_anchor_reset(
+    '20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000003',
+    '42000000-0000-0000-0000-000000000007',session_id,session_version,reset_millis-60000
+  );
+  if not coalesce((reset_result->>'accepted')::boolean,false)
+     or reset_retry is distinct from reset_result
+     or coalesce((reset_loser->>'accepted')::boolean,false)
+     or reset_loser->'session'->>'id'<>session_id::text
+     or (reset_loser->'session'->>'first_started_at')::timestamptz<>(reset_result->'session'->>'first_started_at')::timestamptz then
+    raise exception 'anchor reset retry or stale reset did not converge: %, %, %',reset_result,reset_retry,reset_loser;
+  end if;
+  session_version:=(reset_result->'session'->>'version')::bigint;
   first_result := timegenie.unassigned_resolve_shared(
     '20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000003',
     '42000000-0000-0000-0000-000000000001',session_id,session_version,'work',
-    jsonb_build_object('generated_entry_id','73000000-0000-0000-0000-000000000001')
+    jsonb_build_object('generated_entry_id','73000000-0000-0000-0000-000000000001','generated_entry',jsonb_build_object(
+      'id','73000000-0000-0000-0000-000000000001','origin_unassigned_session_id',session_id::text,
+      'label_snapshot','未归属处理事项','note',null,'allocations',jsonb_build_array(jsonb_build_object(
+        'id','73100000-0000-0000-0000-000000000001','task_id','62000000-0000-0000-0000-000000000001','minutes',1,'note',null
+      ))
+    ))
   );
   retry_result := timegenie.unassigned_resolve_shared(
     '20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000003',
     '42000000-0000-0000-0000-000000000001',session_id,session_version,'work',
-    jsonb_build_object('generated_entry_id','73000000-0000-0000-0000-000000000001')
+    jsonb_build_object('generated_entry_id','73000000-0000-0000-0000-000000000001','generated_entry',jsonb_build_object(
+      'id','73000000-0000-0000-0000-000000000001','origin_unassigned_session_id',session_id::text,
+      'label_snapshot','未归属处理事项','note',null,'allocations',jsonb_build_array(jsonb_build_object(
+        'id','73100000-0000-0000-0000-000000000001','task_id','62000000-0000-0000-0000-000000000001','minutes',1,'note',null
+      ))
+    ))
   );
   loser_result := timegenie.unassigned_resolve_shared(
     '20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000003',
@@ -2081,6 +2150,24 @@ begin
   end if;
   if first_result->'session'->>'resolved_at' is null then
     raise exception 'shared unassigned resolution did not use server resolved_at';
+  end if;
+  if first_result->'generatedEntry'->>'id'<>'73000000-0000-0000-0000-000000000001'
+     or first_result->'session'->>'generated_entry_id'<>'73000000-0000-0000-0000-000000000001'
+     or (first_result->'generatedEntry'->>'started_at')::timestamptz<>(first_result->'session'->>'first_started_at')::timestamptz
+     or (first_result->'generatedEntry'->>'ended_at')::timestamptz<>(first_result->'session'->>'resolved_at')::timestamptz
+     or (first_result->'generatedEntry'->>'duration_seconds')::bigint<>(first_result->'session'->>'duration_seconds')::bigint then
+    raise exception 'shared resolution did not atomically create the authoritative final entry: %',first_result;
+  end if;
+  next_session:=timegenie.unassigned_get_or_create_shared(
+    '20000000-0000-0000-0000-000000000002',
+    '30000000-0000-0000-0000-000000000003',null,null,null
+  );
+  if first_result->'nextSession' is null
+     or first_result->'nextSession'->>'predecessor_session_id'<>session_id::text
+     or (first_result->'nextSession'->>'first_started_at')::timestamptz
+        <> (first_result->'session'->>'resolved_at')::timestamptz
+     or next_session->>'id'<>first_result->'nextSession'->>'id' then
+    raise exception 'resolution did not establish exactly one next anchor at the authoritative boundary: %',first_result;
   end if;
   retry_result := timegenie.cloud_apply_patch(
     '20000000-0000-0000-0000-000000000002',
@@ -2100,6 +2187,52 @@ begin
   if not coalesce((retry_result->>'superseded')::boolean,false)
      or retry_result->'session'->>'resolution_type' <> 'work' then
     raise exception 'superseded shared unassigned lifecycle did not adopt terminal session';
+  end if;
+end $$;
+
+-- Timer start clears the current anchor in the same cloud operation; timer
+-- stop creates exactly one new anchor at its authoritative ended_at boundary.
+do $$
+declare start_payload jsonb; stop_payload jsonb; first_stop jsonb; retry_stop jsonb; active_anchor jsonb; start_millis bigint; stop_millis bigint;
+begin
+  start_millis:=floor(extract(epoch from clock_timestamp())*1000)::bigint;
+  stop_millis:=start_millis+60000;
+  start_payload:=jsonb_build_object(
+    'id','74000000-0000-0000-0000-000000000001','work_date',timegenie.workspace_work_date('20000000-0000-0000-0000-000000000002',to_timestamp(start_millis::double precision/1000)),
+    'kind','work','source_type','timer','state','running','default_task_id','62000000-0000-0000-0000-000000000001',
+    'label_snapshot','原子计时验证','started_at',start_millis,'ended_at',null,'duration_seconds',0,'note',null,
+    'created_at',start_millis,'updated_at',start_millis,'version',1,
+    'segments',jsonb_build_array(jsonb_build_object('id','74100000-0000-0000-0000-000000000001','sequence_no',1,'started_at',start_millis,'ended_at',null,'duration_seconds',0)),
+    'allocations',jsonb_build_array()
+  );
+  perform timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000003',
+    '42000000-0000-0000-0000-000000000008','timer_start','time_entry','74000000-0000-0000-0000-000000000001',
+    null,1,1,start_payload
+  );
+  if timegenie.unassigned_get_state('20000000-0000-0000-0000-000000000002') is not null then
+    raise exception 'timer start did not atomically clear the active anchor';
+  end if;
+  stop_payload:=start_payload||jsonb_build_object(
+    'state','ended','ended_at',stop_millis,'duration_seconds',60,'updated_at',stop_millis,'version',2,
+    'segments',jsonb_build_array(jsonb_build_object('id','74100000-0000-0000-0000-000000000001','sequence_no',1,'started_at',start_millis,'ended_at',stop_millis,'duration_seconds',60))
+  );
+  first_stop:=timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000003',
+    '42000000-0000-0000-0000-000000000009','timer_stop','time_entry','74000000-0000-0000-0000-000000000001',
+    1,2,1,stop_payload
+  );
+  retry_stop:=timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000003',
+    '42000000-0000-0000-0000-000000000009','timer_stop','time_entry','74000000-0000-0000-0000-000000000001',
+    1,2,1,stop_payload
+  );
+  active_anchor:=timegenie.unassigned_get_state('20000000-0000-0000-0000-000000000002');
+  if first_stop is distinct from retry_stop
+     or active_anchor is null
+     or (active_anchor->>'first_started_at')::timestamptz<>to_timestamp(stop_millis::double precision/1000)
+     or active_anchor->>'session_id' is null then
+    raise exception 'timer stop did not create one idempotent authoritative anchor: %',active_anchor;
   end if;
 end $$;
 

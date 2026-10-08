@@ -185,7 +185,6 @@ export const useWorkdayStore = defineStore("workday", () => {
   const workspaceDayStartAt = ref(0);
   const workspaceDayEndAt = ref(0);
   const unassignedStartedAt = ref<number>();
-  const unassignedAccumulatedSeconds = ref(0);
   const unassignedFirstStartedAt = ref<number>();
   const unassignedLastEndedAt = ref<number>();
   const unassignedDialogOpen = ref(false);
@@ -232,10 +231,9 @@ export const useWorkdayStore = defineStore("workday", () => {
   const timerStopConfirmationSlices = computed(() => timerStopConfirmation.value?.slices ?? (timerStopConfirmationEntry.value ? [timerStopConfirmationEntry.value] : []));
   const doneCount = computed(() => tasks.filter((task) => task.status === "done").length);
   const unassignedSeconds = computed(() => {
-    const liveSeconds = unassignedStartedAt.value
+    return unassignedStartedAt.value
       ? Math.max(0, Math.floor((now.value - unassignedStartedAt.value) / 1_000))
       : 0;
-    return unassignedAccumulatedSeconds.value + liveSeconds;
   });
   const visibleTasks = computed(() => {
     const childMap = new Map<string, Task[]>();
@@ -270,7 +268,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       }, 1_000);
     }
     if (!timeRefreshClock) {
-      timeRefreshClock = window.setInterval(() => void Promise.all([loadTimeData(), loadUnassignedState()]).then(() => loadTodayOverview()), 5_000);
+      timeRefreshClock = window.setInterval(() => void loadTimeData().then(() => loadTodayOverview()), 5_000);
     }
   }
 
@@ -575,19 +573,13 @@ export const useWorkdayStore = defineStore("workday", () => {
     const previousSessionId = unassignedSessionId.value;
     const sessionChanged = Boolean(previousSessionId && previousSessionId !== state.sessionId);
     if (sessionChanged) unassignedDialogOpen.value = false;
-    const previousSeconds = previousSessionId === state.sessionId ? unassignedSeconds.value : 0;
-    const liveSeconds = state.currentSegmentStartedAt
-      ? Math.max(0, Math.floor((syncedAt - state.currentSegmentStartedAt) / 1_000))
-      : 0;
-    const elapsedSeconds = Math.max(state.elapsedSeconds, previousSeconds);
     unassignedSessionId.value = state.sessionId;
     unassignedWorkDate.value = state.workDate;
     unassignedVersion.value = state.version;
     unassignedThresholdSeconds.value = state.thresholdSeconds;
     unassignedFirstStartedAt.value = state.firstStartedAt;
     unassignedLastEndedAt.value = state.lastEndedAt;
-    unassignedStartedAt.value = state.currentSegmentStartedAt;
-    unassignedAccumulatedSeconds.value = Math.max(0, elapsedSeconds - liveSeconds);
+    unassignedStartedAt.value = state.currentSegmentStartedAt ?? state.firstStartedAt;
   }
 
   function replaceTask(record: TaskRecord) {
@@ -653,10 +645,9 @@ export const useWorkdayStore = defineStore("workday", () => {
   function promptUnassignedResolution(force = false) {
     const checkedAt = Date.now();
     now.value = checkedAt;
-    const liveSeconds = unassignedStartedAt.value
+    const totalSeconds = unassignedStartedAt.value
       ? Math.max(0, Math.floor((checkedAt - unassignedStartedAt.value) / 1_000))
       : 0;
-    const totalSeconds = unassignedAccumulatedSeconds.value + liveSeconds;
     if (unassignedDialogOpen.value) return false;
     if (totalSeconds < 1 && unassignedHistoricalPending.value.length) {
       applyUnassignedState(unassignedHistoricalPending.value[0]);
@@ -673,7 +664,6 @@ export const useWorkdayStore = defineStore("workday", () => {
     markUnassignedStateChanged();
     unassignedDialogOpen.value = false;
     unassignedStartedAt.value = undefined;
-    unassignedAccumulatedSeconds.value = 0;
     unassignedFirstStartedAt.value = undefined;
     unassignedLastEndedAt.value = undefined;
     unassignedSessionId.value = "";
@@ -1050,7 +1040,8 @@ export const useWorkdayStore = defineStore("workday", () => {
     if (taskId && !persistedTaskId) throw new Error("计时事项保存失败");
     const entry = toUiTimeEntry(await startTimerRecord(persistedTaskId, note.trim() || undefined));
     markTimeDataChanged();
-    markUnassignedStateChanged();
+    resetUnassignedTracking();
+    unassignedCurrentSession.value = undefined;
     entries.unshift(entry);
     selectedTaskId.value = persistedTaskId ?? "";
     selectedEntryId.value = entry.id;
@@ -1094,6 +1085,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     markUnassignedStateChanged();
     selectedEntryId.value = stopped.id;
     timerStopConfirmationEntryId.value = stopped.id;
+    resetUnassignedTracking();
     await notifyTimerStopConfirmation(stopped.id);
     await loadWorkspaceData();
     await loadUnassignedState();

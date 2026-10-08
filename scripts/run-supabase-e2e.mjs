@@ -20,23 +20,32 @@ if (process.env.TG_SUPABASE_E2E_ALLOW_RESET !== "1") {
   process.exit(2);
 }
 
-const result = spawnSync(
-  "cargo",
-  [
-    "test",
-    "--manifest-path",
-    "src-tauri/Cargo.toml",
-    "cloud_e2e::real_supabase_two_device_flow",
-    "--",
-    "--ignored",
-    "--nocapture",
-  ],
-  { stdio: "inherit", shell: process.platform === "win32" },
-);
+const tests = [
+  "cloud_e2e::real_supabase_two_device_flow",
+  "cloud_e2e::real_supabase_unassigned_two_device_flow",
+];
 
-if (result.error) {
-  console.error(`无法启动 Supabase 双设备端到端测试：${result.error.message}`);
-  process.exit(1);
+for (const test of tests) {
+  const result = spawnSync(
+    "cargo",
+    [
+      "test",
+      "--manifest-path",
+      "src-tauri/Cargo.toml",
+      test,
+      "--",
+      "--ignored",
+      "--nocapture",
+      "--test-threads=1",
+    ],
+    { stdio: "inherit", shell: process.platform === "win32" },
+  );
+
+  if (result.error) {
+    console.error(`无法启动 Supabase 双设备端到端测试：${result.error.message}`);
+    process.exit(1);
+  }
+  if (result.status !== 0) {
+    process.exit(result.status ?? 1);
+  }
 }
-
-process.exit(result.status ?? 1);
