@@ -21,7 +21,6 @@ const summary = computed(() => overview.value?.summary ?? {
   activeCount: 0,
   notStartedCount: 0,
   unassignedMinutes: 0,
-  historicalUnassignedCount: 0,
   completionRate: 0,
 });
 const subjectOptions = computed(() => [{ id: "", name: "全部主体" }, ...store.subjects.map((subject) => ({ id: subject.id, name: subject.name }))]);
@@ -168,9 +167,8 @@ function taskTitle(task: TodayWorkOverviewTaskRecord) {
       <div class="today-summary-item emphasis"><span>今日投入</span><strong>{{ formatMinutes(summary.actualMinutes) }}</strong><small>{{ overview?.scope.subjectName ?? '全部主体' }}</small></div>
       <div class="today-summary-item"><span>今日预计</span><strong>{{ formatMinutes(summary.estimatedMinutes) }}</strong><small>{{ summary.estimatedMinutes ? '按今日预计优先' : '暂无预计' }}</small></div>
       <div class="today-summary-item"><span>完成率</span><strong>{{ completionPercent }}%</strong><small>{{ summary.completedCount }} 完成 · {{ summary.activeCount }} 已开始 · {{ summary.notStartedCount }} 未开始</small></div>
-      <button class="today-summary-item action" type="button" :disabled="summary.unassignedMinutes <= 0 && summary.historicalUnassignedCount <= 0" @click="emit('resolveUnassigned')">
+      <button class="today-summary-item action" type="button" :disabled="summary.unassignedMinutes <= 0" @click="emit('resolveUnassigned')">
         <span>{{ allSubjectScope ? '未归属' : '未归属（全局）' }}</span><strong>{{ formatMinutes(summary.unassignedMinutes) }}</strong><small>{{ summary.unassignedMinutes ? '点击处理' : '无待处理时间' }}</small>
-        <small v-if="summary.historicalUnassignedCount">另有 {{ summary.historicalUnassignedCount }} 个历史日期待处理</small>
       </button>
     </div>
 

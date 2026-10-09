@@ -14,7 +14,6 @@ import {
   getWorkspaceCalendarContext,
   getTimerState,
   getUnassignedStateSnapshot,
-  getUnassignedSession,
   listSubjects,
   listTasks,
   listTodayTasks,
@@ -189,10 +188,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   const unassignedLastEndedAt = ref<number>();
   const unassignedDialogOpen = ref(false);
   const unassignedWorkDate = ref("");
-  const unassignedHistoricalPending = ref<UnassignedStateRecord[]>([]);
   const unassignedCurrentSession = ref<UnassignedStateRecord>();
-  const unassignedHistoricalPendingCount = ref(0);
-  const earliestHistoricalUnassignedDate = ref<string>();
   const timerStopConfirmationEntryId = ref("");
   const timerStopConfirmation = ref<{
     currentEntryId: string;
@@ -532,14 +528,8 @@ export const useWorkdayStore = defineStore("workday", () => {
     try {
       const snapshot = await getUnassignedStateSnapshot();
       if (requestSeq !== unassignedStateRequestSeq || mutationSeq !== unassignedStateMutationSeq) return;
-      unassignedHistoricalPending.value = snapshot.historicalPending;
       unassignedCurrentSession.value = snapshot.current;
-      unassignedHistoricalPendingCount.value = snapshot.historicalPendingCount;
-      earliestHistoricalUnassignedDate.value = snapshot.earliestHistoricalDate;
-      const selected = unassignedDialogOpen.value
-        ? [snapshot.current, ...snapshot.historicalPending].find((item) => item?.sessionId === unassignedSessionId.value)
-        : snapshot.current;
-      applyUnassignedState(selected ?? snapshot.current ?? null);
+      applyUnassignedState(snapshot.current ?? null);
     } catch (error) {
       console.error("加载未归属时间失败", error);
     }
@@ -649,11 +639,6 @@ export const useWorkdayStore = defineStore("workday", () => {
       ? Math.max(0, Math.floor((checkedAt - unassignedStartedAt.value) / 1_000))
       : 0;
     if (unassignedDialogOpen.value) return false;
-    if (totalSeconds < 1 && unassignedHistoricalPending.value.length) {
-      applyUnassignedState(unassignedHistoricalPending.value[0]);
-      unassignedDialogOpen.value = true;
-      return true;
-    }
     if (totalSeconds < 1) return false;
     if (!force && totalSeconds <= unassignedThresholdSeconds.value) return false;
     unassignedDialogOpen.value = true;
@@ -670,12 +655,6 @@ export const useWorkdayStore = defineStore("workday", () => {
     unassignedWorkDate.value = "";
     unassignedVersion.value = 0;
     unassignedStateMissingRefreshes = 0;
-  }
-
-  async function selectUnassignedSession(sessionId: string) {
-    const state = await getUnassignedSession(sessionId);
-    applyUnassignedState(state);
-    unassignedDialogOpen.value = true;
   }
 
   async function commitTaskToggle(task: Task): Promise<TaskCompletionResult | undefined> {
@@ -1404,7 +1383,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     workspaceTimezone, workspaceToday, workspaceDayStartAt, workspaceDayEndAt, refreshWorkspaceCalendar,
     now, todayMinutes, allocatedMinutes, pendingMinutes, doneCount, unassignedSeconds, unassignedStartedAt,
     unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen, unassignedWorkDate, unassignedSessionId,
-    unassignedCurrentSession, unassignedHistoricalPending, unassignedHistoricalPendingCount, earliestHistoricalUnassignedDate, selectUnassignedSession,
+    unassignedCurrentSession,
     workspaceLoaded, workspaceLoading, loadWorkspaceData, loadTimeData, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addChildTask, saveTask, duplicateTask, deleteTask, moveTask, reorderTask,
     indentTask, outdentTask, startTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, adjustTimerStopAllocation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, publicReportText, previewObsidianReport, writeObsidianReport,
     beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, resolveUnassignedTime

@@ -65,9 +65,6 @@ pub struct UnassignedResolveResult {
 #[serde(rename_all = "camelCase")]
 pub struct UnassignedStateSnapshotDto {
     pub current: Option<UnassignedStateDto>,
-    pub historical_pending: Vec<UnassignedStateDto>,
-    pub historical_pending_count: i64,
-    pub earliest_historical_date: Option<String>,
 }
 
 pub fn get_state(database: &Database) -> Result<Option<UnassignedStateDto>, String> {
@@ -83,35 +80,12 @@ pub fn get_state_snapshot(database: &Database) -> Result<UnassignedStateSnapshot
 }
 
 fn load_state_snapshot(
-    connection: &rusqlite::Connection,
-    workspace_id: &str,
+    _connection: &rusqlite::Connection,
+    _workspace_id: &str,
     current: Option<UnassignedStateDto>,
-    now: i64,
+    _now: i64,
 ) -> Result<UnassignedStateSnapshotDto, String> {
-    let current_date = crate::work_calendar::current_work_date(connection, now)?;
-    let ids = connection
-        .prepare(
-            "SELECT id FROM unassigned_sessions
-             WHERE workspace_id=?1 AND work_date<?2 AND state IN ('collecting','awaiting_resolution')
-             ORDER BY work_date,id",
-        )
-        .map_err(|error| error.to_string())?
-        .query_map(params![workspace_id, current_date], |row| row.get::<_, String>(0))
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    let historical_pending = ids
-        .iter()
-        .map(|id| load_state(connection, id, now, false))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(UnassignedStateSnapshotDto {
-        historical_pending_count: historical_pending.len() as i64,
-        earliest_historical_date: historical_pending
-            .first()
-            .map(|item| item.work_date.clone()),
-        current,
-        historical_pending,
-    })
+    Ok(UnassignedStateSnapshotDto { current })
 }
 
 pub fn get_session_state(
@@ -287,6 +261,17 @@ fn resolve_work_with_cloud_operation(
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
+    if let Some(result) = adopt_existing_generated_resolution(
+        &transaction,
+        &workspace_id,
+        &device_id,
+        &request.session_id,
+        &request.operation_id,
+        "unassigned_resolve_work",
+    )? {
+        transaction.commit().map_err(|error| error.to_string())?;
+        return Ok(result);
+    }
     let state = seal_session(
         &transaction,
         &workspace_id,
@@ -559,6 +544,22 @@ fn resolve_without_allocations(
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
+    let operation_type = if resolution_type == "break" {
+        "unassigned_resolve_break"
+    } else {
+        "unassigned_discard"
+    };
+    if let Some(result) = adopt_existing_generated_resolution(
+        &transaction,
+        &workspace_id,
+        &device_id,
+        &request.session_id,
+        &request.operation_id,
+        operation_type,
+    )? {
+        transaction.commit().map_err(|error| error.to_string())?;
+        return Ok(result);
+    }
     let state = seal_session(
         &transaction,
         &workspace_id,
@@ -618,11 +619,7 @@ fn resolve_without_allocations(
         &workspace_id,
         &device_id,
         &request.operation_id,
-        if resolution_type == "break" {
-            "unassigned_resolve_break"
-        } else {
-            "unassigned_discard"
-        },
+        operation_type,
         &result,
     )?;
     start_next_session_if_idle(
@@ -729,6 +726,7 @@ pub fn start_after_timer(
     shared: bool,
 ) -> Result<(), String> {
     let current_date = crate::work_calendar::current_work_date(transaction, now)?;
+    discard_superseded_sessions(transaction, workspace_id, None, now)?;
     let existing_session = active_session_id(transaction, workspace_id, &current_date)?;
     if let Some(session_id) = existing_session {
         transaction
@@ -773,6 +771,20 @@ fn seal_session(
     expected_version: i64,
     now: i64,
 ) -> Result<UnassignedStateDto, String> {
+    let latest_session_id: Option<String> = transaction
+        .query_row(
+            "SELECT id FROM unassigned_sessions
+             WHERE workspace_id=?1 AND state IN ('collecting','awaiting_resolution')
+             ORDER BY work_date DESC,first_started_at DESC,id DESC LIMIT 1",
+            [workspace_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if latest_session_id.as_deref() != Some(session_id) {
+        discard_superseded_sessions(transaction, workspace_id, latest_session_id.as_deref(), now)?;
+        return Err("NOT_FOUND: 该未归属时间已被最新起点取代".to_string());
+    }
     let version: Option<i64> = transaction
         .query_row(
             "SELECT version FROM unassigned_sessions
@@ -919,6 +931,108 @@ fn insert_generated_entry(
     Ok(())
 }
 
+fn adopt_existing_generated_resolution(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    device_id: &str,
+    session_id: &str,
+    operation_id: &str,
+    operation_type: &str,
+) -> Result<Option<UnassignedResolveResult>, String> {
+    let existing = transaction
+        .query_row(
+            "SELECT id,kind,label_snapshot,note,duration_seconds,
+                    COALESCE(ended_at,updated_at)
+             FROM time_entries
+             WHERE workspace_id=?1 AND origin_unassigned_session_id=?2
+             ORDER BY updated_at DESC,id LIMIT 1",
+            params![workspace_id, session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((entry_id, kind, label, note, elapsed_seconds, resolved_at)) = existing else {
+        return Ok(None);
+    };
+
+    let invalid_time =
+        label.contains("无效") || note.as_deref().is_some_and(|value| value.contains("无效"));
+    let resolution_type = if kind == "work" {
+        "work"
+    } else if invalid_time {
+        "discard"
+    } else {
+        "break"
+    };
+    let final_state = if resolution_type == "discard" {
+        "discarded"
+    } else {
+        "resolved"
+    };
+
+    transaction
+        .execute(
+            "UPDATE unassigned_segments
+             SET ended_at=COALESCE(ended_at,MAX(started_at,?1)),
+                 duration_seconds=CASE WHEN ended_at IS NULL
+                   THEN MAX(0,(MAX(started_at,?1)-started_at)/1000)
+                   ELSE duration_seconds END
+             WHERE workspace_id=?2 AND session_id=?3",
+            params![resolved_at, workspace_id, session_id],
+        )
+        .map_err(|error| error.to_string())?;
+    let changed = transaction
+        .execute(
+            "UPDATE unassigned_sessions
+             SET state=?1,resolution_type=?2,generated_entry_id=?3,
+                 duration_seconds=?4,last_ended_at=?5,resolved_at=?5,prompted_at=NULL,
+                 updated_at=MAX(updated_at,?5),
+                 version=CASE WHEN state IN ('collecting','awaiting_resolution')
+                   THEN version+1 ELSE version END
+             WHERE id=?6 AND workspace_id=?7",
+            params![
+                final_state,
+                resolution_type,
+                entry_id,
+                elapsed_seconds,
+                resolved_at,
+                session_id,
+                workspace_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err("NOT_FOUND: 未归属会话不存在".to_string());
+    }
+
+    let result = UnassignedResolveResult {
+        session_id: session_id.to_string(),
+        generated_entry_id: Some(entry_id),
+        resolution_type: resolution_type.to_string(),
+        elapsed_seconds,
+        required_minutes: settlement_minutes(elapsed_seconds),
+    };
+    save_processed_result(
+        transaction,
+        workspace_id,
+        device_id,
+        operation_id,
+        operation_type,
+        &result,
+    )?;
+    bump_revision(transaction)?;
+    Ok(Some(result))
+}
+
 fn create_session(
     transaction: &Transaction<'_>,
     workspace_id: &str,
@@ -1006,16 +1120,79 @@ fn start_next_session_if_idle(
     shared: bool,
     predecessor_session_id: Option<&str>,
 ) -> Result<(), String> {
-    if !has_active_timer(transaction, workspace_id)? {
-        create_session(
-            transaction,
-            workspace_id,
-            now,
-            if shared { "cloud" } else { "local" },
-            predecessor_session_id,
-        )?;
+    if has_active_timer(transaction, workspace_id)? {
+        return Ok(());
     }
+    let work_date = crate::work_calendar::current_work_date(transaction, now)?;
+    discard_superseded_sessions(transaction, workspace_id, None, now)?;
+    if active_session_id(transaction, workspace_id, &work_date)?.is_some() {
+        return Ok(());
+    }
+    create_session_for_date(
+        transaction,
+        workspace_id,
+        &work_date,
+        now,
+        None,
+        if shared { "cloud" } else { "local" },
+        predecessor_session_id,
+    )?;
     Ok(())
+}
+
+fn discard_superseded_sessions(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    keep_session_id: Option<&str>,
+    boundary: i64,
+) -> Result<Vec<String>, String> {
+    let session_ids = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT id FROM unassigned_sessions
+                 WHERE workspace_id=?1 AND state IN ('collecting','awaiting_resolution')
+                   AND (?2 IS NULL OR id<>?2)
+                 ORDER BY work_date,first_started_at,id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![workspace_id, keep_session_id], |row| row.get(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    for session_id in &session_ids {
+        transaction
+            .execute(
+                "UPDATE unassigned_segments
+                 SET ended_at=COALESCE(ended_at,started_at),duration_seconds=0,lease_token=NULL
+                 WHERE workspace_id=?2 AND session_id=?3",
+                params![boundary, workspace_id, session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "UPDATE unassigned_sessions
+                 SET state='discarded',resolution_type='discard',generated_entry_id=NULL,
+                     duration_seconds=0,prompted_at=NULL,
+                     last_ended_at=MAX(first_started_at,?1),resolved_at=MAX(first_started_at,?1),
+                     updated_at=MAX(updated_at,?1),last_continuous_at=MAX(first_started_at,?1),
+                     migration_state='superseded',version=version+1
+                 WHERE workspace_id=?2 AND id=?3 AND state IN ('collecting','awaiting_resolution')",
+                params![boundary, workspace_id, session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM sync_outbox
+                 WHERE workspace_id=?1 AND entity_type='unassigned_session' AND entity_id=?2
+                   AND state IN ('pending','failed','conflict')",
+                params![workspace_id, session_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(session_ids)
 }
 
 fn session_version(connection: &rusqlite::Connection, session_id: &str) -> Result<i64, String> {
@@ -1132,22 +1309,13 @@ fn coordinate_unassigned_sessions(
 ) -> Result<(), String> {
     let timezone = crate::work_calendar::workspace_timezone(transaction, workspace_id)?;
     let current_date = crate::work_calendar::work_date_at(timezone, now)?;
-    type ActiveSession = (
-        String,
-        String,
-        i64,
-        i64,
-        Option<String>,
-        String,
-        Option<i64>,
-    );
+    type ActiveSession = (String, String, i64, i64, Option<i64>);
     let sessions = {
         let mut statement = transaction
             .prepare(
                 "SELECT u.id,u.work_date,u.first_started_at,
                         COALESCE((SELECT last_heartbeat_at FROM tracking_runtime_state r WHERE r.workspace_id=u.workspace_id),
                                  last_continuous_at,updated_at,first_started_at),
-                        predecessor_session_id,shared_source,
                         (SELECT started_at FROM unassigned_segments s
                          WHERE s.session_id=u.id AND s.ended_at IS NULL LIMIT 1)
                  FROM unassigned_sessions u
@@ -1163,8 +1331,6 @@ fn coordinate_unassigned_sessions(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
                 ))
             })
             .map_err(|error| error.to_string())?
@@ -1175,46 +1341,18 @@ fn coordinate_unassigned_sessions(
     let has_timer = has_active_timer(transaction, workspace_id)?;
     let current = sessions
         .iter()
-        .find(|session| session.1 == current_date)
+        .filter(|session| session.1 == current_date)
+        .max_by(|left, right| left.2.cmp(&right.2).then(left.0.cmp(&right.0)))
         .cloned();
-    let latest_open_old = sessions
+    let latest_old = sessions
         .iter()
-        .filter(|session| session.1 < current_date && session.6.is_some())
+        .filter(|session| session.1 < current_date)
         .max_by(|left, right| left.1.cmp(&right.1).then(left.2.cmp(&right.2)))
         .cloned();
+    let keep_session_id = current.as_ref().map(|session| session.0.as_str());
+    discard_superseded_sessions(transaction, workspace_id, keep_session_id, now)?;
 
-    for (session_id, work_date, first_started_at, last_continuous_at, _, _, open_started_at) in
-        sessions.iter().filter(|session| session.1 < current_date)
-    {
-        let Some(open_started_at) = open_started_at else {
-            continue;
-        };
-        let bounds = crate::work_calendar::day_bounds(timezone, work_date)?;
-        let is_latest = latest_open_old
-            .as_ref()
-            .is_some_and(|latest| latest.0 == *session_id);
-        let continuous =
-            is_latest && now.saturating_sub(*last_continuous_at) <= CONTINUITY_GRACE_MILLIS;
-        let boundary = if continuous {
-            bounds.end_at.min(now)
-        } else {
-            (*last_continuous_at)
-                .max(*first_started_at)
-                .max(*open_started_at)
-                .min(bounds.end_at)
-                .min(now)
-        };
-        close_open_segment(transaction, session_id, boundary)?;
-        refresh_session_duration(transaction, session_id, boundary)?;
-        transaction
-            .execute(
-                "UPDATE unassigned_sessions SET last_continuous_at=?1 WHERE id=?2",
-                params![boundary, session_id],
-            )
-            .map_err(|error| error.to_string())?;
-    }
-
-    if let Some((session_id, _, _first_started_at, last_continuous_at, _, _, open_started_at)) =
+    if let Some((session_id, _, _first_started_at, last_continuous_at, open_started_at)) =
         current.as_ref()
     {
         if open_started_at.is_some() {
@@ -1258,37 +1396,23 @@ fn coordinate_unassigned_sessions(
         return Ok(());
     }
 
-    let continuous_old = latest_open_old
+    let continuous_old = latest_old
         .as_ref()
         .is_some_and(|session| now.saturating_sub(session.3) <= CONTINUITY_GRACE_MILLIS);
-    if continuous_old {
-        let latest = latest_open_old.as_ref().unwrap();
-        let old_end = crate::work_calendar::day_bounds(timezone, &latest.1)?.end_at;
-        let slices = crate::work_calendar::split_interval_by_day(timezone, old_end, now)?;
-        let mut predecessor = Some(latest.0.clone());
-        for (index, slice) in slices.iter().enumerate() {
-            let is_last = index + 1 == slices.len();
-            let session_id = create_session_for_date(
-                transaction,
-                workspace_id,
-                &slice.work_date,
-                slice.started_at,
-                (!is_last).then_some(slice.ended_at),
-                shared_source,
-                predecessor.as_deref(),
-            )?;
-            predecessor = Some(session_id.clone());
-            let _ = is_last;
-        }
+    let started_at = if continuous_old {
+        crate::work_calendar::day_bounds(timezone, &current_date)?.start_at
     } else {
-        create_session(
-            transaction,
-            workspace_id,
-            now,
-            shared_source,
-            latest_open_old.as_ref().map(|session| session.0.as_str()),
-        )?;
-    }
+        now
+    };
+    create_session_for_date(
+        transaction,
+        workspace_id,
+        &current_date,
+        started_at,
+        None,
+        shared_source,
+        latest_old.as_ref().map(|session| session.0.as_str()),
+    )?;
     Ok(())
 }
 
@@ -1655,6 +1779,74 @@ mod tests {
         .unwrap();
         assert_eq!(result.resolution_type, "discard");
         assert!(result.generated_entry_id.is_some());
+    }
+
+    #[test]
+    fn discard_adopts_existing_entry_for_the_same_session() {
+        let (database, _) = setup();
+        let session = get_state(&database).unwrap().unwrap();
+        let entry_id = Uuid::now_v7().to_string();
+        let resolved_at = now_millis();
+        let connection = database.open().unwrap();
+        let workspace_id = workspace_id(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO time_entries(
+                   id,workspace_id,work_date,kind,source_type,state,label_snapshot,
+                   started_at,ended_at,duration_seconds,note,origin_unassigned_session_id,
+                   created_at,updated_at,version
+                 ) VALUES (
+                   ?1,?2,?3,'break','unassigned','ended','无效时间',
+                   ?4,?5,60,'已由同步生成',?6,?4,?5,1
+                 )",
+                params![
+                    entry_id,
+                    workspace_id,
+                    session.work_date,
+                    resolved_at - 60_000,
+                    resolved_at,
+                    session.session_id
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let result = discard(
+            &database,
+            ResolveSessionRequest {
+                session_id: session.session_id.clone(),
+                expected_version: session.version,
+                operation_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.generated_entry_id.as_deref(),
+            Some(entry_id.as_str())
+        );
+        assert_eq!(result.resolution_type, "discard");
+        let connection = database.open().unwrap();
+        let entry_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM time_entries WHERE origin_unassigned_session_id=?1",
+                [&session.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let terminal: (String, String, String) = connection
+            .query_row(
+                "SELECT state,resolution_type,generated_entry_id
+                 FROM unassigned_sessions WHERE id=?1",
+                [&session.session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(entry_count, 1);
+        assert_eq!(
+            terminal,
+            ("discarded".to_string(), "discard".to_string(), entry_id)
+        );
     }
 
     #[test]
@@ -2177,7 +2369,7 @@ mod tests {
     }
 
     #[test]
-    fn unassigned_continuity_creates_one_session_per_calendar_day() {
+    fn coordinate_discards_history_and_creates_only_latest_calendar_anchor() {
         let (database, _) = setup();
         let workspace_id = reset_unassigned_sessions(&database);
         let started_at = shanghai_millis("2026-10-05 23:59:30");
@@ -2196,17 +2388,28 @@ mod tests {
 
         let connection = database.open().unwrap();
         let rows = connection.prepare("SELECT id,work_date,duration_seconds,predecessor_session_id FROM unassigned_sessions ORDER BY work_date").unwrap().query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,Option<String>>(3)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 2);
         assert_eq!(
             rows.iter().map(|row| row.1.as_str()).collect::<Vec<_>>(),
-            vec!["2026-10-05", "2026-10-06", "2026-10-07"]
+            vec!["2026-10-05", "2026-10-07"]
         );
-        assert_eq!(
-            rows.iter().map(|row| row.2).collect::<Vec<_>>(),
-            vec![30, 86_400, 0]
-        );
+        assert_eq!(rows.iter().map(|row| row.2).collect::<Vec<_>>(), vec![0, 0]);
         assert_eq!(rows[1].3.as_deref(), Some(first_session.as_str()));
-        assert_eq!(rows[2].3.as_deref(), Some(rows[1].0.as_str()));
+        let old_state: (String, Option<String>, String) = connection
+            .query_row(
+                "SELECT state,resolution_type,migration_state FROM unassigned_sessions WHERE id=?1",
+                [&first_session],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            old_state,
+            (
+                "discarded".to_string(),
+                Some("discard".to_string()),
+                "superseded".to_string()
+            )
+        );
         let open_segments: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM unassigned_segments WHERE ended_at IS NULL",
@@ -2280,7 +2483,7 @@ mod tests {
             )
             .unwrap();
         let today: (String,i64) = connection.query_row("SELECT work_date,first_started_at FROM unassigned_sessions WHERE work_date='2026-10-06'",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
-        assert_eq!(old_duration, 60);
+        assert_eq!(old_duration, 0);
         assert_eq!(today, ("2026-10-06".to_string(), now));
     }
 
@@ -2324,7 +2527,80 @@ mod tests {
     }
 
     #[test]
-    fn state_snapshot_lists_historical_pending_sessions_separately_by_date() {
+    fn historical_session_is_superseded_before_it_can_be_resolved() {
+        let (database, _) = setup();
+        let workspace_id = reset_unassigned_sessions(&database);
+        let historical_start = shanghai_millis("2026-10-05 10:00:00");
+        let historical_end = shanghai_millis("2026-10-05 10:01:00");
+        let historical_session = seed_unassigned_session(
+            &database,
+            &workspace_id,
+            "2026-10-05",
+            historical_start,
+            historical_end,
+        );
+        let connection = database.open().unwrap();
+        connection
+            .execute(
+                "UPDATE unassigned_segments
+                 SET ended_at=?1,duration_seconds=60 WHERE session_id=?2",
+                params![historical_end, historical_session],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE unassigned_sessions
+                 SET duration_seconds=60,last_ended_at=?1,state='awaiting_resolution',version=2
+                 WHERE id=?2",
+                params![historical_end, historical_session],
+            )
+            .unwrap();
+        let now = now_millis();
+        let today = crate::work_calendar::current_work_date(&connection, now).unwrap();
+        drop(connection);
+        let today_session =
+            seed_unassigned_session(&database, &workspace_id, &today, now - 60_000, now);
+        let mut connection = database.open().unwrap();
+        let transaction = connection.transaction().unwrap();
+        coordinate_unassigned_sessions(&transaction, &workspace_id, now, "local").unwrap();
+        transaction.commit().unwrap();
+
+        let result = discard(
+            &database,
+            ResolveSessionRequest {
+                session_id: historical_session.clone(),
+                expected_version: 2,
+                operation_id: Uuid::now_v7().to_string(),
+            },
+        );
+        assert!(result.is_err());
+
+        let connection = database.open().unwrap();
+        let active_today = connection
+            .prepare(
+                "SELECT id FROM unassigned_sessions
+                 WHERE workspace_id=?1 AND work_date=?2
+                   AND state IN ('collecting','awaiting_resolution')",
+            )
+            .unwrap()
+            .query_map(params![workspace_id, today], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(active_today, vec![today_session]);
+        let historical_state: (String, Option<String>, i64) = connection.query_row(
+            "SELECT state,resolution_type,duration_seconds FROM unassigned_sessions WHERE id=?1",
+            [&historical_session],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            historical_state,
+            ("discarded".to_string(), Some("discard".to_string()), 0)
+        );
+    }
+
+    #[test]
+    fn state_snapshot_exposes_only_latest_anchor() {
         let (database, _) = setup();
         let workspace_id = reset_unassigned_sessions(&database);
         let first_start = shanghai_millis("2026-10-04 10:00:00");
@@ -2344,31 +2620,16 @@ mod tests {
 
         let snapshot = get_state_snapshot(&database).unwrap();
         assert!(snapshot.current.is_some());
-        assert_eq!(snapshot.historical_pending_count, 2);
-        assert_eq!(
-            snapshot.earliest_historical_date.as_deref(),
-            Some("2026-10-04")
-        );
-        assert_eq!(
-            snapshot
-                .historical_pending
-                .iter()
-                .map(|state| state.work_date.as_str())
-                .collect::<Vec<_>>(),
-            vec!["2026-10-04", "2026-10-05"]
-        );
-        assert_eq!(
-            snapshot
-                .historical_pending
-                .iter()
-                .map(|state| state.elapsed_seconds)
-                .collect::<Vec<_>>(),
-            vec![600, 1200]
-        );
+        let connection = database.open().unwrap();
+        let unresolved: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM unassigned_sessions WHERE state IN ('collecting','awaiting_resolution')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(unresolved, 1);
     }
 
     #[test]
-    fn state_snapshot_excludes_system_cleared_anchor_but_keeps_historical_pending() {
+    fn state_snapshot_does_not_expose_historical_unresolved_sessions() {
         let (database, _) = setup();
         let workspace_id = reset_unassigned_sessions(&database);
         let pending_start = shanghai_millis("2026-10-04 10:00:00");
@@ -2407,11 +2668,23 @@ mod tests {
         drop(connection);
 
         let snapshot = get_state_snapshot(&database).unwrap();
-        assert_eq!(snapshot.historical_pending_count, 1);
-        assert_eq!(snapshot.historical_pending[0].session_id, pending_id);
-        assert!(snapshot
-            .historical_pending
-            .iter()
-            .all(|session| session.session_id != cleared_id));
+        assert!(snapshot.current.is_some());
+        let connection = database.open().unwrap();
+        let pending_state: String = connection
+            .query_row(
+                "SELECT state FROM unassigned_sessions WHERE id=?1",
+                [&pending_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_state, "discarded");
+        let cleared_state: String = connection
+            .query_row(
+                "SELECT state FROM unassigned_sessions WHERE id=?1",
+                [&cleared_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cleared_state, "discarded");
     }
 }

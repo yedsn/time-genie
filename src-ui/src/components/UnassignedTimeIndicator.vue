@@ -31,6 +31,5 @@ function openAllocation() {
     <ClockAlert :size="14" />
     <span>未归属</span>
     <time>{{ clockText }}</time>
-    <b v-if="store.unassignedHistoricalPendingCount">+{{ store.unassignedHistoricalPendingCount }}</b>
   </button>
 </template>

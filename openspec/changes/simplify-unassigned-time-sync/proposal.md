@@ -11,6 +11,7 @@
 - 停止事项计时后，如果没有其他活动事项，则从统一的停止边界重新建立未归属起点。
 - 达到处理阈值只作为客户端本地派生状态，不再形成云端写入或待保存操作。
 - 分配、记为休息、丢弃仍作为幂等处理动作同步；处理成功后，如工作空间仍为空闲，则以统一处理边界重新开始未归属计时。
+- 每个工作空间只保留最新的未归属起点；发现更旧日期或被新起点取代的未处理会话时自动废弃，不生成工时，也不要求用户处理。
 - 应用退出或失去连续运行确认期间不累计未归属时间；恢复运行且没有活动事项时，从恢复时间建立新起点。
 - 右下角保存状态只反映真实待上传业务操作；Realtime 连接、纯拉取和本地时间显示刷新不得单独表现为“正在保存”。
 - 本地模式采用相同的简化业务规则，但不建立云端共享状态或启动云端同步。
@@ -29,6 +30,6 @@
 
 - Rust 未归属状态机与事项计时联动：`src-tauri/src/unassigned.rs`、`src-tauri/src/time_tracking.rs`、`src-tauri/src/cloud_sync.rs`。
 - Vue 状态刷新与保存状态呈现：`src-ui/src/store.ts`、`src-ui/src/views/MainWorkbench.vue`、`src-ui/src/services/cloudSyncPresentation.ts`。
-- SQLite 数据结构与迁移：`src-tauri/migrations/`，需要安全处理现有活动分段和未处理历史会话。
+- SQLite 数据结构与迁移：`src-tauri/migrations/`，需要安全处理现有活动分段并自动废弃旧的未处理历史会话。
 - Supabase 表、RPC、增量实体和来源诊断：`supabase/schema.sql` 及配套部署补丁。
 - 双设备、事项开始/停止、跨日、应用退出恢复和保存状态相关测试。

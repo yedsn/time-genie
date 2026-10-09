@@ -1988,6 +1988,10 @@ fn apply_incremental_unassigned_session(
             && incoming_segments
                 .iter()
                 .any(|segment| optional_millis(segment, "ended_at").is_none()));
+    let incoming_unresolved = matches!(
+        incoming_state.as_str(),
+        "collecting" | "awaiting_resolution"
+    );
     let state = if incoming_active {
         "collecting".to_string()
     } else {
@@ -1996,6 +2000,87 @@ fn apply_incremental_unassigned_session(
     let superseded_at =
         optional_millis(data, "resolved_at").unwrap_or_else(|| millis(data, "first_started_at"));
     let incoming_predecessor = optional_text(data, "predecessor_session_id");
+    if incoming_active {
+        if let Some(predecessor_session_id) = incoming_predecessor.as_deref() {
+            let competing_session_ids = {
+                let mut statement = transaction.prepare(
+                    "SELECT id FROM unassigned_sessions
+                     WHERE workspace_id=?1 AND id<>?2 AND predecessor_session_id=?3",
+                )?;
+                let rows = statement
+                    .query_map(
+                        params![workspace_id, session_id, predecessor_session_id],
+                        |row| row.get(0),
+                    )?
+                    .collect::<Result<Vec<String>, _>>()?;
+                rows
+            };
+            for competing_session_id in competing_session_ids {
+                transaction.execute(
+                    "DELETE FROM sync_outbox WHERE entity_type='unassigned_session' AND entity_id=?1",
+                    [competing_session_id],
+                )?;
+            }
+            transaction.execute(
+                "DELETE FROM sync_outbox
+                 WHERE workspace_id=?1 AND entity_type='unassigned_session'
+                   AND entity_id IN (SELECT id FROM unassigned_sessions
+                     WHERE workspace_id=?1 AND id<>?2 AND predecessor_session_id=?3)",
+                params![workspace_id, session_id, predecessor_session_id],
+            )?;
+            transaction.execute(
+                "UPDATE unassigned_sessions SET predecessor_session_id=NULL
+                 WHERE workspace_id=?1 AND id<>?2 AND predecessor_session_id=?3",
+                params![workspace_id, session_id, predecessor_session_id],
+            )?;
+        }
+    }
+    let incoming_work_date = text(data, "work_date");
+    let incoming_started_at = millis(data, "first_started_at");
+    let newer_local_session: Option<String> = if incoming_unresolved {
+        transaction
+            .query_row(
+                "SELECT id FROM unassigned_sessions
+                 WHERE workspace_id=?1 AND id<>?2 AND state IN ('collecting','awaiting_resolution')
+                   AND (?5=0 OR (
+                     shared_source='cloud' AND migration_state='adopted'
+                     AND (work_date>?3 OR (work_date=?3 AND first_started_at>?4))
+                   ))
+                 ORDER BY work_date DESC,first_started_at DESC,id DESC LIMIT 1",
+                params![
+                    workspace_id,
+                    session_id,
+                    incoming_work_date,
+                    incoming_started_at,
+                    incoming_active as i64
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
+    } else {
+        None
+    };
+    let incoming_superseded = newer_local_session.is_some();
+    if incoming_active && !incoming_superseded {
+        transaction.execute(
+            "DELETE FROM sync_outbox
+             WHERE workspace_id=?1 AND entity_type='unassigned_session' AND entity_id<>?2
+               AND state IN ('pending','failed','conflict')",
+            params![workspace_id, session_id],
+        )?;
+        transaction.execute(
+            "UPDATE unassigned_sessions
+             SET predecessor_session_id=NULL
+             WHERE workspace_id=?1 AND id<>?2 AND state IN ('collecting','awaiting_resolution')",
+            params![workspace_id, session_id],
+        )?;
+    } else if incoming_active {
+        transaction.execute(
+            "UPDATE unassigned_sessions SET predecessor_session_id=NULL
+             WHERE workspace_id=?1 AND id=?2",
+            params![workspace_id, session_id],
+        )?;
+    }
     let generated_entry_id = optional_text(data, "generated_entry_id").filter(|entry_id| {
         transaction
             .query_row(
@@ -2012,7 +2097,7 @@ fn apply_incremental_unassigned_session(
         .or_else(|| optional_millis(data, "last_ended_at"))
         .or_else(|| optional_millis(data, "updated_at"))
         .or_else(|| optional_millis(data, "first_started_at"));
-    if incoming_active {
+    if incoming_active && !incoming_superseded {
         transaction.execute(
             "UPDATE unassigned_sessions
              SET state='discarded',resolution_type='discard',duration_seconds=0,
@@ -2020,10 +2105,18 @@ fn apply_incremental_unassigned_session(
                  updated_at=MAX(updated_at,?1),migration_state='superseded'
              WHERE workspace_id=?2 AND id<>?3
                AND state IN ('collecting','awaiting_resolution')
-               AND EXISTS(SELECT 1 FROM unassigned_segments segment
-                          WHERE segment.session_id=unassigned_sessions.id
-                            AND segment.ended_at IS NULL)",
-            params![superseded_at, workspace_id, session_id],
+               AND (shared_source<>'cloud' OR migration_state<>'adopted'
+                    OR work_date<?4 OR (work_date=?4 AND first_started_at<=?5)
+                    OR NOT EXISTS(SELECT 1 FROM unassigned_segments open_segment
+                                  WHERE open_segment.session_id=unassigned_sessions.id
+                                    AND open_segment.ended_at IS NULL))",
+            params![
+                superseded_at,
+                workspace_id,
+                session_id,
+                incoming_work_date,
+                incoming_started_at
+            ],
         )?;
         transaction.execute(
             "UPDATE unassigned_segments
@@ -2058,6 +2151,11 @@ fn apply_incremental_unassigned_session(
             params![superseded_at, workspace_id, session_id],
         )?;
     }
+    let state = if incoming_superseded {
+        "discarded".to_string()
+    } else {
+        state
+    };
     if matches!(state.as_str(), "collecting" | "awaiting_resolution") {
         if let Some(predecessor_session_id) = incoming_predecessor.as_deref() {
             transaction.execute(
@@ -2125,21 +2223,41 @@ fn apply_incremental_unassigned_session(
             text(data, "work_date"),
             state,
             integer(data, "threshold_seconds"),
-            if incoming_active {
+            if incoming_active && !incoming_superseded {
                 0
             } else {
-                integer(data, "duration_seconds")
+                if incoming_superseded {
+                    0
+                } else {
+                    integer(data, "duration_seconds")
+                }
             },
             millis(data, "first_started_at"),
             optional_millis(data, "last_ended_at"),
-            if incoming_active {
+            if incoming_active && !incoming_superseded {
                 None
             } else {
-                optional_millis(data, "prompted_at")
+                if incoming_superseded {
+                    None
+                } else {
+                    optional_millis(data, "prompted_at")
+                }
             },
-            optional_text(data, "resolution_type"),
-            generated_entry_id,
-            optional_millis(data, "resolved_at"),
+            if incoming_superseded {
+                Some("discard".to_string())
+            } else {
+                optional_text(data, "resolution_type")
+            },
+            if incoming_superseded {
+                None
+            } else {
+                generated_entry_id
+            },
+            if incoming_superseded {
+                Some(superseded_at)
+            } else {
+                optional_millis(data, "resolved_at")
+            },
             millis(data, "created_at"),
             millis(data, "updated_at"),
             integer(data, "version"),
@@ -2148,11 +2266,23 @@ fn apply_incremental_unassigned_session(
             last_continuous_at,
         ],
     )?;
+    if incoming_superseded {
+        transaction.execute(
+            "UPDATE unassigned_sessions
+             SET state='discarded',resolution_type='discard',generated_entry_id=NULL,
+                 duration_seconds=0,prompted_at=NULL,last_ended_at=?1,resolved_at=?1,
+                 migration_state='superseded',last_continuous_at=?1
+             WHERE workspace_id=?2 AND id=?3",
+            params![superseded_at, workspace_id, session_id],
+        )?;
+    }
     transaction.execute(
         "DELETE FROM unassigned_segments WHERE workspace_id=?1 AND session_id=?2",
         params![workspace_id, session_id],
     )?;
-    let segments = if incoming_active {
+    let segments = if incoming_superseded {
+        Vec::new()
+    } else if incoming_active {
         let started_at = incoming_segments
             .iter()
             .filter(|segment| optional_millis(segment, "ended_at").is_none())
@@ -2186,6 +2316,15 @@ fn apply_incremental_unassigned_session(
                 integer(&segment, "duration_seconds"),
                 optional_text(&segment, "lease_token"),
             ],
+        )?;
+    }
+    if incoming_active && !incoming_superseded {
+        transaction.execute(
+            "DELETE FROM sync_outbox
+             WHERE entity_type='unassigned_session'
+               AND entity_id IN (SELECT id FROM unassigned_sessions
+                 WHERE workspace_id=?1 AND migration_state='superseded')",
+            [workspace_id],
         )?;
     }
     Ok(changed)
@@ -7131,7 +7270,7 @@ mod tests {
     }
 
     #[test]
-    fn active_anchor_payload_is_normalized_without_discarding_historical_pending() {
+    fn incoming_latest_anchor_discards_historical_pending() {
         let (_directory, database, cloud_workspace_id, local_workspace_id, _subject_id) =
             cloud_database_for_incremental_test("incremental-unassigned-anchor-normalize.sqlite3");
         let device_id = storage_mode(&database).unwrap().device_id;
@@ -7185,7 +7324,7 @@ mod tests {
             [&historical_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).unwrap();
-        assert_eq!(historical, ("awaiting_resolution".to_string(), 600, 1));
+        assert_eq!(historical, ("discarded".to_string(), 0, 1));
         let active: (String, i64, Option<i64>, i64) = connection.query_row(
             "SELECT state,duration_seconds,prompted_at,
                     (SELECT COUNT(*) FROM unassigned_segments WHERE session_id=?1 AND ended_at IS NULL)
@@ -7203,7 +7342,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_awaiting_resolution_incremental_stays_historical_pending() {
+    fn incoming_historical_pending_is_superseded_when_latest_anchor_exists() {
         let (_directory, database, cloud_workspace_id, _local_workspace_id, _subject_id) =
             cloud_database_for_incremental_test("incremental-unassigned-closed-history.sqlite3");
         let device_id = storage_mode(&database).unwrap().device_id;
@@ -7251,7 +7390,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(historical, ("awaiting_resolution".to_string(), 60, 0));
+        assert_eq!(historical, ("discarded".to_string(), 0, 0));
         assert_eq!(
             crate::unassigned::get_state(&database)
                 .unwrap()
@@ -7840,7 +7979,8 @@ mod tests {
         assert_eq!(local_state, ("superseded".to_string(), None));
         let stale_outbox: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM sync_outbox WHERE entity_id=?1",
+                "SELECT COUNT(*) FROM sync_outbox WHERE entity_id=?1
+                   AND state IN ('pending','sending','failed','conflict')",
                 [&local_candidate],
                 |row| row.get(0),
             )

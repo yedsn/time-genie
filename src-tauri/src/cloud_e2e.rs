@@ -1804,6 +1804,14 @@ fn isolated_unassigned_resolution_stops_the_old_clock_on_both_devices() {
         }]
     });
     for database in [&device_a, &device_b] {
+        let connection = database.open().unwrap();
+        connection
+            .execute("DELETE FROM unassigned_segments", [])
+            .unwrap();
+        connection
+            .execute("DELETE FROM unassigned_sessions", [])
+            .unwrap();
+        drop(connection);
         cloud_sync::apply_remote_unassigned_session_for_test(database, &active_payload).unwrap();
         let state = unassigned::get_state(database).unwrap().unwrap();
         assert_eq!(state.session_id, active_payload["id"].as_str().unwrap());
@@ -2386,11 +2394,15 @@ fn real_supabase_unassigned_two_device_flow() {
     assert_eq!(today_anchor_a.session_id, today_anchor_b.session_id);
     assert_eq!(today_anchor_a.first_started_at, today_start);
     for database in [&device_a, &device_b] {
-        let snapshot = unassigned::get_state_snapshot(database).unwrap();
-        assert!(snapshot
-            .historical_pending
-            .iter()
-            .any(|state| state.session_id == old_cross_day_id));
+        let connection = database.open().unwrap();
+        let old_state: String = connection
+            .query_row(
+                "SELECT state FROM unassigned_sessions WHERE id=?1",
+                [&old_cross_day_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_state, "discarded");
     }
     cloud_sync::release_lease(
         &device_a,
@@ -2405,7 +2417,7 @@ fn real_supabase_unassigned_two_device_flow() {
         cloud_sync::sync_status(&device_a)
             .unwrap()
             .pending_operations,
-        &format!("previous={old_cross_day_id}:historical-pending"),
+        &format!("previous={old_cross_day_id}:discarded"),
     );
 
     reset_owned_workspaces(&device_a);

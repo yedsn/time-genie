@@ -75,6 +75,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "repair_unassigned_active_index",
         sql: include_str!("../migrations/0012_repair_unassigned_active_index.sql"),
     },
+    Migration {
+        version: 13,
+        name: "supersede_historical_unassigned",
+        sql: include_str!("../migrations/0013_supersede_historical_unassigned.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -505,7 +510,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let database = Database::initialize_at(directory.path().join("test.sqlite3")).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 12);
+        assert_eq!(status.schema_version, 13);
         for table in REQUIRED_TABLES {
             assert!(
                 status.tables.iter().any(|value| value == table),
@@ -545,7 +550,7 @@ mod tests {
         let workspace_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migration_count, 12);
+        assert_eq!(migration_count, 13);
         assert_eq!(workspace_count, 1);
     }
 
@@ -632,7 +637,7 @@ mod tests {
         assert_eq!(task_title, "升级前事项");
         assert_eq!(queued, 1);
         assert_eq!(deferred_table, 6);
-        assert_eq!(database.status().unwrap().schema_version, 12);
+        assert_eq!(database.status().unwrap().schema_version, 13);
     }
 
     #[test]
@@ -834,7 +839,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             active,
-            ("legacy_local".to_string(), "candidate".to_string())
+            ("legacy_local".to_string(), "superseded".to_string())
         );
         assert_eq!(
             history,
@@ -1008,12 +1013,20 @@ mod tests {
             .unwrap();
         assert_eq!(history_allocation, 1);
 
-        let historical: (String, i64) = connection.query_row(
-            "SELECT state,duration_seconds FROM unassigned_sessions WHERE id='historical-pending'",
+        let historical: (String, i64, Option<String>, String) = connection.query_row(
+            "SELECT state,duration_seconds,resolution_type,migration_state FROM unassigned_sessions WHERE id='historical-pending'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).unwrap();
-        assert_eq!(historical, ("awaiting_resolution".to_string(), 600));
+        assert_eq!(
+            historical,
+            (
+                "discarded".to_string(),
+                0,
+                Some("discard".to_string()),
+                "superseded".to_string()
+            )
+        );
         let historical_segments: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM unassigned_segments WHERE session_id='historical-pending'",
@@ -1022,6 +1035,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(historical_segments, 1);
+        let generated_from_historical: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM time_entries WHERE origin_unassigned_session_id='historical-pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generated_from_historical, 0);
 
         let active: (String, i64, i64, i64, Option<i64>) = connection.query_row(
             "SELECT state,duration_seconds,first_started_at,version,last_ended_at FROM unassigned_sessions WHERE id='active-anchor'",
@@ -1056,7 +1077,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outbox_operations, vec!["keep-op", "sending-op"]);
-        assert_eq!(database.status().unwrap().schema_version, 12);
+        assert_eq!(database.status().unwrap().schema_version, 13);
 
         // Deployment rollback keeps the migrated database in place. Rehearse
         // the previous client's read path against that database and verify
@@ -1143,7 +1164,7 @@ mod tests {
         drop(connection);
 
         let database = Database::initialize_at(path).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 12);
+        assert_eq!(database.status().unwrap().schema_version, 13);
         let connection = database.open().unwrap();
 
         let stale_index_count: i64 = connection
@@ -1320,11 +1341,7 @@ mod tests {
         let pending: (String,i64,String) = connection.query_row("SELECT work_date,duration_seconds,state FROM unassigned_sessions WHERE id='pending'",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
         assert_eq!(
             pending,
-            (
-                "2026-10-05".to_string(),
-                600,
-                "awaiting_resolution".to_string()
-            )
+            ("2026-10-05".to_string(), 0, "discarded".to_string())
         );
         let today_sessions: i64 = connection
             .query_row(
@@ -1493,7 +1510,7 @@ mod tests {
 
         let database = Database::initialize_at(path).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 12);
+        assert_eq!(status.schema_version, 13);
         assert!(status.tables.iter().any(|table| table == "device_hooks"));
         assert!(status
             .tables

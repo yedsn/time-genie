@@ -307,7 +307,6 @@ export type TodayWorkOverviewSummaryRecord = {
   activeCount: number;
   notStartedCount: number;
   unassignedMinutes: number;
-  historicalUnassignedCount: number;
   completionRate: number;
 };
 
@@ -372,9 +371,6 @@ export type UnassignedStateRecord = {
 
 export type UnassignedStateSnapshotRecord = {
   current?: UnassignedStateRecord;
-  historicalPending: UnassignedStateRecord[];
-  historicalPendingCount: number;
-  earliestHistoricalDate?: string;
 };
 
 export type UnassignedResolveResult = {

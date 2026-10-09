@@ -60,14 +60,6 @@ function formatTime(timestamp: number) {
   return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: store.workspaceTimezone }).format(timestamp);
 }
 
-function dateLabel(date: string) {
-  if (date === store.workspaceToday) return "今天";
-  const today = new Date(`${store.workspaceToday}T00:00:00Z`);
-  const target = new Date(`${date}T00:00:00Z`);
-  const days = Math.round((today.getTime() - target.getTime()) / 86_400_000);
-  return days === 1 ? "昨天" : date;
-}
-
 function createAllocationId() {
   return `unassigned-allocation-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
@@ -209,29 +201,9 @@ function errorText(error: unknown, fallback: string) {
     <div class="unassigned-dialog-head">
       <span class="unassigned-dialog-icon"><ClockAlert :size="20" /></span>
       <div>
-        <h2>处理{{ dateLabel(store.unassignedWorkDate) }}的未归属时间</h2>
-        <p>每个日期独立处理，历史时间不会并入今天。</p>
+        <h2>发现一段未归属时间</h2>
+        <p>这段时间没有关联事项，需要处理后才能继续使用工作台。</p>
       </div>
-    </div>
-
-    <div v-if="store.unassignedHistoricalPending.length" class="unassigned-session-tabs">
-      <button
-        v-if="store.unassignedCurrentSession"
-        type="button"
-        :class="{ active: store.unassignedCurrentSession.sessionId === store.unassignedSessionId }"
-        @click="store.selectUnassignedSession(store.unassignedCurrentSession.sessionId)"
-      >
-        今天 · {{ Math.ceil(store.unassignedCurrentSession.elapsedSeconds / 60) }} 分钟
-      </button>
-      <button
-        v-for="session in store.unassignedHistoricalPending"
-        :key="session.sessionId"
-        type="button"
-        :class="{ active: session.sessionId === store.unassignedSessionId }"
-        @click="store.selectUnassignedSession(session.sessionId)"
-      >
-        {{ dateLabel(session.workDate) }} · {{ Math.ceil(session.elapsedSeconds / 60) }} 分钟
-      </button>
     </div>
 
     <div class="unassigned-live-period">

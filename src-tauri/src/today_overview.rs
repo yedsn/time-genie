@@ -32,7 +32,6 @@ pub struct TodayWorkOverviewSummaryDto {
     pub active_count: i64,
     pub not_started_count: i64,
     pub unassigned_minutes: i64,
-    pub historical_unassigned_count: i64,
     pub completion_rate: f64,
 }
 
@@ -221,15 +220,6 @@ pub fn get_today_work_overview(
         .get(&request.today_date)
         .copied()
         .unwrap_or(0);
-    today_summary.historical_unassigned_count = connection
-        .query_row(
-            "SELECT COUNT(*) FROM unassigned_sessions
-             WHERE workspace_id=?1 AND work_date<?2
-               AND state IN ('collecting','awaiting_resolution')",
-            params![workspace_id, request.today_date],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
     let total_count = today_summary.completed_count
         + today_summary.active_count
         + today_summary.not_started_count;
@@ -1068,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn overview_keeps_historical_unassigned_out_of_today_minutes() {
+    fn overview_ignores_historical_unassigned_time() {
         let (database, workspace_id, _) = setup();
         let connection = database.open().unwrap();
         insert_unassigned(&connection, &workspace_id, "2026-09-28", 1_200, 1_000);
@@ -1077,7 +1067,6 @@ mod tests {
 
         let overview = get_today_work_overview(&database, request(None)).unwrap();
         assert_eq!(overview.summary.unassigned_minutes, 5);
-        assert_eq!(overview.summary.historical_unassigned_count, 1);
         assert_eq!(
             overview
                 .timeline
