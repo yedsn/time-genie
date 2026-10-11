@@ -2,11 +2,20 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { storeToRefs } from "pinia";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { Braces, CalendarDays, CalendarRange, Check, ClipboardCopy, FilePenLine, FileText, Folder, HardDriveDownload, MoreHorizontal, Pencil, Plus, ReceiptText, RefreshCcw, Search, Sparkles, Trash2 } from "lucide-vue-next";
+import { ArrowDown, ArrowUp, Braces, CalendarDays, CalendarRange, Check, ChevronRight, ClipboardCopy, Copy, FilePenLine, FileText, Folder, HardDriveDownload, LayoutTemplate, MoreHorizontal, Pencil, Plus, ReceiptText, RefreshCcw, Search, Sparkles, Star, Trash2 } from "lucide-vue-next";
 import { MdEditor, MdPreview } from "md-editor-v3";
 import "md-editor-v3/lib/style.css";
 import { useWorkdayStore, type ReportRecord, type ReportType, type Task } from "../store";
 import { getReportTaskSuggestions, getSettings, querySeaTableReimbursements, type ObsidianReportWritePreview, type ReportTaskSuggestion, type ReportTemplateRecord } from "../services/tauri";
+import {
+  insertTemplateToken,
+  placeholdersForReportType,
+  planTemplateDeletion,
+  renderTemplatePreview,
+  reorderTemplateIds,
+  selectReportTemplate,
+  validateReportTemplateDraft,
+} from "../services/reportTemplateEditorCore";
 
 const store = useWorkdayStore();
 const { reports } = storeToRefs(store);
@@ -33,26 +42,20 @@ const templateSaving = ref(false);
 const templateDraft = ref("");
 const templateRecord = ref<ReportTemplateRecord>();
 const templateType = ref<ReportType>("daily");
-const templateSubjectId = ref("");
+const templates = ref<ReportTemplateRecord[]>([]);
+const selectedTemplateId = ref("");
+const templateName = ref("");
+const templateDescription = ref("");
+const templateMode = ref<"edit" | "create">("edit");
+const templateEditor = ref<HTMLTextAreaElement>();
+const draftTemplateId = ref("");
+const templatePickerOpen = ref(false);
+const templatePickerId = ref("");
 const obsidianDialogOpen = ref(false);
 const obsidianLoading = ref(false);
 const obsidianWriting = ref(false);
 const obsidianStrategy = ref<"overwrite" | "append">("overwrite");
 const obsidianPreview = ref<ObsidianReportWritePreview>();
-
-const templateVariables = [
-  { token: "{{姓名}}", label: "姓名" },
-  { token: "{{日期}}", label: "日期" },
-  { token: "{{星期}}", label: "星期" },
-  { token: "{{日期范围}}", label: "日期范围" },
-  { token: "{{工作时段}}", label: "工作时段" },
-  { token: "{{总工时}}", label: "总工时" },
-  { token: "{{今日事项}}", label: "今日事项" },
-  { token: "{{明日计划}}", label: "明日计划" },
-  { token: "{{统计信息}}", label: "统计信息" },
-  { token: "{{每日情况}}", label: "每日情况" },
-  { token: "{{总结}}", label: "总结" },
-] as const;
 
 const toolbars = [
   "revoke", "next", "-", "bold", "italic", "strikeThrough", "title", "quote",
@@ -125,7 +128,27 @@ const templatePreview = computed(() => {
     "{{每日情况}}": "- 2026-09-21：6h\n- 2026-09-22：缺少日报或结算数据",
     "{{总结}}": "- 在这里补充本期总结。",
   };
-  return Object.entries(replacements).reduce((content, [token, value]) => content.split(token).join(value), templateDraft.value);
+  return renderTemplatePreview(templateDraft.value, replacements);
+});
+const selectedDraftTemplate = computed(() => templates.value.find((item) => item.id === draftTemplateId.value));
+const draftTemplatePreview = computed(() => {
+  const previewTemplateId = templatePickerOpen.value ? templatePickerId.value : draftTemplateId.value;
+  const template = templates.value.find((item) => item.id === previewTemplateId);
+  if (!template) return "";
+  const replacements: Record<string, string> = {
+    "{{姓名}}": "晓健",
+    "{{日期}}": toDateValue(draftReferenceDate.value),
+    "{{星期}}": "周四",
+    "{{日期范围}}": periodValue(draftType.value, draftReferenceDate.value),
+    "{{工作时段}}": "10:00-12:00 13:30-17:30",
+    "{{总工时}}": formatHours(360),
+    "{{今日事项}}": "1. 已完成事项\n2. 进行中的事项",
+    "{{明日计划}}": "1. 明日重点事项",
+    "{{统计信息}}": "- 累计用时：6h\n- 已完成事项：4 项",
+    "{{每日情况}}": "- 周一：6h\n- 周二：5h",
+    "{{总结}}": "- 在这里补充本期总结。",
+  };
+  return renderTemplatePreview(template.content, replacements);
 });
 
 watch(selectedReport, (report) => {
@@ -135,6 +158,11 @@ watch(selectedReport, (report) => {
 watch([draftSubjectId, draftType, draftReferenceDate], () => {
   if (!reportDialogOpen.value || dialogMode.value !== "create") return;
   void loadSuggestedTasks(true);
+});
+watch(draftType, () => {
+  if (!reportDialogOpen.value) return;
+  templatePickerOpen.value = false;
+  void loadDraftTemplates(true);
 });
 
 function reportTypeLabel(type: ReportType) {
@@ -305,6 +333,7 @@ async function openCreateDialog() {
   draftReferenceDate.value = new Date();
   draftTaskQuery.value = "";
   reportDialogOpen.value = true;
+  await loadDraftTemplates(true);
   await loadSuggestedTasks(true);
 }
 
@@ -317,7 +346,28 @@ async function openScopeDialog(report: ReportRecord) {
   draftTaskIds.value = [...report.taskIds];
   draftTaskQuery.value = "";
   reportDialogOpen.value = true;
+  await loadDraftTemplates(false, report.templateId);
   await loadSuggestedTasks(false);
+}
+
+async function loadDraftTemplates(selectDefault: boolean, preferredId?: string) {
+  templates.value = await store.loadReportTemplates(draftType.value);
+  const selected = selectReportTemplate(templates.value, { preferredId, currentId: draftTemplateId.value, selectDefault });
+  draftTemplateId.value = selected?.id ?? "";
+}
+
+function openTemplatePicker() {
+  templatePickerId.value = draftTemplateId.value || templates.value.find((item) => item.isDefault)?.id || templates.value[0]?.id || "";
+  templatePickerOpen.value = true;
+}
+
+function confirmTemplatePicker() {
+  if (!templatePickerId.value) {
+    ElMessage.warning("请选择报告模板");
+    return;
+  }
+  draftTemplateId.value = templatePickerId.value;
+  templatePickerOpen.value = false;
 }
 
 function toggleAllDraftTasks() {
@@ -364,6 +414,7 @@ async function saveReportDialog() {
           subjectId: subject.id,
           referenceDate,
           taskIds: [...draftTaskIds.value],
+          templateId: draftTemplateId.value,
         });
         const updated = await store.regenerateReport(scoped);
         selectedReportId.value = updated.id;
@@ -379,6 +430,7 @@ async function saveReportDialog() {
         subjectId: subject.id,
         referenceDate,
         taskIds: [...draftTaskIds.value],
+        templateId: draftTemplateId.value,
       });
       selectedReportId.value = report.id;
       reportFilter.value = "all";
@@ -394,6 +446,7 @@ async function saveReportDialog() {
       subjectId: subject.id,
       referenceDate,
       taskIds: [...draftTaskIds.value],
+      templateId: draftTemplateId.value,
     });
     selectedReportId.value = updated.id;
     reportDialogOpen.value = false;
@@ -412,6 +465,7 @@ async function saveReportDialog() {
         subjectId: subject.id,
         referenceDate,
         taskIds: [...draftTaskIds.value],
+        templateId: draftTemplateId.value,
       });
       const updated = await store.regenerateReport(scoped);
       selectedReportId.value = updated.id;
@@ -461,14 +515,12 @@ async function saveMarkdown(showMessage = true) {
   }
 }
 
-async function openTemplateSettings(report: ReportRecord) {
+async function openTemplateSettings(report?: ReportRecord) {
   templateDialogOpen.value = true;
   templateLoading.value = true;
-  templateType.value = report.type;
-  templateSubjectId.value = report.subjectId;
+  templateType.value = report?.type ?? "daily";
   try {
-    templateRecord.value = await store.getReportTemplate(report.type, report.subjectId);
-    templateDraft.value = templateRecord.value.content;
+    await loadTemplates(report?.templateId);
   } catch (error) {
     templateDialogOpen.value = false;
     ElMessage.error(errorText(error, "模板加载失败"));
@@ -477,30 +529,101 @@ async function openTemplateSettings(report: ReportRecord) {
   }
 }
 
+async function loadTemplates(preferredId?: string) {
+  templates.value = await store.loadReportTemplates(templateType.value);
+  const selected = templates.value.find((item) => item.id === preferredId) ?? templates.value.find((item) => item.id === selectedTemplateId.value) ?? templates.value.find((item) => item.isDefault) ?? templates.value[0];
+  if (selected) selectTemplate(selected);
+}
+
+function selectTemplate(template: ReportTemplateRecord) {
+  templateMode.value = "edit";
+  templateRecord.value = template;
+  selectedTemplateId.value = template.id;
+  templateName.value = template.name;
+  templateDescription.value = template.description ?? "";
+  templateDraft.value = template.content;
+}
+
+function newTemplate() {
+  templateMode.value = "create";
+  templateRecord.value = undefined;
+  selectedTemplateId.value = "";
+  templateName.value = "";
+  templateDescription.value = "";
+  templateDraft.value = templateType.value === "daily" ? "# {{日期}} {{星期}}\n\n{{今日事项}}\n" : "# {{日期范围}}\n\n{{统计信息}}\n\n{{每日情况}}\n\n{{总结}}\n";
+}
+
+async function switchTemplateType(type: ReportType) {
+  templateType.value = type;
+  templateLoading.value = true;
+  try { await loadTemplates(); } finally { templateLoading.value = false; }
+}
+
 function insertTemplateVariable(token: string) {
-  templateDraft.value += token;
+  const editor = templateEditor.value;
+  if (!editor) { templateDraft.value += token; return; }
+  const result = insertTemplateToken(templateDraft.value, editor.selectionStart, editor.selectionEnd, token);
+  templateDraft.value = result.content;
+  requestAnimationFrame(() => { editor.focus(); editor.setSelectionRange(result.selectionStart, result.selectionEnd); });
 }
 
 async function saveTemplate() {
-  if (!templateDraft.value.trim()) {
-    ElMessage.warning("报告模板不能为空");
-    return;
-  }
+  const validationError = validateReportTemplateDraft({ type: templateType.value, name: templateName.value, content: templateDraft.value, templates: templates.value, currentId: templateRecord.value?.id });
+  if (validationError) { ElMessage.warning(validationError); return; }
   templateSaving.value = true;
   try {
-    templateRecord.value = await store.saveReportTemplate({
-      type: templateType.value,
-      subjectId: templateSubjectId.value,
-      content: templateDraft.value,
-      expectedVersion: templateRecord.value?.subjectId ? templateRecord.value.version : undefined,
-    });
-    templateDialogOpen.value = false;
-    ElMessage.success("模板已保存，重新生成报告后生效");
+    templateRecord.value = templateMode.value === "create"
+      ? await store.createReportTemplate({ reportType: templateType.value, name: templateName.value, description: templateDescription.value || undefined, content: templateDraft.value })
+      : await store.updateReportTemplate({ templateId: templateRecord.value!.id, name: templateName.value, description: templateDescription.value || undefined, content: templateDraft.value, sortOrder: templateRecord.value!.sortOrder, expectedVersion: templateRecord.value!.version });
+    await loadTemplates(templateRecord.value.id);
+    ElMessage.success("模板已保存，已生成的报告不会自动改变");
   } catch (error) {
     ElMessage.error(errorText(error, "模板保存失败"));
   } finally {
     templateSaving.value = false;
   }
+}
+
+async function duplicateTemplate() {
+  if (!templateRecord.value) return;
+  const result = await ElMessageBox.prompt("请输入副本名称", "复制模板", { inputValue: `${templateRecord.value.name} 副本`, confirmButtonText: "复制", cancelButtonText: "取消" }).catch(() => undefined);
+  if (!result?.value) return;
+  try {
+    const copy = await store.duplicateReportTemplate({ templateId: templateRecord.value.id, name: result.value, description: templateRecord.value.description });
+    await loadTemplates(copy.id);
+    ElMessage.success("模板已复制");
+  } catch (error) { ElMessage.error(errorText(error, "复制模板失败")); }
+}
+
+async function setDefaultTemplate() {
+  if (!templateRecord.value || templateRecord.value.isDefault) return;
+  try {
+    const updated = await store.setDefaultReportTemplate(templateRecord.value.id, templateRecord.value.version);
+    await loadTemplates(updated.id);
+    ElMessage.success("已设为默认模板");
+  } catch (error) { ElMessage.error(errorText(error, "设置默认模板失败")); }
+}
+
+async function deleteTemplate() {
+  const target = templateRecord.value;
+  if (!target) return;
+  const plan = planTemplateDeletion(target, templates.value);
+  if ("error" in plan) { ElMessage.warning(plan.error); return; }
+  const replacement = plan.replacement;
+  try {
+    await ElMessageBox.confirm(target.isDefault ? `删除默认模板后，“${replacement!.name}”将成为新默认模板。历史报告仍可使用已归档模板重新生成。` : "删除后模板将从新建报告中隐藏，历史报告仍可使用它重新生成。", "删除模板", { type: "warning", confirmButtonText: "删除", cancelButtonText: "取消" });
+    await store.deleteReportTemplate(target.id, target.version, replacement?.id);
+    await loadTemplates();
+    ElMessage.success("模板已删除");
+  } catch (error) { if (error !== "cancel") ElMessage.error(errorText(error, "删除模板失败")); }
+}
+
+async function moveTemplate(offset: -1 | 1) {
+  if (!templateRecord.value) return;
+  const templateIds = reorderTemplateIds(templates.value, templateRecord.value.id, offset);
+  if (!templateIds) return;
+  templates.value = await store.reorderReportTemplates(templateType.value, templateIds);
+  selectTemplate(templates.value.find((item) => item.id === templateRecord.value!.id)!);
 }
 
 async function openObsidianPreview(report: ReportRecord) {
@@ -677,7 +800,7 @@ function existingReportId(error: unknown) {
     <aside class="report-library">
       <header class="report-library-head">
         <div><h2>报告</h2><span>{{ reports.length ? `${reports.length} 份记录` : '按日期与周期归档' }}</span></div>
-        <button class="primary-button compact" type="button" @click="openCreateDialog"><Plus :size="14" />创建</button>
+        <div class="report-library-actions"><button class="secondary-button compact" type="button" @click="openTemplateSettings()"><Braces :size="14" />模板</button><button class="primary-button compact" type="button" @click="openCreateDialog"><Plus :size="14" />创建</button></div>
       </header>
 
       <label class="report-search-field">
@@ -725,11 +848,11 @@ function existingReportId(error: unknown) {
       <header class="report-editor-head">
         <div>
           <div class="report-editor-title"><h2>{{ selectedReport.period }}</h2><span :class="['report-type-badge', reportTypeClass(selectedReport.type)]">{{ reportTypeLabel(selectedReport.type) }}</span></div>
-          <p><span>{{ selectedReport.subjectName }}</span><i></i><span>{{ selectedReport.taskIds.length }} 个事项</span><i></i><span>{{ formatUpdatedAt(selectedReport.updatedAt) }} 更新</span><template v-if="selectedReport.generatedCount > 1"><i></i><span>已生成 {{ selectedReport.generatedCount }} 次</span></template></p>
+          <p><span>{{ selectedReport.subjectName }}</span><i></i><span>{{ selectedReport.taskIds.length }} 个事项</span><i></i><span>模板：{{ selectedReport.templateName || '默认模板' }}<template v-if="selectedReport.templateArchived">（已归档）</template></span><i></i><span>{{ formatUpdatedAt(selectedReport.updatedAt) }} 更新</span><template v-if="selectedReport.generatedCount > 1"><i></i><span>已生成 {{ selectedReport.generatedCount }} 次</span></template></p>
         </div>
         <div class="report-editor-actions">
           <button class="icon-button subtle" type="button" title="调整报告范围" @click="openScopeDialog(selectedReport)"><Pencil :size="14" /></button>
-          <button class="icon-button subtle" type="button" title="设置当前类型模板" @click="openTemplateSettings(selectedReport)"><Braces :size="14" /></button>
+          <button class="icon-button subtle" type="button" title="管理报告模板" @click="openTemplateSettings(selectedReport)"><Braces :size="14" /></button>
           <button class="secondary-button compact report-regenerate-button" type="button" @click="regenerateReport(selectedReport)"><Sparkles :size="13" />重新生成</button>
           <button class="primary-button compact report-save-button" type="button" :disabled="!hasUnsavedChanges || reportSaving" @click="saveMarkdown()"><Check :size="14" />{{ hasUnsavedChanges ? '保存修改' : '已保存' }}</button>
           <el-dropdown trigger="click" placement="bottom-end" popper-class="report-action-popper" @command="handleSelectedReportCommand">
@@ -778,7 +901,7 @@ function existingReportId(error: unknown) {
       <button class="primary-button" type="button" @click="openCreateDialog"><Plus :size="15" />创建第一份报告</button>
     </section>
 
-    <el-dialog v-model="reportDialogOpen" class="report-create-dialog" :title="dialogTitle" width="min(680px, 94vw)" append-to-body destroy-on-close>
+    <el-dialog v-model="reportDialogOpen" class="report-create-dialog" :title="dialogTitle" width="min(640px, 94vw)" append-to-body destroy-on-close>
       <div class="report-create-form">
         <section class="report-create-section report-scope-section">
           <header><span>1</span><div><strong>报告范围</strong><small>确定报告的归档周期和所属主体</small></div></header>
@@ -795,6 +918,14 @@ function existingReportId(error: unknown) {
             </div>
             <div :class="['report-scope-result', reportTypeClass(draftType)]"><span>归档范围</span><strong>{{ periodValue(draftType, draftReferenceDate) }}</strong></div>
           </div>
+        </section>
+
+        <section class="report-create-section report-template-section">
+          <button class="report-template-trigger" type="button" :disabled="!templates.length" @click="openTemplatePicker">
+            <span class="report-template-trigger-icon"><LayoutTemplate :size="16" /></span>
+            <span class="report-template-trigger-copy"><small>报告模板</small><strong>{{ selectedDraftTemplate?.name || '暂无可用模板' }}</strong><em>{{ selectedDraftTemplate?.isDefault ? '默认模板' : '本次单独选择' }}</em></span>
+            <span class="report-template-trigger-action">{{ draftTemplateId ? '更换' : '选择' }}<ChevronRight :size="14" /></span>
+          </button>
         </section>
 
         <section class="report-create-section report-import-section">
@@ -820,18 +951,43 @@ function existingReportId(error: unknown) {
       </div>
       <template #footer>
         <div class="report-dialog-summary"><strong>{{ periodValue(draftType, draftReferenceDate) }}</strong><span>{{ store.subjects.find((subject) => subject.id === draftSubjectId)?.name }} · {{ draftSummary.total }} 项 · {{ formatHours(draftSummary.minutes) }}</span></div>
-        <div class="report-dialog-actions"><button class="secondary-button" type="button" @click="reportDialogOpen = false">取消</button><button class="primary-button" type="button" :disabled="!draftTaskIds.length || reportSaving" @click="saveReportDialog"><Check :size="14" />{{ dialogMode === 'create' ? existingDraftReport ? '覆盖并生成' : '生成并保存' : '保存范围' }}</button></div>
+        <div class="report-dialog-actions"><button class="secondary-button" type="button" @click="reportDialogOpen = false">取消</button><button class="primary-button" type="button" :disabled="!draftTaskIds.length || !draftTemplateId || reportSaving" @click="saveReportDialog"><Check :size="14" />{{ dialogMode === 'create' ? existingDraftReport ? '覆盖并生成' : '生成并保存' : '保存范围' }}</button></div>
       </template>
     </el-dialog>
 
-    <el-dialog v-model="templateDialogOpen" class="report-template-dialog" :title="`${reportTypeLabel(templateType)}模板设置`" width="min(920px, 94vw)" append-to-body destroy-on-close>
+    <el-dialog v-model="templatePickerOpen" class="report-template-picker-dialog" :title="reportTypeLabel(draftType) + '模板'" width="min(760px, 94vw)" append-to-body destroy-on-close>
+      <div class="report-template-picker-layout">
+        <div class="report-template-picker-list" role="radiogroup" aria-label="选择报告模板">
+          <button v-for="item in templates" :key="item.id" type="button" :class="['report-template-picker-item', { active: templatePickerId === item.id }]" role="radio" :aria-checked="templatePickerId === item.id" @click="templatePickerId = item.id">
+            <span><strong>{{ item.name }}</strong><small>{{ item.description || '适用于全部主体' }}</small></span>
+            <i v-if="item.isDefault">默认</i>
+            <Check v-if="templatePickerId === item.id" :size="15" />
+          </button>
+        </div>
+        <div class="report-template-picker-preview">
+          <header><div><small>模板预览</small><strong>{{ templates.find((item) => item.id === templatePickerId)?.name || '请选择模板' }}</strong></div><span>仅用于本次报告</span></header>
+          <MdPreview v-if="templatePickerId" editor-id="report-draft-template-preview" :model-value="draftTemplatePreview" language="zh-CN" theme="dark" preview-theme="github" code-theme="github" />
+          <div v-else class="report-template-picker-empty"><LayoutTemplate :size="22" /><span>选择左侧模板查看内容</span></div>
+        </div>
+      </div>
+      <template #footer><button class="secondary-button" type="button" @click="templatePickerOpen = false">取消</button><button class="primary-button" type="button" :disabled="!templatePickerId" @click="confirmTemplatePicker">使用这个模板</button></template>
+    </el-dialog>
+
+    <el-dialog v-model="templateDialogOpen" class="report-template-dialog" title="报告模板管理" width="min(1080px, 96vw)" append-to-body destroy-on-close>
       <div v-if="templateLoading" class="report-dialog-loading">正在加载模板...</div>
       <div v-else class="report-template-layout">
+        <aside class="template-library-pane">
+          <div class="report-filter-tabs"><button v-for="type in (['daily', 'weekly', 'monthly'] as ReportType[])" :key="type" type="button" :class="{ active: templateType === type }" @click="switchTemplateType(type)">{{ reportTypeLabel(type) }}</button></div>
+          <button class="primary-button compact template-add-button" type="button" @click="newTemplate"><Plus :size="13" />新建模板</button>
+          <button v-for="item in templates" :key="item.id" type="button" :class="['template-list-item', { active: selectedTemplateId === item.id }]" @click="selectTemplate(item)"><span class="template-list-copy"><strong>{{ item.name }}</strong><small>{{ item.description || '适用于全部主体' }}</small></span><span class="template-list-badges"><i v-if="item.isBuiltin" class="builtin">内置</i><i v-if="item.isDefault">默认</i></span></button>
+        </aside>
         <section class="template-editor-pane">
-          <div class="template-pane-head"><div><strong>模板内容</strong><span>仅应用于当前主体的{{ reportTypeLabel(templateType) }}</span></div></div>
-          <textarea v-model="templateDraft" spellcheck="false" aria-label="报告模板内容"></textarea>
+          <div class="template-pane-head"><div><strong>{{ templateMode === 'create' ? '新建' : '编辑' }}{{ reportTypeLabel(templateType) }}模板</strong><span>默认对全部主体通用</span></div><div v-if="templateRecord" class="template-inline-actions"><button type="button" title="上移" @click="moveTemplate(-1)"><ArrowUp :size="13" /></button><button type="button" title="下移" @click="moveTemplate(1)"><ArrowDown :size="13" /></button></div></div>
+          <input v-model="templateName" class="template-name-input" placeholder="模板名称，如：客户周报" />
+          <input v-model="templateDescription" class="template-name-input" placeholder="模板说明（可选）" />
+          <textarea ref="templateEditor" v-model="templateDraft" spellcheck="false" aria-label="报告模板内容"></textarea>
           <div class="template-variable-list">
-            <button v-for="variable in templateVariables" :key="variable.token" type="button" @click="insertTemplateVariable(variable.token)"><code>{{ variable.token }}</code><span>{{ variable.label }}</span></button>
+            <button v-for="variable in placeholdersForReportType(templateType)" :key="variable.token" type="button" :title="`${variable.description}，示例：${variable.example}`" @click="insertTemplateVariable(variable.token)"><code>{{ variable.token }}</code><span>{{ variable.label }}</span></button>
           </div>
         </section>
         <section class="template-preview-pane">
@@ -839,7 +995,7 @@ function existingReportId(error: unknown) {
           <MdPreview editor-id="report-template-preview" :model-value="templatePreview" language="zh-CN" theme="dark" preview-theme="github" code-theme="github" />
         </section>
       </div>
-      <template #footer><button class="secondary-button" type="button" @click="templateDialogOpen = false">取消</button><button class="primary-button" type="button" :disabled="templateLoading || templateSaving" @click="saveTemplate">{{ templateSaving ? '保存中...' : '保存模板' }}</button></template>
+      <template #footer><div class="template-footer-actions"><button v-if="templateRecord" class="secondary-button" type="button" @click="duplicateTemplate"><Copy :size="13" />复制</button><button v-if="templateRecord && !templateRecord.isDefault" class="secondary-button" type="button" @click="setDefaultTemplate"><Star :size="13" />设为默认</button><button v-if="templateRecord" class="secondary-button danger" type="button" @click="deleteTemplate"><Trash2 :size="13" />删除</button></div><div><button class="secondary-button" type="button" @click="templateDialogOpen = false">关闭</button><button class="primary-button" type="button" :disabled="templateLoading || templateSaving" @click="saveTemplate">{{ templateSaving ? '保存中...' : '保存模板' }}</button></div></template>
     </el-dialog>
 
     <el-dialog v-model="obsidianDialogOpen" class="report-write-dialog" title="写入 Obsidian" width="min(720px, 94vw)" append-to-body destroy-on-close :close-on-click-modal="!obsidianWriting" :close-on-press-escape="!obsidianWriting">

@@ -18,7 +18,11 @@ use crate::cloud_sync::{
 };
 use crate::database::Database;
 use crate::recurring::{self, RecurrenceSaveRequest};
-use crate::reports::{self, ReportCreateRequest, ReportListRequest};
+use crate::reports::{
+    self, ReportCreateRequest, ReportListRequest, ReportTemplateCreateRequest,
+    ReportTemplateDeleteRequest, ReportTemplateListRequest, ReportTemplateSetDefaultRequest,
+    ReportVersionRequest,
+};
 use crate::subjects;
 use crate::supabase::{
     self, CloudConfigureRequest, CloudDeviceRegisterRequest, CloudSignInRequest,
@@ -474,7 +478,7 @@ impl PlanningCloudServer {
         let connection = database.open().unwrap();
         let mut statement = connection
             .prepare(
-                "SELECT id,report_type,subject_id,content,is_builtin,created_at,updated_at,version,deleted_at FROM report_templates",
+                "SELECT id,report_type,name,description,content,is_default,is_builtin,sort_order,created_at,updated_at,version,deleted_at FROM report_templates",
             )
             .unwrap();
         let templates = statement
@@ -482,13 +486,17 @@ impl PlanningCloudServer {
                 Ok(json!({
                     "id": row.get::<_, String>(0)?,
                     "report_type": row.get::<_, String>(1)?,
-                    "subject_id": row.get::<_, Option<String>>(2)?,
-                    "content": row.get::<_, String>(3)?,
-                    "is_builtin": row.get::<_, i64>(4)? == 1,
-                    "created_at": row.get::<_, i64>(5)?,
-                    "updated_at": row.get::<_, i64>(6)?,
-                    "version": row.get::<_, i64>(7)?,
-                    "deleted_at": row.get::<_, Option<i64>>(8)?,
+                    "subject_id": Value::Null,
+                    "name": row.get::<_, String>(2)?,
+                    "description": row.get::<_, Option<String>>(3)?,
+                    "content": row.get::<_, String>(4)?,
+                    "is_default": row.get::<_, i64>(5)? == 1,
+                    "is_builtin": row.get::<_, i64>(6)? == 1,
+                    "sort_order": row.get::<_, i64>(7)?,
+                    "created_at": row.get::<_, i64>(8)?,
+                    "updated_at": row.get::<_, i64>(9)?,
+                    "version": row.get::<_, i64>(10)?,
+                    "deleted_at": row.get::<_, Option<i64>>(11)?,
                 }))
             })
             .unwrap()
@@ -907,6 +915,73 @@ fn handle_planning_cloud_request(
                 version,
             );
         }
+        "report_template" => {
+            let current = state
+                .report_templates
+                .get(entity_id)
+                .and_then(|row| row["version"].as_i64());
+            if current != base_version {
+                return write_http_json(
+                    &mut stream,
+                    409,
+                    json!({ "message": "SYNC_CONFLICT: report template version changed" }),
+                );
+            }
+            let version = payload["version"].as_i64().unwrap_or(1);
+            let report_type = payload["report_type"].as_str().map(str::to_string);
+            let mut secondary_changes = Vec::new();
+            if (payload["is_default"].as_bool() == Some(true)
+                || payload["is_default"].as_i64() == Some(1))
+                && payload["deleted_at"].is_null()
+            {
+                for (other_id, template) in &mut state.report_templates {
+                    if other_id != entity_id
+                        && template["report_type"].as_str() == report_type.as_deref()
+                        && template["deleted_at"].is_null()
+                        && (template["is_default"].as_bool() == Some(true)
+                            || template["is_default"].as_i64() == Some(1))
+                    {
+                        template["is_default"] = Value::Bool(false);
+                        let next_version = template["version"].as_i64().unwrap_or_default() + 1;
+                        template["version"] = Value::Number(next_version.into());
+                        secondary_changes.push((other_id.clone(), next_version));
+                    }
+                }
+            }
+            state
+                .report_templates
+                .insert(entity_id.to_string(), payload.clone());
+            if let Some(replacement_id) = payload["replacement_template_id"].as_str() {
+                if let Some(replacement) = state.report_templates.get_mut(replacement_id) {
+                    replacement["is_default"] = Value::Bool(true);
+                    let next_version = replacement["version"].as_i64().unwrap_or_default() + 1;
+                    replacement["version"] = Value::Number(next_version.into());
+                    secondary_changes.push((replacement_id.to_string(), next_version));
+                }
+            }
+            for (changed_id, changed_version) in secondary_changes {
+                record_change(
+                    &mut state,
+                    workspace_id,
+                    "report_templates",
+                    &changed_id,
+                    "update",
+                    changed_version,
+                );
+            }
+            record_change(
+                &mut state,
+                workspace_id,
+                "report_templates",
+                entity_id,
+                if payload["deleted_at"].is_null() {
+                    "update"
+                } else {
+                    "delete"
+                },
+                version,
+            );
+        }
         "task_occurrence" => {
             let current = state
                 .occurrences
@@ -1009,10 +1084,19 @@ fn handle_planning_cloud_request(
             );
         }
     }
+    let authoritative = match entity_type {
+        "report_template" => state.report_templates.get(entity_id).cloned(),
+        _ => None,
+    };
     write_http_json(
         &mut stream,
         200,
-        json!({ "entityType": entity_type, "entityId": entity_id }),
+        json!({
+            "entityType": entity_type,
+            "entityId": entity_id,
+            "version": authoritative.as_ref().and_then(|row| row["version"].as_i64()),
+            "authoritative": authoritative
+        }),
     );
 }
 
@@ -1256,6 +1340,7 @@ fn isolated_supabase_planning_two_device_flow() {
             reference_date: today_text.clone(),
             subject_id: subject.id.clone(),
             task_ids: vec![task.id.clone()],
+            template_id: None,
             client_request_id: Uuid::now_v7().to_string(),
         },
     )
@@ -1629,6 +1714,288 @@ fn isolated_supabase_planning_two_device_flow() {
     )
     .unwrap();
     assert_eq!(cloud.request_counts().1, snapshots_before_reset + 1);
+}
+
+#[test]
+fn isolated_named_report_templates_two_device_flow() {
+    let directory = tempfile::tempdir().unwrap();
+    let device_a = Database::initialize_at(directory.path().join("templates-a.sqlite3")).unwrap();
+    let device_b = Database::initialize_at(directory.path().join("templates-b.sqlite3")).unwrap();
+    let cloud = PlanningCloudServer::start();
+    let workspace_id = Uuid::now_v7().to_string();
+    configure_isolated_planning_device(
+        &device_a,
+        &cloud.base_url,
+        &workspace_id,
+        "templates-user-a",
+    );
+    configure_isolated_planning_device(
+        &device_b,
+        &cloud.base_url,
+        &workspace_id,
+        "templates-user-b",
+    );
+    let subject = subjects::list_subjects(&device_a).unwrap().remove(0);
+    let task = create_task(&device_a, &subject.id, "模板同步事项");
+    cloud.seed(&device_a, &subject, &task);
+    cloud_sync::pull_snapshot(&device_b).unwrap();
+
+    let customer = reports::create_template_for_cloud_test(
+        &device_a,
+        ReportTemplateCreateRequest {
+            report_type: "daily".to_string(),
+            name: "客户日报".to_string(),
+            description: Some("全部主体均可选择".to_string()),
+            content: "# 客户日报 {{日期}}\n\n{{今日事项}}".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    pull_all(&device_b);
+    let on_b = reports::list_templates(
+        &device_b,
+        ReportTemplateListRequest {
+            report_type: Some("daily".to_string()),
+        },
+    )
+    .unwrap();
+    assert!(on_b.iter().any(|item| {
+        item.id == customer.id
+            && item.name == "客户日报"
+            && item.description.as_deref() == Some("全部主体均可选择")
+            && item.sort_order == customer.sort_order
+    }));
+
+    let chosen = reports::set_default_template_for_cloud_test(
+        &device_a,
+        ReportTemplateSetDefaultRequest {
+            template_id: customer.id.clone(),
+            expected_version: customer.version,
+        },
+    )
+    .unwrap();
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    {
+        let state = cloud.state.lock().unwrap();
+        let cloud_target = state.report_templates.get(&chosen.id).unwrap();
+        assert_eq!(
+            cloud_target["is_default"]
+                .as_bool()
+                .unwrap_or_else(|| cloud_target["is_default"].as_i64() == Some(1)),
+            true,
+            "云端模拟器未保存目标默认模板: {cloud_target}"
+        );
+    }
+    pull_all(&device_b);
+    let on_b = reports::list_templates(
+        &device_b,
+        ReportTemplateListRequest {
+            report_type: Some("daily".to_string()),
+        },
+    )
+    .unwrap();
+    assert_eq!(on_b.iter().filter(|item| item.is_default).count(), 1);
+    assert!(
+        on_b.iter()
+            .any(|item| item.id == chosen.id && item.is_default),
+        "目标模板未成为默认: {:?}",
+        on_b.iter()
+            .map(|item| (&item.id, &item.name, item.is_default, item.version))
+            .collect::<Vec<_>>()
+    );
+
+    let compact = reports::create_template_for_cloud_test(
+        &device_a,
+        ReportTemplateCreateRequest {
+            report_type: "daily".to_string(),
+            name: "精简日报".to_string(),
+            description: None,
+            content: "# {{日期}}\n\n{{总工时}}".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    pull_all(&device_b);
+    let before_race_a = reports::list_templates(
+        &device_a,
+        ReportTemplateListRequest {
+            report_type: Some("daily".to_string()),
+        },
+    )
+    .unwrap();
+    let before_race_b = reports::list_templates(
+        &device_b,
+        ReportTemplateListRequest {
+            report_type: Some("daily".to_string()),
+        },
+    )
+    .unwrap();
+    let customer_a = before_race_a
+        .iter()
+        .find(|item| item.id == chosen.id)
+        .unwrap();
+    let compact_b = before_race_b
+        .iter()
+        .find(|item| item.id == compact.id)
+        .unwrap();
+    reports::set_default_template_for_cloud_test(
+        &device_a,
+        ReportTemplateSetDefaultRequest {
+            template_id: customer_a.id.clone(),
+            expected_version: customer_a.version,
+        },
+    )
+    .unwrap();
+    reports::set_default_template_for_cloud_test(
+        &device_b,
+        ReportTemplateSetDefaultRequest {
+            template_id: compact_b.id.clone(),
+            expected_version: compact_b.version,
+        },
+    )
+    .unwrap();
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    assert_eq!(push_all(&device_b).conflicts, 0);
+    pull_all(&device_a);
+    pull_all(&device_b);
+    let defaults = [&device_a, &device_b]
+        .into_iter()
+        .map(|database| {
+            reports::list_templates(
+                database,
+                ReportTemplateListRequest {
+                    report_type: Some("daily".to_string()),
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.is_default)
+            .map(|item| item.id)
+            .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(defaults[0], vec![compact.id.clone()]);
+    assert_eq!(defaults[1], vec![compact.id.clone()]);
+
+    let report = reports::create_report(
+        &device_a,
+        ReportCreateRequest {
+            report_type: "daily".to_string(),
+            reference_date: chrono::Local::now()
+                .date_naive()
+                .format("%Y-%m-%d")
+                .to_string(),
+            subject_id: subject.id.clone(),
+            task_ids: vec![task.id.clone()],
+            template_id: Some(chosen.id.clone()),
+            client_request_id: Uuid::now_v7().to_string(),
+        },
+    )
+    .unwrap();
+    cloud_sync::enqueue_entity_deferred(
+        &device_a,
+        "report_create",
+        "report",
+        Some(&report.id),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    pull_all(&device_b);
+    let report_on_b = reports::list_reports(
+        &device_b,
+        ReportListRequest {
+            report_type: None,
+            subject_id: None,
+            query: None,
+        },
+    )
+    .unwrap()
+    .reports
+    .into_iter()
+    .find(|item| item.id == report.id)
+    .unwrap();
+    assert_eq!(report_on_b.template_id.as_deref(), Some(chosen.id.as_str()));
+
+    let chosen_before_delete = reports::list_templates(
+        &device_a,
+        ReportTemplateListRequest {
+            report_type: Some("daily".to_string()),
+        },
+    )
+    .unwrap()
+    .into_iter()
+    .find(|item| item.id == chosen.id)
+    .unwrap();
+    reports::set_default_template_for_cloud_test(
+        &device_a,
+        ReportTemplateSetDefaultRequest {
+            template_id: chosen.id.clone(),
+            expected_version: chosen_before_delete.version,
+        },
+    )
+    .unwrap();
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    pull_all(&device_b);
+
+    let current_templates = reports::list_templates(
+        &device_a,
+        ReportTemplateListRequest {
+            report_type: Some("daily".to_string()),
+        },
+    )
+    .unwrap();
+    let chosen_version_for_delete = current_templates
+        .iter()
+        .find(|item| item.id == chosen.id)
+        .unwrap()
+        .version;
+    let replacement = current_templates
+        .into_iter()
+        .find(|item| item.id != chosen.id)
+        .unwrap();
+    reports::delete_template_for_cloud_test(
+        &device_a,
+        ReportTemplateDeleteRequest {
+            template_id: chosen.id.clone(),
+            replacement_template_id: Some(replacement.id.clone()),
+            expected_version: chosen_version_for_delete,
+        },
+    )
+    .unwrap();
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    pull_all(&device_b);
+    let active_on_b = reports::list_templates(
+        &device_b,
+        ReportTemplateListRequest {
+            report_type: Some("daily".to_string()),
+        },
+    )
+    .unwrap();
+    assert_eq!(active_on_b.iter().filter(|item| item.is_default).count(), 1);
+    assert!(active_on_b
+        .iter()
+        .any(|item| item.id == replacement.id && item.is_default));
+    let archived = reports::get_template_by_id(
+        &device_b,
+        reports::ReportTemplateIdRequest {
+            template_id: chosen.id.clone(),
+        },
+    )
+    .unwrap();
+    assert!(archived.deleted_at.is_some());
+
+    let regenerated = reports::regenerate_report(
+        &device_b,
+        ReportVersionRequest {
+            report_id: report_on_b.id,
+            expected_version: report_on_b.version,
+        },
+    )
+    .unwrap();
+    assert_eq!(regenerated.template_id.as_deref(), Some(chosen.id.as_str()));
+    assert!(regenerated.markdown.starts_with("# 客户日报"));
 }
 
 #[test]

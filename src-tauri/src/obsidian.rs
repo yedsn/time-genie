@@ -1105,6 +1105,7 @@ mod tests {
                 reference_date: "2026-09-24".to_string(),
                 subject_id,
                 task_ids: vec![task_id],
+                template_id: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )
@@ -1258,6 +1259,7 @@ mod tests {
                 reference_date: target_date_text,
                 subject_id,
                 task_ids: confirmed.tasks.iter().map(|task| task.id.clone()).collect(),
+                template_id: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )

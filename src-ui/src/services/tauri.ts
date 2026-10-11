@@ -391,6 +391,9 @@ export type ReportRecordDto = {
   period: string;
   referenceDate: string;
   taskIds: string[];
+  templateId?: string;
+  templateName?: string;
+  templateArchived: boolean;
   markdown: string;
   contentSource: "generated" | "edited";
   generatedCount: number;
@@ -401,10 +404,22 @@ export type ReportRecordDto = {
 export type ReportTemplateRecord = {
   id: string;
   reportType: "daily" | "weekly" | "monthly";
-  subjectId?: string;
+  name: string;
+  description?: string;
   content: string;
+  isDefault: boolean;
   isBuiltin: boolean;
+  sortOrder: number;
+  deletedAt?: number;
   version: number;
+};
+
+export type ReportTemplatePlaceholder = {
+  token: string;
+  label: string;
+  description: string;
+  example: string;
+  reportTypes: Array<"daily" | "weekly" | "monthly">;
 };
 
 export type ReportTaskSuggestion = {
@@ -767,6 +782,7 @@ export async function createReport(request: {
   referenceDate: string;
   subjectId: string;
   taskIds: string[];
+  templateId?: string;
 }): Promise<ReportRecordDto> {
   return await invoke("report_create", { request: { ...request, clientRequestId: crypto.randomUUID() } });
 }
@@ -777,6 +793,7 @@ export async function updateReportScope(request: {
   referenceDate: string;
   subjectId: string;
   taskIds: string[];
+  templateId?: string;
   expectedVersion: number;
 }): Promise<ReportRecordDto> {
   return await invoke("report_update_scope", { request });
@@ -830,6 +847,42 @@ export async function executeObsidianReportWrite(
 
 export async function getSettings(): Promise<SettingsSnapshot> {
   return await invoke<SettingsSnapshot>("settings_get");
+}
+
+export async function listReportTemplates(reportType?: "daily" | "weekly" | "monthly"): Promise<ReportTemplateRecord[]> {
+  return await invoke("report_template_list", { request: { reportType } });
+}
+
+export async function getReportTemplateById(templateId: string): Promise<ReportTemplateRecord> {
+  return await invoke("report_template_get_by_id", { request: { templateId } });
+}
+
+export async function createReportTemplate(request: { reportType: "daily" | "weekly" | "monthly"; name: string; description?: string; content: string }): Promise<ReportTemplateRecord> {
+  return await invoke("report_template_create", { request });
+}
+
+export async function updateReportTemplate(request: { templateId: string; name: string; description?: string; content: string; sortOrder: number; expectedVersion: number }): Promise<ReportTemplateRecord> {
+  return await invoke("report_template_update", { request });
+}
+
+export async function duplicateReportTemplate(request: { templateId: string; name: string; description?: string }): Promise<ReportTemplateRecord> {
+  return await invoke("report_template_duplicate", { request });
+}
+
+export async function setDefaultReportTemplate(templateId: string, expectedVersion: number): Promise<ReportTemplateRecord> {
+  return await invoke("report_template_set_default", { request: { templateId, expectedVersion } });
+}
+
+export async function deleteReportTemplate(templateId: string, expectedVersion: number, replacementTemplateId?: string): Promise<void> {
+  await invoke("report_template_delete", { request: { templateId, expectedVersion, replacementTemplateId } });
+}
+
+export async function reorderReportTemplates(reportType: "daily" | "weekly" | "monthly", templateIds: string[]): Promise<ReportTemplateRecord[]> {
+  return await invoke("report_template_reorder", { request: { reportType, templateIds } });
+}
+
+export async function getReportTemplatePlaceholders(reportType: "daily" | "weekly" | "monthly"): Promise<ReportTemplatePlaceholder[]> {
+  return await invoke("report_template_placeholders", { reportType });
 }
 
 export async function getWorkspaceCalendarContext(): Promise<WorkspaceCalendarContext> {

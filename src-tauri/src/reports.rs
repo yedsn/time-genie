@@ -19,6 +19,9 @@ pub struct ReportDto {
     pub period: String,
     pub reference_date: String,
     pub task_ids: Vec<String>,
+    pub template_id: Option<String>,
+    pub template_name: Option<String>,
+    pub template_archived: bool,
     pub markdown: String,
     pub content_source: String,
     pub generated_count: i64,
@@ -64,6 +67,8 @@ pub struct ReportCreateRequest {
     pub reference_date: String,
     pub subject_id: String,
     pub task_ids: Vec<String>,
+    #[serde(default)]
+    pub template_id: Option<String>,
     pub client_request_id: String,
 }
 
@@ -75,6 +80,8 @@ pub struct ReportScopeUpdateRequest {
     pub reference_date: String,
     pub subject_id: String,
     pub task_ids: Vec<String>,
+    #[serde(default)]
+    pub template_id: Option<String>,
     pub expected_version: i64,
 }
 
@@ -105,9 +112,13 @@ pub struct PublicReportDto {
 pub struct ReportTemplateDto {
     pub id: String,
     pub report_type: String,
-    pub subject_id: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
     pub content: String,
+    pub is_default: bool,
     pub is_builtin: bool,
+    pub sort_order: i64,
+    pub deleted_at: Option<i64>,
     pub version: i64,
 }
 
@@ -115,6 +126,8 @@ pub struct ReportTemplateDto {
 #[serde(rename_all = "camelCase")]
 pub struct ReportTemplateGetRequest {
     pub report_type: String,
+    #[serde(default)]
+    #[allow(dead_code)]
     pub subject_id: Option<String>,
 }
 
@@ -122,9 +135,82 @@ pub struct ReportTemplateGetRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ReportTemplateSaveRequest {
     pub report_type: String,
+    #[allow(dead_code)]
     pub subject_id: Option<String>,
     pub content: String,
     pub expected_version: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportTemplateListRequest {
+    pub report_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportTemplateIdRequest {
+    pub template_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportTemplateCreateRequest {
+    pub report_type: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportTemplateUpdateRequest {
+    pub template_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub content: String,
+    pub sort_order: i64,
+    pub expected_version: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportTemplateDuplicateRequest {
+    pub template_id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportTemplateSetDefaultRequest {
+    pub template_id: String,
+    pub expected_version: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportTemplateDeleteRequest {
+    pub template_id: String,
+    pub replacement_template_id: Option<String>,
+    pub expected_version: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportTemplateReorderRequest {
+    pub report_type: String,
+    pub template_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportTemplatePlaceholderDto {
+    pub token: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+    pub example: &'static str,
+    pub report_types: &'static [&'static str],
 }
 
 #[derive(Debug, Clone)]
@@ -236,6 +322,14 @@ fn create_report_with_cloud_operation(
         return Ok(result);
     }
     ensure_subject(&connection, &workspace_id, &request.subject_id)?;
+    if let Some(template_id) = request.template_id.as_deref() {
+        load_selectable_template(
+            &connection,
+            &workspace_id,
+            template_id,
+            &request.report_type,
+        )?;
+    }
     let existing: Option<String> = connection
         .query_row(
             "SELECT id FROM reports WHERE workspace_id = ?1 AND report_type = ?2 AND subject_id = ?3
@@ -259,6 +353,7 @@ fn create_report_with_cloud_operation(
         &transaction,
         &workspace_id,
         &request.report_type,
+        request.template_id.as_deref(),
         &request.subject_id,
         &period_start,
         &period_end,
@@ -334,12 +429,23 @@ fn update_report_scope_with_cloud_operation(
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
+    let current = load_report(&transaction, &request.report_id)?;
+    let template_id = match request.template_id.as_deref() {
+        Some(id) => {
+            load_selectable_template(&transaction, &workspace_id, id, &request.report_type)?;
+            Some(id.to_string())
+        }
+        None if current.report_type == request.report_type => current.template_id,
+        None => {
+            return Err("VALIDATION_ERROR: 切换报告类型时请选择对应类型的模板".to_string());
+        }
+    };
     let changed = transaction
         .execute(
             "UPDATE reports SET report_type = ?1, subject_id = ?2, period_start = ?3, period_end = ?4,
-                    reference_date = ?5, updated_at = ?6, version = version + 1
-             WHERE id = ?7 AND workspace_id = ?8 AND version = ?9 AND deleted_at IS NULL",
-            params![request.report_type, request.subject_id, period_start, period_end, request.reference_date, now, request.report_id, workspace_id, request.expected_version],
+                    reference_date = ?5, template_id = ?6, updated_at = ?7, version = version + 1
+             WHERE id = ?8 AND workspace_id = ?9 AND version = ?10 AND deleted_at IS NULL",
+            params![request.report_type, request.subject_id, period_start, period_end, request.reference_date, template_id, now, request.report_id, workspace_id, request.expected_version],
         )
         .map_err(|error| error.to_string())?;
     if changed == 0 {
@@ -451,6 +557,7 @@ fn regenerate_report_with_cloud_operation(
         &transaction,
         &workspace_id,
         &current.report_type,
+        current.template_id.as_deref(),
         &current.subject_id,
         &current.period_start,
         &current.period_end,
@@ -539,6 +646,7 @@ pub fn public_report(
         &connection,
         &workspace_id,
         &report.report_type,
+        report.template_id.as_deref(),
         &report.subject_id,
         &report.period_start,
         &report.period_end,
@@ -557,11 +665,370 @@ pub fn get_template(
     validate_report_type(&request.report_type)?;
     let connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
-    load_effective_template(
+    load_default_template(&connection, &workspace_id, &request.report_type)
+}
+
+pub fn list_templates(
+    database: &Database,
+    request: ReportTemplateListRequest,
+) -> Result<Vec<ReportTemplateDto>, String> {
+    if let Some(report_type) = request.report_type.as_deref() {
+        validate_report_type(report_type)?;
+    }
+    let connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id FROM report_templates
+             WHERE workspace_id = ?1 AND deleted_at IS NULL
+               AND (?2 IS NULL OR report_type = ?2)
+             ORDER BY CASE report_type WHEN 'daily' THEN 1 WHEN 'weekly' THEN 2 ELSE 3 END,
+                      sort_order, lower(name), id",
+        )
+        .map_err(|error| error.to_string())?;
+    let ids = statement
+        .query_map(params![workspace_id, request.report_type], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    ids.iter()
+        .map(|id| load_template_by_id(&connection, id, false))
+        .collect()
+}
+
+pub fn get_template_by_id(
+    database: &Database,
+    request: ReportTemplateIdRequest,
+) -> Result<ReportTemplateDto, String> {
+    let connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    load_template_in_workspace(&connection, &workspace_id, &request.template_id, true)
+}
+
+fn create_template_with_cloud_operation(
+    database: &Database,
+    request: ReportTemplateCreateRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+) -> Result<ReportTemplateDto, String> {
+    validate_report_type(&request.report_type)?;
+    let name = validate_template_name(&request.name)?;
+    validate_template(&request.report_type, &request.content)?;
+    let mut connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    ensure_template_name_available(
         &connection,
         &workspace_id,
         &request.report_type,
-        request.subject_id.as_deref(),
+        &name,
+        None,
+    )?;
+    let id = Uuid::now_v7().to_string();
+    let now = now_millis();
+    let sort_order: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(sort_order), 0) + 10 FROM report_templates
+             WHERE workspace_id = ?1 AND report_type = ?2 AND deleted_at IS NULL",
+            params![workspace_id, request.report_type],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    transaction.execute(
+        "INSERT INTO report_templates(
+           id,workspace_id,report_type,subject_id,name,description,content,is_default,is_builtin,sort_order,created_at,updated_at,version
+         ) VALUES (?1,?2,?3,NULL,?4,?5,?6,0,0,?7,?8,?8,1)",
+        params![id, workspace_id, request.report_type, name, request.description.and_then(normalize_optional_text), request.content, sort_order, now],
+    ).map_err(map_template_write_error)?;
+    bump_revision(&transaction)?;
+    let result = load_template_by_id(&transaction, &id, false)?;
+    enqueue_template_change(&transaction, cloud_operation, "report_template", &id, None)?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(result)
+}
+
+#[cfg(test)]
+pub fn create_template_for_cloud_test(
+    database: &Database,
+    request: ReportTemplateCreateRequest,
+) -> Result<ReportTemplateDto, String> {
+    let state = crate::supabase::storage_mode(database)?;
+    create_template_with_cloud_operation(
+        database,
+        request,
+        Some((&state, "report_template_create")),
+    )
+}
+
+fn update_template_with_cloud_operation(
+    database: &Database,
+    request: ReportTemplateUpdateRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+) -> Result<ReportTemplateDto, String> {
+    let name = validate_template_name(&request.name)?;
+    let mut connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    let current =
+        load_template_in_workspace(&connection, &workspace_id, &request.template_id, false)?;
+    validate_template(&current.report_type, &request.content)?;
+    ensure_template_name_available(
+        &connection,
+        &workspace_id,
+        &current.report_type,
+        &name,
+        Some(&current.id),
+    )?;
+    let now = now_millis();
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let changed = transaction.execute(
+        "UPDATE report_templates SET name=?1,description=?2,content=?3,sort_order=?4,updated_at=?5,version=version+1
+         WHERE id=?6 AND workspace_id=?7 AND version=?8 AND deleted_at IS NULL",
+        params![name, request.description.and_then(normalize_optional_text), request.content, request.sort_order, now, request.template_id, workspace_id, request.expected_version],
+    ).map_err(map_template_write_error)?;
+    if changed == 0 {
+        return Err("VERSION_CONFLICT: 报告模板已变化".to_string());
+    }
+    bump_revision(&transaction)?;
+    let result = load_template_by_id(&transaction, &request.template_id, false)?;
+    enqueue_template_change(
+        &transaction,
+        cloud_operation,
+        "report_template",
+        &request.template_id,
+        Some(request.expected_version),
+    )?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(result)
+}
+
+fn duplicate_template_with_cloud_operation(
+    database: &Database,
+    request: ReportTemplateDuplicateRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+) -> Result<ReportTemplateDto, String> {
+    let connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    let source =
+        load_template_in_workspace(&connection, &workspace_id, &request.template_id, false)?;
+    drop(connection);
+    create_template_with_cloud_operation(
+        database,
+        ReportTemplateCreateRequest {
+            report_type: source.report_type,
+            name: request.name,
+            description: request.description.or(source.description),
+            content: source.content,
+        },
+        cloud_operation,
+    )
+}
+
+fn set_default_template_with_cloud_operation(
+    database: &Database,
+    request: ReportTemplateSetDefaultRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+) -> Result<ReportTemplateDto, String> {
+    let mut connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    let target =
+        load_template_in_workspace(&connection, &workspace_id, &request.template_id, false)?;
+    if target.version != request.expected_version {
+        return Err("VERSION_CONFLICT: 报告模板已变化".to_string());
+    }
+    let now = now_millis();
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    transaction.execute(
+        "UPDATE report_templates SET is_default=0,updated_at=?1,version=version+1
+         WHERE workspace_id=?2 AND report_type=?3 AND is_default=1 AND id<>?4 AND deleted_at IS NULL",
+        params![now, workspace_id, target.report_type, target.id],
+    ).map_err(|error| error.to_string())?;
+    let changed = transaction
+        .execute(
+            "UPDATE report_templates SET is_default=1,updated_at=?1,version=version+1
+         WHERE id=?2 AND workspace_id=?3 AND version=?4 AND deleted_at IS NULL",
+            params![now, target.id, workspace_id, request.expected_version],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err("VERSION_CONFLICT: 报告模板已变化".to_string());
+    }
+    bump_revision(&transaction)?;
+    let result = load_template_by_id(&transaction, &target.id, false)?;
+    enqueue_template_change(
+        &transaction,
+        cloud_operation,
+        "report_template_set_default",
+        &target.id,
+        Some(request.expected_version),
+    )?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(result)
+}
+
+#[cfg(test)]
+pub fn set_default_template_for_cloud_test(
+    database: &Database,
+    request: ReportTemplateSetDefaultRequest,
+) -> Result<ReportTemplateDto, String> {
+    let state = crate::supabase::storage_mode(database)?;
+    set_default_template_with_cloud_operation(
+        database,
+        request,
+        Some((&state, "report_template_set_default")),
+    )
+}
+
+fn delete_template_with_cloud_operation(
+    database: &Database,
+    request: ReportTemplateDeleteRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+) -> Result<(), String> {
+    let mut connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    let target =
+        load_template_in_workspace(&connection, &workspace_id, &request.template_id, false)?;
+    if target.version != request.expected_version {
+        return Err("VERSION_CONFLICT: 报告模板已变化".to_string());
+    }
+    let active_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM report_templates WHERE workspace_id=?1 AND report_type=?2 AND deleted_at IS NULL",
+        params![workspace_id, target.report_type], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if active_count <= 1 {
+        return Err("VALIDATION_ERROR: 每种报告类型至少需要保留一份模板".to_string());
+    }
+    let replacement = if target.is_default {
+        let id = request
+            .replacement_template_id
+            .as_deref()
+            .ok_or_else(|| "VALIDATION_ERROR: 删除默认模板时请选择替代默认模板".to_string())?;
+        Some(load_selectable_template(
+            &connection,
+            &workspace_id,
+            id,
+            &target.report_type,
+        )?)
+    } else {
+        None
+    };
+    let now = now_millis();
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let changed = transaction
+        .execute(
+            "UPDATE report_templates SET is_default=0,deleted_at=?1,updated_at=?1,version=version+1
+         WHERE id=?2 AND workspace_id=?3 AND version=?4 AND deleted_at IS NULL",
+            params![now, target.id, workspace_id, request.expected_version],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err("VERSION_CONFLICT: 报告模板已变化".to_string());
+    }
+    if let Some(replacement) = replacement.as_ref() {
+        transaction.execute(
+            "UPDATE report_templates SET is_default=1,updated_at=?1,version=version+1 WHERE id=?2",
+            params![now, replacement.id],
+        ).map_err(|error| error.to_string())?;
+    }
+    bump_revision(&transaction)?;
+    if let Some((state, operation_type)) = cloud_operation {
+        let mut payload = crate::cloud_sync::entity_payload_from_connection(
+            &transaction,
+            "report_template",
+            Some(&target.id),
+        )?;
+        if let Some(replacement) = replacement.as_ref() {
+            payload
+                .as_object_mut()
+                .ok_or_else(|| "CACHE_ERROR: 报告模板同步快照不是对象".to_string())?
+                .insert(
+                    "replacement_template_id".to_string(),
+                    serde_json::Value::String(replacement.id.clone()),
+                );
+        }
+        crate::cloud_sync::enqueue_payload_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "report_template",
+            &target.id,
+            Some(request.expected_version),
+            &payload,
+            None,
+            None,
+        )?;
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+pub fn delete_template_for_cloud_test(
+    database: &Database,
+    request: ReportTemplateDeleteRequest,
+) -> Result<(), String> {
+    let state = crate::supabase::storage_mode(database)?;
+    delete_template_with_cloud_operation(
+        database,
+        request,
+        Some((&state, "report_template_delete")),
+    )
+}
+
+fn reorder_templates_with_cloud_operation(
+    database: &Database,
+    request: ReportTemplateReorderRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+) -> Result<Vec<ReportTemplateDto>, String> {
+    validate_report_type(&request.report_type)?;
+    let mut connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    let current = list_templates(
+        database,
+        ReportTemplateListRequest {
+            report_type: Some(request.report_type.clone()),
+        },
+    )?;
+    let current_ids: HashSet<_> = current.iter().map(|item| item.id.as_str()).collect();
+    let request_ids: HashSet<_> = request.template_ids.iter().map(String::as_str).collect();
+    if current_ids != request_ids {
+        return Err("VALIDATION_ERROR: 模板排序列表不完整".to_string());
+    }
+    let now = now_millis();
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    for (index, id) in request.template_ids.iter().enumerate() {
+        let base_version = current
+            .iter()
+            .find(|item| item.id == *id)
+            .map(|item| item.version);
+        transaction.execute(
+            "UPDATE report_templates SET sort_order=?1,updated_at=?2,version=version+1 WHERE id=?3 AND workspace_id=?4",
+            params![(index as i64 + 1) * 10, now, id, workspace_id],
+        ).map_err(|error| error.to_string())?;
+        enqueue_template_change(
+            &transaction,
+            cloud_operation,
+            "report_template_reorder",
+            id,
+            base_version,
+        )?;
+    }
+    bump_revision(&transaction)?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    list_templates(
+        database,
+        ReportTemplateListRequest {
+            report_type: Some(request.report_type),
+        },
     )
 }
 
@@ -571,17 +1038,14 @@ fn save_template_with_cloud_operation(
     cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<ReportTemplateDto, String> {
     validate_report_type(&request.report_type)?;
-    validate_template(&request.content)?;
+    validate_template(&request.report_type, &request.content)?;
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
-    if let Some(subject_id) = &request.subject_id {
-        ensure_subject(&connection, &workspace_id, subject_id)?;
-    }
     let existing: Option<(String, i64)> = connection
         .query_row(
             "SELECT id, version FROM report_templates
-             WHERE workspace_id = ?1 AND report_type = ?2 AND subject_id IS ?3 AND deleted_at IS NULL",
-            params![workspace_id, request.report_type, request.subject_id],
+             WHERE workspace_id = ?1 AND report_type = ?2 AND is_default = 1 AND deleted_at IS NULL",
+            params![workspace_id, request.report_type],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
@@ -600,7 +1064,7 @@ fn save_template_with_cloud_operation(
         }
         transaction
             .execute(
-                "UPDATE report_templates SET content = ?1, is_builtin = 0, updated_at = ?2, version = version + 1 WHERE id = ?3",
+                "UPDATE report_templates SET content = ?1, updated_at = ?2, version = version + 1 WHERE id = ?3",
                 params![request.content, now, id],
             )
             .map_err(|error| error.to_string())?;
@@ -609,15 +1073,15 @@ fn save_template_with_cloud_operation(
         let id = Uuid::now_v7().to_string();
         transaction
             .execute(
-                "INSERT INTO report_templates(id, workspace_id, report_type, subject_id, content, is_builtin, created_at, updated_at, version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?6, 1)",
-                params![id, workspace_id, request.report_type, request.subject_id, request.content, now],
+                "INSERT INTO report_templates(id, workspace_id, report_type, subject_id, name, content, is_default, is_builtin, sort_order, created_at, updated_at, version)
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, 1, 0, 10, ?6, ?6, 1)",
+                params![id, workspace_id, request.report_type, format!("标准{}", report_type_label(&request.report_type)), request.content, now],
             )
             .map_err(|error| error.to_string())?;
         id
     };
     bump_revision(&transaction)?;
-    let result = load_template_by_id(&transaction, &id)?;
+    let result = load_template_by_id(&transaction, &id, false)?;
     if let Some((state, operation_type)) = cloud_operation {
         crate::cloud_sync::enqueue_entity_in_transaction(
             &transaction,
@@ -638,8 +1102,10 @@ fn load_report(connection: &rusqlite::Connection, report_id: &str) -> Result<Rep
         .query_row(
             "SELECT r.id, r.report_type, r.subject_id, s.name, r.period_start, r.period_end,
                     r.reference_date, r.markdown_content, r.content_source, r.generation_count,
-                    r.updated_at, r.version
+                    r.updated_at, r.version, r.template_id, template.name,
+                    CASE WHEN template.deleted_at IS NULL THEN 0 ELSE 1 END
              FROM reports r JOIN subjects s ON s.id = r.subject_id
+             LEFT JOIN report_templates template ON template.id = r.template_id
              WHERE r.id = ?1 AND r.deleted_at IS NULL",
             [report_id],
             |row| {
@@ -656,6 +1122,9 @@ fn load_report(connection: &rusqlite::Connection, report_id: &str) -> Result<Rep
                     period_end: end,
                     reference_date: row.get(6)?,
                     task_ids: Vec::new(),
+                    template_id: row.get(12)?,
+                    template_name: row.get(13)?,
+                    template_archived: row.get::<_, i64>(14)? == 1,
                     markdown: row.get(7)?,
                     content_source: row.get(8)?,
                     generated_count: row.get(9)?,
@@ -712,14 +1181,18 @@ fn render_report(
     connection: &rusqlite::Connection,
     workspace_id: &str,
     report_type: &str,
+    template_id: Option<&str>,
     subject_id: &str,
     period_start: &str,
     period_end: &str,
     task_ids: &[String],
 ) -> Result<(String, String), String> {
     validate_report_type(report_type)?;
-    let template =
-        load_effective_template(connection, workspace_id, report_type, Some(subject_id))?;
+    let template = if let Some(template_id) = template_id {
+        load_bound_template(connection, workspace_id, template_id, report_type)?
+    } else {
+        load_default_template(connection, workspace_id, report_type)?
+    };
     let user_name = setting_string(connection, workspace_id, "user_name", "晓健")?;
     let work_period = setting_string(connection, workspace_id, "default_work_period_text", "")?;
     let salary_hourly_rate = setting_number(connection, workspace_id, "salary_hourly_rate", 0.0)?;
@@ -1376,70 +1849,268 @@ fn format_report_duration(minutes: i64, format: &str) -> String {
     }
 }
 
-fn load_effective_template(
+fn load_default_template(
     connection: &rusqlite::Connection,
     workspace_id: &str,
     report_type: &str,
-    subject_id: Option<&str>,
 ) -> Result<ReportTemplateDto, String> {
-    if let Some(subject_id) = subject_id {
-        let id: Option<String> = connection
-            .query_row(
-                "SELECT id FROM report_templates WHERE workspace_id = ?1 AND report_type = ?2
-                 AND subject_id = ?3 AND deleted_at IS NULL",
-                params![workspace_id, report_type, subject_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        if let Some(id) = id {
-            return load_template_by_id(connection, &id);
-        }
-    }
     let id: String = connection
         .query_row(
             "SELECT id FROM report_templates WHERE workspace_id = ?1 AND report_type = ?2
-             AND subject_id IS NULL AND deleted_at IS NULL",
+             AND is_default = 1 AND deleted_at IS NULL",
             params![workspace_id, report_type],
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
-    load_template_by_id(connection, &id)
+    load_template_by_id(connection, &id, false)
 }
 
 fn load_template_by_id(
     connection: &rusqlite::Connection,
     id: &str,
+    include_deleted: bool,
 ) -> Result<ReportTemplateDto, String> {
     connection
         .query_row(
-            "SELECT id, report_type, subject_id, content, is_builtin, version FROM report_templates WHERE id = ?1 AND deleted_at IS NULL",
-            [id],
+            "SELECT id, report_type, name, description, content, is_default, is_builtin, sort_order, deleted_at, version
+             FROM report_templates WHERE id = ?1 AND (?2 = 1 OR deleted_at IS NULL)",
+            params![id, include_deleted as i64],
             |row| Ok(ReportTemplateDto {
-                id: row.get(0)?, report_type: row.get(1)?, subject_id: row.get(2)?, content: row.get(3)?,
-                is_builtin: row.get::<_, i64>(4)? == 1, version: row.get(5)?,
+                id: row.get(0)?, report_type: row.get(1)?, name: row.get(2)?, description: row.get(3)?,
+                content: row.get(4)?, is_default: row.get::<_, i64>(5)? == 1,
+                is_builtin: row.get::<_, i64>(6)? == 1, sort_order: row.get(7)?,
+                deleted_at: row.get(8)?, version: row.get(9)?,
             }),
         )
-        .map_err(|error| error.to_string())
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "NOT_FOUND: 报告模板不存在".to_string())
 }
 
-fn validate_template(content: &str) -> Result<(), String> {
+fn load_template_in_workspace(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    id: &str,
+    include_deleted: bool,
+) -> Result<ReportTemplateDto, String> {
+    let belongs: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM report_templates WHERE id=?1 AND workspace_id=?2 AND (?3=1 OR deleted_at IS NULL))",
+        params![id, workspace_id, include_deleted as i64], |row| row.get::<_, i64>(0),
+    ).map_err(|error| error.to_string())? == 1;
+    if !belongs {
+        return Err("NOT_FOUND: 报告模板不存在".to_string());
+    }
+    load_template_by_id(connection, id, include_deleted)
+}
+
+fn load_selectable_template(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    id: &str,
+    report_type: &str,
+) -> Result<ReportTemplateDto, String> {
+    let template = load_template_in_workspace(connection, workspace_id, id, false)?;
+    if template.report_type != report_type {
+        return Err("VALIDATION_ERROR: 报告模板类型与报告类型不一致".to_string());
+    }
+    Ok(template)
+}
+
+fn load_bound_template(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    id: &str,
+    report_type: &str,
+) -> Result<ReportTemplateDto, String> {
+    let template = load_template_in_workspace(connection, workspace_id, id, true)?;
+    if template.report_type != report_type {
+        return Err("VALIDATION_ERROR: 报告绑定的模板类型不匹配".to_string());
+    }
+    Ok(template)
+}
+
+fn validate_template_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("VALIDATION_ERROR: 模板名称不能为空".to_string());
+    }
+    if name.chars().count() > 80 {
+        return Err("VALIDATION_ERROR: 模板名称不能超过 80 个字符".to_string());
+    }
+    Ok(name.to_string())
+}
+
+fn normalize_optional_text(value: String) -> Option<String> {
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn ensure_template_name_available(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    report_type: &str,
+    name: &str,
+    exclude_id: Option<&str>,
+) -> Result<(), String> {
+    let duplicate: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM report_templates WHERE workspace_id=?1 AND report_type=?2
+         AND lower(trim(name))=lower(trim(?3)) AND deleted_at IS NULL AND (?4 IS NULL OR id<>?4))",
+            params![workspace_id, report_type, name, exclude_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| error.to_string())?
+        == 1;
+    if duplicate {
+        Err("VALIDATION_ERROR: 同类型模板名称已存在".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn map_template_write_error(error: rusqlite::Error) -> String {
+    let message = error.to_string();
+    if message.contains("uq_report_templates_active_name")
+        || message.contains("report_templates.workspace_id")
+    {
+        "VALIDATION_ERROR: 同类型模板名称已存在".to_string()
+    } else {
+        message
+    }
+}
+
+fn enqueue_template_change(
+    transaction: &Transaction<'_>,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    fallback_operation: &str,
+    id: &str,
+    base_version: Option<i64>,
+) -> Result<(), String> {
+    if let Some((state, operation_type)) = cloud_operation {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            transaction,
+            state,
+            operation_type,
+            "report_template",
+            Some(id),
+            base_version,
+            None,
+        )
+        .map(|_| ())
+    } else {
+        let _ = fallback_operation;
+        Ok(())
+    }
+}
+
+fn report_type_label(report_type: &str) -> &'static str {
+    match report_type {
+        "daily" => "日报",
+        "weekly" => "周报",
+        _ => "月报",
+    }
+}
+
+const TEMPLATE_PLACEHOLDERS: &[ReportTemplatePlaceholderDto] = &[
+    ReportTemplatePlaceholderDto {
+        token: "{{姓名}}",
+        label: "姓名",
+        description: "设置中的用户姓名",
+        example: "晓健",
+        report_types: &["daily", "weekly", "monthly"],
+    },
+    ReportTemplatePlaceholderDto {
+        token: "{{日期}}",
+        label: "日期",
+        description: "报告周期起始日期",
+        example: "2026-10-11",
+        report_types: &["daily"],
+    },
+    ReportTemplatePlaceholderDto {
+        token: "{{星期}}",
+        label: "星期",
+        description: "日报日期对应的星期",
+        example: "周日",
+        report_types: &["daily"],
+    },
+    ReportTemplatePlaceholderDto {
+        token: "{{日期范围}}",
+        label: "日期范围",
+        description: "周报或月报覆盖范围",
+        example: "2026-10-05 至 2026-10-11",
+        report_types: &["weekly", "monthly"],
+    },
+    ReportTemplatePlaceholderDto {
+        token: "{{工作时段}}",
+        label: "工作时段",
+        description: "设置中的默认工作时段",
+        example: "09:00-18:00",
+        report_types: &["daily"],
+    },
+    ReportTemplatePlaceholderDto {
+        token: "{{总工时}}",
+        label: "总工时",
+        description: "所选事项累计用时",
+        example: "360min",
+        report_types: &["daily", "weekly", "monthly"],
+    },
+    ReportTemplatePlaceholderDto {
+        token: "{{今日事项}}",
+        label: "今日事项",
+        description: "日报所选事项明细",
+        example: "1. 完成登录优化",
+        report_types: &["daily"],
+    },
+    ReportTemplatePlaceholderDto {
+        token: "{{明日计划}}",
+        label: "明日计划",
+        description: "下一日待办事项",
+        example: "1. 联调同步",
+        report_types: &["daily"],
+    },
+    ReportTemplatePlaceholderDto {
+        token: "{{每日情况}}",
+        label: "每日情况",
+        description: "周期内按日汇总",
+        example: "- 2026-10-11：6h",
+        report_types: &["weekly", "monthly"],
+    },
+    ReportTemplatePlaceholderDto {
+        token: "{{统计信息}}",
+        label: "统计信息",
+        description: "工时与事项统计",
+        example: "- 累计用时：6h",
+        report_types: &["weekly", "monthly"],
+    },
+    ReportTemplatePlaceholderDto {
+        token: "{{总结}}",
+        label: "总结",
+        description: "报告总结占位内容",
+        example: "- 本期总结",
+        report_types: &["weekly", "monthly"],
+    },
+];
+
+pub fn template_placeholders(
+    report_type: &str,
+) -> Result<Vec<ReportTemplatePlaceholderDto>, String> {
+    validate_report_type(report_type)?;
+    Ok(TEMPLATE_PLACEHOLDERS
+        .iter()
+        .filter(|item| item.report_types.contains(&report_type))
+        .cloned()
+        .collect())
+}
+
+fn validate_template(report_type: &str, content: &str) -> Result<(), String> {
     if content.trim().is_empty() {
         return Err("VALIDATION_ERROR: 报告模板不能为空".to_string());
     }
-    let allowed = [
-        "{{姓名}}",
-        "{{日期}}",
-        "{{星期}}",
-        "{{日期范围}}",
-        "{{工作时段}}",
-        "{{总工时}}",
-        "{{今日事项}}",
-        "{{明日计划}}",
-        "{{每日情况}}",
-        "{{统计信息}}",
-        "{{总结}}",
-    ];
+    let allowed: HashSet<_> = TEMPLATE_PLACEHOLDERS
+        .iter()
+        .filter(|item| item.report_types.contains(&report_type))
+        .map(|item| item.token)
+        .collect();
     let mut rest = content;
     while let Some(start) = rest.find("{{") {
         let after = &rest[start..];
@@ -1447,8 +2118,14 @@ fn validate_template(content: &str) -> Result<(), String> {
             return Err("VALIDATION_ERROR: 模板占位符未闭合".to_string());
         };
         let token = &after[..end + 2];
-        if !allowed.contains(&token) {
+        if !TEMPLATE_PLACEHOLDERS.iter().any(|item| item.token == token) {
             return Err(format!("VALIDATION_ERROR: 未知占位符 {token}"));
+        }
+        if !allowed.contains(token) {
+            return Err(format!(
+                "VALIDATION_ERROR: 占位符 {token} 不适用于{}",
+                report_type_label(report_type)
+            ));
         }
         rest = &after[end + 2..];
     }
@@ -1698,6 +2375,115 @@ pub fn report_template_save(
     crate::cloud_sync::flush_if_online(&database)?;
     Ok(result)
 }
+#[tauri::command]
+pub fn report_template_list(
+    database: tauri::State<'_, Database>,
+    request: ReportTemplateListRequest,
+) -> Result<Vec<ReportTemplateDto>, String> {
+    list_templates(&database, request)
+}
+#[tauri::command]
+pub fn report_template_get_by_id(
+    database: tauri::State<'_, Database>,
+    request: ReportTemplateIdRequest,
+) -> Result<ReportTemplateDto, String> {
+    get_template_by_id(&database, request)
+}
+#[tauri::command]
+pub fn report_template_create(
+    database: tauri::State<'_, Database>,
+    request: ReportTemplateCreateRequest,
+) -> Result<ReportTemplateDto, String> {
+    crate::supabase::ensure_repository_write_mode(&database)?;
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = create_template_with_cloud_operation(
+        &database,
+        request,
+        Some((&state, "report_template_create")),
+    )?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
+}
+#[tauri::command]
+pub fn report_template_update(
+    database: tauri::State<'_, Database>,
+    request: ReportTemplateUpdateRequest,
+) -> Result<ReportTemplateDto, String> {
+    crate::supabase::ensure_repository_write_mode(&database)?;
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = update_template_with_cloud_operation(
+        &database,
+        request,
+        Some((&state, "report_template_update")),
+    )?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
+}
+#[tauri::command]
+pub fn report_template_duplicate(
+    database: tauri::State<'_, Database>,
+    request: ReportTemplateDuplicateRequest,
+) -> Result<ReportTemplateDto, String> {
+    crate::supabase::ensure_repository_write_mode(&database)?;
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = duplicate_template_with_cloud_operation(
+        &database,
+        request,
+        Some((&state, "report_template_duplicate")),
+    )?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
+}
+#[tauri::command]
+pub fn report_template_set_default(
+    database: tauri::State<'_, Database>,
+    request: ReportTemplateSetDefaultRequest,
+) -> Result<ReportTemplateDto, String> {
+    crate::supabase::ensure_repository_write_mode(&database)?;
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = set_default_template_with_cloud_operation(
+        &database,
+        request,
+        Some((&state, "report_template_set_default")),
+    )?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
+}
+#[tauri::command]
+pub fn report_template_delete(
+    database: tauri::State<'_, Database>,
+    request: ReportTemplateDeleteRequest,
+) -> Result<(), String> {
+    crate::supabase::ensure_repository_write_mode(&database)?;
+    let state = crate::supabase::storage_mode(&database)?;
+    delete_template_with_cloud_operation(
+        &database,
+        request,
+        Some((&state, "report_template_delete")),
+    )?;
+    crate::cloud_sync::flush_if_online(&database)
+}
+#[tauri::command]
+pub fn report_template_reorder(
+    database: tauri::State<'_, Database>,
+    request: ReportTemplateReorderRequest,
+) -> Result<Vec<ReportTemplateDto>, String> {
+    crate::supabase::ensure_repository_write_mode(&database)?;
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = reorder_templates_with_cloud_operation(
+        &database,
+        request,
+        Some((&state, "report_template_reorder")),
+    )?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
+}
+#[tauri::command]
+pub fn report_template_placeholders(
+    report_type: String,
+) -> Result<Vec<ReportTemplatePlaceholderDto>, String> {
+    template_placeholders(&report_type)
+}
 
 #[cfg(test)]
 mod tests {
@@ -1786,6 +2572,7 @@ mod tests {
                 reference_date: date.clone(),
                 subject_id,
                 task_ids: vec![task_id],
+                template_id: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )
@@ -1850,6 +2637,7 @@ mod tests {
                 reference_date: date,
                 subject_id: subject_id.clone(),
                 task_ids: vec![task_id],
+                template_id: None,
                 client_request_id: create_operation_id.clone(),
             },
             Some((&state, "report_create", Some(create_operation_id.as_str()))),
@@ -1935,8 +2723,10 @@ mod tests {
                 operation == "report_template_save"
                     && entity_type == "report_template"
                     && entity_id.as_deref() == Some(&template.id)
-                    && base_version.is_none()
+                    && *base_version == Some(template.version - 1)
                     && value["content"] == "# {{日期}}\n{{今日事项}}"
+                    && value["subject_id"].is_null()
+                    && value["name"] == "标准日报"
             }
         ));
         assert!(outbox.iter().any(
@@ -1991,6 +2781,7 @@ mod tests {
                 reference_date: date,
                 subject_id,
                 task_ids: vec![timed_task_id],
+                template_id: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )
@@ -2047,6 +2838,7 @@ mod tests {
                 reference_date: today,
                 subject_id,
                 task_ids: vec![task_id],
+                template_id: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )
@@ -2111,6 +2903,7 @@ mod tests {
                 reference_date: "2026-09-29".to_string(),
                 subject_id,
                 task_ids: vec![task.id],
+                template_id: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )
@@ -2209,6 +3002,7 @@ mod tests {
                 reference_date: today_text,
                 subject_id,
                 task_ids: vec![task.id.clone()],
+                template_id: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )
@@ -2276,6 +3070,7 @@ mod tests {
                 })
                 .unwrap(),
             "daily",
+            None,
             &subject_id,
             friday,
             friday,
@@ -2297,6 +3092,7 @@ mod tests {
                 reference_date: date.clone(),
                 subject_id: subject_id.clone(),
                 task_ids: vec![task_id.clone()],
+                template_id: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )
@@ -2308,6 +3104,7 @@ mod tests {
                 reference_date: date,
                 subject_id,
                 task_ids: vec![task_id],
+                template_id: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )
@@ -2326,7 +3123,10 @@ mod tests {
             normalize_period("monthly", "2026-09-24").unwrap(),
             ("2026-09-01".to_string(), "2026-09-30".to_string())
         );
-        assert!(validate_template("{{未知}} ").is_err());
+        assert!(validate_template("daily", "{{未知}} ").is_err());
+        assert!(validate_template("daily", "{{日期范围}}").is_err());
+        assert!(validate_template("daily", "{{日期").is_err());
+        assert!(validate_template("daily", "   ").is_err());
         assert_eq!(format_decimal_hours(12), "0.2h");
         assert_eq!(format_decimal_hours(90), "1.5h");
         assert_eq!(normalize_duration_format("minutes"), "minutes");
@@ -2334,6 +3134,232 @@ mod tests {
         assert_eq!(normalize_duration_format("unknown"), "minutes");
         assert_eq!(format_report_duration(90, "minutes"), "90min");
         assert_eq!(format_report_duration(90, "hours"), "1.5h");
+    }
+
+    #[test]
+    fn named_templates_are_global_selectable_and_keep_report_binding() {
+        let (database, subject_id, task_id) = setup();
+        let created = create_template_with_cloud_operation(
+            &database,
+            ReportTemplateCreateRequest {
+                report_type: "daily".to_string(),
+                name: "精简日报".to_string(),
+                description: Some("全部主体通用".to_string()),
+                content: "# {{日期}}\n\n{{今日事项}}".to_string(),
+            },
+            None,
+        )
+        .unwrap();
+        let list = list_templates(
+            &database,
+            ReportTemplateListRequest {
+                report_type: Some("daily".to_string()),
+            },
+        )
+        .unwrap();
+        assert!(list.iter().any(|item| item.id == created.id));
+        assert_eq!(list.iter().filter(|item| item.is_default).count(), 1);
+
+        let report = create_report(
+            &database,
+            ReportCreateRequest {
+                report_type: "daily".to_string(),
+                reference_date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+                subject_id,
+                task_ids: vec![task_id],
+                template_id: Some(created.id.clone()),
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(report.template_id.as_deref(), Some(created.id.as_str()));
+        assert_eq!(report.template_name.as_deref(), Some("精简日报"));
+
+        let default = set_default_template_with_cloud_operation(
+            &database,
+            ReportTemplateSetDefaultRequest {
+                template_id: created.id.clone(),
+                expected_version: created.version,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(default.is_default);
+        let regenerated = regenerate_report(
+            &database,
+            ReportVersionRequest {
+                report_id: report.id,
+                expected_version: report.version,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            regenerated.template_id.as_deref(),
+            Some(created.id.as_str())
+        );
+    }
+
+    #[test]
+    fn template_delete_protects_last_item_and_archived_binding_remains_readable() {
+        let (database, _, _) = setup();
+        let daily = list_templates(
+            &database,
+            ReportTemplateListRequest {
+                report_type: Some("daily".to_string()),
+            },
+        )
+        .unwrap();
+        let error = delete_template_with_cloud_operation(
+            &database,
+            ReportTemplateDeleteRequest {
+                template_id: daily[0].id.clone(),
+                replacement_template_id: None,
+                expected_version: daily[0].version,
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("至少需要保留"));
+
+        let second = create_template_with_cloud_operation(
+            &database,
+            ReportTemplateCreateRequest {
+                report_type: "daily".to_string(),
+                name: "临时日报".to_string(),
+                description: None,
+                content: "{{今日事项}}".to_string(),
+            },
+            None,
+        )
+        .unwrap();
+        delete_template_with_cloud_operation(
+            &database,
+            ReportTemplateDeleteRequest {
+                template_id: second.id.clone(),
+                replacement_template_id: None,
+                expected_version: second.version,
+            },
+            None,
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let archived = load_template_in_workspace(
+            &connection,
+            &workspace_id(&connection).unwrap(),
+            &second.id,
+            true,
+        )
+        .unwrap();
+        assert!(archived.deleted_at.is_some());
+        assert!(!list_templates(
+            &database,
+            ReportTemplateListRequest {
+                report_type: Some("daily".to_string())
+            }
+        )
+        .unwrap()
+        .iter()
+        .any(|item| item.id == second.id));
+    }
+
+    #[test]
+    fn named_template_rules_cover_names_versions_defaults_and_type_binding() {
+        let (database, subject_id, task_id) = setup();
+        let daily = create_template_with_cloud_operation(
+            &database,
+            ReportTemplateCreateRequest {
+                report_type: "daily".to_string(),
+                name: "通用模板".to_string(),
+                description: None,
+                content: "{{今日事项}}".to_string(),
+            },
+            None,
+        )
+        .unwrap();
+        let duplicate_error = create_template_with_cloud_operation(
+            &database,
+            ReportTemplateCreateRequest {
+                report_type: "daily".to_string(),
+                name: " 通用模板 ".to_string(),
+                description: None,
+                content: "{{今日事项}}".to_string(),
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(duplicate_error.contains("名称已存在"));
+        let weekly = create_template_with_cloud_operation(
+            &database,
+            ReportTemplateCreateRequest {
+                report_type: "weekly".to_string(),
+                name: "通用模板".to_string(),
+                description: None,
+                content: "{{统计信息}}".to_string(),
+            },
+            None,
+        )
+        .unwrap();
+        let copy = duplicate_template_with_cloud_operation(
+            &database,
+            ReportTemplateDuplicateRequest {
+                template_id: daily.id.clone(),
+                name: "通用模板副本".to_string(),
+                description: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(!copy.is_default);
+        let stale_error = update_template_with_cloud_operation(
+            &database,
+            ReportTemplateUpdateRequest {
+                template_id: daily.id.clone(),
+                name: daily.name.clone(),
+                description: None,
+                content: daily.content.clone(),
+                sort_order: daily.sort_order,
+                expected_version: daily.version + 9,
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(stale_error.contains("VERSION_CONFLICT"));
+        let default = set_default_template_with_cloud_operation(
+            &database,
+            ReportTemplateSetDefaultRequest {
+                template_id: daily.id.clone(),
+                expected_version: daily.version,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(default.is_default);
+        assert_eq!(
+            list_templates(
+                &database,
+                ReportTemplateListRequest {
+                    report_type: Some("daily".to_string())
+                }
+            )
+            .unwrap()
+            .iter()
+            .filter(|item| item.is_default)
+            .count(),
+            1
+        );
+        let cross_type = create_report(
+            &database,
+            ReportCreateRequest {
+                report_type: "daily".to_string(),
+                reference_date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+                subject_id,
+                task_ids: vec![task_id],
+                template_id: Some(weekly.id),
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(cross_type.contains("类型"));
     }
 
     #[test]
@@ -2355,6 +3381,7 @@ mod tests {
                 reference_date: chrono::Local::now().format("%Y-%m-%d").to_string(),
                 subject_id,
                 task_ids: vec![task_id],
+                template_id: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )
@@ -2382,6 +3409,7 @@ mod tests {
                 reference_date: chrono::Local::now().format("%Y-%m-%d").to_string(),
                 subject_id,
                 task_ids: vec![task_id],
+                template_id: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )
@@ -2423,6 +3451,7 @@ mod tests {
                 reference_date,
                 subject_id,
                 task_ids: vec![task_id],
+                template_id: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )
@@ -2441,6 +3470,7 @@ mod tests {
                 reference_date: date,
                 subject_id,
                 task_ids: vec![task_id],
+                template_id: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )

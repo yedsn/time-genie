@@ -282,14 +282,20 @@ create table if not exists timegenie.report_templates (
   workspace_id uuid not null references timegenie.workspaces(id) on delete cascade,
   report_type text not null check (report_type in ('daily', 'weekly', 'monthly')),
   subject_id uuid references timegenie.subjects(id),
+  name text not null check (length(btrim(name)) > 0),
+  description text,
   content text not null,
+  is_default boolean not null default false,
   is_builtin boolean not null default false,
+  sort_order integer not null default 0,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   version bigint not null default 1,
   deleted_at timestamptz
 );
-create unique index if not exists uq_report_templates_scope on timegenie.report_templates(workspace_id, report_type, coalesce(subject_id, '00000000-0000-0000-0000-000000000000'::uuid)) where deleted_at is null;
+create unique index if not exists uq_report_templates_active_name on timegenie.report_templates(workspace_id, report_type, lower(btrim(name))) where deleted_at is null;
+create unique index if not exists uq_report_templates_active_default on timegenie.report_templates(workspace_id, report_type) where is_default and deleted_at is null;
+create index if not exists idx_report_templates_active_order on timegenie.report_templates(workspace_id, report_type, sort_order, name) where deleted_at is null;
 
 create table if not exists timegenie.reports (
   id uuid primary key default gen_random_uuid(),
@@ -428,10 +434,10 @@ begin
     (p_workspace_id, 'default_work_period_text', '""'::jsonb),
     (p_workspace_id, 'salary_hourly_rate', '0'::jsonb)
   on conflict(workspace_id, key) do nothing;
-  insert into timegenie.report_templates(workspace_id, report_type, content, is_builtin) values
-    (p_workspace_id, 'daily', E'【{{姓名}}】{{日期}} {{星期}} {{工作时段}} {{总工时}}\n\n{{今日事项}}\n\n## 明日计划：\n\n{{明日计划}}\n', true),
-    (p_workspace_id, 'weekly', E'# {{日期范围}}\n\n{{统计信息}}\n\n## 每日情况\n\n{{每日情况}}\n\n## 总结\n\n{{总结}}\n', true),
-    (p_workspace_id, 'monthly', E'# {{日期范围}}\n\n{{统计信息}}\n\n## 本月事项\n\n{{每日情况}}\n\n## 总结\n\n{{总结}}\n', true)
+  insert into timegenie.report_templates(workspace_id, report_type, name, description, content, is_default, is_builtin, sort_order) values
+    (p_workspace_id, 'daily', '标准日报', '系统内置模板', E'【{{姓名}}】{{日期}} {{星期}} {{工作时段}} {{总工时}}\n\n{{今日事项}}\n\n## 明日计划：\n\n{{明日计划}}\n', true, true, 10),
+    (p_workspace_id, 'weekly', '标准周报', '系统内置模板', E'# {{日期范围}}\n\n{{统计信息}}\n\n## 每日情况\n\n{{每日情况}}\n\n## 总结\n\n{{总结}}\n', true, true, 10),
+    (p_workspace_id, 'monthly', '标准月报', '系统内置模板', E'# {{日期范围}}\n\n{{统计信息}}\n\n## 本月事项\n\n{{每日情况}}\n\n## 总结\n\n{{总结}}\n', true, true, 10)
   on conflict do nothing;
   return jsonb_build_object('workspaceId', p_workspace_id, 'defaultSubjectId', default_subject_id);
 end $$;
@@ -1247,9 +1253,9 @@ begin
     on conflict(id) do update set ended_at = excluded.ended_at, duration_seconds = excluded.duration_seconds, lease_token = excluded.lease_token;
   end loop;
   for row_data in select value from jsonb_array_elements(coalesce(p_snapshot->'report_templates', '[]'::jsonb)) loop
-    insert into timegenie.report_templates(id, workspace_id, report_type, subject_id, content, is_builtin, created_at, updated_at, version, deleted_at)
-    values((row_data->>'id')::uuid, p_workspace_id, row_data->>'report_type', nullif(row_data->>'subject_id','')::uuid, row_data->>'content', coalesce((row_data->>'is_builtin')::integer,0) <> 0, to_timestamp((row_data->>'created_at')::double precision / 1000), to_timestamp((row_data->>'updated_at')::double precision / 1000), coalesce((row_data->>'version')::bigint,1), case when row_data->>'deleted_at' is null then null else to_timestamp((row_data->>'deleted_at')::double precision / 1000) end)
-    on conflict(id) do update set content = excluded.content, updated_at = excluded.updated_at, version = greatest(timegenie.report_templates.version, excluded.version), deleted_at = excluded.deleted_at;
+    insert into timegenie.report_templates(id, workspace_id, report_type, subject_id, name, description, content, is_default, is_builtin, sort_order, created_at, updated_at, version, deleted_at)
+    values((row_data->>'id')::uuid, p_workspace_id, row_data->>'report_type', null, coalesce(nullif(btrim(row_data->>'name'),''), '迁移模板 - ' || left(row_data->>'id',8)), nullif(row_data->>'description',''), row_data->>'content', coalesce((row_data->>'is_default')::boolean,false), coalesce((row_data->>'is_builtin')::integer,0) <> 0, coalesce((row_data->>'sort_order')::integer,0), to_timestamp((row_data->>'created_at')::double precision / 1000), to_timestamp((row_data->>'updated_at')::double precision / 1000), coalesce((row_data->>'version')::bigint,1), case when row_data->>'deleted_at' is null then null else to_timestamp((row_data->>'deleted_at')::double precision / 1000) end)
+    on conflict(id) do update set report_type=excluded.report_type, subject_id=null, name=excluded.name, description=excluded.description, content=excluded.content, is_default=excluded.is_default, is_builtin=excluded.is_builtin, sort_order=excluded.sort_order, updated_at = excluded.updated_at, version = greatest(timegenie.report_templates.version, excluded.version), deleted_at = excluded.deleted_at;
   end loop;
   for row_data in select value from jsonb_array_elements(coalesce(p_snapshot->'reports', '[]'::jsonb)) loop
     insert into timegenie.reports(id, workspace_id, report_type, subject_id, period_start, period_end, reference_date, template_id, markdown_content, content_source, generation_count, input_revision_hash, generated_at, created_at, updated_at, version, created_by_device_id, updated_by_device_id, deleted_at)
@@ -1583,9 +1589,9 @@ begin
     on conflict(id) do nothing;
     result_value := jsonb_build_object('entityType','task','entityId',p_entity_id,'version',(select version from timegenie.tasks where id = p_entity_id::uuid));
   elsif p_entity_type = 'report_template' then
-    insert into timegenie.report_templates(id, workspace_id, report_type, subject_id, content, is_builtin, created_at, updated_at, version, deleted_at)
-    values((row_data->>'id')::uuid, p_workspace_id, row_data->>'report_type', nullif(row_data->>'subject_id','')::uuid, row_data->>'content', coalesce((row_data->>'is_builtin')::boolean,false), to_timestamp(coalesce((row_data->>'created_at')::double precision, extract(epoch from now()) * 1000) / 1000), to_timestamp(coalesce((row_data->>'updated_at')::double precision, extract(epoch from now()) * 1000) / 1000), coalesce((row_data->>'version')::bigint,1), case when row_data->>'deleted_at' is null then null else to_timestamp((row_data->>'deleted_at')::double precision / 1000) end)
-    on conflict(id) do update set content = excluded.content, is_builtin = excluded.is_builtin, updated_at = excluded.updated_at, version = excluded.version, deleted_at = excluded.deleted_at;
+    insert into timegenie.report_templates(id, workspace_id, report_type, subject_id, name, description, content, is_default, is_builtin, sort_order, created_at, updated_at, version, deleted_at)
+    values((row_data->>'id')::uuid, p_workspace_id, row_data->>'report_type', null, coalesce(nullif(btrim(row_data->>'name'),''), '迁移模板 - ' || left(row_data->>'id',8)), nullif(row_data->>'description',''), row_data->>'content', coalesce((row_data->>'is_default')::boolean,false), coalesce((row_data->>'is_builtin')::boolean,false), coalesce((row_data->>'sort_order')::integer,0), to_timestamp(coalesce((row_data->>'created_at')::double precision, extract(epoch from now()) * 1000) / 1000), to_timestamp(coalesce((row_data->>'updated_at')::double precision, extract(epoch from now()) * 1000) / 1000), coalesce((row_data->>'version')::bigint,1), case when row_data->>'deleted_at' is null then null else to_timestamp((row_data->>'deleted_at')::double precision / 1000) end)
+    on conflict(id) do update set report_type=excluded.report_type, subject_id=null, name=excluded.name, description=excluded.description, content=excluded.content, is_default=excluded.is_default, is_builtin=excluded.is_builtin, sort_order=excluded.sort_order, updated_at=excluded.updated_at, version=excluded.version, deleted_at=excluded.deleted_at;
     result_value := jsonb_build_object('entityType','report_template','entityId',p_entity_id,'version',(select version from timegenie.report_templates where id = p_entity_id::uuid));
   elsif p_entity_type = 'time_entry' then
     insert into timegenie.time_entries(id, workspace_id, work_date, kind, source_type, state, default_task_id, label_snapshot, started_at, ended_at, duration_seconds, note, origin_unassigned_session_id, created_at, updated_at, version, created_by_device_id, updated_by_device_id, deleted_at)
@@ -2954,3 +2960,71 @@ grant delete on timegenie.workspaces to authenticated;
 grant execute on function timegenie.cloud_apply_patch(uuid,uuid,uuid,text,text,text,bigint,jsonb) to authenticated;
 grant execute on function timegenie.cloud_apply_patch(uuid,uuid,uuid,text,text,text,bigint,bigint,bigint,jsonb) to authenticated;
 grant execute on function timegenie.migration_import_snapshot(uuid,uuid,uuid,jsonb) to authenticated;
+
+-- Named report template library. Templates are global to a workspace; reports
+-- bind a concrete template id and archived templates remain readable.
+create or replace function timegenie.set_report_template_default(
+  p_workspace_id uuid,p_template_id uuid,p_expected_version bigint default null
+) returns jsonb language plpgsql security definer set search_path=timegenie,extensions,pg_catalog as $$
+declare target timegenie.report_templates%rowtype;
+begin
+  if not timegenie.is_workspace_owner(p_workspace_id) then raise exception 'AUTH_REQUIRED'; end if;
+  select * into target from timegenie.report_templates where id=p_template_id and workspace_id=p_workspace_id and deleted_at is null for update;
+  if not found then raise exception 'NOT_FOUND: report template'; end if;
+  if p_expected_version is not null and target.version<>p_expected_version then raise exception 'VERSION_CONFLICT'; end if;
+  update timegenie.report_templates set is_default=false,updated_at=clock_timestamp(),version=version+1 where workspace_id=p_workspace_id and report_type=target.report_type and is_default and id<>p_template_id and deleted_at is null;
+  update timegenie.report_templates set is_default=true,updated_at=clock_timestamp(),version=version+1 where id=p_template_id;
+  return (select to_jsonb(row_value) from timegenie.report_templates row_value where id=p_template_id);
+end $$;
+
+create or replace function timegenie.apply_named_report_template(
+  p_workspace_id uuid,p_device_id uuid,p_operation_id uuid,p_operation_type text,p_entity_id text,p_base_version bigint,p_payload jsonb,p_request jsonb
+) returns jsonb language plpgsql security definer set search_path=timegenie,extensions,pg_catalog as $$
+declare existing timegenie.report_templates%rowtype; payload_version bigint; cached jsonb; result_value jsonb; target_type text; target_name text; deleting boolean; replacement_id uuid;
+begin
+  if not timegenie.is_workspace_owner(p_workspace_id) then raise exception 'AUTH_REQUIRED'; end if;
+  if not timegenie.is_registered_device(p_workspace_id,p_device_id) then raise exception 'DEVICE_NOT_REGISTERED'; end if;
+  cached:=timegenie.processed_operation_result(p_workspace_id,p_operation_id,p_operation_type,p_request); if cached is not null then return cached; end if;
+  if p_entity_id is null or p_payload->>'id' is distinct from p_entity_id then raise exception 'VALIDATION_ERROR: entity id does not match payload id'; end if;
+  target_type:=p_payload->>'report_type'; target_name:=btrim(p_payload->>'name');
+  if target_type not in ('daily','weekly','monthly') or target_name is null or target_name='' or coalesce(btrim(p_payload->>'content'),'')='' then raise exception 'VALIDATION_ERROR: invalid report template'; end if;
+  perform pg_advisory_xact_lock(hashtextextended(p_workspace_id::text||':report-template:'||target_type,0));
+  select * into existing from timegenie.report_templates where workspace_id=p_workspace_id and id=p_entity_id::uuid for update; payload_version:=coalesce((p_payload->>'version')::bigint,1);
+  if p_base_version is null and found then raise exception 'SYNC_CONFLICT: expected new entity'; end if;
+  if p_base_version is not null and (not found or existing.version<>p_base_version) then raise exception 'SYNC_CONFLICT: template version changed'; end if;
+  if p_base_version is null and payload_version<>1 then raise exception 'VERSION_CONFLICT: new template version must be 1'; end if;
+  if p_base_version is not null and payload_version<=p_base_version then raise exception 'VERSION_CONFLICT: template version must advance'; end if;
+  deleting:=p_payload->>'deleted_at' is not null;
+  if deleting and (select count(*) from timegenie.report_templates where workspace_id=p_workspace_id and report_type=target_type and deleted_at is null and id<>p_entity_id::uuid)=0 then raise exception 'VALIDATION_ERROR: each report type requires one template'; end if;
+  if deleting and existing.is_default then
+    replacement_id:=nullif(p_payload->>'replacement_template_id','')::uuid;
+    if replacement_id is null or not exists(select 1 from timegenie.report_templates where id=replacement_id and workspace_id=p_workspace_id and report_type=target_type and id<>p_entity_id::uuid and deleted_at is null) then raise exception 'VALIDATION_ERROR: deleting the default template requires a compatible replacement'; end if;
+  end if;
+  if coalesce((p_payload->>'is_default')::boolean,false) and not deleting then update timegenie.report_templates set is_default=false,updated_at=clock_timestamp(),version=version+1 where workspace_id=p_workspace_id and report_type=target_type and id<>p_entity_id::uuid and is_default and deleted_at is null; end if;
+  insert into timegenie.report_templates(id,workspace_id,report_type,subject_id,name,description,content,is_default,is_builtin,sort_order,created_at,updated_at,version,deleted_at) values(p_entity_id::uuid,p_workspace_id,target_type,null,target_name,nullif(p_payload->>'description',''),p_payload->>'content',coalesce((p_payload->>'is_default')::boolean,false) and not deleting,coalesce((p_payload->>'is_builtin')::boolean,false),coalesce((p_payload->>'sort_order')::integer,0),to_timestamp(coalesce((p_payload->>'created_at')::double precision,extract(epoch from clock_timestamp())*1000)/1000),to_timestamp(coalesce((p_payload->>'updated_at')::double precision,extract(epoch from clock_timestamp())*1000)/1000),payload_version,case when deleting then to_timestamp((p_payload->>'deleted_at')::double precision/1000) else null end) on conflict(id) do update set report_type=excluded.report_type,subject_id=null,name=excluded.name,description=excluded.description,content=excluded.content,is_default=excluded.is_default,is_builtin=excluded.is_builtin,sort_order=excluded.sort_order,updated_at=excluded.updated_at,version=excluded.version,deleted_at=excluded.deleted_at;
+  if replacement_id is not null then
+    update timegenie.report_templates set is_default=false,updated_at=clock_timestamp(),version=version+1 where workspace_id=p_workspace_id and report_type=target_type and id<>replacement_id and is_default and deleted_at is null;
+    update timegenie.report_templates set is_default=true,updated_at=clock_timestamp(),version=version+1 where id=replacement_id;
+  end if;
+  if not exists(select 1 from timegenie.report_templates where workspace_id=p_workspace_id and report_type=target_type and is_default and deleted_at is null) then update timegenie.report_templates set is_default=true,updated_at=clock_timestamp(),version=version+1 where id=(select id from timegenie.report_templates where workspace_id=p_workspace_id and report_type=target_type and deleted_at is null order by sort_order,created_at,id limit 1); end if;
+  result_value:=jsonb_build_object('entityType','report_template','entityId',p_entity_id,'version',(select version from timegenie.report_templates where id=p_entity_id::uuid),'authoritative',timegenie.cloud_incremental_entity_get(p_workspace_id,'report_templates',p_entity_id)->'data');
+  perform timegenie.record_processed_operation(p_workspace_id,p_operation_id,p_device_id,p_operation_type,p_request,result_value); return result_value;
+end $$;
+
+create or replace function timegenie.cloud_apply_patch(p_workspace_id uuid,p_device_id uuid,p_operation_id uuid,p_operation_type text,p_entity_type text,p_entity_id text,p_base_version bigint,p_payload jsonb) returns jsonb language plpgsql security definer set search_path=timegenie,extensions,pg_catalog as $$ begin
+  if p_entity_type='report_template' then return timegenie.apply_named_report_template(p_workspace_id,p_device_id,p_operation_id,p_operation_type,p_entity_id,p_base_version,p_payload,jsonb_build_object('deviceId',p_device_id,'entityType',p_entity_type,'entityId',p_entity_id,'baseVersion',p_base_version,'payload',coalesce(p_payload,'{}'::jsonb))); end if;
+  if p_entity_type='unassigned_session' and p_operation_type in ('unassigned_session_pause','unassigned_session_resume','unassigned_session_awaiting_resolution') then return timegenie.cloud_apply_simplified_unassigned(p_workspace_id,p_device_id,p_operation_id,p_operation_type,p_entity_id,p_base_version,p_payload); end if;
+  if p_entity_type='time_entry' and coalesce(p_payload->>'source_type','')='timer' then return timegenie.apply_calendar_time_entry(p_workspace_id,p_device_id,p_operation_id,p_operation_type,p_entity_id,p_base_version,p_payload,jsonb_build_object('deviceId',p_device_id,'entityType',p_entity_type,'entityId',p_entity_id,'baseVersion',p_base_version,'payload',coalesce(p_payload,'{}'::jsonb))); end if;
+  return timegenie.cloud_apply_patch_pre_calendar(p_workspace_id,p_device_id,p_operation_id,p_operation_type,p_entity_type,p_entity_id,p_base_version,p_payload);
+end $$;
+
+create or replace function timegenie.cloud_apply_patch(p_workspace_id uuid,p_device_id uuid,p_operation_id uuid,p_operation_type text,p_entity_type text,p_entity_id text,p_base_version bigint,p_payload_version bigint,p_coalesced_count bigint,p_payload jsonb) returns jsonb language plpgsql security definer set search_path=timegenie,extensions,pg_catalog as $$ begin
+  if p_payload_version is null or (p_payload->>'version')::bigint<>p_payload_version or p_coalesced_count is null or p_coalesced_count<1 then raise exception 'VERSION_CONFLICT: invalid coalesced payload'; end if;
+  if p_entity_type='report_template' then return timegenie.apply_named_report_template(p_workspace_id,p_device_id,p_operation_id,p_operation_type,p_entity_id,p_base_version,p_payload,jsonb_build_object('deviceId',p_device_id,'entityType',p_entity_type,'entityId',p_entity_id,'baseVersion',p_base_version,'payloadVersion',p_payload_version,'coalescedCount',p_coalesced_count,'payload',coalesce(p_payload,'{}'::jsonb))); end if;
+  if p_entity_type='unassigned_session' and p_operation_type in ('unassigned_session_pause','unassigned_session_resume','unassigned_session_awaiting_resolution') then return timegenie.cloud_apply_simplified_unassigned(p_workspace_id,p_device_id,p_operation_id,p_operation_type,p_entity_id,p_base_version,p_payload); end if;
+  if p_entity_type='time_entry' and coalesce(p_payload->>'source_type','')='timer' then return timegenie.apply_calendar_time_entry(p_workspace_id,p_device_id,p_operation_id,p_operation_type,p_entity_id,p_base_version,p_payload,jsonb_build_object('deviceId',p_device_id,'entityType',p_entity_type,'entityId',p_entity_id,'baseVersion',p_base_version,'payloadVersion',p_payload_version,'coalescedCount',p_coalesced_count,'payload',coalesce(p_payload,'{}'::jsonb))); end if;
+  return timegenie.cloud_apply_patch_pre_calendar(p_workspace_id,p_device_id,p_operation_id,p_operation_type,p_entity_type,p_entity_id,p_base_version,p_payload_version,p_coalesced_count,p_payload);
+end $$;
+
+revoke execute on function timegenie.apply_named_report_template(uuid,uuid,uuid,text,text,bigint,jsonb,jsonb) from public,anon,authenticated;
+grant execute on function timegenie.set_report_template_default(uuid,uuid,bigint) to authenticated;

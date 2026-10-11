@@ -80,6 +80,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "supersede_historical_unassigned",
         sql: include_str!("../migrations/0013_supersede_historical_unassigned.sql"),
     },
+    Migration {
+        version: 14,
+        name: "named_report_templates",
+        sql: include_str!("../migrations/0014_named_report_templates.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -376,23 +381,26 @@ fn seed_local_workspace(transaction: &Transaction<'_>) -> Result<(), String> {
     let templates = [
         (
             "daily",
+            "标准日报",
             "【{{姓名}}】{{日期}} {{星期}} {{工作时段}} {{总工时}}\n\n{{今日事项}}\n\n## 明日计划：\n\n{{明日计划}}\n",
         ),
         (
             "weekly",
+            "标准周报",
             "# {{日期范围}}\n\n{{统计信息}}\n\n## 每日情况\n\n{{每日情况}}\n\n## 总结\n\n{{总结}}\n",
         ),
         (
             "monthly",
+            "标准月报",
             "# {{日期范围}}\n\n{{统计信息}}\n\n## 本月事项\n\n{{每日情况}}\n\n## 总结\n\n{{总结}}\n",
         ),
     ];
-    for (report_type, content) in templates {
+    for (index, (report_type, name, content)) in templates.into_iter().enumerate() {
         transaction
             .execute(
-                "INSERT INTO report_templates(id, workspace_id, report_type, subject_id, content, is_builtin, created_at, updated_at, version)
-                 VALUES (?1, ?2, ?3, NULL, ?4, 1, ?5, ?5, 1)",
-                params![Uuid::now_v7().to_string(), workspace_id, report_type, content, now],
+                "INSERT INTO report_templates(id, workspace_id, report_type, subject_id, content, is_builtin, created_at, updated_at, version, name, description, is_default, sort_order)
+                 VALUES (?1, ?2, ?3, NULL, ?4, 1, ?5, ?5, 1, ?6, '系统内置模板', 1, ?7)",
+                params![Uuid::now_v7().to_string(), workspace_id, report_type, content, now, name, (index as i64 + 1) * 10],
             )
             .map_err(|error| error.to_string())?;
     }
@@ -510,7 +518,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let database = Database::initialize_at(directory.path().join("test.sqlite3")).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 13);
+        assert_eq!(status.schema_version, 14);
         for table in REQUIRED_TABLES {
             assert!(
                 status.tables.iter().any(|value| value == table),
@@ -550,8 +558,128 @@ mod tests {
         let workspace_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migration_count, 13);
+        assert_eq!(migration_count, 14);
         assert_eq!(workspace_count, 1);
+    }
+
+    #[test]
+    fn named_template_migration_preserves_legacy_templates_and_report_content() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("named-template-upgrade.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection).unwrap();
+        connection.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL);").unwrap();
+        for migration in &MIGRATIONS[..13] {
+            let transaction = connection.transaction().unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version,name,applied_at) VALUES (?1,?2,1)",
+                    params![migration.version, migration.name],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        connection.execute_batch(
+            "INSERT INTO workspaces(id,name,timezone,storage_mode,created_at,updated_at,version) VALUES ('ws','迁移','Asia/Shanghai','local',1,1,1);
+             INSERT INTO subjects(id,workspace_id,name,sort_order,created_at,updated_at,version) VALUES ('subject-a','ws','客户',10,1,1,1),('subject-b','ws','客户 ',20,1,1,1);
+             INSERT INTO report_templates(id,workspace_id,report_type,subject_id,content,is_builtin,created_at,updated_at,version) VALUES
+               ('default-daily','ws','daily',NULL,'默认内容',1,1,1,3),
+               ('subject-template-a','ws','daily','subject-a','客户 A 内容',0,2,2,4),
+               ('subject-template-b','ws','daily','subject-b','客户 B 内容',0,3,3,5);
+             INSERT INTO reports(id,workspace_id,report_type,subject_id,period_start,period_end,reference_date,template_id,markdown_content,content_source,generation_count,created_at,updated_at,version)
+               VALUES ('report','ws','daily','subject-a','2026-10-11','2026-10-11','2026-10-11','subject-template-a','# 手工内容','edited',7,4,4,9);
+             INSERT INTO app_metadata(key,value) VALUES ('initial_demo_tasks_seeded','1');",
+        ).unwrap();
+        drop(connection);
+
+        let database = Database::initialize_at(path.clone()).unwrap();
+        let connection = database.open().unwrap();
+        let templates = connection.prepare("SELECT id,name,subject_id,content,is_default FROM report_templates WHERE workspace_id='ws' ORDER BY id").unwrap()
+            .query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,String>(3)?,row.get::<_,i64>(4)?))).unwrap()
+            .collect::<Result<Vec<_>,_>>().unwrap();
+        assert_eq!(templates.len(), 5);
+        assert!(templates.iter().all(|item| item.2.is_none()));
+        assert!(templates.iter().any(|item| item.0 == "subject-template-a"
+            && item.1 == "客户 - 日报"
+            && item.3 == "客户 A 内容"));
+        assert!(templates.iter().any(|item| item.0 == "subject-template-b"
+            && item.1 == "客户 - 日报 (2)"
+            && item.3 == "客户 B 内容"));
+        assert_eq!(
+            templates
+                .iter()
+                .filter(|item| item.4 == 1 && item.0.contains("daily"))
+                .count(),
+            1
+        );
+        let report: (Option<String>,String,i64,i64) = connection.query_row("SELECT template_id,markdown_content,generation_count,version FROM reports WHERE id='report'",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(
+            report,
+            (
+                Some("subject-template-a".to_string()),
+                "# 手工内容".to_string(),
+                7,
+                9
+            )
+        );
+
+        // Rollback drill: the previous application selected one effective
+        // template per type. After migration that compatible read must resolve
+        // to the new default without deleting the additional global templates
+        // or changing historical report bindings/content.
+        let legacy_effective: (String, String) = connection
+            .query_row(
+                "SELECT id,content FROM report_templates
+                 WHERE workspace_id='ws' AND report_type='daily' AND subject_id IS NULL
+                   AND deleted_at IS NULL
+                 ORDER BY is_default DESC,is_builtin DESC,created_at,id LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy_effective.0, "default-daily");
+        assert_eq!(legacy_effective.1, "默认内容");
+        let counts_before_rollback_read: (i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM report_templates WHERE workspace_id='ws'),
+                        (SELECT COUNT(*) FROM reports WHERE workspace_id='ws')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let report_after_rollback_read: (Option<String>, String, i64, i64) = connection
+            .query_row(
+                "SELECT template_id,markdown_content,generation_count,version FROM reports WHERE id='report'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(counts_before_rollback_read, (5, 1));
+        assert_eq!(report_after_rollback_read, report);
+        drop(connection);
+        Database::initialize_at(path.clone()).unwrap();
+        let reopened = Connection::open(path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT COUNT(*) FROM report_templates WHERE workspace_id='ws'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT template_id FROM reports WHERE id='report'",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap(),
+            Some("subject-template-a".to_string())
+        );
     }
 
     #[test]
@@ -637,7 +765,7 @@ mod tests {
         assert_eq!(task_title, "升级前事项");
         assert_eq!(queued, 1);
         assert_eq!(deferred_table, 6);
-        assert_eq!(database.status().unwrap().schema_version, 13);
+        assert_eq!(database.status().unwrap().schema_version, 14);
     }
 
     #[test]
@@ -1077,7 +1205,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outbox_operations, vec!["keep-op", "sending-op"]);
-        assert_eq!(database.status().unwrap().schema_version, 13);
+        assert_eq!(database.status().unwrap().schema_version, 14);
 
         // Deployment rollback keeps the migrated database in place. Rehearse
         // the previous client's read path against that database and verify
@@ -1164,7 +1292,7 @@ mod tests {
         drop(connection);
 
         let database = Database::initialize_at(path).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 13);
+        assert_eq!(database.status().unwrap().schema_version, 14);
         let connection = database.open().unwrap();
 
         let stale_index_count: i64 = connection
@@ -1510,7 +1638,7 @@ mod tests {
 
         let database = Database::initialize_at(path).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 13);
+        assert_eq!(status.schema_version, 14);
         assert!(status.tables.iter().any(|table| table == "device_hooks"));
         assert!(status
             .tables

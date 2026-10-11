@@ -28,6 +28,14 @@ import {
   getReportTemplate as getReportTemplateRecord,
   getPublicReportText,
   saveReportTemplate as saveReportTemplateRecord,
+  listReportTemplates,
+  createReportTemplate,
+  updateReportTemplate,
+  duplicateReportTemplate,
+  setDefaultReportTemplate,
+  deleteReportTemplate,
+  reorderReportTemplates,
+  getReportTemplatePlaceholders,
   previewObsidianReportWrite,
   executeObsidianReportWrite,
   resolveUnassignedBreak,
@@ -150,6 +158,9 @@ export type ReportRecord = {
   generatedCount: number;
   updatedAt: number;
   version: number;
+  templateId?: string;
+  templateName?: string;
+  templateArchived: boolean;
 };
 
 const defaultSubjectId = "subject-default";
@@ -544,6 +555,9 @@ export const useWorkdayStore = defineStore("workday", () => {
       generatedCount: report.generatedCount,
       updatedAt: report.updatedAt,
       version: report.version,
+      templateId: report.templateId,
+      templateName: report.templateName,
+      templateArchived: report.templateArchived,
     };
   }
 
@@ -1264,25 +1278,27 @@ export const useWorkdayStore = defineStore("workday", () => {
     await loadTodayOverview();
   }
 
-  async function createReport(request: { type: ReportType; referenceDate: string; subjectId: string; taskIds: string[] }) {
+  async function createReport(request: { type: ReportType; referenceDate: string; subjectId: string; taskIds: string[]; templateId?: string }) {
     const result = await createReportRecord({
       reportType: request.type,
       referenceDate: request.referenceDate,
       subjectId: request.subjectId,
       taskIds: request.taskIds,
+      templateId: request.templateId,
     });
     const report = toUiReport(result);
     reports.value.unshift(report);
     return report;
   }
 
-  async function updateReportScope(report: ReportRecord, request: { type: ReportType; referenceDate: string; subjectId: string; taskIds: string[] }) {
+  async function updateReportScope(report: ReportRecord, request: { type: ReportType; referenceDate: string; subjectId: string; taskIds: string[]; templateId?: string }) {
     const updated = toUiReport(await updateReportScopeRecord({
       reportId: report.id,
       reportType: request.type,
       referenceDate: request.referenceDate,
       subjectId: request.subjectId,
       taskIds: request.taskIds,
+      templateId: request.templateId,
       expectedVersion: report.version,
     }));
     const index = reports.value.findIndex((item) => item.id === updated.id);
@@ -1347,6 +1363,10 @@ export const useWorkdayStore = defineStore("workday", () => {
     if (index >= 0) entries.splice(index, 1, next);
     else entries.unshift(next);
     return next;
+  }
+
+  async function loadReportTemplates(type?: ReportType) {
+    return await listReportTemplates(type);
   }
 
   function cloneTimeEntry(entry: TimeEntry): TimeEntry {
@@ -1420,7 +1440,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen, unassignedWorkDate, unassignedSessionId,
     unassignedCurrentSession,
     workspaceLoaded, workspaceLoading, loadWorkspaceData, loadTimeData, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addChildTask, saveTask, duplicateTask, deleteTask, moveTask, reorderTask,
-    indentTask, outdentTask, startTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, adjustTimerStopAllocation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, publicReportText, previewObsidianReport, writeObsidianReport,
+    indentTask, outdentTask, startTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, adjustTimerStopAllocation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, loadReportTemplates, createReportTemplate, updateReportTemplate, duplicateReportTemplate, setDefaultReportTemplate, deleteReportTemplate, reorderReportTemplates, getReportTemplatePlaceholders, publicReportText, previewObsidianReport, writeObsidianReport,
     beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, dismissUnassignedResolution, resolveUnassignedTime
   };
 });

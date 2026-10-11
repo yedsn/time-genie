@@ -1764,7 +1764,15 @@ fn apply_incremental_entity(
             apply_incremental_unassigned_session(transaction, workspace_id, data)
         }
         "time_entries" => apply_incremental_time_entry(transaction, workspace_id, data),
-        "report_templates" => transaction.execute("INSERT INTO report_templates(id,workspace_id,report_type,subject_id,content,is_builtin,created_at,updated_at,version,deleted_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(id) DO UPDATE SET report_type=excluded.report_type,subject_id=excluded.subject_id,content=excluded.content,is_builtin=excluded.is_builtin,updated_at=excluded.updated_at,version=excluded.version,deleted_at=excluded.deleted_at", params![text(data,"id"),workspace_id,text(data,"report_type"),optional_text(data,"subject_id"),text(data,"content"),boolean(data,"is_builtin") as i64,millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version"),optional_millis(data,"deleted_at")]),
+        "report_templates" => {
+            if boolean(data, "is_default") && optional_millis(data, "deleted_at").is_none() {
+                transaction.execute(
+                    "UPDATE report_templates SET is_default=0 WHERE workspace_id=?1 AND report_type=?2 AND id<>?3 AND deleted_at IS NULL",
+                    params![workspace_id, text(data, "report_type"), text(data, "id")],
+                ).map_err(|error| error.to_string())?;
+            }
+            transaction.execute("INSERT INTO report_templates(id,workspace_id,report_type,subject_id,name,description,content,is_default,is_builtin,sort_order,created_at,updated_at,version,deleted_at) VALUES (?1,?2,?3,NULL,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) ON CONFLICT(id) DO UPDATE SET report_type=excluded.report_type,subject_id=NULL,name=excluded.name,description=excluded.description,content=excluded.content,is_default=excluded.is_default,is_builtin=excluded.is_builtin,sort_order=excluded.sort_order,updated_at=excluded.updated_at,version=excluded.version,deleted_at=excluded.deleted_at", params![text(data,"id"),workspace_id,text(data,"report_type"),data.get("name").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("迁移模板 - {}", text(data,"id").chars().take(8).collect::<String>())),optional_text(data,"description"),text(data,"content"),boolean(data,"is_default") as i64,boolean(data,"is_builtin") as i64,integer(data,"sort_order"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version"),optional_millis(data,"deleted_at")])
+        },
         "reports" => apply_incremental_report(transaction, workspace_id, data),
         "integration_configs" => transaction.execute("INSERT INTO integration_configs(workspace_id,provider,enabled,config_json,secret_ref,updated_at,version) VALUES (?1,?2,?3,?4,COALESCE((SELECT secret_ref FROM integration_configs WHERE workspace_id=?1 AND provider=?2),NULL),?5,?6) ON CONFLICT(workspace_id,provider) DO UPDATE SET enabled=excluded.enabled,config_json=excluded.config_json,updated_at=excluded.updated_at,version=excluded.version", params![workspace_id,text(data,"provider"),boolean(data,"enabled") as i64,data.get("config_json").cloned().unwrap_or_else(|| json!({})).to_string(),millis(data,"updated_at"),integer(data,"version")]),
         "external_bindings" => transaction.execute("INSERT INTO external_bindings(id,workspace_id,provider,entity_type,entity_id,external_id,external_revision,last_synced_hash,last_synced_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(workspace_id,provider,entity_type,entity_id) DO UPDATE SET external_id=excluded.external_id,external_revision=excluded.external_revision,last_synced_hash=excluded.last_synced_hash,last_synced_at=excluded.last_synced_at", params![text(data,"id"),workspace_id,text(data,"provider"),text(data,"entity_type"),text(data,"entity_id"),text(data,"external_id"),optional_text(data,"external_revision"),optional_text(data,"last_synced_hash"),optional_millis(data,"last_synced_at")]),
@@ -3095,6 +3103,9 @@ fn push_outbox_locked(
                             adopt_shared_unassigned_rpc_result(database, session)?;
                         }
                     }
+                    if operation.entity_type == "report_template" {
+                        adopt_authoritative_report_template_result(database, operation, &value)?;
+                    }
                     delete_outbox(database, &operation.operation_id)?;
                     pushed += 1;
                 }
@@ -3129,6 +3140,62 @@ fn push_outbox_locked(
         pending,
         conflicts,
     })
+}
+
+fn adopt_authoritative_report_template_result(
+    database: &Database,
+    operation: &OutboxOperation,
+    value: &Value,
+) -> Result<(), String> {
+    let Some(authoritative) = value.get("authoritative").filter(|row| !row.is_null()) else {
+        return Ok(());
+    };
+    let template_id = authoritative
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "SYNC_ERROR: 权威报告模板缺少 ID".to_string())?;
+    if operation.entity_id.as_deref() != Some(template_id) {
+        return Err("SYNC_ERROR: 权威报告模板与待同步实体不一致".to_string());
+    }
+    let incoming_version = authoritative
+        .get("version")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "SYNC_ERROR: 权威报告模板缺少版本".to_string())?;
+    let local_workspace_id = local_cache_workspace_id(database)?;
+    let mut connection = database.open()?;
+    let current_version: Option<i64> = connection
+        .query_row(
+            "SELECT version FROM report_templates WHERE workspace_id=?1 AND id=?2",
+            params![local_workspace_id, template_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if current_version.is_some_and(|version| version > incoming_version) {
+        return Ok(());
+    }
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    apply_incremental_entity(
+        &transaction,
+        &local_workspace_id,
+        &IncrementalEntity {
+            entity_type: "report_templates".to_string(),
+            source_entity_type: "report_templates".to_string(),
+            entity_id: template_id.to_string(),
+            change_seq: 0,
+            deleted: false,
+            data: Some(authoritative.clone()),
+        },
+    )?;
+    transaction
+        .execute(
+            "UPDATE app_metadata SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='global_revision'",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 fn adopt_authoritative_calendar_timer_result(
@@ -4499,7 +4566,7 @@ fn entity_payload(
     entity_payload_from_connection(&connection, entity_type, entity_id)
 }
 
-fn entity_payload_from_connection(
+pub(crate) fn entity_payload_from_connection(
     connection: &rusqlite::Connection,
     entity_type: &str,
     entity_id: Option<&str>,
@@ -5923,7 +5990,7 @@ fn replace_snapshot_table(
         }
         "report_templates" => {
             replace_simple_rows(transaction, table, workspace_id, rows, |tx, row, ws| {
-                tx.execute("INSERT INTO report_templates(id,workspace_id,report_type,subject_id,content,is_builtin,created_at,updated_at,version,deleted_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![text(row,"id"),ws,text(row,"report_type"),optional_text(row,"subject_id"),text(row,"content"),boolean(row,"is_builtin") as i64,millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version"),optional_millis(row,"deleted_at")])
+                tx.execute("INSERT INTO report_templates(id,workspace_id,report_type,subject_id,name,description,content,is_default,is_builtin,sort_order,created_at,updated_at,version,deleted_at) VALUES (?1,?2,?3,NULL,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)", params![text(row,"id"),ws,text(row,"report_type"),row.get("name").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("迁移模板 - {}", text(row,"id").chars().take(8).collect::<String>())),optional_text(row,"description"),text(row,"content"),boolean(row,"is_default") as i64,boolean(row,"is_builtin") as i64,integer(row,"sort_order"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version"),optional_millis(row,"deleted_at")])
             })?
         }
         "reports" => replace_simple_rows(transaction, table, workspace_id, rows, |tx, row, ws| {
@@ -6052,7 +6119,9 @@ fn optional_integer(value: &Value, key: &str) -> Option<i64> {
     value.get(key).and_then(Value::as_i64)
 }
 fn boolean(value: &Value, key: &str) -> bool {
-    value.get(key).and_then(Value::as_bool).unwrap_or(false)
+    value
+        .get(key)
+        .is_some_and(|value| value.as_bool().unwrap_or_else(|| value.as_i64() == Some(1)))
 }
 fn optional_time(value: &Value, key: &str) -> Option<String> {
     optional_text(value, key).map(|time| time.chars().take(5).collect())
