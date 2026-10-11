@@ -20,6 +20,7 @@ import { cloudDeviceActionDisabled, cloudDeviceActionLabel, cloudDeviceKind, run
 import { isCompletionFeedbackEnabled, playCompletionFeedback, setCompletionFeedbackEnabled, setCompletionFeedbackSoundEnabled } from "../services/completionFeedback";
 import { remainingOpenTaskCount } from "../services/completionFeedbackCore";
 import { APP_THEMES, applyAppTheme, isAppTheme, type AppTheme } from "../services/theme";
+import { cloneWorkSchedule, createDefaultWorkSchedule, getSubjectWorkSchedule, saveSubjectWorkSchedule, type WorkScheduleDay } from "../services/subjectWorkScheduleMock";
 
 const store = useWorkdayStore();
 const appVersion = __APP_VERSION__;
@@ -48,7 +49,13 @@ const settingsNavGroups = [
 const subjectDialogOpen = ref(false);
 const subjectNameDraft = ref("");
 const editingSubjectId = ref("");
-const subjectDialogTitle = computed(() => editingSubjectId.value ? "编辑主体名称" : "添加主体");
+const subjectDialogTitle = computed(() => editingSubjectId.value ? "主体设置" : "添加主体");
+const weekdayLabels = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+const subjectScheduleDraft = ref<WorkScheduleDay[]>(createDefaultWorkSchedule());
+const scheduleCopySource = ref(0);
+const scheduleCopyTargets = ref([1, 2, 3, 4]);
+const scheduleCopyOpen = ref(false);
+const subjectScheduleError = ref("");
 const windowMaximized = ref(false);
 const settingsSnapshot = ref<SettingsSnapshot>();
 const settingsLoaded = ref(false);
@@ -953,6 +960,8 @@ onUnmounted(() => {
 function openSubjectDialog() {
   editingSubjectId.value = "";
   subjectNameDraft.value = "";
+  subjectScheduleDraft.value = createDefaultWorkSchedule();
+  subjectScheduleError.value = "";
   subjectDialogOpen.value = true;
 }
 
@@ -961,17 +970,81 @@ function openSubjectEditor(subjectId: string) {
   if (!subject) return;
   editingSubjectId.value = subject.id;
   subjectNameDraft.value = subject.name;
+  subjectScheduleDraft.value = getSubjectWorkSchedule(subject.id);
+  subjectScheduleError.value = "";
   subjectDialogOpen.value = true;
 }
 
+function toggleScheduleDay(day: WorkScheduleDay) {
+  if (!day.enabled) day.segments = [];
+  else if (!day.segments.length) day.segments = [{ start: "10:00", end: "12:00" }];
+  subjectScheduleError.value = "";
+}
+
+function addScheduleSegment(day: WorkScheduleDay) {
+  const previous = day.segments[day.segments.length - 1];
+  day.enabled = true;
+  day.segments.push(previous ? { start: previous.end, end: "18:00" } : { start: "10:00", end: "12:00" });
+  subjectScheduleError.value = "";
+}
+
+function removeScheduleSegment(day: WorkScheduleDay, index: number) {
+  day.segments.splice(index, 1);
+  if (!day.segments.length) day.enabled = false;
+  subjectScheduleError.value = "";
+}
+
+function restoreDefaultSchedule() {
+  subjectScheduleDraft.value = createDefaultWorkSchedule();
+  subjectScheduleError.value = "";
+}
+
+function applyMondayToWorkdays() {
+  const monday = cloneWorkSchedule(subjectScheduleDraft.value)[0];
+  subjectScheduleDraft.value = subjectScheduleDraft.value.map((day) => day.weekday < 5
+    ? { ...monday, weekday: day.weekday, segments: monday.segments.map((segment) => ({ ...segment })) }
+    : day);
+  subjectScheduleError.value = "";
+}
+
+function copyScheduleToTargets() {
+  const source = subjectScheduleDraft.value.find((day) => day.weekday === scheduleCopySource.value);
+  if (!source || !scheduleCopyTargets.value.length) return;
+  subjectScheduleDraft.value = subjectScheduleDraft.value.map((day) => scheduleCopyTargets.value.includes(day.weekday)
+    ? { ...source, weekday: day.weekday, segments: source.segments.map((segment) => ({ ...segment })) }
+    : day);
+  scheduleCopyOpen.value = false;
+  subjectScheduleError.value = "";
+}
+
+function validateSchedule() {
+  for (const day of subjectScheduleDraft.value) {
+    if (!day.enabled) continue;
+    const segments = day.segments.slice().sort((left, right) => left.start.localeCompare(right.start));
+    if (!segments.length) return `${weekdayLabels[day.weekday]}至少需要一个工作时段`;
+    for (let index = 0; index < segments.length; index += 1) {
+      const segment = segments[index];
+      if (!segment.start || !segment.end || segment.start >= segment.end) return `${weekdayLabels[day.weekday]}的结束时间必须晚于开始时间`;
+      if (index > 0 && segments[index - 1].end > segment.start) return `${weekdayLabels[day.weekday]}存在重叠的工作时段`;
+    }
+  }
+  return "";
+}
+
 async function saveSubject() {
+  subjectScheduleError.value = validateSchedule();
+  if (subjectScheduleError.value) {
+    ElMessage.warning(subjectScheduleError.value);
+    return;
+  }
   if (editingSubjectId.value) {
     if (!(await store.renameSubject(editingSubjectId.value, subjectNameDraft.value))) {
       ElMessage.warning("主体名称不能为空，也不能与现有主体重复");
       return;
     }
+    saveSubjectWorkSchedule(editingSubjectId.value, subjectScheduleDraft.value);
     subjectDialogOpen.value = false;
-    ElMessage.success("主体名称已更新");
+    ElMessage.success("主体设置已更新；工作时段当前仅保留在本次运行中");
     return;
   }
   const subjectId = await store.addSubject(subjectNameDraft.value);
@@ -979,8 +1052,9 @@ async function saveSubject() {
     ElMessage.warning("请输入主体名称");
     return;
   }
+  saveSubjectWorkSchedule(subjectId, subjectScheduleDraft.value);
   subjectDialogOpen.value = false;
-  ElMessage.success("主体已添加");
+  ElMessage.success("主体已添加；工作时段当前仅保留在本次运行中");
 }
 
 function subjectTaskCount(subjectId: string) {
@@ -1619,11 +1693,44 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
         <button class="primary-button" type="button" :disabled="importSaving || !importItems.some((item) => item.selected && item.title.trim())" @click="confirmPlanImport">{{ importSaving ? '导入中...' : '确认导入' }}</button>
       </template>
     </el-dialog>
-    <el-dialog v-model="subjectDialogOpen" class="subject-create-dialog" :title="subjectDialogTitle" width="min(420px, 90vw)" append-to-body>
-      <label class="subject-name-field"><span>主体名称</span><input v-model="subjectNameDraft" autofocus placeholder="例如：研发支持、个人事项" @keydown.enter.prevent="saveSubject" /></label>
+    <el-dialog v-model="subjectDialogOpen" class="subject-create-dialog subject-settings-dialog" :title="subjectDialogTitle" width="min(720px, 94vw)" append-to-body>
+      <div class="subject-settings-content">
+        <label class="subject-name-field"><span>主体名称</span><input v-model="subjectNameDraft" autofocus placeholder="例如：研发支持、个人事项" /></label>
+        <section class="subject-schedule-editor">
+          <header class="subject-schedule-head">
+            <div><strong>每周工作时段</strong><span>日报会按主体和日期自动使用当天时段</span></div>
+            <div>
+              <button class="secondary-button compact" type="button" @click="applyMondayToWorkdays">周一应用到工作日</button>
+              <button class="secondary-button compact" type="button" @click="scheduleCopyOpen = !scheduleCopyOpen"><Copy :size="12" />复制</button>
+              <button class="secondary-button compact" type="button" @click="restoreDefaultSchedule"><RefreshCw :size="12" />恢复默认</button>
+            </div>
+          </header>
+          <div v-if="scheduleCopyOpen" class="subject-schedule-copy">
+            <label><span>复制</span><select v-model.number="scheduleCopySource"><option v-for="(label, index) in weekdayLabels" :key="label" :value="index">{{ label }}</option></select></label>
+            <span>到</span>
+            <div><label v-for="(label, index) in weekdayLabels" :key="label"><input v-model="scheduleCopyTargets" type="checkbox" :value="index" :disabled="index === scheduleCopySource" />{{ label }}</label></div>
+            <button class="primary-button compact" type="button" :disabled="!scheduleCopyTargets.length" @click="copyScheduleToTargets">应用</button>
+          </div>
+          <div class="subject-schedule-days">
+            <article v-for="day in subjectScheduleDraft" :key="day.weekday" class="subject-schedule-day" :class="{ resting: !day.enabled }">
+              <label class="subject-schedule-day-toggle"><input v-model="day.enabled" type="checkbox" @change="toggleScheduleDay(day)" /><strong>{{ weekdayLabels[day.weekday] }}</strong><span>{{ day.enabled ? `${day.segments.length} 个时段` : '休息' }}</span></label>
+              <div v-if="day.enabled" class="subject-schedule-segments">
+                <div v-for="(segment, index) in day.segments" :key="index" class="subject-schedule-segment">
+                  <input v-model="segment.start" type="time" aria-label="开始时间" @input="subjectScheduleError = ''" /><span>至</span><input v-model="segment.end" type="time" aria-label="结束时间" @input="subjectScheduleError = ''" />
+                  <button type="button" title="删除时段" @click="removeScheduleSegment(day, index)"><X :size="13" /></button>
+                </div>
+                <button class="subject-schedule-add" type="button" @click="addScheduleSegment(day)"><Plus :size="12" />添加时段</button>
+              </div>
+              <span v-else class="subject-schedule-rest">当天不安排工作</span>
+            </article>
+          </div>
+          <p v-if="subjectScheduleError" class="subject-schedule-error">{{ subjectScheduleError }}</p>
+          <p class="subject-schedule-preview-note">界面预览阶段：工作时段仅在本次应用运行中生效，尚未写入本地数据库或同步到云端。</p>
+        </section>
+      </div>
       <template #footer>
         <button class="secondary-button" type="button" @click="subjectDialogOpen = false">取消</button>
-        <button class="primary-button" type="button" @click="saveSubject">{{ editingSubjectId ? '保存名称' : '添加主体' }}</button>
+        <button class="primary-button" type="button" @click="saveSubject">{{ editingSubjectId ? '保存设置' : '添加主体' }}</button>
       </template>
     </el-dialog>
   </main>

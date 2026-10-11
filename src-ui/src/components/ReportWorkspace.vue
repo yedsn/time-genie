@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { storeToRefs } from "pinia";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { ArrowDown, ArrowUp, Braces, CalendarDays, CalendarRange, Check, ChevronRight, ClipboardCopy, Copy, FilePenLine, FileText, Folder, HardDriveDownload, LayoutTemplate, MoreHorizontal, Pencil, Plus, ReceiptText, RefreshCcw, Search, Sparkles, Star, Trash2 } from "lucide-vue-next";
+import { ArrowDown, ArrowUp, Braces, CalendarDays, CalendarRange, Check, ChevronRight, ClipboardCopy, Clock3, Copy, FilePenLine, FileText, Folder, HardDriveDownload, LayoutTemplate, MoreHorizontal, Pencil, Plus, ReceiptText, RefreshCcw, Search, Sparkles, Star, Trash2 } from "lucide-vue-next";
 import { MdEditor, MdPreview } from "md-editor-v3";
 import "md-editor-v3/lib/style.css";
 import { useWorkdayStore, type ReportRecord, type ReportType, type Task } from "../store";
@@ -16,6 +16,7 @@ import {
   selectReportTemplate,
   validateReportTemplateDraft,
 } from "../services/reportTemplateEditorCore";
+import { workPeriodTextForDate } from "../services/subjectWorkScheduleMock";
 
 const store = useWorkdayStore();
 const { reports } = storeToRefs(store);
@@ -131,6 +132,7 @@ const templatePreview = computed(() => {
   return renderTemplatePreview(templateDraft.value, replacements);
 });
 const selectedDraftTemplate = computed(() => templates.value.find((item) => item.id === draftTemplateId.value));
+const draftWorkPeriod = computed(() => workPeriodTextForDate(draftSubjectId.value, draftReferenceDate.value));
 const draftTemplatePreview = computed(() => {
   const previewTemplateId = templatePickerOpen.value ? templatePickerId.value : draftTemplateId.value;
   const template = templates.value.find((item) => item.id === previewTemplateId);
@@ -140,7 +142,7 @@ const draftTemplatePreview = computed(() => {
     "{{日期}}": toDateValue(draftReferenceDate.value),
     "{{星期}}": "周四",
     "{{日期范围}}": periodValue(draftType.value, draftReferenceDate.value),
-    "{{工作时段}}": "10:00-12:00 13:30-17:30",
+    "{{工作时段}}": draftWorkPeriod.value,
     "{{总工时}}": formatHours(360),
     "{{今日事项}}": "1. 已完成事项\n2. 进行中的事项",
     "{{明日计划}}": "1. 明日重点事项",
@@ -916,6 +918,7 @@ function existingReportId(error: unknown) {
               <label class="report-scope-control"><span class="report-scope-control-icon"><CalendarDays :size="15" /></span><span class="report-scope-control-content"><span>日期或周期</span><el-date-picker v-model="draftReferenceDate" :type="draftType === 'daily' ? 'date' : draftType === 'weekly' ? 'week' : 'month'" :format="draftType === 'daily' ? 'YYYY-MM-DD' : draftType === 'weekly' ? 'YYYY 第 ww 周' : 'YYYY-MM'" :clearable="false" popper-class="report-control-popper" /></span></label>
               <label class="report-scope-control"><span class="report-scope-control-icon subject"><Folder :size="15" /></span><span class="report-scope-control-content"><span>主体</span><el-select v-model="draftSubjectId" placeholder="选择主体" popper-class="report-control-popper"><el-option v-for="subject in store.subjects" :key="subject.id" :label="subject.name" :value="subject.id" /></el-select></span></label>
             </div>
+            <div v-if="draftType === 'daily'" class="report-work-period-preview"><Clock3 :size="13" /><span>当天工作时段</span><strong>{{ draftWorkPeriod }}</strong><small>来自主体设置</small></div>
             <div :class="['report-scope-result', reportTypeClass(draftType)]"><span>归档范围</span><strong>{{ periodValue(draftType, draftReferenceDate) }}</strong></div>
           </div>
         </section>
