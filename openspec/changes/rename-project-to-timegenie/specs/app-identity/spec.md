@@ -2,119 +2,104 @@
 
 ## Purpose
 
-定义应用的对外显示名、工程与构建产物标识、本机数据与凭据的存放位置，以及在品牌改名过程中必须保持不变的领域术语与用户既有约定，使改名后的应用对用户、操作系统与外部服务都呈现为一个完整且连续的身份。
+定义 TimeGenie 在系统与分发层、内部技术标识、稳定应用身份和中文应用界面中的名称边界，并保证已发布版本从中文系统名称切换为英文系统名称时继续使用原有数据、凭据和更新配置。
 
 ## ADDED Requirements
 
-### Requirement: 应用显示名一致性
+### Requirement: 系统与分发名称统一使用英文
 
-所有用户可见的应用名称位置 SHALL 使用中文显示名「时序」，包括主窗口标题、窗口标题栏、侧栏品牌块、系统托盘提示、安装包名称、开始菜单条目与桌面快捷方式名称。
+应用在操作系统和发布渠道中的主名称 SHALL 为 TimeGenie。
 
-英文产品名 `TimeGenie` SHALL 仅用于工程标识与网络标识；它 MAY 出现在 README、关于页等允许双语并列的位置，但 MUST NOT 替代用户可见的应用名称。
+该规则 SHALL 覆盖安装包、主程序文件、默认安装目录、开始菜单条目、桌面快捷方式、卸载项、主窗口系统标题、系统托盘提示、macOS .app 名称及 Release 名称。
 
-#### Scenario: 主窗口与标题栏展示中文名
+#### Scenario: Windows 打包产物使用英文名称
 
-- **WHEN** 用户启动应用并显示主窗口
-- **THEN** 主窗口标题为「时序」
-- **AND** 窗口标题栏中的应用名文字为「时序」
+- **WHEN** 执行 Windows NSIS release 构建
+- **THEN** 安装包文件名使用 TimeGenie 前缀
+- **AND** 安装后的主程序文件名为 TimeGenie.exe
+- **AND** 默认安装目录、开始菜单条目和卸载项名称均为 TimeGenie
 
-#### Scenario: 托盘提示展示中文名
+#### Scenario: macOS 打包产物使用英文名称
 
-- **WHEN** 用户把鼠标悬停在系统托盘图标上
-- **THEN** 提示文字为「时序」
+- **WHEN** 执行 macOS app 或 DMG release 构建
+- **THEN** 应用包名称为 TimeGenie.app
+- **AND** DMG 与更新归档使用 TimeGenie 英文名称
 
-#### Scenario: 安装后系统入口展示中文名
+#### Scenario: 系统窗口和托盘使用英文名称
 
-- **WHEN** 用户完成安装并在开始菜单中查找该应用
-- **THEN** 开始菜单条目名称为「时序」
-- **AND** 安装包文件名与安装目录名称体现「时序」
+- **WHEN** 用户启动应用并在系统任务切换器或托盘中查看应用
+- **THEN** 主窗口的系统标题为 TimeGenie
+- **AND** Tauri 托盘和 Windows 原生兜底托盘的提示均为 TimeGenie
 
-### Requirement: 工程与构建产物标识统一
+### Requirement: 应用内容界面保留中文显示名
 
-应用的工程标识 SHALL 统一为 `timegenie`，覆盖 npm 包名、Cargo 包名与 lib 名、可执行文件名、bundle identifier、Supabase `project_id` 与 Supabase 客户端标识字符串。
+应用内容区 SHALL 继续使用中文显示名「时序」，包括前端自定义标题栏和侧栏品牌块。
 
-端到端验证所使用的环境变量前缀 SHALL 统一为 `TG_`。代码库中 MUST NOT 残留 `work-report-assistant`、`work_report_assistant`、`Work Report Assistant`、`com.workreportassistant` 或 `WRA_` 作为应用标识出现。
+系统层英文名称 MUST NOT 导致应用业务文案、托盘菜单命令或领域术语被批量改为英文。
 
-#### Scenario: 构建产物使用新标识
+#### Scenario: 自定义界面继续显示中文品牌
 
-- **WHEN** 执行 Windows release 构建
-- **THEN** `src-tauri/target/release/` 下的可执行文件名为 `timegenie.exe`
+- **WHEN** 用户打开主工作台
+- **THEN** 自定义标题栏中的应用名为「时序」
+- **AND** 侧栏品牌块中的应用名为「时序」
 
-#### Scenario: bundle identifier 变更生效
+#### Scenario: 中文业务界面不受影响
 
-- **WHEN** 检查 `src-tauri/tauri.conf.json`
-- **THEN** `identifier` 为 `com.timegenie.desktop`
-- **AND** `productName` 体现中文显示名「时序」
+- **WHEN** 用户使用计划、计时、工时结算、报告或设置功能
+- **THEN** 相关操作文案继续使用中文
+- **AND** 「日报」「周报」「月报」「已分配」「待结算」等领域术语保持不变
 
-#### Scenario: 端到端验证环境变量使用新前缀
+### Requirement: 内部技术标识保持统一且稳定
 
-- **WHEN** 用户按 README 说明配置双设备端到端验证
-- **THEN** README 中列出的变量名为 `TG_SUPABASE_URL`、`TG_SUPABASE_ANON_KEY`、`TG_SUPABASE_EMAIL`、`TG_SUPABASE_PASSWORD`、`TG_SUPABASE_E2E_ALLOW_RESET`
-- **AND** 未设置 `TG_SUPABASE_E2E_ALLOW_RESET=1` 时测试拒绝执行并给出中文提示
+内部技术标识 SHALL 继续使用小写 timegenie，稳定应用身份 SHALL 继续使用 com.timegenie.desktop。
 
-### Requirement: 本机数据与凭据的迁移
+修改系统产品名时 MUST NOT 改变 npm/Cargo 包名、Rust lib 名、数据库文件名、凭据 service、Supabase schema、缓存 key、环境变量前缀或 updater endpoints。
 
-本次变更 SHALL 交付一套可执行且可验证的一次性迁移步骤，使改名后的应用能在新位置继续使用已有的本机工作区数据。
+#### Scenario: identifier 与数据位置保持不变
 
-迁移范围 SHALL 覆盖 SQLite 数据库文件，以及设置中的设备级配置；系统凭据库中的 SeaTable Base API Token 与 Supabase 用户会话因 service 名变更无法自动沿用，SHALL 被明确标注为需要重新录入或重新登录。
+- **WHEN** 系统产品名从「时序」改为 TimeGenie
+- **THEN** Tauri identifier 仍为 com.timegenie.desktop
+- **AND** 应用仍从 %APPDATA%\com.timegenie.desktop\timegenie.sqlite3 读取本机数据
 
-#### Scenario: 迁移后工作区数据完整
+#### Scenario: 凭据与云端标识保持不变
 
-- **WHEN** 按迁移步骤把旧应用数据目录搬迁到新目录后启动应用
-- **THEN** 主体的数量与名称、事项数量、时间记录与工时分配与迁移前一致
-- **AND** 已生成的报告仍可在报告页中打开
+- **WHEN** 用户安装英文系统名版本并启动应用
+- **THEN** SeaTable 与 Supabase 使用原有 timegenie 凭据标识
+- **AND** Supabase schema 仍为 timegenie
+- **AND** updater endpoints 保持原值
 
-#### Scenario: 迁移后设备级配置保留
+### Requirement: 发布元数据使用英文主名称
 
-- **WHEN** 迁移完成并进入设置页
-- **THEN** Obsidian 根目录与日报路径规则仍为迁移前配置的值
-- **AND** SeaTable 服务地址、事项表、事项视图与报销表配置仍可读
+GitHub/Gitee Release 名称、本地发布脚本中的应用名称及发布说明 SHALL 使用 TimeGenie。
 
-#### Scenario: 凭据需重新建立
+README 和文档站 MAY 保留中文名称，但 SHALL 使用英文优先的 TimeGenie（时序）表达。
 
-- **WHEN** 迁移完成后首次使用 SeaTable 同步或 Supabase 云端模式
-- **THEN** 应用提示需要重新录入 Base API Token 或重新登录，而不是静默使用失效凭据
+#### Scenario: 自动发布使用英文品牌
 
-#### Scenario: 未迁移时的行为被显式说明
+- **WHEN** release workflow 为版本标签创建 Release
+- **THEN** Release 名称为 TimeGenie v<version>
+- **AND** Release 说明中的应用名和 macOS 安装路径示例使用 TimeGenie
 
-- **WHEN** 用户未执行迁移即启动改名后的应用
-- **THEN** 应用以空白工作区正常启动
-- **AND** 该现象在迁移说明中被写清，避免被误判为数据丢失
+### Requirement: 单用户迁移采用备份后卸载重装
 
-### Requirement: 领域术语与既有用户约定保持不变
+本次系统名称调整 SHALL 通过一次性人工卸载重装完成，MUST NOT 为此引入运行时自动迁移代码。
 
-品牌改名 MUST NOT 改变报告类型词「日报」「周报」「月报」，MUST NOT 改变 Obsidian 日报路径规则的默认值 `工作日报/{date}.md`，也 MUST NOT 改变工时结算术语「原始工时」「已分配」「待结算」及其口径定义。
+迁移步骤 SHALL 要求在卸载前备份 %APPDATA%\com.timegenie.desktop，在安装新版本前确认原数据目录仍存在，并在新版本启动后核对核心数据。
 
-用户既有的 Obsidian 目录结构与默认路径约定 MUST NOT 因改名被改写。
+#### Scenario: 卸载旧程序后保留用户数据
 
-#### Scenario: 报告类型词不变
+- **WHEN** 用户备份数据并卸载旧的「时序」
+- **THEN** 用户确认 %APPDATA%\com.timegenie.desktop\timegenie.sqlite3 仍存在
+- **AND** 若该目录被意外删除，用户可从备份恢复到相同路径
 
-- **WHEN** 用户在报告页查看类型筛选
-- **THEN** 选项仍为「日报」「周报」「月报」
+#### Scenario: 新安装继续读取原有数据
 
-#### Scenario: Obsidian 默认路径规则不变
+- **WHEN** 用户安装并启动 TimeGenie
+- **THEN** 主体、事项、计时记录、工时分配和报告与卸载前一致
+- **AND** 原有设备设置与可复用凭据继续生效
 
-- **WHEN** 用户在全新环境中打开设置页的日报路径规则
-- **THEN** 默认值仍为 `工作日报/{date}.md`
+#### Scenario: 系统入口完成清理
 
-#### Scenario: 工时结算术语不变
-
-- **WHEN** 用户查看 README 中的工时口径说明
-- **THEN** 「原始工时」「已分配」「待结算」三个术语及其定义（待结算工时等于原始工时减去已分配工时）保持不变
-- **AND** 界面上「已分配」与「待结算」的文案保持不变
-
-#### Scenario: 领域词计数减幅可完全归因
-
-- **WHEN** 对改名前后在 `src-ui` 与 `src-tauri` 内检索 `日报`
-- **THEN** 计数由 49 降为 43
-- **AND** 减少的 6 处恰好是被移除的含「日报」的品牌名，不含任何报告类型词或路径规则
-
-### Requirement: 本地外观缓存可重建
-
-主题偏好等外观相关本地缓存在存储键变更后 SHALL 回落为默认外观，MUST NOT 导致界面无法渲染或报错；用户 SHALL 能在设置页重新选择外观。
-
-#### Scenario: 升级后界面正常渲染
-
-- **WHEN** 存储键变更后用户首次启动应用
-- **THEN** 应用以默认外观正常渲染全部页面
-- **AND** 设置页的外观选项可正常切换并持久化
+- **WHEN** 新版本验证完成
+- **THEN** 开始菜单和卸载列表中只保留 TimeGenie
+- **AND** 不再保留旧的「时序」安装目录或快捷方式

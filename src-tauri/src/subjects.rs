@@ -100,9 +100,15 @@ fn create_subject_with_cloud_operation(
             params![id, workspace_id, name, sort_order, now],
         )
         .map_err(|error| error.to_string())?;
+    let schedule_ids = crate::subject_work_schedules::insert_default_schedule(
+        &transaction,
+        &workspace_id,
+        &id,
+        now,
+    )?;
     bump_revision(&transaction)?;
     if let Some((state, operation_type)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
+        let subject_operation_id = crate::cloud_sync::enqueue_entity_in_transaction(
             &transaction,
             state,
             operation_type,
@@ -111,6 +117,18 @@ fn create_subject_with_cloud_operation(
             None,
             None,
         )?;
+        for schedule_id in schedule_ids {
+            crate::cloud_sync::enqueue_entity_in_transaction_with_dependency(
+                &transaction,
+                state,
+                "subject_work_schedule_create",
+                "subject_work_schedule",
+                Some(&schedule_id),
+                None,
+                None,
+                subject_operation_id.as_deref(),
+            )?;
+        }
     }
     let subject = load_subject(&transaction, &id)?;
     transaction.commit().map_err(|error| error.to_string())?;

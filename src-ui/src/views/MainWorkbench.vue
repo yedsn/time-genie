@@ -20,7 +20,7 @@ import { cloudDeviceActionDisabled, cloudDeviceActionLabel, cloudDeviceKind, run
 import { isCompletionFeedbackEnabled, playCompletionFeedback, setCompletionFeedbackEnabled, setCompletionFeedbackSoundEnabled } from "../services/completionFeedback";
 import { remainingOpenTaskCount } from "../services/completionFeedbackCore";
 import { APP_THEMES, applyAppTheme, isAppTheme, type AppTheme } from "../services/theme";
-import { cloneWorkSchedule, createDefaultWorkSchedule, getSubjectWorkSchedule, saveSubjectWorkSchedule, type WorkScheduleDay } from "../services/subjectWorkScheduleMock";
+import { cloneWorkSchedule, createDefaultWorkSchedule, loadSubjectWorkSchedule, saveSubjectWorkSchedule, type WorkScheduleDay } from "../services/subjectWorkScheduleMock";
 
 const store = useWorkdayStore();
 const appVersion = __APP_VERSION__;
@@ -965,14 +965,19 @@ function openSubjectDialog() {
   subjectDialogOpen.value = true;
 }
 
-function openSubjectEditor(subjectId: string) {
+async function openSubjectEditor(subjectId: string) {
   const subject = store.subjects.find((item) => item.id === subjectId);
   if (!subject) return;
   editingSubjectId.value = subject.id;
   subjectNameDraft.value = subject.name;
-  subjectScheduleDraft.value = getSubjectWorkSchedule(subject.id);
   subjectScheduleError.value = "";
   subjectDialogOpen.value = true;
+  try {
+    subjectScheduleDraft.value = await loadSubjectWorkSchedule(subject.id);
+  } catch (error) {
+    subjectDialogOpen.value = false;
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  }
 }
 
 function toggleScheduleDay(day: WorkScheduleDay) {
@@ -1042,9 +1047,9 @@ async function saveSubject() {
       ElMessage.warning("主体名称不能为空，也不能与现有主体重复");
       return;
     }
-    saveSubjectWorkSchedule(editingSubjectId.value, subjectScheduleDraft.value);
+    subjectScheduleDraft.value = await saveSubjectWorkSchedule(editingSubjectId.value, subjectScheduleDraft.value);
     subjectDialogOpen.value = false;
-    ElMessage.success("主体设置已更新；工作时段当前仅保留在本次运行中");
+    ElMessage.success("主体设置已更新");
     return;
   }
   const subjectId = await store.addSubject(subjectNameDraft.value);
@@ -1052,9 +1057,11 @@ async function saveSubject() {
     ElMessage.warning("请输入主体名称");
     return;
   }
-  saveSubjectWorkSchedule(subjectId, subjectScheduleDraft.value);
+  const defaults = await loadSubjectWorkSchedule(subjectId);
+  const customized = defaults.map((day) => ({ ...day, enabled: subjectScheduleDraft.value[day.weekday].enabled, segments: subjectScheduleDraft.value[day.weekday].segments.map((segment) => ({ ...segment })) }));
+  await saveSubjectWorkSchedule(subjectId, customized);
   subjectDialogOpen.value = false;
-  ElMessage.success("主体已添加；工作时段当前仅保留在本次运行中");
+  ElMessage.success("主体已添加");
 }
 
 function subjectTaskCount(subjectId: string) {
@@ -1725,7 +1732,7 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
             </article>
           </div>
           <p v-if="subjectScheduleError" class="subject-schedule-error">{{ subjectScheduleError }}</p>
-          <p class="subject-schedule-preview-note">界面预览阶段：工作时段仅在本次应用运行中生效，尚未写入本地数据库或同步到云端。</p>
+          <p class="subject-schedule-preview-note">保存后会先写入本机；云端模式下会在后台同步到其他设备。</p>
         </section>
       </div>
       <template #footer>

@@ -7,7 +7,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $RootDir = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-$AppName = "时序"
+$AppName = "TimeGenie"
 
 function Fail([string]$Message) {
   Write-Error "[release] $Message"

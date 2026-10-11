@@ -1,7 +1,7 @@
-# 时序（TimeGenie）
+# TimeGenie（时序）
 
 <p align="center">
-  <img src="src-tauri/icons/icon.png" alt="时序 TimeGenie" width="96" height="96" />
+  <img src="src-tauri/icons/icon.png" alt="TimeGenie 时序" width="96" height="96" />
 </p>
 
 <p align="center">
@@ -13,7 +13,7 @@
   <img alt="SQLite" src="https://img.shields.io/badge/SQLite-local--first-003b57?logo=sqlite" />
 </p>
 
-时序（TimeGenie）是一个 Windows 优先的本地优先桌面工作台，用于管理待办、记录与分配工时、生成日报/周报/月报，并与 Obsidian、SeaTable、Supabase 衔接。
+TimeGenie（时序）是一个 Windows 优先的本地优先桌面工作台，用于管理待办、记录与分配工时、生成日报/周报/月报，并与 Obsidian、SeaTable、Supabase 衔接。
 
 它面向需要每天整理计划、计时、结算和汇报的人：待办负责承接计划，计时负责留下真实工作记录，报告负责把结果整理成可复制、可写入 Obsidian 的 Markdown。
 

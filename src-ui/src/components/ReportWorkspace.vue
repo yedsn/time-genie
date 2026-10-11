@@ -6,7 +6,7 @@ import { ArrowDown, ArrowUp, Braces, CalendarDays, CalendarRange, Check, Chevron
 import { MdEditor, MdPreview } from "md-editor-v3";
 import "md-editor-v3/lib/style.css";
 import { useWorkdayStore, type ReportRecord, type ReportType, type Task } from "../store";
-import { getReportTaskSuggestions, getSettings, querySeaTableReimbursements, type ObsidianReportWritePreview, type ReportTaskSuggestion, type ReportTemplateRecord } from "../services/tauri";
+import { getReportTaskSuggestions, getReportWorkPeriodPreview, getSettings, querySeaTableReimbursements, type ObsidianReportWritePreview, type ReportTaskSuggestion, type ReportTemplateRecord } from "../services/tauri";
 import {
   insertTemplateToken,
   placeholdersForReportType,
@@ -16,7 +16,7 @@ import {
   selectReportTemplate,
   validateReportTemplateDraft,
 } from "../services/reportTemplateEditorCore";
-import { workPeriodTextForDate } from "../services/subjectWorkScheduleMock";
+import { loadSubjectWorkSchedule, workPeriodTextForDate } from "../services/subjectWorkScheduleMock";
 
 const store = useWorkdayStore();
 const { reports } = storeToRefs(store);
@@ -36,6 +36,7 @@ const draftTaskSuggestions = ref<ReportTaskSuggestion[]>([]);
 const draftTasksLoading = ref(false);
 const reportDurationFormat = ref<"minutes" | "hours">("minutes");
 let draftSuggestionRequest = 0;
+let draftWorkPeriodRequest = 0;
 const reportSaving = ref(false);
 const templateDialogOpen = ref(false);
 const templateLoading = ref(false);
@@ -132,7 +133,7 @@ const templatePreview = computed(() => {
   return renderTemplatePreview(templateDraft.value, replacements);
 });
 const selectedDraftTemplate = computed(() => templates.value.find((item) => item.id === draftTemplateId.value));
-const draftWorkPeriod = computed(() => workPeriodTextForDate(draftSubjectId.value, draftReferenceDate.value));
+const draftWorkPeriod = ref(workPeriodTextForDate(draftSubjectId.value, draftReferenceDate.value));
 const draftTemplatePreview = computed(() => {
   const previewTemplateId = templatePickerOpen.value ? templatePickerId.value : draftTemplateId.value;
   const template = templates.value.find((item) => item.id === previewTemplateId);
@@ -158,9 +159,18 @@ watch(selectedReport, (report) => {
 }, { immediate: true });
 
 watch([draftSubjectId, draftType, draftReferenceDate], () => {
-  if (!reportDialogOpen.value || dialogMode.value !== "create") return;
+  if (!reportDialogOpen.value) return;
+  void loadDraftWorkPeriod();
+  if (dialogMode.value !== "create") return;
   void loadSuggestedTasks(true);
 });
+watch(draftSubjectId, (subjectId) => {
+  if (subjectId) {
+    void loadSubjectWorkSchedule(subjectId).catch((error) => {
+      ElMessage.error(errorText(error, "加载主体工作时段失败"));
+    });
+  }
+}, { immediate: true });
 watch(draftType, () => {
   if (!reportDialogOpen.value) return;
   templatePickerOpen.value = false;
@@ -336,7 +346,25 @@ async function openCreateDialog() {
   draftTaskQuery.value = "";
   reportDialogOpen.value = true;
   await loadDraftTemplates(true);
-  await loadSuggestedTasks(true);
+  await Promise.all([loadSuggestedTasks(true), loadDraftWorkPeriod()]);
+}
+
+async function loadDraftWorkPeriod() {
+  const requestId = ++draftWorkPeriodRequest;
+  const fallback = workPeriodTextForDate(draftSubjectId.value, draftReferenceDate.value);
+  if (draftType.value !== "daily" || !draftSubjectId.value) {
+    draftWorkPeriod.value = fallback;
+    return;
+  }
+  try {
+    const value = await getReportWorkPeriodPreview(
+      draftSubjectId.value,
+      toDateValue(draftReferenceDate.value),
+    );
+    if (requestId === draftWorkPeriodRequest) draftWorkPeriod.value = value;
+  } catch {
+    if (requestId === draftWorkPeriodRequest) draftWorkPeriod.value = fallback;
+  }
 }
 
 async function openScopeDialog(report: ReportRecord) {
@@ -349,7 +377,7 @@ async function openScopeDialog(report: ReportRecord) {
   draftTaskQuery.value = "";
   reportDialogOpen.value = true;
   await loadDraftTemplates(false, report.templateId);
-  await loadSuggestedTasks(false);
+  await Promise.all([loadSuggestedTasks(false), loadDraftWorkPeriod()]);
 }
 
 async function loadDraftTemplates(selectDefault: boolean, preferredId?: string) {
@@ -918,7 +946,7 @@ function existingReportId(error: unknown) {
               <label class="report-scope-control"><span class="report-scope-control-icon"><CalendarDays :size="15" /></span><span class="report-scope-control-content"><span>日期或周期</span><el-date-picker v-model="draftReferenceDate" :type="draftType === 'daily' ? 'date' : draftType === 'weekly' ? 'week' : 'month'" :format="draftType === 'daily' ? 'YYYY-MM-DD' : draftType === 'weekly' ? 'YYYY 第 ww 周' : 'YYYY-MM'" :clearable="false" popper-class="report-control-popper" /></span></label>
               <label class="report-scope-control"><span class="report-scope-control-icon subject"><Folder :size="15" /></span><span class="report-scope-control-content"><span>主体</span><el-select v-model="draftSubjectId" placeholder="选择主体" popper-class="report-control-popper"><el-option v-for="subject in store.subjects" :key="subject.id" :label="subject.name" :value="subject.id" /></el-select></span></label>
             </div>
-            <div v-if="draftType === 'daily'" class="report-work-period-preview"><Clock3 :size="13" /><span>当天工作时段</span><strong>{{ draftWorkPeriod }}</strong><small>来自主体设置</small></div>
+            <div v-if="draftType === 'daily'" class="report-work-period-preview"><Clock3 :size="13" /><span>当天工作时段</span><strong>{{ draftWorkPeriod }}</strong><small>来自主体设置或当天实际工作</small></div>
             <div :class="['report-scope-result', reportTypeClass(draftType)]"><span>归档范围</span><strong>{{ periodValue(draftType, draftReferenceDate) }}</strong></div>
           </div>
         </section>

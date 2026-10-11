@@ -3,10 +3,10 @@ import { defineConfig } from "vitepress";
 const githubRepo = "https://github.com/yedsn/time-genie";
 const repoName = process.env.GITHUB_REPOSITORY?.split("/")[1] ?? "time-genie";
 const base = process.env.DOCS_BASE ?? (process.env.GITHUB_ACTIONS === "true" ? `/${repoName}/` : "/");
-const siteDescription = "时序（TimeGenie）是一个 Windows 优先的本地优先桌面工作台，用于管理待办、记录与分配工时、生成日报/周报/月报，并与 Obsidian、SeaTable、Supabase 衔接。";
+const siteDescription = "TimeGenie（时序）是一个 Windows 优先的本地优先桌面工作台，用于管理待办、记录与分配工时、生成日报/周报/月报，并与 Obsidian、SeaTable、Supabase 衔接。";
 
 export default defineConfig({
-  title: "时序 TimeGenie",
+  title: "TimeGenie（时序）",
   description: siteDescription,
   lang: "zh-CN",
   base,
@@ -16,7 +16,7 @@ export default defineConfig({
     ["link", { rel: "icon", type: "image/svg+xml", href: `${base}logo.svg` }],
     ["meta", { name: "theme-color", content: "#1a2d24" }],
     ["meta", { property: "og:type", content: "website" }],
-    ["meta", { property: "og:title", content: "时序 TimeGenie" }],
+    ["meta", { property: "og:title", content: "TimeGenie（时序）" }],
     ["meta", { property: "og:description", content: siteDescription }],
   ],
   themeConfig: {
@@ -61,7 +61,7 @@ export default defineConfig({
     docFooter: { prev: "上一页", next: "下一页" },
     lastUpdated: { text: "最后更新于" },
     footer: {
-      message: "时序 TimeGenie 文档站",
+      message: "TimeGenie（时序）文档站",
       copyright: "Copyright 2026 TimeGenie Contributors",
     },
   },

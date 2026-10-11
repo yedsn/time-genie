@@ -1,7 +1,7 @@
 ---
 layout: home
 hero:
-  name: "时序 TimeGenie"
+  name: "TimeGenie（时序）"
   text: "本地优先的桌面工作台"
   tagline: 管理待办、记录与分配工时、生成日报/周报/月报，并与 Obsidian、SeaTable、Supabase 衔接。
   image:

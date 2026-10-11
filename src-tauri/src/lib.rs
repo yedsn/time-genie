@@ -22,6 +22,7 @@ mod recurring;
 mod reports;
 mod seatable;
 mod settings;
+mod subject_work_schedules;
 mod subjects;
 mod supabase;
 mod tasks;
@@ -274,7 +275,7 @@ pub fn run() {
             let tray_icon = TrayIconBuilder::with_id("timegenie")
                 .icon(tray_icon_image)
                 .menu(&menu)
-                .tooltip("时序")
+                .tooltip("TimeGenie")
                 .show_menu_on_left_click(false)
                 .on_menu_event({
                     let database = database.clone();
@@ -426,6 +427,8 @@ pub fn run() {
             subjects::subject_list,
             subjects::subject_create,
             subjects::subject_rename,
+            subject_work_schedules::subject_work_schedule_get,
+            subject_work_schedules::subject_work_schedule_save,
             tasks::task_list,
             tasks::task_daily_estimate_set,
             tasks::task_create,
@@ -462,6 +465,7 @@ pub fn run() {
             unassigned::unassigned_discard,
             reports::report_list,
             reports::report_task_suggestions,
+            reports::report_work_period_preview,
             reports::report_create,
             reports::report_update_scope,
             reports::report_save_content,

@@ -2,69 +2,54 @@
 
 ## Why
 
-项目即将首次公开发布，但当前名称只覆盖了产品的五个模块中的一个。`work-report-assistant` / 「工作日报助手」把产品说成了"日报工具"，而它实际上是一个本地优先的工作台：计划、计时、工时结算、日报/周报/月报生成与外部同步。产品自己已经在用别的定位词描述自己——侧栏副标题（本变更中由"本地优先工作台"改为"计时 · 工时 · 日报"），顶部标题是"{{页面}}工作台"——说明现有名称已经落后于产品本身。
+项目已经完成从旧工程名到 TimeGenie 技术标识的主体改名，但 Tauri 的 productName、系统托盘提示和发布流程仍以中文「时序」作为系统级名称。这导致 Windows 安装目录、开始菜单、卸载项、macOS 应用包和部分 Release 信息以中文命名，与可执行文件、仓库、更新资产和内部技术标识不一致。
 
-更关键的是时间窗口。`identifier` 决定 Tauri 的应用数据目录、安装包身份与开机启动项，发布后变更会让新旧版本在系统层面成为两个互不相干的应用，用户已存的本机数据与凭据不会自动跟随，届时必须编写迁移逻辑并承担升级路径断裂的风险。当前项目尚无任何外部用户，`openspec/specs/` 也尚无已同步的主 spec，这是定名的唯一零成本窗口。
+当前应用已经发布到 v0.2.8，不能再把改名视为首次发布前的零成本身份替换。后续调整必须保持 com.timegenie.desktop、用户数据目录、数据库文件、凭据服务和更新地址不变，只改变系统与分发层的名称。当前仅有项目维护者本人使用已安装版本，可以采用“备份用户数据、卸载旧程序、安装新程序”的一次性迁移，不需要在产品中保留自动迁移代码。
 
 ## What Changes
 
-- 应用对外身份改为**中文显示名「时序」+ 英文产品名 `TimeGenie`**，两者并行：用户可见位置用中文名，工程与网络标识用 `timegenie`。
-- 工程标识统一为 `timegenie`：本地目录、GitHub 仓库、npm 包名、Cargo 包名与 lib 名、bundle identifier、SQLite 文件名、系统凭据库 service 名、主题缓存 key、Supabase 客户端标识字符串与 `supabase/config.toml` 的 `project_id`。
-- 环境变量前缀由 `WRA_` 改为 `TG_`：共 5 个变量名、12 处引用，分布在 `README.md`（5 处）、`src-tauri/src/cloud_e2e.rs`（6 处，其中 `WRA_SUPABASE_E2E_ALLOW_RESET` 出现 2 次）与 `src-tauri/src/lib.rs` 的开发期变量 `WRA_USE_APP_DATA_DIR`（1 处）。其中 `WRA_USE_APP_DATA_DIR` 带行为含义，控制 debug 构建是否改用 `target/dev-data` 而非真实数据目录。
-- **BREAKING**：`identifier` 由 `com.workreportassistant.desktop` 改为 `com.timegenie.desktop`，导致 Tauri 应用数据目录从 `%APPDATA%\com.workreportassistant.desktop` 变为 `%APPDATA%\com.timegenie.desktop`，已有本机 SQLite 数据不再被读取。
-- **BREAKING**：系统凭据库 service 名变更，已保存的 SeaTable Base API Token 与 Supabase 用户会话不再被读取，需要重新录入或重新登录。
-- 主题缓存 key 由 `work-report-assistant:app-theme` 改为 `timegenie:app-theme`，用户主题偏好重置（可接受，仅影响外观）。
-- 修正一处既有不一致：`src-ui/index.html` 的 `<title>` 目前是英文 `Work Report Assistant`，与应用内中文界面不一致，本次统一。
-- 明确**不得改动**的部分：报告类型词 `日报/周报/月报`、Obsidian 默认路径规则 `工作日报/{date}.md`、结算术语 `原始工时/已分配/待结算`、`supabase/schema.sql` 的表结构与 RLS 策略、归档 change 的 id 与内容。
+- 建立三层命名规则：系统与分发层统一使用英文产品名 TimeGenie；内部技术标识继续使用小写 timegenie；应用内容界面继续显示中文名「时序」。
+- 将 Tauri productName 改为 TimeGenie，并显式设置 mainBinaryName 为 TimeGenie，使安装包、应用包、安装目录、系统入口与主程序文件统一使用英文名称和一致大小写。
+- 将主窗口的系统标题、Tauri 托盘提示与原生 Windows 兜底托盘提示改为 TimeGenie；自定义标题栏、侧栏品牌块和其他应用内容区仍显示「时序」。
+- 将 GitHub Release 名称、Release 说明、macOS 应用路径示例和本地发布脚本中的应用名统一为 TimeGenie。
+- README 与文档站中的产品标题采用英文优先的双语写法 TimeGenie（时序）；中文产品名只作为面向中文用户的界面名称和辅助说明。
+- 保持应用身份和数据位置不变：com.timegenie.desktop、%APPDATA%\com.timegenie.desktop、timegenie.sqlite3、系统凭据 service、Supabase schema、更新端点均不修改。
+- 采用一次性人工迁移：退出并备份数据，卸载旧的「时序」，确认数据目录仍存在，再安装 TimeGenie 并核对数据。
 
 ## Capabilities
 
 ### New Capabilities
 
-- `app-identity`: 应用的对外显示名、工程与构建产物标识、本机数据与凭据的存放位置，以及在品牌改名过程中必须保持不变的领域术语。本次为新能力，因为项目尚无已同步的主 spec；选择新建而非复用 `daily-workbench` 等归档能力，是因为改名不影响这些能力的功能需求，而"应用身份"本身是一份会被后续变更（图标、版本、关于页、自动更新与代码签名）持续扩展的独立契约。
+- app-identity：定义 TimeGenie 在系统、分发、技术标识和应用界面四类位置的命名契约，以及已发布版本调整系统名称时的数据连续性要求。
 
 ### Modified Capabilities
 
-无。归档 change 中的 `daily-workbench`、`time-tracking-and-allocation`、`report-generation`、`external-sync`、`task-daily-planning`、`task-completion-feedback` 均未同步到 `openspec/specs/`（当前主 spec 为空），且本次改名不改变其中任何功能需求。
+无。此次调整只改变应用身份呈现，不改变计划、计时、工时结算、报告生成、外部同步或云端存储等业务能力。
 
 ## Impact
 
-全量清点口径：在实施开始时对 `HEAD` 用 `git grep -i` 对连字符形式、下划线形式、带空格的英文名、反向域名、`WRA_` 前缀、驼峰形式与中文显示名七类模式清点，排除 `openspec/` 后命中 **51 行、22 个文件**；其中 2 行是必须保留的归档 change id，另有 4 行位于自动生成或锁定文件（`Cargo.lock`、`package-lock.json`、`gen/schemas/capabilities.json`）。以下按层列出。
+**应用配置与运行时**
 
-**应用配置与前端**
+- src-tauri/tauri.conf.json：productName、mainBinaryName、主窗口系统标题。
+- src-tauri/src/lib.rs：Tauri 托盘提示。
+- src-tauri/src/native_tray.rs：Windows 原生兜底托盘提示。
+- src-ui/index.html、src-ui/src/views/MainWorkbench.vue：继续保留中文界面名称，用于验证系统名称与界面名称已正确分层。
 
-- `src-tauri/tauri.conf.json`：`productName`、主窗口 `title`、`identifier`。
-- `src-ui/index.html`：`<title>`。
-- `src-ui/src/views/MainWorkbench.vue`：标题栏应用名、侧栏品牌块。
-- `src-ui/src/services/theme.ts`：主题缓存 key。
+**发布与文档**
 
-**Rust 侧**
+- .github/workflows/release.yml：Release 名称、说明和 macOS 应用路径。
+- scripts/release/release.ps1：发布脚本显示的应用名。
+- README.md、docs/index.md、docs/.vitepress/config.mts 及相关设计文档标题：改为英文优先的双语品牌表达。
+- 安装包、更新归档和签名文件继续使用既有 TimeGenie 英文前缀。
 
-- `src-tauri/Cargo.toml`：包名、`description`、`authors`、`[lib] name`。
-- `src-tauri/src/main.rs`：lib 引用路径。
-- `src-tauri/src/lib.rs`：托盘 id 的 3 处引用、托盘 tooltip（改为「时序」）、启动失败提示文案（`expect` 消息）、开发期环境变量 `WRA_USE_APP_DATA_DIR` 的读取点。
-- `src-tauri/src/native_tray.rs`：**Tauri 托盘之外的原生 Win32 兜底托盘**，含托盘 id 查询、Win32 窗口类名 `work_report_assistant_native_tray`，以及第二处用户可见 tooltip。该文件在规划期不存在，实施开始时才出现在代码库中。
-- `src-tauri/src/settings.rs`：凭据库 service 常量。
-- `src-tauri/src/database.rs`：SQLite 文件名常量。
-- `src-tauri/src/supabase.rs`：客户端标识字符串（3 处）。
-- `src-tauri/src/cloud_e2e.rs`：6 处环境变量引用（5 个变量名）。
-- `src-tauri/capabilities/default.json` 与已纳入版本管理的 `src-tauri/gen/schemas/capabilities.json`（生成物，需随源文件重新生成）。
+**明确不改动**
 
-**仓库与文档**
+- Tauri identifier com.timegenie.desktop。
+- 本机数据目录与数据库文件名。
+- 系统凭据、Supabase schema、环境变量前缀和更新 URL。
+- 应用业务界面的中文文案以及「日报/周报/月报」等领域术语。
 
-- `package.json`、`README.md`、`supabase/config.toml`、`supabase/schema.sql` 首行注释。
-- `docs/20260924_work-report-assistant_数据结构设计.md`、`docs/20260924_work-report-assistant_后端接口设计.md`：文件名与文档标题。两份文档正文中"对应 OpenSpec change：`create-work-report-assistant-desktop-app`"的引用**必须保留**，因为归档 change 的 id 不改写。
-- `.vscode/launch.json`、`.vscode/tasks.json`：仅使用 `${workspaceFolder}` 相对路径，不含品牌名，无需改动（已核实）。
+**人工迁移**
 
-**构建产物与锁定文件**
-
-- `src-tauri/target/release/work-report-assistant.exe` 将重建为 `timegenie.exe`（exe 名来自 Cargo 包名，已核实）。`src-tauri/Cargo.lock`、`package-lock.json` 随包名重新生成。
-
-**本机运行环境（一次性人工操作）**
-
-- `%APPDATA%\com.workreportassistant.desktop\work-report-assistant.sqlite3`（606 KB，末次写入 2026-09-29）需要搬迁到新目录。
-- Windows 凭据管理器中的 SeaTable Token 与 Supabase 会话需要重新建立。
-
-**仓库外动作（不在代码变更范围内，作为实施步骤记录）**
-
-- GitHub 仓库改名、本地目录改名、`git remote set-url`。
+- 当前 Windows 安装项「时序」位于 %LOCALAPPDATA%\时序；用户数据位于独立的 %APPDATA%\com.timegenie.desktop。
+- 先备份用户数据，再卸载旧程序并安装 TimeGenie。不搬迁、不重命名用户数据目录。

@@ -1,4 +1,4 @@
-# 时序后端接口设计
+# TimeGenie（时序）后端接口设计
 
 > 日期：2026-09-24  
 > 对应 OpenSpec change：`create-work-report-assistant-desktop-app`  

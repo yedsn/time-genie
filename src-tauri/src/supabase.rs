@@ -2263,6 +2263,14 @@ fn local_snapshot(database: &Database, workspace_id: &str) -> Result<Value, Stri
     let mut result = serde_json::Map::new();
     for (table, sql) in [
         ("subjects", "SELECT * FROM subjects WHERE workspace_id = ?1"),
+        (
+            "subject_work_schedules",
+            "SELECT * FROM subject_work_schedules WHERE workspace_id = ?1 ORDER BY subject_id, weekday",
+        ),
+        (
+            "subject_work_schedule_segments",
+            "SELECT * FROM subject_work_schedule_segments WHERE workspace_id = ?1 ORDER BY schedule_id, sequence_no",
+        ),
         ("tasks", "SELECT * FROM tasks WHERE workspace_id = ?1 ORDER BY parent_id IS NOT NULL, created_at"),
         ("task_status_events", "SELECT * FROM task_status_events WHERE workspace_id = ?1"),
         ("task_daily_estimates", "SELECT * FROM task_daily_estimates WHERE workspace_id = ?1"),
@@ -3963,6 +3971,30 @@ mod tests {
         assert_eq!(
             snapshot["task_daily_estimates"][0]["estimate_minutes"],
             json!(60)
+        );
+    }
+
+    #[test]
+    fn local_snapshot_includes_subject_work_schedules() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("schedule-migration.sqlite3")).unwrap();
+        let workspace_id: String = database
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let snapshot = local_snapshot(&database, &workspace_id).unwrap();
+        assert_eq!(
+            snapshot["subject_work_schedules"].as_array().unwrap().len(),
+            7
+        );
+        assert_eq!(
+            snapshot["subject_work_schedule_segments"]
+                .as_array()
+                .unwrap()
+                .len(),
+            10
         );
     }
 

@@ -1,4 +1,4 @@
-# 时序数据结构设计
+# TimeGenie（时序）数据结构设计
 
 > 日期：2026-09-24  
 > 对应 OpenSpec change：`create-work-report-assistant-desktop-app`  

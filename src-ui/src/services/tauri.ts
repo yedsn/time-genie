@@ -457,6 +457,15 @@ export type SeaTableConnectionResult = {
   warnings: string[];
 };
 
+export type SubjectWorkScheduleSegment = { start: string; end: string };
+export type SubjectWorkScheduleDay = {
+  id: string;
+  weekday: number;
+  enabled: boolean;
+  segments: SubjectWorkScheduleSegment[];
+  version: number;
+};
+
 export type SeaTableSyncPreviewItem = {
   itemId: string;
   taskId: string;
@@ -506,6 +515,14 @@ export async function createSubject(name: string): Promise<{ subject: SubjectRec
 
 export async function renameSubject(subjectId: string, name: string, expectedVersion: number): Promise<SubjectRecord> {
   return await invoke<SubjectRecord>("subject_rename", { request: { subjectId, name, expectedVersion } });
+}
+
+export async function getSubjectWorkSchedule(subjectId: string): Promise<SubjectWorkScheduleDay[]> {
+  return await invoke("subject_work_schedule_get", { request: { subjectId } });
+}
+
+export async function saveSubjectWorkSchedule(subjectId: string, days: SubjectWorkScheduleDay[]): Promise<SubjectWorkScheduleDay[]> {
+  return await invoke("subject_work_schedule_save", { request: { subjectId, days } });
 }
 
 export async function listTasks(subjectId?: string, plannedDate?: string, dailyEstimateDate?: string): Promise<TaskListResult> {
@@ -775,6 +792,15 @@ export async function getReportTaskSuggestions(request: {
   subjectId: string;
 }): Promise<ReportTaskSuggestion[]> {
   return await invoke("report_task_suggestions", { request });
+}
+
+export async function getReportWorkPeriodPreview(
+  subjectId: string,
+  referenceDate: string,
+): Promise<string> {
+  return await invoke("report_work_period_preview", {
+    request: { subjectId, referenceDate },
+  });
 }
 
 export async function createReport(request: {

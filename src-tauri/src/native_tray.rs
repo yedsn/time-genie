@@ -202,7 +202,7 @@ unsafe fn tray_data(window: HWND, icon: HICON) -> NOTIFYICONDATAW {
         hIcon: icon,
         ..Default::default()
     };
-    let tooltip = wide("时序");
+    let tooltip = wide("TimeGenie");
     let length = tooltip.len().min(data.szTip.len());
     data.szTip[..length].copy_from_slice(&tooltip[..length]);
     data

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use chrono::{Datelike, Duration, NaiveDate};
+use chrono::{Datelike, Duration, NaiveDate, TimeZone};
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -58,6 +58,13 @@ pub struct ReportTaskSuggestionDto {
     pub task_id: String,
     pub actual_minutes: i64,
     pub daily_estimate_minutes: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportWorkPeriodPreviewRequest {
+    pub subject_id: String,
+    pub reference_date: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -295,6 +302,24 @@ pub fn suggest_report_tasks(
             })
         })
         .collect())
+}
+
+pub fn preview_report_work_period(
+    database: &Database,
+    request: ReportWorkPeriodPreviewRequest,
+) -> Result<String, String> {
+    let date = NaiveDate::parse_from_str(&request.reference_date, "%Y-%m-%d")
+        .map_err(|_| "VALIDATION_ERROR: 报告日期格式无效".to_string())?;
+    let connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    ensure_subject(&connection, &workspace_id, &request.subject_id)?;
+    daily_work_period_text(
+        &connection,
+        &workspace_id,
+        &request.subject_id,
+        &request.reference_date,
+        date.weekday().num_days_from_monday() as i64,
+    )
 }
 
 #[cfg(test)]
@@ -1194,7 +1219,8 @@ fn render_report(
         load_default_template(connection, workspace_id, report_type)?
     };
     let user_name = setting_string(connection, workspace_id, "user_name", "晓健")?;
-    let work_period = setting_string(connection, workspace_id, "default_work_period_text", "")?;
+    let fallback_work_period =
+        setting_string(connection, workspace_id, "default_work_period_text", "")?;
     let salary_hourly_rate = setting_number(connection, workspace_id, "salary_hourly_rate", 0.0)?;
     let duration_format = setting_string(
         connection,
@@ -1272,6 +1298,17 @@ fn render_report(
         NaiveDate::parse_from_str(period_start, "%Y-%m-%d").map_err(|error| error.to_string())?;
     let weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
         [date.weekday().num_days_from_monday() as usize];
+    let work_period = if report_type == "daily" {
+        daily_work_period_text(
+            connection,
+            workspace_id,
+            subject_id,
+            period_start,
+            date.weekday().num_days_from_monday() as i64,
+        )?
+    } else {
+        fallback_work_period
+    };
     let values = [
         ("{{姓名}}", user_name),
         ("{{日期}}", period_start.to_string()),
@@ -1293,6 +1330,67 @@ fn render_report(
         markdown = markdown.replace(token, &value);
     }
     Ok((template.id, format!("{}\n", markdown.trim_end())))
+}
+
+fn daily_work_period_text(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    work_date: &str,
+    weekday: i64,
+) -> Result<String, String> {
+    let configured = crate::subject_work_schedules::work_period_text(
+        connection,
+        workspace_id,
+        subject_id,
+        weekday,
+    )?;
+    if let Some(value) = configured.as_deref().filter(|value| *value != "休息") {
+        return Ok(value.to_string());
+    }
+
+    let (started_at, ended_at): (Option<i64>, Option<i64>) = connection
+        .query_row(
+            "SELECT MIN(e.started_at), MAX(e.ended_at)
+             FROM time_entries e
+             WHERE e.workspace_id = ?1
+               AND e.work_date = ?2
+               AND e.kind = 'work'
+               AND e.state = 'ended'
+               AND e.ended_at IS NOT NULL
+               AND e.deleted_at IS NULL
+               AND EXISTS (
+                 SELECT 1
+                 FROM time_allocations a
+                 JOIN tasks t ON t.id = a.task_id
+                 WHERE a.workspace_id = e.workspace_id
+                   AND a.entry_id = e.id
+                   AND a.minutes > 0
+                   AND t.workspace_id = e.workspace_id
+                   AND t.subject_id = ?3
+                   AND t.deleted_at IS NULL
+               )",
+            params![workspace_id, work_date, subject_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    let (Some(started_at), Some(ended_at)) = (started_at, ended_at) else {
+        return Ok("休息".to_string());
+    };
+    let timezone = crate::work_calendar::workspace_timezone(connection, workspace_id)?;
+    let started = timezone
+        .timestamp_millis_opt(started_at)
+        .single()
+        .ok_or_else(|| "VALIDATION_ERROR: 工作开始时间无效".to_string())?;
+    let ended = timezone
+        .timestamp_millis_opt(ended_at)
+        .single()
+        .ok_or_else(|| "VALIDATION_ERROR: 工作结束时间无效".to_string())?;
+    Ok(format!(
+        "{}-{}",
+        started.format("%H:%M"),
+        ended.format("%H:%M")
+    ))
 }
 
 fn latest_reimbursement_summary(
@@ -2043,8 +2141,8 @@ const TEMPLATE_PLACEHOLDERS: &[ReportTemplatePlaceholderDto] = &[
     ReportTemplatePlaceholderDto {
         token: "{{工作时段}}",
         label: "工作时段",
-        description: "设置中的默认工作时段",
-        example: "09:00-18:00",
+        description: "报告主体当天的工作时段",
+        example: "10:00-12:00 13:30-17:30",
         report_types: &["daily"],
     },
     ReportTemplatePlaceholderDto {
@@ -2276,6 +2374,13 @@ pub fn report_task_suggestions(
     suggest_report_tasks(&database, request)
 }
 #[tauri::command]
+pub fn report_work_period_preview(
+    database: tauri::State<'_, Database>,
+    request: ReportWorkPeriodPreviewRequest,
+) -> Result<String, String> {
+    preview_report_work_period(&database, request)
+}
+#[tauri::command]
 pub fn report_create(
     database: tauri::State<'_, Database>,
     request: ReportCreateRequest,
@@ -2496,6 +2601,7 @@ mod tests {
     };
     use crate::time_tracking::{create_manual_entry, ManualEntryRequest};
     use crate::today_overview::{get_today_work_overview, TodayWorkOverviewRequest};
+    use chrono::NaiveDateTime;
     use serde_json::{json, Value};
     use tempfile::tempdir;
 
@@ -2559,6 +2665,68 @@ mod tests {
         )
         .unwrap();
         (database, subject_id, task.id)
+    }
+
+    fn local_millis(value: &str) -> i64 {
+        let timezone: chrono_tz::Tz = "Asia/Shanghai".parse().unwrap();
+        timezone
+            .from_local_datetime(
+                &NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").unwrap(),
+            )
+            .single()
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    fn insert_report_work_entry(
+        database: &Database,
+        workspace_id: &str,
+        task_id: Option<&str>,
+        entry_id: &str,
+        work_date: &str,
+        start: &str,
+        end: &str,
+        kind: &str,
+        deleted: bool,
+    ) {
+        let connection = database.open().unwrap();
+        let started_at = local_millis(start);
+        let ended_at = local_millis(end);
+        connection
+            .execute(
+                "INSERT INTO time_entries(
+                   id,workspace_id,work_date,kind,source_type,state,label_snapshot,started_at,ended_at,
+                   duration_seconds,created_at,updated_at,version,deleted_at
+                 ) VALUES (?1,?2,?3,?4,'manual','ended','日报时段测试',?5,?6,?7,?5,?6,1,?8)",
+                params![
+                    entry_id,
+                    workspace_id,
+                    work_date,
+                    kind,
+                    started_at,
+                    ended_at,
+                    (ended_at - started_at) / 1000,
+                    deleted.then_some(ended_at)
+                ],
+            )
+            .unwrap();
+        if let Some(task_id) = task_id {
+            connection
+                .execute(
+                    "INSERT INTO time_allocations(
+                       id,workspace_id,entry_id,task_id,minutes,created_at,updated_at,version
+                     ) VALUES (?1,?2,?3,?4,1,?5,?6,1)",
+                    params![
+                        format!("allocation-{entry_id}"),
+                        workspace_id,
+                        entry_id,
+                        task_id,
+                        started_at,
+                        ended_at
+                    ],
+                )
+                .unwrap();
+        }
     }
 
     #[test]
@@ -3079,6 +3247,288 @@ mod tests {
         .unwrap();
         let tomorrow_section = markdown.split("## 明日计划：").nth(1).unwrap_or_default();
         assert!(!tomorrow_section.contains("仅工作日事项"));
+    }
+
+    #[test]
+    fn daily_report_uses_subject_work_schedule_for_the_report_weekday() {
+        let (database, subject_id, task_id) = setup();
+        let mut days = crate::subject_work_schedules::get_schedule(&database, &subject_id).unwrap();
+        days[0].segments = vec![crate::subject_work_schedules::WorkScheduleSegmentDto {
+            start: "09:15".to_string(),
+            end: "11:45".to_string(),
+        }];
+        crate::subject_work_schedules::save_schedule_for_test(
+            &database,
+            crate::subject_work_schedules::WorkScheduleSaveRequest {
+                subject_id: subject_id.clone(),
+                days,
+            },
+        )
+        .unwrap();
+        let monday = "2026-10-05";
+        let workspace_id: String = database
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        insert_report_work_entry(
+            &database,
+            &workspace_id,
+            Some(&task_id),
+            "configured-day-actual",
+            monday,
+            "2026-10-05 07:00:00",
+            "2026-10-05 20:00:00",
+            "work",
+            false,
+        );
+        let (_, markdown) = render_report(
+            &database.open().unwrap(),
+            &workspace_id,
+            "daily",
+            None,
+            &subject_id,
+            monday,
+            monday,
+            &[],
+        )
+        .unwrap();
+        assert!(markdown.contains("09:15-11:45"));
+        assert!(!markdown.contains("07:00-20:00"));
+
+        let sunday = "2026-10-11";
+        let (_, markdown) = render_report(
+            &database.open().unwrap(),
+            &workspace_id,
+            "daily",
+            None,
+            &subject_id,
+            sunday,
+            sunday,
+            &[],
+        )
+        .unwrap();
+        assert!(markdown.contains("休息"));
+    }
+
+    #[test]
+    fn daily_report_uses_one_actual_range_on_rest_day_and_filters_other_entries() {
+        let (database, subject_id, task_id) = setup();
+        let workspace_id: String = database
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let sunday_schedule_id: String = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM subject_work_schedules WHERE subject_id=?1 AND weekday=6",
+                [&subject_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let connection = database.open().unwrap();
+        connection
+            .execute(
+                "DELETE FROM subject_work_schedule_segments WHERE schedule_id=?1",
+                [&sunday_schedule_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM subject_work_schedules WHERE id=?1",
+                [&sunday_schedule_id],
+            )
+            .unwrap();
+        let other_subject = Uuid::now_v7().to_string();
+        let other_task = Uuid::now_v7().to_string();
+        let now = local_millis("2026-10-11 07:00:00");
+        database
+            .open()
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO subjects(id,workspace_id,name,sort_order,created_at,updated_at,version)
+                 VALUES ('{other_subject}','{workspace_id}','其他主体',20,{now},{now},1);
+                 INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version)
+                 VALUES ('{other_task}','{workspace_id}','{other_subject}','其他事项','open','manual',10,{now},{now},1);"
+            ))
+            .unwrap();
+
+        insert_report_work_entry(
+            &database,
+            &workspace_id,
+            Some(&task_id),
+            "target-morning",
+            "2026-10-11",
+            "2026-10-11 08:00:00",
+            "2026-10-11 10:00:00",
+            "work",
+            false,
+        );
+        insert_report_work_entry(
+            &database,
+            &workspace_id,
+            Some(&task_id),
+            "target-afternoon",
+            "2026-10-11",
+            "2026-10-11 14:00:00",
+            "2026-10-11 18:00:00",
+            "work",
+            false,
+        );
+        insert_report_work_entry(
+            &database,
+            &workspace_id,
+            Some(&other_task),
+            "other-subject",
+            "2026-10-11",
+            "2026-10-11 06:00:00",
+            "2026-10-11 22:00:00",
+            "work",
+            false,
+        );
+        insert_report_work_entry(
+            &database,
+            &workspace_id,
+            Some(&task_id),
+            "target-break",
+            "2026-10-11",
+            "2026-10-11 05:00:00",
+            "2026-10-11 23:00:00",
+            "break",
+            false,
+        );
+        insert_report_work_entry(
+            &database,
+            &workspace_id,
+            Some(&task_id),
+            "target-deleted",
+            "2026-10-11",
+            "2026-10-11 04:00:00",
+            "2026-10-11 23:30:00",
+            "work",
+            true,
+        );
+        insert_report_work_entry(
+            &database,
+            &workspace_id,
+            None,
+            "unallocated",
+            "2026-10-11",
+            "2026-10-11 03:00:00",
+            "2026-10-11 23:45:00",
+            "work",
+            false,
+        );
+        let running_started = local_millis("2026-10-11 02:00:00");
+        database.open().unwrap().execute(
+            "INSERT INTO time_entries(
+               id,workspace_id,work_date,kind,source_type,state,default_task_id,label_snapshot,started_at,
+               duration_seconds,created_at,updated_at,version
+             ) VALUES ('running',?1,'2026-10-11','work','timer','running',?2,'运行中',?3,0,?3,?3,1)",
+            params![workspace_id, task_id, running_started],
+        ).unwrap();
+
+        let (_, markdown) = render_report(
+            &database.open().unwrap(),
+            &workspace_id,
+            "daily",
+            None,
+            &subject_id,
+            "2026-10-11",
+            "2026-10-11",
+            &[],
+        )
+        .unwrap();
+        assert!(markdown.contains("08:00-18:00"));
+        assert!(!markdown.contains("08:00-10:00 14:00-18:00"));
+        assert_eq!(
+            preview_report_work_period(
+                &database,
+                ReportWorkPeriodPreviewRequest {
+                    subject_id,
+                    reference_date: "2026-10-11".to_string(),
+                },
+            )
+            .unwrap(),
+            "08:00-18:00"
+        );
+    }
+
+    #[test]
+    fn daily_report_rest_day_without_actual_work_stays_rest_and_regeneration_refreshes_range() {
+        let (database, subject_id, task_id) = setup();
+        let workspace_id: String = database
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            daily_work_period_text(
+                &database.open().unwrap(),
+                &workspace_id,
+                &subject_id,
+                "2026-10-11",
+                6,
+            )
+            .unwrap(),
+            "休息"
+        );
+        insert_report_work_entry(
+            &database,
+            &workspace_id,
+            Some(&task_id),
+            "initial-overtime",
+            "2026-10-11",
+            "2026-10-11 10:00:00",
+            "2026-10-11 12:00:00",
+            "work",
+            false,
+        );
+        let created = create_report(
+            &database,
+            ReportCreateRequest {
+                report_type: "daily".to_string(),
+                reference_date: "2026-10-11".to_string(),
+                subject_id: subject_id.clone(),
+                task_ids: vec![task_id.clone()],
+                template_id: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        assert!(created.markdown.contains("10:00-12:00"));
+        let edited = save_report_content(
+            &database,
+            ReportContentSaveRequest {
+                report_id: created.id.clone(),
+                markdown: "# 手工工作时段 11:00-11:30".to_string(),
+                expected_version: created.version,
+            },
+        )
+        .unwrap();
+        insert_report_work_entry(
+            &database,
+            &workspace_id,
+            Some(&task_id),
+            "later-overtime",
+            "2026-10-11",
+            "2026-10-11 08:00:00",
+            "2026-10-11 18:00:00",
+            "work",
+            false,
+        );
+        let regenerated = regenerate_report(
+            &database,
+            ReportVersionRequest {
+                report_id: created.id,
+                expected_version: edited.version,
+            },
+        )
+        .unwrap();
+        assert!(regenerated.markdown.contains("08:00-18:00"));
+        assert!(!regenerated.markdown.contains("11:00-11:30"));
     }
 
     #[test]

@@ -85,6 +85,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "named_report_templates",
         sql: include_str!("../migrations/0014_named_report_templates.sql"),
     },
+    Migration {
+        version: 15,
+        name: "subject_work_schedules",
+        sql: include_str!("../migrations/0015_subject_work_schedules.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -337,6 +342,12 @@ fn seed_local_workspace(transaction: &Transaction<'_>) -> Result<(), String> {
             params![subject_id, workspace_id, now],
         )
         .map_err(|error| error.to_string())?;
+    crate::subject_work_schedules::insert_default_schedule(
+        transaction,
+        &workspace_id,
+        &subject_id,
+        now,
+    )?;
 
     for (key, value) in [
         ("default_subject_id", serde_json::json!(subject_id)),
@@ -485,6 +496,8 @@ mod tests {
         "workspaces",
         "devices",
         "subjects",
+        "subject_work_schedules",
+        "subject_work_schedule_segments",
         "work_days",
         "tasks",
         "task_daily_estimates",
@@ -518,7 +531,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let database = Database::initialize_at(directory.path().join("test.sqlite3")).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 14);
+        assert_eq!(status.schema_version, 15);
         for table in REQUIRED_TABLES {
             assert!(
                 status.tables.iter().any(|value| value == table),
@@ -558,7 +571,7 @@ mod tests {
         let workspace_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migration_count, 14);
+        assert_eq!(migration_count, 15);
         assert_eq!(workspace_count, 1);
     }
 
@@ -765,7 +778,7 @@ mod tests {
         assert_eq!(task_title, "升级前事项");
         assert_eq!(queued, 1);
         assert_eq!(deferred_table, 6);
-        assert_eq!(database.status().unwrap().schema_version, 14);
+        assert_eq!(database.status().unwrap().schema_version, 15);
     }
 
     #[test]
@@ -1205,7 +1218,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outbox_operations, vec!["keep-op", "sending-op"]);
-        assert_eq!(database.status().unwrap().schema_version, 14);
+        assert_eq!(database.status().unwrap().schema_version, 15);
 
         // Deployment rollback keeps the migrated database in place. Rehearse
         // the previous client's read path against that database and verify
@@ -1292,7 +1305,7 @@ mod tests {
         drop(connection);
 
         let database = Database::initialize_at(path).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 14);
+        assert_eq!(database.status().unwrap().schema_version, 15);
         let connection = database.open().unwrap();
 
         let stale_index_count: i64 = connection
@@ -1638,7 +1651,7 @@ mod tests {
 
         let database = Database::initialize_at(path).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 14);
+        assert_eq!(status.schema_version, 15);
         assert!(status.tables.iter().any(|table| table == "device_hooks"));
         assert!(status
             .tables

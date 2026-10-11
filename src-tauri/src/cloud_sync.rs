@@ -1087,6 +1087,7 @@ fn rewind_for_ready_deferred_entities(
              AND outbox.entity_id=deferred.entity_id
              AND outbox.entity_type=CASE deferred.entity_type
                WHEN 'subjects' THEN 'subject' WHEN 'tasks' THEN 'task'
+               WHEN 'subject_work_schedules' THEN 'subject_work_schedule'
                WHEN 'task_daily_estimates' THEN 'task_daily_estimate'
                WHEN 'task_recurrence_rules' THEN 'task_recurrence_rule'
                WHEN 'task_occurrences' THEN 'task_occurrence'
@@ -1177,6 +1178,7 @@ fn local_cache_workspace_id(database: &Database) -> Result<String, String> {
 fn incremental_outbox_identity(entity: &IncrementalEntity) -> (&str, &str) {
     match entity.entity_type.as_str() {
         "subjects" => ("subject", entity.entity_id.as_str()),
+        "subject_work_schedules" => ("subject_work_schedule", entity.entity_id.as_str()),
         "tasks" => ("task", entity.entity_id.as_str()),
         "task_daily_estimates" => ("task_daily_estimate", entity.entity_id.as_str()),
         "task_recurrence_rules" => ("task_recurrence_rule", entity.entity_id.as_str()),
@@ -1197,6 +1199,7 @@ fn expected_incremental_entity_type(source_entity_type: &str) -> Option<&str> {
         "time_segments" | "time_allocations" => Some("time_entries"),
         "report_tasks" => Some("reports"),
         "subjects"
+        | "subject_work_schedules"
         | "work_days"
         | "app_settings"
         | "tasks"
@@ -1217,6 +1220,7 @@ fn expected_incremental_entity_type(source_entity_type: &str) -> Option<&str> {
 fn incremental_domain(entity_type: &str) -> Result<&'static str, String> {
     match entity_type {
         "subjects" => Ok("subjects"),
+        "subject_work_schedules" => Ok("subjects"),
         "tasks"
         | "task_status_events"
         | "task_daily_estimates"
@@ -1638,6 +1642,7 @@ fn incremental_entity_needs_apply(
             return external_binding_differs(transaction, workspace_id, data);
         }
         "unassigned_sessions" => return Ok(true),
+        "subject_work_schedules" => transaction.query_row("SELECT version FROM subject_work_schedules WHERE workspace_id=?1 AND id=?2",params![workspace_id,entity.entity_id],|row|row.get(0)).optional(),
         other => transaction.query_row(&format!("SELECT version FROM {other} WHERE workspace_id=?1 AND id=?2"),params![workspace_id,entity.entity_id],|row|row.get(0)).optional(),
     }.map_err(|error| error.to_string())?;
     Ok(incoming_version
@@ -1744,6 +1749,15 @@ fn apply_incremental_entity(
         .ok_or_else(|| "VALIDATION_ERROR: 非删除增量缺少实体内容".to_string())?;
     match entity.entity_type.as_str() {
         "subjects" => transaction.execute("INSERT INTO subjects(id,workspace_id,name,sort_order,created_at,updated_at,version,created_by_device_id,updated_by_device_id,deleted_at) VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8) ON CONFLICT(id) DO UPDATE SET name=excluded.name,sort_order=excluded.sort_order,updated_at=excluded.updated_at,version=excluded.version,deleted_at=excluded.deleted_at", params![text(data,"id"),workspace_id,text(data,"name"),integer(data,"sort_order"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version"),optional_millis(data,"deleted_at")]),
+        "subject_work_schedules" => {
+            let schedule_id = text(data, "id");
+            transaction.execute("INSERT INTO subject_work_schedules(id,workspace_id,subject_id,weekday,is_workday,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET subject_id=excluded.subject_id,weekday=excluded.weekday,is_workday=excluded.is_workday,updated_at=excluded.updated_at,version=excluded.version", params![schedule_id,workspace_id,text(data,"subject_id"),integer(data,"weekday"),boolean(data,"is_workday") as i64,millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version")]).map_err(|error| error.to_string())?;
+            transaction.execute("DELETE FROM subject_work_schedule_segments WHERE schedule_id=?1", [&schedule_id]).map_err(|error| error.to_string())?;
+            for (index, segment) in data.get("segments").and_then(Value::as_array).into_iter().flatten().enumerate() {
+                transaction.execute("INSERT INTO subject_work_schedule_segments(id,workspace_id,schedule_id,sequence_no,start_minute,end_minute) VALUES (?1,?2,?3,?4,?5,?6)", params![text(segment,"id"),workspace_id,schedule_id,index as i64 + 1,integer(segment,"start_minute"),integer(segment,"end_minute")]).map_err(|error| error.to_string())?;
+            }
+            Ok(1)
+        },
         "work_days" => transaction.execute("INSERT INTO work_days(workspace_id,work_date,timezone,work_period_text,note,settled_at,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(workspace_id,work_date) DO UPDATE SET timezone=excluded.timezone,work_period_text=excluded.work_period_text,note=excluded.note,settled_at=excluded.settled_at,updated_at=excluded.updated_at,version=excluded.version", params![workspace_id,text(data,"work_date"),text(data,"timezone"),optional_text(data,"work_period_text"),optional_text(data,"note"),optional_millis(data,"settled_at"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version")]),
         "app_settings" => transaction.execute("INSERT INTO app_settings(workspace_id,key,value_json,updated_at,version) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(workspace_id,key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at,version=excluded.version", params![workspace_id,text(data,"key"),data.get("value_json").cloned().unwrap_or(Value::Null).to_string(),millis(data,"updated_at"),integer(data,"version")]),
         "tasks" => {
@@ -1805,7 +1819,12 @@ fn validate_incremental_identity(entity: &IncrementalEntity) -> Result<(), Strin
     }
     let data = entity.data.as_ref();
     let matches = match entity.entity_type.as_str() {
-        "subjects" | "tasks" | "task_status_events" | "time_entries" | "report_templates"
+        "subjects"
+        | "subject_work_schedules"
+        | "tasks"
+        | "task_status_events"
+        | "time_entries"
+        | "report_templates"
         | "reports" => {
             data.and_then(|row| row.get("id")).and_then(Value::as_str)
                 == Some(entity.entity_id.as_str())
@@ -1875,6 +1894,7 @@ fn validate_incremental_entity_key(entity_type: &str, entity_id: &str) -> Result
         "work_days" => parts.len() == 1 && valid_date(entity_id),
         "app_settings" | "integration_configs" => parts.len() == 1 && !entity_id.trim().is_empty(),
         "subjects"
+        | "subject_work_schedules"
         | "tasks"
         | "task_status_events"
         | "task_recurrence_rules"
@@ -2368,6 +2388,10 @@ fn delete_incremental_entity(
     let changed = match entity.entity_type.as_str() {
         "subjects" => transaction.execute(
             "DELETE FROM subjects WHERE workspace_id=?1 AND id=?2",
+            params![workspace_id, entity.entity_id],
+        ),
+        "subject_work_schedules" => transaction.execute(
+            "DELETE FROM subject_work_schedules WHERE workspace_id=?1 AND id=?2",
             params![workspace_id, entity.entity_id],
         ),
         "work_days" => transaction.execute(
@@ -2912,6 +2936,7 @@ fn ensure_supported_cloud_entity_type(entity_type: &str) -> Result<(), String> {
     if matches!(
         entity_type,
         "subject"
+            | "subject_work_schedule"
             | "task"
             | "time_entry"
             | "unassigned_session"
@@ -4299,6 +4324,7 @@ fn cloud_entity_payload<'a>(
 ) -> Option<&'a Value> {
     let (table, key, expected) = match entity_type {
         "subject" => ("subjects", "id", entity_id?),
+        "subject_work_schedule" => ("subject_work_schedules", "id", entity_id?),
         "task" => ("tasks", "id", entity_id?),
         "time_entry" => ("time_entries", "id", entity_id?),
         "unassigned_session" => ("unassigned_sessions", "id", entity_id?),
@@ -4580,6 +4606,15 @@ pub(crate) fn entity_payload_from_connection(
         .map_err(|error| error.to_string())?;
     let (sql, identifier) = match entity_type {
         "subject" => ("SELECT * FROM subjects WHERE workspace_id = ?1 AND id = ?2", entity_id),
+        "subject_work_schedule" => {
+            let id = entity_id.ok_or_else(|| "VALIDATION_ERROR: 主体工作时段同步缺少实体 ID".to_string())?;
+            let mut value = query_json_row(connection, "SELECT * FROM subject_work_schedules WHERE workspace_id=?1 AND id=?2", &local_workspace_id, id)?;
+            let mut statement = connection.prepare("SELECT * FROM subject_work_schedule_segments WHERE workspace_id=?1 AND schedule_id=?2 ORDER BY sequence_no").map_err(|error| error.to_string())?;
+            let column_names = statement.column_names().into_iter().map(ToOwned::to_owned).collect::<Vec<_>>();
+            let rows = statement.query_map(params![local_workspace_id,id], |row| row_to_json(row,&column_names)).map_err(|error| error.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|error| error.to_string())?;
+            value.as_object_mut().ok_or_else(|| "CACHE_ERROR: 主体工作时段缓存不是对象".to_string())?.insert("segments".to_string(), Value::Array(rows));
+            return Ok(value);
+        }
         "task" => ("SELECT * FROM tasks WHERE workspace_id = ?1 AND id = ?2", entity_id),
         "time_entry" => {
             let id = entity_id.ok_or_else(|| "VALIDATION_ERROR: 时间记录同步缺少实体 ID".to_string())?;
@@ -5335,6 +5370,18 @@ fn apply_snapshot_with_policy(
     };
     clear_snapshot_cache(&transaction, &local_workspace_id)?;
     replace_snapshot_table(&transaction, snapshot, "subjects", &local_workspace_id)?;
+    replace_snapshot_table(
+        &transaction,
+        snapshot,
+        "subject_work_schedules",
+        &local_workspace_id,
+    )?;
+    replace_snapshot_table(
+        &transaction,
+        snapshot,
+        "subject_work_schedule_segments",
+        &local_workspace_id,
+    )?;
     replace_snapshot_table(&transaction, snapshot, "tasks", &local_workspace_id)?;
     replace_snapshot_table(
         &transaction,
@@ -5911,6 +5958,16 @@ fn replace_snapshot_table(
                 transaction.execute("INSERT INTO subjects(id, workspace_id, name, sort_order, created_at, updated_at, version, created_by_device_id, updated_by_device_id, deleted_at) VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8)", params![text(&row,"id"),workspace_id,text(&row,"name"),integer(&row,"sort_order"),millis(&row,"created_at"),millis(&row,"updated_at"),integer(&row,"version"),optional_millis(&row,"deleted_at")]).map_err(|error| error.to_string())?;
             }
         }
+        "subject_work_schedules" => {
+            replace_simple_rows(transaction, table, workspace_id, rows, |tx, row, ws| {
+                tx.execute("INSERT INTO subject_work_schedules(id,workspace_id,subject_id,weekday,is_workday,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![text(row,"id"),ws,text(row,"subject_id"),integer(row,"weekday"),boolean(row,"is_workday") as i64,millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version")])
+            })?
+        }
+        "subject_work_schedule_segments" => {
+            replace_simple_rows(transaction, table, workspace_id, rows, |tx, row, ws| {
+                tx.execute("INSERT INTO subject_work_schedule_segments(id,workspace_id,schedule_id,sequence_no,start_minute,end_minute) VALUES (?1,?2,?3,?4,?5,?6)", params![text(row,"id"),ws,text(row,"schedule_id"),integer(row,"sequence_no"),integer(row,"start_minute"),integer(row,"end_minute")])
+            })?
+        }
         "tasks" => {
             for row in &rows {
                 transaction.execute("INSERT INTO tasks(id,workspace_id,subject_id,parent_id,title,status,planned_date,planned_time,estimate_minutes,note,project_name,solution_name,source_type,source_ref,sort_order,completed_at,created_at,updated_at,version,deleted_at) VALUES (?1,?2,?3,NULL,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)", params![text(row,"id"),workspace_id,text(row,"subject_id"),text(row,"title"),text(row,"status"),optional_text(row,"planned_date"),optional_time(row,"planned_time"),optional_integer(row,"estimate_minutes"),optional_text(row,"note"),optional_text(row,"project_name"),optional_text(row,"solution_name"),text(row,"source_type"),optional_text(row,"source_ref"),integer(row,"sort_order"),optional_millis(row,"completed_at"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version"),optional_millis(row,"deleted_at")]).map_err(|error| error.to_string())?;
@@ -6072,6 +6129,8 @@ fn clear_snapshot_cache(transaction: &Transaction<'_>, workspace_id: &str) -> Re
     for table in [
         "external_bindings",
         "integration_configs",
+        "subject_work_schedule_segments",
+        "subject_work_schedules",
         "report_tasks",
         "task_occurrences",
         "task_recurrence_rules",
@@ -6641,6 +6700,10 @@ mod tests {
 
     #[test]
     fn incremental_domains_cover_planning_time_and_reports() {
+        assert_eq!(
+            incremental_domain("subject_work_schedules").unwrap(),
+            "subjects"
+        );
         assert_eq!(incremental_domain("task_daily_estimates").unwrap(), "tasks");
         assert_eq!(
             incremental_domain("task_recurrence_rules").unwrap(),
@@ -6649,6 +6712,54 @@ mod tests {
         assert_eq!(incremental_domain("task_occurrences").unwrap(), "tasks");
         assert_eq!(incremental_domain("time_entries").unwrap(), "time");
         assert_eq!(incremental_domain("reports").unwrap(), "reports");
+    }
+
+    #[test]
+    fn subject_work_schedule_incremental_replaces_complete_day_image() {
+        let (_directory, database, cloud_workspace_id, local_workspace_id, subject_id) =
+            cloud_database_for_incremental_test("schedule-incremental.sqlite3");
+        let connection = database.open().unwrap();
+        let schedule_id: String = connection
+            .query_row(
+                "SELECT id FROM subject_work_schedules WHERE workspace_id=?1 AND subject_id=?2 AND weekday=0",
+                params![local_workspace_id, subject_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+        let entity = incremental_entity(
+            "subject_work_schedules",
+            "subject_work_schedules",
+            schedule_id.clone(),
+            false,
+            Some(json!({
+                "id": schedule_id,
+                "workspace_id": cloud_workspace_id,
+                "subject_id": subject_id,
+                "weekday": 0,
+                "is_workday": true,
+                "created_at": 1_000,
+                "updated_at": 2_000,
+                "version": 2,
+                "segments": [
+                    {"id": Uuid::now_v7().to_string(), "sequence_no": 1, "start_minute": 540, "end_minute": 720},
+                    {"id": Uuid::now_v7().to_string(), "sequence_no": 2, "start_minute": 810, "end_minute": 1020}
+                ]
+            })),
+        );
+        let domains = apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &storage_mode(&database).unwrap().device_id,
+            1,
+            &[entity],
+        )
+        .unwrap();
+        assert_eq!(domains, vec!["subjects"]);
+        let schedule = crate::subject_work_schedules::get_schedule(&database, &subject_id).unwrap();
+        assert_eq!(schedule[0].segments[0].start, "09:00");
+        assert_eq!(schedule[0].segments[1].end, "17:00");
+        assert_eq!(schedule[0].version, 2);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 import { reactive } from "vue";
+import { getSubjectWorkSchedule as getSubjectWorkScheduleRecord, saveSubjectWorkSchedule as saveSubjectWorkScheduleRecord, type SubjectWorkScheduleDay } from "./tauri";
 
 export type WorkScheduleSegment = {
   start: string;
@@ -6,9 +7,11 @@ export type WorkScheduleSegment = {
 };
 
 export type WorkScheduleDay = {
+  id: string;
   weekday: number;
   enabled: boolean;
   segments: WorkScheduleSegment[];
+  version: number;
 };
 
 const DEFAULT_SEGMENTS: WorkScheduleSegment[] = [
@@ -20,9 +23,11 @@ const subjectSchedules = reactive(new Map<string, WorkScheduleDay[]>());
 
 export function createDefaultWorkSchedule(): WorkScheduleDay[] {
   return Array.from({ length: 7 }, (_, weekday) => ({
+    id: "",
     weekday,
     enabled: weekday < 5,
     segments: weekday < 5 ? DEFAULT_SEGMENTS.map((segment) => ({ ...segment })) : [],
+    version: 0,
   }));
 }
 
@@ -38,8 +43,16 @@ export function getSubjectWorkSchedule(subjectId: string): WorkScheduleDay[] {
   return cloneWorkSchedule(schedule ?? createDefaultWorkSchedule());
 }
 
-export function saveSubjectWorkSchedule(subjectId: string, schedule: WorkScheduleDay[]) {
+export async function loadSubjectWorkSchedule(subjectId: string): Promise<WorkScheduleDay[]> {
+  const schedule = await getSubjectWorkScheduleRecord(subjectId);
   subjectSchedules.set(subjectId, cloneWorkSchedule(schedule));
+  return cloneWorkSchedule(schedule);
+}
+
+export async function saveSubjectWorkSchedule(subjectId: string, schedule: WorkScheduleDay[]): Promise<WorkScheduleDay[]> {
+  const saved = await saveSubjectWorkScheduleRecord(subjectId, schedule as SubjectWorkScheduleDay[]);
+  subjectSchedules.set(subjectId, cloneWorkSchedule(saved));
+  return cloneWorkSchedule(saved);
 }
 
 export function workPeriodTextForDate(subjectId: string, date: Date): string {

@@ -129,9 +129,9 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 时序 ${{ github.ref_name }}
+          releaseName: TimeGenie ${{ github.ref_name }}
           releaseBody: |
-            Automated GitHub Release for 时序.
+            Automated GitHub Release for TimeGenie.
 
             - Includes the Windows NSIS installer.
             - Includes macOS Apple Silicon and Intel DMG packages.
@@ -141,7 +141,7 @@ jobs:
             macOS users may need to run this after moving the app to Applications:
 
             ```bash
-            xattr -cr /Applications/时序.app
+            xattr -cr /Applications/TimeGenie.app
             ```
           releaseDraft: false
           prerelease: false
