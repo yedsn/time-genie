@@ -187,6 +187,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   const unassignedFirstStartedAt = ref<number>();
   const unassignedLastEndedAt = ref<number>();
   const unassignedDialogOpen = ref(false);
+  const dismissedUnassignedSessionId = ref("");
   const unassignedWorkDate = ref("");
   const unassignedCurrentSession = ref<UnassignedStateRecord>();
   const timerStopConfirmationEntryId = ref("");
@@ -226,6 +227,31 @@ export const useWorkdayStore = defineStore("workday", () => {
   });
   const timerStopConfirmationSlices = computed(() => timerStopConfirmation.value?.slices ?? (timerStopConfirmationEntry.value ? [timerStopConfirmationEntry.value] : []));
   const doneCount = computed(() => tasks.filter((task) => task.status === "done").length);
+  const todayCompletionTaskIds = computed(() => {
+    const taskIds = new Set(tasks
+      .filter((task) => task.version > 0 && (task.todayEstimate ?? 0) > 0)
+      .map((task) => task.id));
+    for (const entry of entries) {
+      if (entry.kind === "break" || entry.workDate !== workspaceToday.value) continue;
+      const allocations = (entry.allocations ?? []).filter((allocation) => allocation.minutes > 0);
+      if (!allocations.length && entry.defaultTask) taskIds.add(entry.defaultTask);
+      for (const allocation of allocations) {
+        if (allocation.minutes > 0) taskIds.add(allocation.taskId);
+      }
+    }
+    return taskIds;
+  });
+  const todayCompletionTotalCount = computed(() => todayCompletionTaskIds.value.size);
+  const todayCompletionDoneCount = computed(() => {
+    const todayTaskById = new Map(todayTasks.map((task) => [task.id, task]));
+    return [...todayCompletionTaskIds.value].filter((taskId) => {
+      const task = todayTaskById.get(taskId) ?? tasks.find((item) => item.id === taskId);
+      return task?.status === "done";
+    }).length;
+  });
+  const todayCompletionPercent = computed(() => todayCompletionTotalCount.value
+    ? Math.round(todayCompletionDoneCount.value / todayCompletionTotalCount.value * 100)
+    : 0);
   const unassignedSeconds = computed(() => {
     return unassignedStartedAt.value
       ? Math.max(0, Math.floor((now.value - unassignedStartedAt.value) / 1_000))
@@ -322,8 +348,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       todayTasks.splice(0, todayTasks.length, ...todayTaskResult.tasks.map(toUiTask));
       const fallbackSubjectId = subjects[0]?.id ?? "";
       if (!subjects.some((subject) => subject.id === selectedSubjectId.value)) selectedSubjectId.value = fallbackSubjectId;
-      if (todayOverviewSubjectId.value && !subjects.some((subject) => subject.id === todayOverviewSubjectId.value)) todayOverviewSubjectId.value = fallbackSubjectId;
-      if (!todayOverviewSubjectId.value && selectedSubjectId.value) todayOverviewSubjectId.value = selectedSubjectId.value;
+      if (todayOverviewSubjectId.value && !subjects.some((subject) => subject.id === todayOverviewSubjectId.value)) todayOverviewSubjectId.value = "";
       if (!tasks.some((task) => task.id === selectedTaskId.value)) {
         selectedTaskId.value = buildVisibleTaskList(tasks.filter((task) => task.subjectId === selectedSubjectId.value))[0]?.id ?? "";
       }
@@ -562,7 +587,10 @@ export const useWorkdayStore = defineStore("workday", () => {
     unassignedStateMissingRefreshes = 0;
     const previousSessionId = unassignedSessionId.value;
     const sessionChanged = Boolean(previousSessionId && previousSessionId !== state.sessionId);
-    if (sessionChanged) unassignedDialogOpen.value = false;
+    if (sessionChanged) {
+      unassignedDialogOpen.value = false;
+      dismissedUnassignedSessionId.value = "";
+    }
     unassignedSessionId.value = state.sessionId;
     unassignedWorkDate.value = state.workDate;
     unassignedVersion.value = state.version;
@@ -641,13 +669,20 @@ export const useWorkdayStore = defineStore("workday", () => {
     if (unassignedDialogOpen.value) return false;
     if (totalSeconds < 1) return false;
     if (!force && totalSeconds <= unassignedThresholdSeconds.value) return false;
+    if (!force && dismissedUnassignedSessionId.value === unassignedSessionId.value) return false;
     unassignedDialogOpen.value = true;
     return true;
+  }
+
+  function dismissUnassignedResolution() {
+    dismissedUnassignedSessionId.value = unassignedSessionId.value;
+    unassignedDialogOpen.value = false;
   }
 
   function resetUnassignedTracking() {
     markUnassignedStateChanged();
     unassignedDialogOpen.value = false;
+    dismissedUnassignedSessionId.value = "";
     unassignedStartedAt.value = undefined;
     unassignedFirstStartedAt.value = undefined;
     unassignedLastEndedAt.value = undefined;
@@ -1381,11 +1416,11 @@ export const useWorkdayStore = defineStore("workday", () => {
   return {
     activePage, subjects, selectedSubjectId, selectedSubject, selectedSubjectTasks, tasks, todayTasks, visibleTasks, statusColors, entries, reports, todayOverview, todayOverviewLoading, todayOverviewSubjectId, todayOverviewSubject, selectedTaskId, selectedEntryId, selectedEntry, runningEntry, timerStopConfirmationEntryId, timerStopConfirmationEntry, timerStopConfirmationSlices, timerStopConfirmation,
     workspaceTimezone, workspaceToday, workspaceDayStartAt, workspaceDayEndAt, refreshWorkspaceCalendar,
-    now, todayMinutes, allocatedMinutes, pendingMinutes, doneCount, unassignedSeconds, unassignedStartedAt,
+    now, todayMinutes, allocatedMinutes, pendingMinutes, doneCount, todayCompletionDoneCount, todayCompletionTotalCount, todayCompletionPercent, unassignedSeconds, unassignedStartedAt,
     unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen, unassignedWorkDate, unassignedSessionId,
     unassignedCurrentSession,
     workspaceLoaded, workspaceLoading, loadWorkspaceData, loadTimeData, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addChildTask, saveTask, duplicateTask, deleteTask, moveTask, reorderTask,
     indentTask, outdentTask, startTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, adjustTimerStopAllocation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, publicReportText, previewObsidianReport, writeObsidianReport,
-    beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, resolveUnassignedTime
+    beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, dismissUnassignedResolution, resolveUnassignedTime
   };
 });

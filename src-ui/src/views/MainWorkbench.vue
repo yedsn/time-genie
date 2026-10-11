@@ -1242,8 +1242,8 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
       </nav>
       <section class="side-summary">
         <span>今日完成</span>
-        <strong>{{ store.doneCount }} / {{ store.tasks.length }}</strong>
-        <div><i :style="{ width: `${Math.round(store.doneCount / store.tasks.length * 100)}%` }"></i></div>
+        <strong>{{ store.todayCompletionDoneCount }} / {{ store.todayCompletionTotalCount }}</strong>
+        <div><i :style="{ width: `${store.todayCompletionPercent}%` }"></i></div>
       </section>
     </aside>
 

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from "vue";
-import { Check, ClockAlert, Coffee, Eraser, Minus, Plus, Trash2 } from "lucide-vue-next";
+import { Check, ClockAlert, Coffee, Eraser, Minus, Plus, Trash2, X } from "lucide-vue-next";
 import { ElMessage } from "element-plus";
 import { useWorkdayStore } from "../store";
 import TaskSelectControl from "./TaskSelectControl.vue";
@@ -110,6 +110,11 @@ function clearAllocations() {
   ElMessage.info("已清空草稿用时，点击分配给事项后保存");
 }
 
+function dismissDialog() {
+  if (saving.value) return;
+  store.dismissUnassignedResolution();
+}
+
 async function assignTime(event?: MouseEvent) {
   for (const allocation of allocations) {
     const committedTaskId = taskControls.get(allocation.id)?.commit();
@@ -204,6 +209,7 @@ function errorText(error: unknown, fallback: string) {
         <h2>发现一段未归属时间</h2>
         <p>这段时间没有关联事项，需要处理后才能继续使用工作台。</p>
       </div>
+      <button class="unassigned-dialog-close" type="button" title="稍后处理" aria-label="关闭未归属时间弹框，稍后处理" :disabled="saving" @click="dismissDialog"><X :size="17" /></button>
     </div>
 
     <div class="unassigned-live-period">

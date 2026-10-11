@@ -872,10 +872,13 @@ pre {
 }
 .unassigned-time-dialog .el-dialog__header { display: none; }
 .unassigned-time-dialog .el-dialog__body { padding: 20px; }
-.unassigned-dialog-head { display: grid; grid-template-columns: 42px minmax(0, 1fr); align-items: start; gap: 12px; }
+.unassigned-dialog-head { display: grid; grid-template-columns: 42px minmax(0, 1fr) 30px; align-items: start; gap: 12px; }
 .unassigned-dialog-icon { width: 42px; height: 42px; display: grid; place-items: center; border: 1px solid rgba(231,183,95,0.22); border-radius: 8px; color: #efc878; background: rgba(231,183,95,0.08); }
 .unassigned-dialog-head h2 { margin: 0; color: var(--text); font-size: 17px; letter-spacing: 0; }
 .unassigned-dialog-head p { margin: 5px 0 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.unassigned-dialog-close { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 6px; color: var(--muted); background: transparent; }
+.unassigned-dialog-close:hover:not(:disabled) { color: var(--text); background: var(--surface-soft); }
+.unassigned-dialog-close:disabled { cursor: default; opacity: 0.45; }
 .unassigned-live-period { min-height: 90px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 2px 14px; margin: 16px 0 14px; border: 1px solid var(--line-soft); border-radius: 7px; padding: 13px 15px; background: var(--surface-inset); }
 .unassigned-live-period span { align-self: end; color: var(--text-soft); font-size: 11px; font-variant-numeric: tabular-nums; }
 .unassigned-live-period time { grid-column: 2; grid-row: 1 / span 2; color: var(--amber); font-size: 31px; line-height: 1; font-weight: 700; font-variant-numeric: tabular-nums; }
