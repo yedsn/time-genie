@@ -14,7 +14,7 @@
 | 两客户端不同候选 ID | `isolated_calendar_day_two_device_candidates_converge_to_one_authoritative_slice`：两端候选 ID 不同，服务端最终只有一个 `timer_chain_id + work_date` 实体，两端均采用同一权威 ID | 通过 |
 | outbox 幂等与依赖 | `cloud_rollover_queues_deterministic_close_then_create_operations`：关闭操作在前，创建操作依赖关闭操作，重复协调不增加队列 | 通过 |
 | 权威实体替换候选 | `authoritative_calendar_timer_replaces_conflicting_local_candidate_and_redirects_dependents`：候选被移除，分配、前序关系和后续 outbox 重定向到权威实体 | 通过 |
-| 历史未归属与今天会话并存 | 未归属日期轮转和历史待处理列表测试：历史会话按日期保留，今日累计不包含历史分钟 | 通过 |
+| 历史未归属与今天会话并存 | 未归属日期轮转和快照测试：历史未处理会话自动废弃且不生成最终记录，只保留今天最新起点 | 通过 |
 | 一端处理后另一端停止旧计时 | `isolated_unassigned_resolution_stops_the_old_clock_on_both_devices`：两端旧会话均无开放 segment，固定为已处理时长，并从相同 `resolved_at` 建立新会话 | 通过 |
 | 失联与租约过期 | PostgreSQL 集成 SQL 和本地恢复测试：旧分段截止最后确认边界，新租约从重新获取时开始，失联区间不补算 | 通过 |
 | 队列和冲突收敛 | 两个隔离客户端验收结束时 `pending_operations = 0`、`conflict_count = 0` | 通过 |

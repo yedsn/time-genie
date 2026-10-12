@@ -22,8 +22,6 @@ pub struct UnassignedStateDto {
     pub version: i64,
 }
 
-const CONTINUITY_GRACE_MILLIS: i64 = 90_000;
-
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct UnassignedAllocationInput {
@@ -1309,15 +1307,11 @@ fn coordinate_unassigned_sessions(
 ) -> Result<(), String> {
     let timezone = crate::work_calendar::workspace_timezone(transaction, workspace_id)?;
     let current_date = crate::work_calendar::work_date_at(timezone, now)?;
-    type ActiveSession = (String, String, i64, i64, Option<i64>);
+    type ActiveSession = (String, String, i64);
     let sessions = {
         let mut statement = transaction
             .prepare(
-                "SELECT u.id,u.work_date,u.first_started_at,
-                        COALESCE((SELECT last_heartbeat_at FROM tracking_runtime_state r WHERE r.workspace_id=u.workspace_id),
-                                 last_continuous_at,updated_at,first_started_at),
-                        (SELECT started_at FROM unassigned_segments s
-                         WHERE s.session_id=u.id AND s.ended_at IS NULL LIMIT 1)
+                "SELECT u.id,u.work_date,u.first_started_at
                  FROM unassigned_sessions u
                  WHERE u.workspace_id=?1 AND u.state IN ('collecting','awaiting_resolution')
                  ORDER BY u.work_date,u.created_at",
@@ -1325,13 +1319,7 @@ fn coordinate_unassigned_sessions(
             .map_err(|error| error.to_string())?;
         let rows = statement
             .query_map([workspace_id], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })
             .map_err(|error| error.to_string())?
             .collect::<Result<Vec<ActiveSession>, _>>()
@@ -1352,43 +1340,7 @@ fn coordinate_unassigned_sessions(
     let keep_session_id = current.as_ref().map(|session| session.0.as_str());
     discard_superseded_sessions(transaction, workspace_id, keep_session_id, now)?;
 
-    if let Some((session_id, _, _first_started_at, last_continuous_at, open_started_at)) =
-        current.as_ref()
-    {
-        if open_started_at.is_some() {
-            if now.saturating_sub(*last_continuous_at) > CONTINUITY_GRACE_MILLIS {
-                transaction
-                    .execute(
-                        "DELETE FROM unassigned_segments WHERE session_id=?1",
-                        [session_id],
-                    )
-                    .map_err(|error| error.to_string())?;
-                if !has_timer {
-                    transaction.execute(
-                        "INSERT INTO unassigned_segments(id,workspace_id,session_id,sequence_no,started_at,duration_seconds) VALUES (?1,?2,?3,1,?4,0)",
-                        params![Uuid::now_v7().to_string(),workspace_id,session_id,now],
-                    ).map_err(|error| error.to_string())?;
-                }
-                transaction
-                    .execute(
-                        "UPDATE unassigned_sessions
-                         SET first_started_at=?1,duration_seconds=0,last_ended_at=NULL,prompted_at=NULL,
-                             state='collecting',updated_at=?1,last_continuous_at=?1,version=version+1
-                         WHERE id=?2",
-                        params![now, session_id],
-                    )
-                    .map_err(|error| error.to_string())?;
-            }
-        }
-        transaction
-            .execute(
-                "INSERT INTO tracking_runtime_state(workspace_id,last_heartbeat_at,updated_at)
-             VALUES (?1,?2,?2)
-             ON CONFLICT(workspace_id) DO UPDATE SET
-               last_heartbeat_at=excluded.last_heartbeat_at,updated_at=excluded.updated_at",
-                params![workspace_id, now],
-            )
-            .map_err(|error| error.to_string())?;
+    if current.is_some() {
         return Ok(());
     }
 
@@ -1396,10 +1348,7 @@ fn coordinate_unassigned_sessions(
         return Ok(());
     }
 
-    let continuous_old = latest_old
-        .as_ref()
-        .is_some_and(|session| now.saturating_sub(session.3) <= CONTINUITY_GRACE_MILLIS);
-    let started_at = if continuous_old {
+    let started_at = if latest_old.is_some() {
         crate::work_calendar::day_bounds(timezone, &current_date)?.start_at
     } else {
         now
@@ -1931,6 +1880,99 @@ mod tests {
     }
 
     #[test]
+    fn cloud_mode_restart_keeps_anchor_without_queuing_reset() {
+        let (database, _) = setup();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id.clone()),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let storage = crate::supabase::storage_mode(&database).unwrap();
+        let initial = get_state_with_cloud_context(&database, Some(&storage))
+            .unwrap()
+            .unwrap();
+        let now = now_millis();
+        let (local_workspace_id, anchor) = {
+            let connection = database.open().unwrap();
+            let local_workspace_id = workspace_id(&connection).unwrap();
+            let timezone = crate::work_calendar::current_workspace_timezone(&connection).unwrap();
+            let work_date = crate::work_calendar::work_date_at(timezone, now).unwrap();
+            (
+                local_workspace_id,
+                crate::work_calendar::day_bounds(timezone, &work_date)
+                    .unwrap()
+                    .start_at,
+            )
+        };
+        let stale_heartbeat = now.saturating_sub(10 * 60 * 1_000);
+        let connection = database.open().unwrap();
+        connection
+            .execute(
+                "UPDATE unassigned_sessions
+                 SET first_started_at=?1,updated_at=?2,last_continuous_at=?2,
+                     shared_source='cloud',migration_state='ready'
+                 WHERE id=?3",
+                params![anchor, stale_heartbeat, initial.session_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE unassigned_segments SET started_at=?1 WHERE session_id=?2",
+                params![anchor, initial.session_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO tracking_runtime_state(workspace_id,last_heartbeat_at,updated_at)
+                 VALUES (?1,?2,?2)
+                 ON CONFLICT(workspace_id) DO UPDATE SET
+                   last_heartbeat_at=excluded.last_heartbeat_at,updated_at=excluded.updated_at",
+                params![local_workspace_id, stale_heartbeat],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM sync_outbox WHERE workspace_id=?1 AND entity_type='unassigned_session'",
+                [&cloud_workspace_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let (refreshed, sync_changed) =
+            get_state_with_cloud_context_and_sync_change(&database, Some(&storage)).unwrap();
+        let refreshed = refreshed.unwrap();
+        assert_eq!(refreshed.session_id, initial.session_id);
+        assert_eq!(refreshed.first_started_at, anchor);
+        assert_eq!(refreshed.current_segment_started_at, Some(anchor));
+        assert_eq!(refreshed.version, initial.version);
+        assert!(!sync_changed);
+        let queued: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1 AND entity_type='unassigned_session'",
+                [&cloud_workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(queued, 0);
+    }
+
+    #[test]
     fn threshold_is_derived_without_mutating_session_or_outbox() {
         let (database, _) = setup();
         let initial = get_state(&database).unwrap().unwrap();
@@ -2457,7 +2499,7 @@ mod tests {
     }
 
     #[test]
-    fn overnight_unassigned_interruption_excludes_offline_gap() {
+    fn overnight_unassigned_continues_from_the_new_day_boundary_after_restart() {
         let (database, _) = setup();
         let workspace_id = reset_unassigned_sessions(&database);
         let started_at = shanghai_millis("2026-10-05 23:50:00");
@@ -2484,7 +2526,61 @@ mod tests {
             .unwrap();
         let today: (String,i64) = connection.query_row("SELECT work_date,first_started_at FROM unassigned_sessions WHERE work_date='2026-10-06'",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
         assert_eq!(old_duration, 0);
-        assert_eq!(today, ("2026-10-06".to_string(), now));
+        assert_eq!(
+            today,
+            (
+                "2026-10-06".to_string(),
+                shanghai_millis("2026-10-06 00:00:00")
+            )
+        );
+    }
+
+    #[test]
+    fn same_day_restart_keeps_the_original_unassigned_anchor() {
+        let (database, _) = setup();
+        let workspace_id = reset_unassigned_sessions(&database);
+        let started_at = shanghai_millis("2026-10-06 08:00:00");
+        let last_heartbeat = shanghai_millis("2026-10-06 08:01:00");
+        let reopened_at = shanghai_millis("2026-10-06 18:00:00");
+        let session_id = seed_unassigned_session(
+            &database,
+            &workspace_id,
+            "2026-10-06",
+            started_at,
+            last_heartbeat,
+        );
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "INSERT INTO tracking_runtime_state(workspace_id,last_heartbeat_at,updated_at)
+                 VALUES (?1,?2,?2)
+                 ON CONFLICT(workspace_id) DO UPDATE SET
+                   last_heartbeat_at=excluded.last_heartbeat_at,updated_at=excluded.updated_at",
+                params![workspace_id, last_heartbeat],
+            )
+            .unwrap();
+
+        let mut connection = database.open().unwrap();
+        let transaction = connection.transaction().unwrap();
+        coordinate_unassigned_sessions(&transaction, &workspace_id, reopened_at, "local").unwrap();
+        let state = load_state(&transaction, &session_id, reopened_at, false).unwrap();
+        transaction.commit().unwrap();
+
+        assert_eq!(state.session_id, session_id);
+        assert_eq!(state.first_started_at, started_at);
+        assert_eq!(state.current_segment_started_at, Some(started_at));
+        assert_eq!(state.elapsed_seconds, 10 * 60 * 60);
+        let version: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT version FROM unassigned_sessions WHERE id=?1",
+                [&state.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 1);
     }
 
     #[test]
