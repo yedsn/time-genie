@@ -27,6 +27,7 @@
 发布完成后检查：
 
 - GitHub Release 中存在安装包、签名文件和 `latest.json`。
+- GitHub Release 的安装包、更新归档与签名文件必须使用 `TimeGenie_` 前缀；生成 `latest.json` 时会拒绝其他产品名前缀的资产。
 - `https://github.com/yedsn/time-genie/releases/latest/download/latest.json` 可下载。
 - `https://gitee.com/hongxiaojian/time-genie/releases/download/latest/latest.json` 可下载，且其中安装包 URL 指向 Gitee。
 - Gitee latest Release 中除 `latest.json` 外，安装包、更新归档和签名文件统一使用 `TimeGenie` 英文前缀，例如 `TimeGenie_0.1.9_x64-setup.exe`。

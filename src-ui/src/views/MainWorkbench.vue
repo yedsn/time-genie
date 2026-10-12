@@ -1278,7 +1278,7 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
   <main class="management-shell">
     <header class="window-titlebar" data-tauri-drag-region="deep">
       <div class="window-titlebar-drag-area" data-tauri-drag-region="deep">
-        <strong class="window-titlebar-app-name" data-tauri-drag-region>时序</strong>
+        <strong class="window-titlebar-app-name" data-tauri-drag-region>TimeGenie</strong>
         <span class="window-titlebar-version" data-tauri-drag-region>v{{ appVersion }}</span>
       </div>
       <div class="window-controls" aria-label="窗口控制">
@@ -1294,7 +1294,7 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
     <aside class="sidebar">
       <div class="brand-block">
         <img class="brand-mark" :src="appIconUrl" alt="" />
-        <div><strong>时序</strong><span>计时 · 工时 · 日报</span></div>
+        <div><strong>TimeGenie</strong><span>时序 · 计时 · 工时 · 日报</span></div>
       </div>
       <nav class="nav-list">
         <template v-for="page in pages" :key="page.id">

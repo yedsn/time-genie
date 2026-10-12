@@ -13,6 +13,7 @@ from pathlib import Path
 
 HTTP_TIMEOUT_SECS = 60
 USER_AGENT = "time-genie-updater-json"
+ASSET_PREFIX = "TimeGenie_"
 
 
 def fail(message: str) -> None:
@@ -120,18 +121,18 @@ def build_latest_json(release: dict, *, token: str) -> dict:
 
     windows_asset = find_asset(
         assets,
-        lambda name: name.endswith("_x64-setup.exe"),
-        "Windows x64 NSIS installer (*_x64-setup.exe)",
+        lambda name: name.startswith(ASSET_PREFIX) and name.endswith("_x64-setup.exe"),
+        "Windows x64 NSIS installer (TimeGenie_*_x64-setup.exe)",
     )
     darwin_x64_asset = find_asset(
         assets,
-        lambda name: name == "_x64.app.tar.gz" or name.endswith("_x64.app.tar.gz"),
-        "macOS Intel app archive (*_x64.app.tar.gz)",
+        lambda name: name.startswith(ASSET_PREFIX) and name.endswith("_x64.app.tar.gz"),
+        "macOS Intel app archive (TimeGenie_*_x64.app.tar.gz)",
     )
     darwin_aarch64_asset = find_asset(
         assets,
-        lambda name: name == "_aarch64.app.tar.gz" or name.endswith("_aarch64.app.tar.gz"),
-        "macOS Apple Silicon app archive (*_aarch64.app.tar.gz)",
+        lambda name: name.startswith(ASSET_PREFIX) and name.endswith("_aarch64.app.tar.gz"),
+        "macOS Apple Silicon app archive (TimeGenie_*_aarch64.app.tar.gz)",
     )
 
     platforms: dict[str, dict] = {}

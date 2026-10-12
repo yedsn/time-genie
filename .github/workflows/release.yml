@@ -57,6 +57,8 @@ jobs:
           if ($package.version -ne $version) { throw "package.json version $($package.version) does not match tag $tag." }
           $tauri = Get-Content src-tauri/tauri.conf.json -Raw -Encoding UTF8 | ConvertFrom-Json
           if ($tauri.version -ne $version) { throw "tauri.conf.json version $($tauri.version) does not match tag $tag." }
+          if ($tauri.productName -ne 'TimeGenie') { throw "tauri.conf.json productName must be TimeGenie, got $($tauri.productName)." }
+          if ($tauri.mainBinaryName -ne 'TimeGenie') { throw "tauri.conf.json mainBinaryName must be TimeGenie, got $($tauri.mainBinaryName)." }
           $cargo = Get-Content src-tauri/Cargo.toml -Raw -Encoding UTF8
           $cargoVersionMatch = [regex]::Match($cargo, '(?m)^version\s*=\s*"([^"]+)"\s*$')
           if (-not $cargoVersionMatch.Success) { throw "Cargo.toml version field was not found." }

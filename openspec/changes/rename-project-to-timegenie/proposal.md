@@ -8,9 +8,9 @@
 
 ## What Changes
 
-- 建立三层命名规则：系统与分发层统一使用英文产品名 TimeGenie；内部技术标识继续使用小写 timegenie；应用内容界面继续显示中文名「时序」。
+- 建立三层命名规则：系统、分发与应用品牌界面统一以英文产品名 TimeGenie 为主；内部技术标识继续使用小写 timegenie；中文名「时序」仅作为界面和中文文档中的辅助名称。
 - 将 Tauri productName 改为 TimeGenie，并显式设置 mainBinaryName 为 TimeGenie，使安装包、应用包、安装目录、系统入口与主程序文件统一使用英文名称和一致大小写。
-- 将主窗口的系统标题、Tauri 托盘提示与原生 Windows 兜底托盘提示改为 TimeGenie；自定义标题栏、侧栏品牌块和其他应用内容区仍显示「时序」。
+- 将主窗口的系统标题、Tauri 托盘提示、原生 Windows 兜底托盘提示、自定义标题栏和侧栏品牌主标题改为 TimeGenie；侧栏可保留「时序」作为辅助名称。
 - 将 GitHub Release 名称、Release 说明、macOS 应用路径示例和本地发布脚本中的应用名统一为 TimeGenie。
 - README 与文档站中的产品标题采用英文优先的双语写法 TimeGenie（时序）；中文产品名只作为面向中文用户的界面名称和辅助说明。
 - 保持应用身份和数据位置不变：com.timegenie.desktop、%APPDATA%\com.timegenie.desktop、timegenie.sqlite3、系统凭据 service、Supabase schema、更新端点均不修改。
@@ -33,7 +33,7 @@
 - src-tauri/tauri.conf.json：productName、mainBinaryName、主窗口系统标题。
 - src-tauri/src/lib.rs：Tauri 托盘提示。
 - src-tauri/src/native_tray.rs：Windows 原生兜底托盘提示。
-- src-ui/index.html、src-ui/src/views/MainWorkbench.vue：继续保留中文界面名称，用于验证系统名称与界面名称已正确分层。
+- src-ui/index.html、src-ui/src/views/MainWorkbench.vue：应用品牌名称改为英文优先，中文「时序」仅作辅助显示。
 
 **发布与文档**
 
