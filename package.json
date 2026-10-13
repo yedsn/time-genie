@@ -13,6 +13,9 @@
         "test:report-template-editor": "tsc src-ui/src/services/reportTemplateEditorCore.ts --outDir .tmp-report-template-editor-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-report-template-editor.mjs",
         "test:cloud-sync-presentation": "tsc src-ui/src/services/cloudSyncPresentation.ts --outDir .tmp-cloud-sync-presentation-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-cloud-sync-presentation.mjs",
         "test:work-data-refresh": "tsc src-ui/src/services/workDataRefresh.ts --outDir .tmp-work-data-refresh-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-work-data-refresh.mjs",
+        "test:time-entry-history": "tsc src-ui/src/services/timeEntryHistoryCore.ts --outDir .tmp-time-entry-history-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-time-entry-history.mjs",
+        "test:time-allocation-export": "tsc src-ui/src/services/timeAllocationExportCore.ts --outDir .tmp-time-allocation-export-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-time-allocation-export.mjs",
+        "test:time-allocation-export-ui": "node scripts/verify-time-allocation-export-ui.mjs",
         "test:cloud-session-presentation": "tsc src-ui/src/services/cloudSessionPresentation.ts src-ui/src/services/cloudSessionPresentationTypes.ts --outDir .tmp-cloud-session-presentation-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-cloud-session-presentation.mjs",
         "test:cloud-device-presentation": "tsc src-ui/src/services/cloudDevicePresentation.ts src-ui/src/services/cloudDevicePresentationTypes.ts --outDir .tmp-cloud-device-presentation-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-cloud-device-presentation.mjs",
         "test:transient-state-guard": "tsc src-ui/src/services/transientStateGuard.ts --outDir .tmp-transient-state-guard-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-transient-state-guard.mjs",
@@ -28,7 +31,8 @@
         "docs:preview": "vitepress preview docs"
     },
     "dependencies": {
-        "@tauri-apps/api": "^2.8.0",
+        "@tauri-apps/api": "2.11.1",
+        "@tauri-apps/plugin-dialog": "2.7.0",
         "canvas-confetti": "^1.9.4",
         "element-plus": "^2.14.5",
         "howler": "^2.2.4",
@@ -45,6 +49,7 @@
         "@types/howler": "^2.2.13",
         "@types/sortablejs": "^1.15.9",
         "@vitejs/plugin-vue": "^5.2.1",
+        "playwright": "^1.63.0",
         "typescript": "^5.7.2",
         "vite": "^6.0.3",
         "vitepress": "^1.6.4",

@@ -51,6 +51,39 @@ pub struct TimeEntryListResult {
     pub revision: i64,
 }
 
+pub const TIME_ENTRY_HISTORY_DAYS_PER_PAGE: i64 = 7;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeEntryHistoryRequest {
+    pub page: i64,
+    #[serde(default = "default_include_breaks")]
+    pub include_breaks: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeEntryHistoryDayDto {
+    pub work_date: String,
+    pub entry_count: i64,
+    pub raw_minutes: i64,
+    pub allocated_minutes: i64,
+    pub pending_minutes: i64,
+    pub break_minutes: i64,
+    pub entries: Vec<TimeEntryDto>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeEntryHistoryResult {
+    pub page: i64,
+    pub page_size: i64,
+    pub total_days: i64,
+    pub total_pages: i64,
+    pub groups: Vec<TimeEntryHistoryDayDto>,
+    pub revision: i64,
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TimerStopResultDto {
@@ -98,6 +131,10 @@ pub struct TimerStopRequest {
 pub struct TimeEntryListRequest {
     pub work_date: String,
     pub include_breaks: bool,
+}
+
+fn default_include_breaks() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -741,6 +778,121 @@ pub fn list_time_entries(
     })
 }
 
+pub fn list_time_entry_history(
+    database: &Database,
+    request: TimeEntryHistoryRequest,
+) -> Result<TimeEntryHistoryResult, String> {
+    if request.page < 1 {
+        return Err("VALIDATION_ERROR: 历史记录页码必须从 1 开始".to_string());
+    }
+    let connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    let total_days: i64 = connection
+        .query_row(
+            "SELECT COUNT(DISTINCT work_date) FROM time_entries
+             WHERE workspace_id=?1 AND deleted_at IS NULL
+               AND (?2=1 OR kind!='break')",
+            params![workspace_id, request.include_breaks],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let total_pages = if total_days == 0 {
+        0
+    } else {
+        (total_days + TIME_ENTRY_HISTORY_DAYS_PER_PAGE - 1) / TIME_ENTRY_HISTORY_DAYS_PER_PAGE
+    };
+    let page = if total_pages == 0 {
+        1
+    } else {
+        request.page.min(total_pages)
+    };
+    let offset = (page - 1) * TIME_ENTRY_HISTORY_DAYS_PER_PAGE;
+    let work_dates = {
+        let mut statement = connection
+            .prepare(
+                "SELECT DISTINCT work_date FROM time_entries
+                 WHERE workspace_id=?1 AND deleted_at IS NULL
+                   AND (?2=1 OR kind!='break')
+                 ORDER BY work_date DESC
+                 LIMIT ?3 OFFSET ?4",
+            )
+            .map_err(|error| error.to_string())?;
+        let dates = statement
+            .query_map(
+                params![
+                    workspace_id,
+                    request.include_breaks,
+                    TIME_ENTRY_HISTORY_DAYS_PER_PAGE,
+                    offset
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        dates
+    };
+    let now = now_millis();
+    let mut groups = Vec::with_capacity(work_dates.len());
+    for work_date in work_dates {
+        let ids = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id FROM time_entries
+                     WHERE workspace_id=?1 AND work_date=?2 AND deleted_at IS NULL
+                       AND (?3=1 OR kind!='break')
+                     ORDER BY started_at DESC,id DESC",
+                )
+                .map_err(|error| error.to_string())?;
+            let entry_ids = statement
+                .query_map(
+                    params![workspace_id, work_date, request.include_breaks],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            entry_ids
+        };
+        let entries = ids
+            .iter()
+            .map(|id| load_entry(&connection, id, now))
+            .collect::<Result<Vec<_>, _>>()?;
+        let raw_minutes = entries
+            .iter()
+            .filter(|entry| entry.kind == "work")
+            .map(|entry| entry.settlement_minutes)
+            .sum();
+        let allocated_minutes = entries
+            .iter()
+            .filter(|entry| entry.kind == "work")
+            .map(|entry| entry.allocated_minutes)
+            .sum();
+        let break_minutes = entries
+            .iter()
+            .filter(|entry| entry.kind == "break")
+            .map(|entry| entry.settlement_minutes)
+            .sum();
+        groups.push(TimeEntryHistoryDayDto {
+            work_date,
+            entry_count: entries.len() as i64,
+            raw_minutes,
+            allocated_minutes,
+            pending_minutes: (raw_minutes - allocated_minutes).max(0),
+            break_minutes,
+            entries,
+        });
+    }
+    Ok(TimeEntryHistoryResult {
+        page,
+        page_size: TIME_ENTRY_HISTORY_DAYS_PER_PAGE,
+        total_days,
+        total_pages,
+        groups,
+        revision: current_revision(&connection)?,
+    })
+}
+
 #[cfg(test)]
 pub fn create_manual_entry(
     database: &Database,
@@ -1348,6 +1500,14 @@ fn load_entry(
         .unwrap_or_else(|| settlement_minutes(entry.duration_seconds));
     entry.allocated_minutes = entry.allocations.iter().map(|item| item.minutes).sum();
     Ok(entry)
+}
+
+pub(crate) fn load_entry_at(
+    connection: &rusqlite::Connection,
+    entry_id: &str,
+    current_time: i64,
+) -> Result<TimeEntryDto, String> {
+    load_entry(connection, entry_id, current_time)
 }
 
 fn chain_settlement_minutes(
@@ -2362,6 +2522,14 @@ pub fn time_entry_list(
 }
 
 #[tauri::command]
+pub fn time_entry_history_list(
+    database: tauri::State<'_, Database>,
+    request: TimeEntryHistoryRequest,
+) -> Result<TimeEntryHistoryResult, String> {
+    list_time_entry_history(&database, request)
+}
+
+#[tauri::command]
 pub fn time_entry_create_manual(
     database: tauri::State<'_, Database>,
     request: ManualEntryRequest,
@@ -2474,6 +2642,378 @@ mod tests {
         )
         .unwrap();
         (database, workspace_id, task.id)
+    }
+
+    fn seed_history_entry(
+        database: &Database,
+        workspace_id: &str,
+        task_id: &str,
+        work_date: &str,
+        source_type: &str,
+        kind: &str,
+        started_at: i64,
+        duration_seconds: i64,
+        allocated_minutes: i64,
+        deleted: bool,
+    ) -> String {
+        let entry_id = Uuid::now_v7().to_string();
+        let ended_at = started_at + duration_seconds * 1_000;
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "INSERT INTO time_entries(
+               id,workspace_id,work_date,kind,source_type,state,default_task_id,label_snapshot,
+               started_at,ended_at,duration_seconds,created_at,updated_at,version,deleted_at
+             ) VALUES (?1,?2,?3,?4,?5,'ended',?6,?7,?8,?9,?10,?8,?9,1,?11)",
+                params![
+                    entry_id,
+                    workspace_id,
+                    work_date,
+                    kind,
+                    source_type,
+                    task_id,
+                    format!("{work_date}-{source_type}-{kind}"),
+                    started_at,
+                    ended_at,
+                    duration_seconds,
+                    deleted.then_some(ended_at)
+                ],
+            )
+            .unwrap();
+        if allocated_minutes > 0 {
+            database.open().unwrap().execute(
+                "INSERT INTO time_allocations(id,workspace_id,entry_id,task_id,minutes,created_at,updated_at,version)
+                 VALUES (?1,?2,?3,?4,?5,?6,?6,1)",
+                params![Uuid::now_v7().to_string(),workspace_id,entry_id,task_id,allocated_minutes,ended_at],
+            ).unwrap();
+        }
+        entry_id
+    }
+
+    #[test]
+    fn history_result_serializes_camel_case_and_empty_page() {
+        let (database, _, _) = setup();
+        let result = list_time_entry_history(
+            &database,
+            TimeEntryHistoryRequest {
+                page: 1,
+                include_breaks: true,
+            },
+        )
+        .unwrap();
+        let value = serde_json::to_value(result).unwrap();
+        assert_eq!(value["page"], 1);
+        assert_eq!(value["pageSize"], TIME_ENTRY_HISTORY_DAYS_PER_PAGE);
+        assert_eq!(value["totalDays"], 0);
+        assert_eq!(value["totalPages"], 0);
+        assert_eq!(value["groups"], json!([]));
+        assert!(value.get("page_size").is_none());
+    }
+
+    #[test]
+    fn history_pages_by_complete_non_empty_days_and_sorts_entries() {
+        let (database, workspace_id, task_id) = setup();
+        let base = shanghai_millis("2026-10-01 09:00:00");
+        for day in 1..=16 {
+            if day == 8 {
+                continue;
+            }
+            let work_date = format!("2026-10-{day:02}");
+            seed_history_entry(
+                &database,
+                &workspace_id,
+                &task_id,
+                &work_date,
+                "manual",
+                "work",
+                base + day as i64 * 86_400_000,
+                600,
+                5,
+                false,
+            );
+        }
+        let later = seed_history_entry(
+            &database,
+            &workspace_id,
+            &task_id,
+            "2026-10-16",
+            "manual",
+            "work",
+            base + 16 * 86_400_000,
+            120,
+            0,
+            false,
+        );
+
+        let first = list_time_entry_history(
+            &database,
+            TimeEntryHistoryRequest {
+                page: 1,
+                include_breaks: true,
+            },
+        )
+        .unwrap();
+        let second = list_time_entry_history(
+            &database,
+            TimeEntryHistoryRequest {
+                page: 2,
+                include_breaks: true,
+            },
+        )
+        .unwrap();
+        let third = list_time_entry_history(
+            &database,
+            TimeEntryHistoryRequest {
+                page: 3,
+                include_breaks: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(first.total_days, 15);
+        assert_eq!(first.total_pages, 3);
+        assert_eq!(first.groups.len(), 7);
+        assert_eq!(second.groups.len(), 7);
+        assert_eq!(third.groups.len(), 1);
+        assert_eq!(first.groups[0].work_date, "2026-10-16");
+        assert_eq!(first.groups[0].entries.len(), 2);
+        assert_eq!(first.groups[0].entries[0].id, later);
+        assert_eq!(first.groups[6].work_date, "2026-10-10");
+        assert_eq!(second.groups[0].work_date, "2026-10-09");
+        assert_eq!(third.groups[0].work_date, "2026-10-01");
+        assert!(first
+            .groups
+            .iter()
+            .all(|group| group.work_date != "2026-10-08"));
+        assert!(second
+            .groups
+            .iter()
+            .all(|group| group.work_date != "2026-10-08"));
+        assert!(third
+            .groups
+            .iter()
+            .all(|group| group.work_date != "2026-10-08"));
+    }
+
+    #[test]
+    fn history_edit_delete_last_entry_clamps_page_and_does_not_disturb_active_timer() {
+        let (database, workspace_id, task_id) = setup();
+        let base = shanghai_millis("2026-09-01 09:00:00");
+        for day in 1..=7 {
+            seed_history_entry(
+                &database,
+                &workspace_id,
+                &task_id,
+                &format!("2026-09-{day:02}"),
+                "manual",
+                "work",
+                base + day as i64 * 86_400_000,
+                600,
+                0,
+                false,
+            );
+        }
+        let active = start_timer(
+            &database,
+            TimerStartRequest {
+                task_id: Some(task_id.clone()),
+                note: Some("验收中的当前计时".to_string()),
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        let oldest = list_time_entry_history(
+            &database,
+            TimeEntryHistoryRequest {
+                page: 2,
+                include_breaks: true,
+            },
+        )
+        .unwrap();
+        let target = &oldest.groups[0].entries[0];
+        let corrected = update_time_entry(
+            &database,
+            TimeEntryUpdateRequest {
+                entry_id: target.id.clone(),
+                started_at: target.started_at - 60_000,
+                ended_at: target.ended_at.unwrap() + 60_000,
+                note: Some("历史修正".to_string()),
+                expected_version: target.version,
+            },
+        )
+        .unwrap();
+        replace_allocations(
+            &database,
+            AllocationReplaceRequest {
+                entry_id: corrected.id.clone(),
+                expected_version: corrected.version,
+                allocations: vec![AllocationInput {
+                    task_id: task_id.clone(),
+                    minutes: 5,
+                    note: None,
+                    complete_task: false,
+                    task_expected_version: None,
+                }],
+            },
+        )
+        .unwrap();
+        let after_edit = list_time_entry_history(
+            &database,
+            TimeEntryHistoryRequest {
+                page: 2,
+                include_breaks: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(after_edit.groups[0].allocated_minutes, 5);
+        let current_before = get_timer_state(&database).unwrap().unwrap();
+        assert_eq!(current_before.id, active.id);
+        let refreshed = list_time_entry_history(
+            &database,
+            TimeEntryHistoryRequest {
+                page: 2,
+                include_breaks: true,
+            },
+        )
+        .unwrap();
+        let current_after = get_timer_state(&database).unwrap().unwrap();
+        assert_eq!(refreshed.page, 2);
+        assert_eq!(current_after.id, active.id);
+        assert_eq!(current_after.state, "running");
+        let version = refreshed.groups[0].entries[0].version;
+        update_time_entry_disposition(
+            &database,
+            TimeEntryDispositionRequest {
+                entry_id: refreshed.groups[0].entries[0].id.clone(),
+                expected_version: version,
+                disposition: "discard".to_string(),
+            },
+        )
+        .unwrap();
+        let clamped = list_time_entry_history(
+            &database,
+            TimeEntryHistoryRequest {
+                page: 2,
+                include_breaks: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(clamped.total_days, 7);
+        assert_eq!(clamped.total_pages, 1);
+        assert_eq!(clamped.page, 1);
+        assert!(clamped
+            .groups
+            .iter()
+            .all(|group| group.work_date != "2026-09-01"));
+        assert_eq!(get_timer_state(&database).unwrap().unwrap().id, active.id);
+    }
+
+    #[test]
+    fn history_includes_formal_sources_summaries_and_excludes_deleted_entries() {
+        let (database, workspace_id, task_id) = setup();
+        let work_date = "2026-10-06";
+        let base = shanghai_millis("2026-10-06 09:00:00");
+        seed_history_entry(
+            &database,
+            &workspace_id,
+            &task_id,
+            work_date,
+            "timer",
+            "work",
+            base,
+            61,
+            1,
+            false,
+        );
+        seed_history_entry(
+            &database,
+            &workspace_id,
+            &task_id,
+            work_date,
+            "manual",
+            "work",
+            base + 3_600_000,
+            600,
+            5,
+            false,
+        );
+        seed_history_entry(
+            &database,
+            &workspace_id,
+            &task_id,
+            work_date,
+            "unassigned",
+            "break",
+            base + 7_200_000,
+            300,
+            0,
+            false,
+        );
+        seed_history_entry(
+            &database,
+            &workspace_id,
+            &task_id,
+            work_date,
+            "manual",
+            "work",
+            base + 10_800_000,
+            600,
+            0,
+            true,
+        );
+        let before: Vec<(String, i64)> = database
+            .open()
+            .unwrap()
+            .prepare("SELECT id,version FROM time_entries ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let outbox_before: i64 = database
+            .open()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+
+        let result = list_time_entry_history(
+            &database,
+            TimeEntryHistoryRequest {
+                page: 1,
+                include_breaks: true,
+            },
+        )
+        .unwrap();
+        let group = &result.groups[0];
+        assert_eq!(group.entry_count, 3);
+        assert_eq!(group.raw_minutes, 12);
+        assert_eq!(group.allocated_minutes, 6);
+        assert_eq!(group.pending_minutes, 6);
+        assert_eq!(group.break_minutes, 5);
+        assert_eq!(
+            group
+                .entries
+                .iter()
+                .map(|entry| entry.source_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unassigned", "manual", "timer"]
+        );
+        let after: Vec<(String, i64)> = database
+            .open()
+            .unwrap()
+            .prepare("SELECT id,version FROM time_entries ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let outbox_after: i64 = database
+            .open()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, before);
+        assert_eq!(outbox_after, outbox_before);
     }
 
     #[test]

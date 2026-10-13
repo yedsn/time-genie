@@ -48,6 +48,8 @@ end $$;
 \ir 20261007_timegenie_unassigned_segment_boundary_fix.sql
 \ir 20261008_timegenie_simplified_unassigned_anchor.sql
 \ir 20261008_timegenie_simplified_unassigned_anchor.sql
+\ir 20261013_timegenie_unassigned_lease_continuity_fix.sql
+\ir 20261013_timegenie_unassigned_lease_continuity_fix.sql
 
 do $$
 begin
@@ -1953,12 +1955,13 @@ begin
   end if;
 end $$;
 
--- An expired lease discards the interrupted anchor at the last confirmed
--- boundary. Reacquiring creates one fresh anchor and never counts the gap.
+-- Lease expiry, takeover, and release must not mutate the shared unassigned
+-- anchor. Only ordinary item timers use lease continuity boundaries.
 set local role authenticated;
 select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
 do $$
-declare first_lease jsonb; second_lease jsonb; new_anchor jsonb; confirmed timestamptz;
+declare first_lease jsonb; second_lease jsonb; anchor_after_takeover jsonb; anchor_after_release jsonb;
+declare original_started timestamptz:=clock_timestamp()-interval '120 seconds'; original_version bigint; generated_count bigint;
 begin
   first_lease:=timegenie.tracking_lease_acquire('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001','94000000-0000-0000-0000-000000000001');
   reset role;
@@ -1968,15 +1971,17 @@ begin
   delete from timegenie.unassigned_sessions where workspace_id='20000000-0000-0000-0000-000000000001' and state in ('collecting','awaiting_resolution');
   insert into timegenie.unassigned_sessions(id,workspace_id,work_date,state,threshold_seconds,duration_seconds,first_started_at,shared_source,migration_state,created_at,updated_at,version,last_continuous_at)
   values('95000000-0000-0000-0000-000000000001','20000000-0000-0000-0000-000000000001',timegenie.workspace_work_date('20000000-0000-0000-0000-000000000001',clock_timestamp()),
-    'collecting',300,0,clock_timestamp()-interval '120 seconds','cloud','adopted',clock_timestamp()-interval '120 seconds',clock_timestamp(),1,clock_timestamp()-interval '90 seconds')
+    'collecting',300,0,original_started,'cloud','adopted',original_started,clock_timestamp(),1,original_started)
   on conflict do nothing;
   insert into timegenie.unassigned_segments(id,workspace_id,session_id,sequence_no,started_at,duration_seconds,lease_token)
-  values('95100000-0000-0000-0000-000000000001','20000000-0000-0000-0000-000000000001','95000000-0000-0000-0000-000000000001',1,clock_timestamp()-interval '120 seconds',0,'94000000-0000-0000-0000-000000000001')
+  values('95100000-0000-0000-0000-000000000001','20000000-0000-0000-0000-000000000001','95000000-0000-0000-0000-000000000001',1,original_started,0,'94000000-0000-0000-0000-000000000001')
   on conflict do nothing;
-  update timegenie.unassigned_segments set started_at=clock_timestamp()-interval '120 seconds'
+  update timegenie.unassigned_segments set started_at=original_started
   where lease_token='94000000-0000-0000-0000-000000000001' and ended_at is null;
+  select version into original_version from timegenie.unassigned_sessions
+  where id='95000000-0000-0000-0000-000000000001';
   update timegenie.tracking_leases set last_confirmed_at=clock_timestamp()-interval '90 seconds',expires_at=clock_timestamp()-interval '45 seconds'
-  where workspace_id='20000000-0000-0000-0000-000000000001' returning last_confirmed_at into confirmed;
+  where workspace_id='20000000-0000-0000-0000-000000000001';
   set local role authenticated;
   perform set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
   second_lease:=timegenie.tracking_lease_acquire('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002','94000000-0000-0000-0000-000000000002');
@@ -1984,22 +1989,34 @@ begin
   if not coalesce((second_lease->>'acquired')::boolean,false) then
     raise exception 'replacement device did not acquire the expired lease';
   end if;
-  if not exists(
-    select 1 from timegenie.unassigned_sessions
-    where id='95000000-0000-0000-0000-000000000001'
-      and state='discarded' and resolution_type='discard' and duration_seconds=0
-      and abs(extract(epoch from (resolved_at-confirmed)))<0.01
-  ) then
-    raise exception 'expired lease did not discard the interrupted anchor at its last confirmed boundary';
+  anchor_after_takeover:=timegenie.timegenie_unassigned_active_anchor('20000000-0000-0000-0000-000000000001',null);
+  if anchor_after_takeover is null
+     or anchor_after_takeover->>'id'<>'95000000-0000-0000-0000-000000000001'
+     or (anchor_after_takeover->>'first_started_at')::timestamptz<>original_started
+     or (anchor_after_takeover->>'version')::bigint<>original_version
+     or jsonb_array_length(anchor_after_takeover->'segments')<>1
+     or anchor_after_takeover->'segments'->0->>'ended_at' is not null
+     or (anchor_after_takeover->'segments'->0->>'started_at')::timestamptz<>original_started then
+    raise exception 'lease takeover mutated the shared unassigned anchor: %',anchor_after_takeover;
   end if;
-  new_anchor:=timegenie.timegenie_unassigned_active_anchor('20000000-0000-0000-0000-000000000001',null);
-  if new_anchor is null
-     or new_anchor->>'id'='95000000-0000-0000-0000-000000000001'
-     or (new_anchor->>'duration_seconds')::bigint<>0
-     or jsonb_array_length(new_anchor->'segments')<>1
-     or new_anchor->'segments'->0->>'ended_at' is not null
-     or (new_anchor->'segments'->0->>'started_at')::timestamptz<=confirmed then
-    raise exception 'replacement lease did not create one fresh zero-duration anchor after the disconnected gap: %',new_anchor;
+  set local role authenticated;
+  perform set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+  if not timegenie.tracking_lease_release('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002','94000000-0000-0000-0000-000000000002') then
+    raise exception 'replacement device did not release its lease';
+  end if;
+  reset role;
+  anchor_after_release:=timegenie.timegenie_unassigned_active_anchor('20000000-0000-0000-0000-000000000001',null);
+  if anchor_after_release is null
+     or anchor_after_release->>'id'<>anchor_after_takeover->>'id'
+     or (anchor_after_release->>'first_started_at')::timestamptz<>original_started
+     or (anchor_after_release->>'version')::bigint<>original_version
+     or anchor_after_release->'segments'->0->>'ended_at' is not null then
+    raise exception 'lease release mutated the shared unassigned anchor: %',anchor_after_release;
+  end if;
+  select count(*) into generated_count from timegenie.time_entries
+  where origin_unassigned_session_id='95000000-0000-0000-0000-000000000001';
+  if generated_count<>0 then
+    raise exception 'lease lifecycle generated an unassigned result';
   end if;
 end $$;
 reset role;

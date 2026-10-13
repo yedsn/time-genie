@@ -21,6 +21,7 @@ const schemaTestFile = path.join(repoRoot, "supabase", "schema_integration_test.
 const calendarDayPatchFile = path.join(repoRoot, "supabase", "20261006b_timegenie_calendar_day_accounting_patch.sql");
 const unassignedSegmentBoundaryPatchFile = path.join(repoRoot, "supabase", "20261007_timegenie_unassigned_segment_boundary_fix.sql");
 const simplifiedUnassignedAnchorPatchFile = path.join(repoRoot, "supabase", "20261008_timegenie_simplified_unassigned_anchor.sql");
+const unassignedLeaseContinuityPatchFile = path.join(repoRoot, "supabase", "20261013_timegenie_unassigned_lease_continuity_fix.sql");
 
 const binaryNames = process.platform === "win32"
   ? {
@@ -89,6 +90,7 @@ function verifyStaticSchemaInvariants() {
   const calendarDayPatch = fs.readFileSync(calendarDayPatchFile, "utf8");
   const unassignedSegmentBoundaryPatch = fs.readFileSync(unassignedSegmentBoundaryPatchFile, "utf8");
   const simplifiedUnassignedAnchorPatch = fs.readFileSync(simplifiedUnassignedAnchorPatchFile, "utf8");
+  const unassignedLeaseContinuityPatch = fs.readFileSync(unassignedLeaseContinuityPatchFile, "utf8");
   const schemaIntegrationTest = fs.readFileSync(schemaTestFile, "utf8");
   const importStart = schema.indexOf("create or replace function timegenie.migration_import_snapshot");
   const applyPatchStart = schema.indexOf("create or replace function timegenie.cloud_apply_patch");
@@ -182,6 +184,9 @@ function verifyStaticSchemaInvariants() {
   if ((schemaIntegrationTest.match(/\\ir 20261008_timegenie_simplified_unassigned_anchor\.sql/g) ?? []).length < 2) {
     throw new Error("The schema integration test must prove the simplified unassigned anchor patch is idempotent.");
   }
+  if ((schemaIntegrationTest.match(/\\ir 20261013_timegenie_unassigned_lease_continuity_fix\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the unassigned lease continuity patch is idempotent.");
+  }
   for (const expected of [
     "create or replace function timegenie.unassigned_anchor_reset",
     "create or replace function timegenie.timegenie_unassigned_system_clear",
@@ -203,6 +208,24 @@ function verifyStaticSchemaInvariants() {
   const simplifiedTick = simplifiedUnassignedAnchorPatch.slice(simplifiedTickStart, simplifiedTickEnd);
   if (simplifiedTick.toLowerCase().includes("update timegenie.unassigned_sessions")) {
     throw new Error("unassigned_tick must not persist natural unassigned-time growth.");
+  }
+  for (const source of [schema, simplifiedUnassignedAnchorPatch, unassignedLeaseContinuityPatch]) {
+    const closeStart = source.lastIndexOf("create or replace function timegenie.close_expired_unassigned_lease");
+    const closeEnd = source.indexOf("end $$;", closeStart);
+    const closeFunction = source.slice(closeStart, closeEnd);
+    if (closeStart < 0 || closeFunction.includes("timegenie_unassigned_system_clear")
+        || closeFunction.includes("update timegenie.unassigned_")) {
+      throw new Error("Tracking lease lifecycle must not clear or mutate the shared unassigned anchor.");
+    }
+  }
+  for (const expected of [
+    "lease takeover mutated the shared unassigned anchor",
+    "lease release mutated the shared unassigned anchor",
+    "lease lifecycle generated an unassigned result",
+  ]) {
+    if (!schemaIntegrationTest.includes(expected)) {
+      throw new Error(`The schema integration test is missing lease continuity coverage: ${expected}`);
+    }
   }
   for (const expected of [
     "greatest(started_at,least(day_end,p_observed_at))",

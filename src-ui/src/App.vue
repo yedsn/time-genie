@@ -7,6 +7,7 @@ import { useWorkdayStore } from "./store";
 import { stopCompletionFeedback } from "./services/completionFeedback";
 import { applyAppTheme, getCachedAppTheme, isAppTheme } from "./services/theme";
 import { workDataRefreshPlan } from "./services/workDataRefresh";
+import { shouldRefreshTimeHistory } from "./services/timeEntryHistoryCore";
 
 applyAppTheme(getCachedAppTheme());
 
@@ -75,7 +76,10 @@ async function flushDomainRefresh() {
       const plan = workDataRefreshPlan(domains, view.value === "main");
       const loads: Promise<unknown>[] = [];
       if (plan.workspace) loads.push(store.loadWorkspaceData());
-      if (plan.time) loads.push(store.loadTimeData());
+      if (plan.time) {
+        loads.push(store.loadTimeData());
+        if (view.value === "main" && shouldRefreshTimeHistory(store.activePage, plan.time)) loads.push(store.loadTimeHistory());
+      }
       if (plan.reports) loads.push(store.loadReports());
       if (plan.unassigned) loads.push(store.loadUnassignedState());
       await Promise.all(loads);

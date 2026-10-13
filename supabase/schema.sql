@@ -2896,7 +2896,10 @@ create or replace function timegenie.close_expired_unassigned_lease(
   p_workspace_id uuid,p_close_at timestamptz
 ) returns void language plpgsql security definer set search_path=timegenie,pg_catalog
 as $$ begin
-  perform timegenie.timegenie_unassigned_system_clear(p_workspace_id,p_close_at);
+  -- Compatibility no-op. Tracking leases prove continuity for ordinary item
+  -- timers only; the shared unassigned anchor is continuous across app exit,
+  -- sleep, lease expiry, release, and device takeover.
+  perform p_workspace_id,p_close_at;
 end $$;
 
 -- New clients route resets to the dedicated RPC. Legacy lifecycle payloads are

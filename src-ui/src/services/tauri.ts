@@ -294,6 +294,43 @@ export type TimeEntryListResult = {
   revision: number;
 };
 
+export type TimeEntryHistoryDayRecord = {
+  workDate: string;
+  entryCount: number;
+  rawMinutes: number;
+  allocatedMinutes: number;
+  pendingMinutes: number;
+  breakMinutes: number;
+  entries: TimeEntryRecord[];
+};
+
+export type TimeEntryHistoryResult = {
+  page: number;
+  pageSize: number;
+  totalDays: number;
+  totalPages: number;
+  groups: TimeEntryHistoryDayRecord[];
+  revision: number;
+};
+
+export type TimeAllocationExportRequest = {
+  startDate: string;
+  endDate: string;
+  includeSpecialTime: boolean;
+};
+
+export type TimeAllocationExportPreview = {
+  rowCount: number;
+  totalMinutes: number;
+  defaultFileName: string;
+};
+
+export type TimeAllocationExportResult = {
+  rowCount: number;
+  totalMinutes: number;
+  path: string;
+};
+
 export type TodayWorkOverviewScopeRecord = {
   subjectId?: string;
   subjectName: string;
@@ -677,6 +714,24 @@ export async function stopTimerRecord(
 
 export async function listTimeEntries(workDate: string, includeBreaks = true): Promise<TimeEntryListResult> {
   return await invoke<TimeEntryListResult>("time_entry_list", { request: { workDate, includeBreaks } });
+}
+
+export async function listTimeEntryHistory(page: number): Promise<TimeEntryHistoryResult> {
+  return await invoke<TimeEntryHistoryResult>("time_entry_history_list", {
+    request: { page, includeBreaks: true },
+  });
+}
+
+export async function previewTimeAllocationExport(
+  request: TimeAllocationExportRequest,
+): Promise<TimeAllocationExportPreview> {
+  return await invoke<TimeAllocationExportPreview>("time_allocation_export_preview", { request });
+}
+
+export async function executeTimeAllocationExport(
+  request: TimeAllocationExportRequest & { targetPath: string },
+): Promise<TimeAllocationExportResult> {
+  return await invoke<TimeAllocationExportResult>("time_allocation_export_execute", { request });
 }
 
 export async function getTodayWorkOverview(request: {

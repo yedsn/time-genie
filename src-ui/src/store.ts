@@ -18,6 +18,7 @@ import {
   listTasks,
   listTodayTasks,
   listTimeEntries,
+  listTimeEntryHistory,
   listReports,
   pauseTimerRecord,
   replaceTimeAllocations,
@@ -54,6 +55,7 @@ import {
   updateTimeEntry,
   updateTimeEntryDisposition,
   type TimeEntryRecord,
+  type TimeEntryHistoryDayRecord,
   type TimerStopResultRecord,
   type TaskRecord,
   type TodayWorkOverviewRecord,
@@ -63,6 +65,7 @@ import {
 } from "./services/tauri";
 import { transientMissingStateResult } from "./services/transientStateGuard";
 import { canSubmitUnassignedResolution } from "./services/unassignedResolutionGuard";
+import { clampHistoryPage, collectTodayEntryTaskIds, findEntryInHistory, isTodayTimeEntry, timerStopHistoryTarget } from "./services/timeEntryHistoryCore";
 
 export type TaskStatus = "open" | "done";
 
@@ -141,6 +144,10 @@ export type TimeEntry = {
   splitBoundaryAt?: number;
 };
 
+export type TimeEntryHistoryDay = Omit<TimeEntryHistoryDayRecord, "entries"> & {
+  entries: TimeEntry[];
+};
+
 export type UnassignedTimeAction = "work" | "break" | "discard";
 
 export type ReportType = "daily" | "weekly" | "monthly";
@@ -183,6 +190,12 @@ export const useWorkdayStore = defineStore("workday", () => {
   const todayTasks = reactive<Task[]>([]);
   const statusColors = reactive<StatusColors>({ ...defaultStatusColors });
   const entries = reactive<TimeEntry[]>([]);
+  const timeHistoryGroups = reactive<TimeEntryHistoryDay[]>([]);
+  const timeHistoryPage = ref(1);
+  const timeHistoryTotalDays = ref(0);
+  const timeHistoryTotalPages = ref(0);
+  const timeHistoryLoading = ref(false);
+  const timeHistoryRevision = ref(0);
   const selectedTaskId = ref("");
   const selectedEntryId = ref("");
   const reports = ref<ReportRecord[]>([]);
@@ -215,6 +228,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   let timeRefreshClock: number | undefined;
   let timeDataRequestSeq = 0;
   let timeDataMutationSeq = 0;
+  let timeHistoryRequestSeq = 0;
   let unassignedStateRequestSeq = 0;
   let unassignedStateMutationSeq = 0;
   let timerStateMissingRefreshes = 0;
@@ -225,13 +239,15 @@ export const useWorkdayStore = defineStore("workday", () => {
   const workspaceLoaded = ref(false);
   const workspaceLoading = ref(false);
   const todayMinutes = computed(() => entries.reduce((sum, entry) => {
-    if (entry.kind === "break") return sum;
+    if (entry.kind === "break" || !isTodayTimeEntry(entry, workspaceToday.value)) return sum;
     return sum + Math.ceil(entryDurationSeconds(entry) / 60);
   }, 0));
-  const allocatedMinutes = computed(() => entries.reduce((sum, entry) => sum + entry.allocated, 0));
+  const allocatedMinutes = computed(() => entries.reduce((sum, entry) => (
+    isTodayTimeEntry(entry, workspaceToday.value) ? sum + entry.allocated : sum
+  ), 0));
   const pendingMinutes = computed(() => Math.max(0, todayMinutes.value - allocatedMinutes.value));
   const runningEntry = computed(() => entries.find((entry) => entry.state === "running" || entry.state === "paused"));
-  const selectedEntry = computed(() => entries.find((entry) => entry.id === selectedEntryId.value));
+  const selectedEntry = computed(() => findTimeEntry(selectedEntryId.value));
   const timerStopConfirmationEntry = computed(() => {
     const fromChain = timerStopConfirmation.value?.slices.find((entry) => entry.id === timerStopConfirmationEntryId.value);
     return fromChain ?? entries.find((entry) => entry.id === timerStopConfirmationEntryId.value && entry.state === "ended");
@@ -242,14 +258,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     const taskIds = new Set(tasks
       .filter((task) => task.version > 0 && (task.todayEstimate ?? 0) > 0)
       .map((task) => task.id));
-    for (const entry of entries) {
-      if (entry.kind === "break" || entry.workDate !== workspaceToday.value) continue;
-      const allocations = (entry.allocations ?? []).filter((allocation) => allocation.minutes > 0);
-      if (!allocations.length && entry.defaultTask) taskIds.add(entry.defaultTask);
-      for (const allocation of allocations) {
-        if (allocation.minutes > 0) taskIds.add(allocation.taskId);
-      }
-    }
+    for (const taskId of collectTodayEntryTaskIds(entries, workspaceToday.value)) taskIds.add(taskId);
     return taskIds;
   });
   const todayCompletionTotalCount = computed(() => todayCompletionTaskIds.value.size);
@@ -498,7 +507,7 @@ export const useWorkdayStore = defineStore("workday", () => {
         timerStopConfirmationEntryId.value = "";
       }
       if (!entries.some((entry) => entry.id === selectedEntryId.value)) {
-        selectedEntryId.value = entries[0]?.id ?? "";
+        if (!findTimeEntry(selectedEntryId.value)) selectedEntryId.value = entries[0]?.id ?? "";
       }
     } catch (error) {
       console.error("加载计时数据失败", error);
@@ -572,6 +581,37 @@ export const useWorkdayStore = defineStore("workday", () => {
     } catch (error) {
       console.error("加载未归属时间失败", error);
     }
+  }
+
+  async function loadTimeHistory(page = timeHistoryPage.value) {
+    const requestSeq = ++timeHistoryRequestSeq;
+    timeHistoryLoading.value = true;
+    try {
+      const result = await listTimeEntryHistory(Math.max(1, Math.round(page)));
+      if (requestSeq !== timeHistoryRequestSeq) return result;
+      timeHistoryPage.value = result.page;
+      timeHistoryTotalDays.value = result.totalDays;
+      timeHistoryTotalPages.value = result.totalPages;
+      timeHistoryRevision.value = result.revision;
+      timeHistoryGroups.splice(0, timeHistoryGroups.length, ...result.groups.map((group) => ({
+        ...group,
+        entries: group.entries.map(toUiTimeEntry),
+      })));
+      if (selectedEntryId.value && !findTimeEntry(selectedEntryId.value)) selectedEntryId.value = "";
+      return result;
+    } catch (error) {
+      console.error("加载时间记录历史失败", error);
+      throw error;
+    } finally {
+      if (requestSeq === timeHistoryRequestSeq) timeHistoryLoading.value = false;
+    }
+  }
+
+  async function selectTimeHistoryPage(page: number) {
+    if (timeHistoryLoading.value) return;
+    const target = clampHistoryPage(page, timeHistoryTotalPages.value);
+    if (target === timeHistoryPage.value && timeHistoryGroups.length) return;
+    await loadTimeHistory(target);
   }
 
   function markTimeDataChanged() {
@@ -1118,6 +1158,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     await loadWorkspaceData();
     await loadUnassignedState();
     await loadTodayOverview();
+    await loadTimeHistory(timeHistoryPage.value);
     return stopped.id;
   }
 
@@ -1135,10 +1176,14 @@ export const useWorkdayStore = defineStore("workday", () => {
     timerStopConfirmation.value = undefined;
   }
 
-  function adjustTimerStopAllocation(entryId = timerStopConfirmationEntryId.value) {
+  async function adjustTimerStopAllocation(entryId = timerStopConfirmationEntryId.value) {
     if (!entryId) return;
-    selectedEntryId.value = entryId;
-    activePage.value = "timer";
+    const alreadyOnTimerPage = activePage.value === "timer";
+    const target = timerStopHistoryTarget(entryId);
+    selectedEntryId.value = target.selectedEntryId;
+    timeHistoryPage.value = target.historyPage;
+    activePage.value = target.activePage;
+    if (alreadyOnTimerPage) await loadTimeHistory(target.historyPage);
     timerStopConfirmationEntryId.value = "";
     timerStopConfirmation.value = undefined;
   }
@@ -1165,6 +1210,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     }
     await loadWorkspaceData();
     await loadTodayOverview();
+    await loadTimeHistory(timeHistoryPage.value);
     const completedTaskIds = completionCandidate && tasks.find((item) => item.id === completionCandidate)?.status === "done"
       ? [completionCandidate]
       : [];
@@ -1180,13 +1226,14 @@ export const useWorkdayStore = defineStore("workday", () => {
     }
     await Promise.all([loadTimeData(), loadWorkspaceData()]);
     await loadTodayOverview();
+    await loadTimeHistory(timeHistoryPage.value);
     timerStopConfirmationEntryId.value = "";
     timerStopConfirmation.value = undefined;
     return true;
   }
 
   async function allocate(entryId: string, allocations: TimeAllocation[]): Promise<BatchCompletionResult | undefined> {
-    const entry = entries.find((item) => item.id === entryId);
+    const entry = findTimeEntry(entryId);
     if (!entry) return;
     const normalized: Array<{ taskId: string; minutes: number; note?: string; completeTask: boolean; taskExpectedVersion?: number }> = [];
     for (const item of allocations) {
@@ -1210,6 +1257,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     replaceTimeEntry(await replaceTimeAllocations(entry.id, entry.version, normalized));
     await loadWorkspaceData();
     await loadTodayOverview();
+    await loadTimeHistory(timeHistoryPage.value);
     const completedTaskIds = [...completionCandidates].filter((taskId) => tasks.find((task) => task.id === taskId)?.status === "done");
     return { completedCount: completedTaskIds.length, completedTaskIds };
   }
@@ -1235,6 +1283,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     selectedEntryId.value = entry.id;
     await loadWorkspaceData();
     await loadTodayOverview();
+    await loadTimeHistory(1);
     const completedTaskIds = completionCandidate && tasks.find((item) => item.id === completionCandidate)?.status === "done"
       ? [completionCandidate]
       : [];
@@ -1242,7 +1291,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function correctTimeEntry(entryId: string, startedAt: number, endedAt: number, note = "") {
-    const entry = entries.find((item) => item.id === entryId);
+    const entry = findTimeEntry(entryId);
     if (!entry) return;
     markTimeDataChanged();
     replaceTimeEntry(await updateTimeEntry({
@@ -1254,28 +1303,28 @@ export const useWorkdayStore = defineStore("workday", () => {
     }));
     await loadWorkspaceData();
     await loadTodayOverview();
+    await loadTimeHistory(timeHistoryPage.value);
   }
 
   async function setTimeEntryDisposition(entryId: string, disposition: "break" | "discard") {
-    const entry = entries.find((item) => item.id === entryId);
+    const entry = findTimeEntry(entryId);
     if (!entry) return;
     markTimeDataChanged();
-    const updated = toUiTimeEntry(await updateTimeEntryDisposition({
+    const updatedRecord = await updateTimeEntryDisposition({
       entryId,
       expectedVersion: entry.version,
       disposition,
-    }));
+    });
     if (disposition === "discard") {
       const index = entries.findIndex((item) => item.id === entryId);
       if (index >= 0) entries.splice(index, 1);
-      if (selectedEntryId.value === entryId) selectedEntryId.value = entries[0]?.id ?? "";
+      if (selectedEntryId.value === entryId) selectedEntryId.value = "";
     } else {
-      const index = entries.findIndex((item) => item.id === updated.id);
-      if (index >= 0) entries.splice(index, 1, updated);
-      else entries.unshift(updated);
+      replaceTimeEntry(updatedRecord);
     }
     await loadWorkspaceData();
     await loadTodayOverview();
+    await loadTimeHistory(timeHistoryPage.value);
   }
 
   async function createReport(request: { type: ReportType; referenceDate: string; subjectId: string; taskIds: string[]; templateId?: string }) {
@@ -1361,8 +1410,18 @@ export const useWorkdayStore = defineStore("workday", () => {
     if (next.state === "running" || next.state === "paused") timerStateMissingRefreshes = 0;
     const index = entries.findIndex((entry) => entry.id === record.id);
     if (index >= 0) entries.splice(index, 1, next);
-    else entries.unshift(next);
+    else if (next.workDate === workspaceToday.value || next.state !== "ended") entries.unshift(next);
+    for (const group of timeHistoryGroups) {
+      const historyIndex = group.entries.findIndex((entry) => entry.id === record.id);
+      if (historyIndex >= 0) group.entries.splice(historyIndex, 1, next);
+    }
     return next;
+  }
+
+  function findTimeEntry(entryId: string) {
+    if (!entryId) return undefined;
+    return entries.find((entry) => entry.id === entryId)
+      ?? findEntryInHistory(timeHistoryGroups, entryId);
   }
 
   async function loadReportTemplates(type?: ReportType) {
@@ -1429,17 +1488,18 @@ export const useWorkdayStore = defineStore("workday", () => {
     resetUnassignedTracking();
     await Promise.all([loadTimeData(), loadWorkspaceData(), loadUnassignedState()]);
     await loadTodayOverview();
+    await loadTimeHistory(timeHistoryPage.value);
     const completedTaskIds = [...completionCandidates].filter((taskId) => tasks.find((task) => task.id === taskId)?.status === "done");
     return { completedCount: completedTaskIds.length, completedTaskIds };
   }
 
   return {
-    activePage, subjects, selectedSubjectId, selectedSubject, selectedSubjectTasks, tasks, todayTasks, visibleTasks, statusColors, entries, reports, todayOverview, todayOverviewLoading, todayOverviewSubjectId, todayOverviewSubject, selectedTaskId, selectedEntryId, selectedEntry, runningEntry, timerStopConfirmationEntryId, timerStopConfirmationEntry, timerStopConfirmationSlices, timerStopConfirmation,
+    activePage, subjects, selectedSubjectId, selectedSubject, selectedSubjectTasks, tasks, todayTasks, visibleTasks, statusColors, entries, timeHistoryGroups, timeHistoryPage, timeHistoryTotalDays, timeHistoryTotalPages, timeHistoryLoading, timeHistoryRevision, reports, todayOverview, todayOverviewLoading, todayOverviewSubjectId, todayOverviewSubject, selectedTaskId, selectedEntryId, selectedEntry, runningEntry, timerStopConfirmationEntryId, timerStopConfirmationEntry, timerStopConfirmationSlices, timerStopConfirmation,
     workspaceTimezone, workspaceToday, workspaceDayStartAt, workspaceDayEndAt, refreshWorkspaceCalendar,
     now, todayMinutes, allocatedMinutes, pendingMinutes, doneCount, todayCompletionDoneCount, todayCompletionTotalCount, todayCompletionPercent, unassignedSeconds, unassignedStartedAt,
     unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen, unassignedWorkDate, unassignedSessionId,
     unassignedCurrentSession,
-    workspaceLoaded, workspaceLoading, loadWorkspaceData, loadTimeData, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addChildTask, saveTask, duplicateTask, deleteTask, moveTask, reorderTask,
+    workspaceLoaded, workspaceLoading, loadWorkspaceData, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addChildTask, saveTask, duplicateTask, deleteTask, moveTask, reorderTask,
     indentTask, outdentTask, startTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, adjustTimerStopAllocation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, loadReportTemplates, createReportTemplate, updateReportTemplate, duplicateReportTemplate, setDefaultReportTemplate, deleteReportTemplate, reorderReportTemplates, getReportTemplatePlaceholders, publicReportText, previewObsidianReport, writeObsidianReport,
     beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, dismissUnassignedResolution, resolveUnassignedTime
   };

@@ -6575,6 +6575,225 @@ mod tests {
     }
 
     #[test]
+    fn isolated_cloud_caches_converge_history_without_creating_outbox_work() {
+        let (_directory_a, database_a, cloud_workspace_a, _local_workspace_a, _subject_a) =
+            cloud_database_for_incremental_test("history-cache-device-a.sqlite3");
+        let (_directory_b, database_b, _initial_cloud_workspace_b, _local_workspace_b, _subject_b) =
+            cloud_database_for_incremental_test("history-cache-device-b.sqlite3");
+        settings::update_setting(
+            &database_b,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_a.clone()),
+            },
+        )
+        .unwrap();
+        let cloud_workspace_b = cloud_workspace_a.clone();
+        let device_a = storage_mode(&database_a).unwrap().device_id;
+        let device_b = storage_mode(&database_b).unwrap().device_id;
+        let entry_id = Uuid::now_v7().to_string();
+        let started_at = 1_780_278_600_000_i64;
+        let version_one = json!({
+            "id": entry_id,
+            "work_date": "2026-05-30",
+            "kind": "work",
+            "source_type": "manual",
+            "state": "ended",
+            "default_task_id": null,
+            "label_snapshot": "跨设备历史记录",
+            "started_at": started_at,
+            "ended_at": started_at + 600_000,
+            "duration_seconds": 600,
+            "note": "设备 A 创建",
+            "origin_unassigned_session_id": null,
+            "created_at": started_at,
+            "updated_at": started_at + 600_000,
+            "version": 1,
+            "deleted_at": null,
+            "segments": [],
+            "allocations": []
+        });
+        for (database, cloud_workspace, device_id) in [
+            (&database_a, &cloud_workspace_a, &device_a),
+            (&database_b, &cloud_workspace_b, &device_b),
+        ] {
+            apply_incremental_entities(
+                database,
+                cloud_workspace,
+                device_id,
+                1,
+                &[incremental_entity(
+                    "time_entries",
+                    "time_entries",
+                    entry_id.clone(),
+                    false,
+                    Some(version_one.clone()),
+                )],
+            )
+            .unwrap();
+        }
+        for day in 23..=29 {
+            let additional_id = Uuid::now_v7().to_string();
+            let additional = json!({
+                "id": additional_id,
+                "work_date": format!("2026-05-{day:02}"),
+                "kind": "work",
+                "source_type": "manual",
+                "state": "ended",
+                "default_task_id": null,
+                "label_snapshot": format!("历史日期 {day}"),
+                "started_at": started_at - i64::from(30 - day) * 86_400_000,
+                "ended_at": started_at - i64::from(30 - day) * 86_400_000 + 600_000,
+                "duration_seconds": 600,
+                "note": null,
+                "origin_unassigned_session_id": null,
+                "created_at": started_at,
+                "updated_at": started_at,
+                "version": 1,
+                "deleted_at": null,
+                "segments": [],
+                "allocations": []
+            });
+            for (database, cloud_workspace, device_id) in [
+                (&database_a, &cloud_workspace_a, &device_a),
+                (&database_b, &cloud_workspace_b, &device_b),
+            ] {
+                apply_incremental_entities(
+                    database,
+                    cloud_workspace,
+                    device_id,
+                    i64::from(day - 21),
+                    &[incremental_entity(
+                        "time_entries",
+                        "time_entries",
+                        additional_id.clone(),
+                        false,
+                        Some(additional.clone()),
+                    )],
+                )
+                .unwrap();
+            }
+        }
+        let version_two = json!({
+            "id": entry_id,
+            "work_date": "2026-05-30",
+            "kind": "work",
+            "source_type": "manual",
+            "state": "ended",
+            "default_task_id": null,
+            "label_snapshot": "跨设备历史记录",
+            "started_at": started_at,
+            "ended_at": started_at + 1_200_000,
+            "duration_seconds": 1_200,
+            "note": "设备 B 已修正",
+            "origin_unassigned_session_id": null,
+            "created_at": started_at,
+            "updated_at": started_at + 1_200_000,
+            "version": 2,
+            "deleted_at": null,
+            "segments": [],
+            "allocations": []
+        });
+        for (database, cloud_workspace, device_id) in [
+            (&database_a, &cloud_workspace_a, &device_a),
+            (&database_b, &cloud_workspace_b, &device_b),
+        ] {
+            apply_incremental_entities(
+                database,
+                cloud_workspace,
+                device_id,
+                2,
+                &[incremental_entity(
+                    "time_entries",
+                    "time_entries",
+                    entry_id.clone(),
+                    false,
+                    Some(version_two.clone()),
+                )],
+            )
+            .unwrap();
+        }
+        let outbox_before = |database: &Database| -> i64 {
+            database
+                .open()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before_a = outbox_before(&database_a);
+        let before_b = outbox_before(&database_b);
+        let history_a = time_tracking::list_time_entry_history(
+            &database_a,
+            time_tracking::TimeEntryHistoryRequest {
+                page: 1,
+                include_breaks: true,
+            },
+        )
+        .unwrap();
+        let history_b = time_tracking::list_time_entry_history(
+            &database_b,
+            time_tracking::TimeEntryHistoryRequest {
+                page: 1,
+                include_breaks: true,
+            },
+        )
+        .unwrap();
+        let older_a = time_tracking::list_time_entry_history(
+            &database_a,
+            time_tracking::TimeEntryHistoryRequest {
+                page: 2,
+                include_breaks: true,
+            },
+        )
+        .unwrap();
+        let older_b = time_tracking::list_time_entry_history(
+            &database_b,
+            time_tracking::TimeEntryHistoryRequest {
+                page: 2,
+                include_breaks: true,
+            },
+        )
+        .unwrap();
+        let comparable = |history: time_tracking::TimeEntryHistoryResult| {
+            let mut value = serde_json::to_value(history).unwrap();
+            value.as_object_mut().unwrap().remove("revision");
+            value
+        };
+        assert_eq!(comparable(history_a), comparable(history_b));
+        assert_eq!(comparable(older_a), comparable(older_b));
+        let refreshed = time_tracking::list_time_entry_history(
+            &database_a,
+            time_tracking::TimeEntryHistoryRequest {
+                page: 1,
+                include_breaks: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(refreshed.groups[0].raw_minutes, 20);
+        assert_eq!(refreshed.total_days, 8);
+        assert_eq!(refreshed.total_pages, 2);
+        assert_eq!(refreshed.groups.len(), 7);
+        assert_eq!(refreshed.groups[0].entries[0].version, 2);
+        assert_eq!(
+            refreshed.groups[0].entries[0].note.as_deref(),
+            Some("设备 B 已修正")
+        );
+        assert_eq!(outbox_before(&database_a), before_a);
+        assert_eq!(outbox_before(&database_b), before_b);
+        assert_eq!(
+            storage_mode(&database_a).unwrap().pending_operations,
+            before_a
+        );
+        assert_eq!(
+            storage_mode(&database_b).unwrap().pending_operations,
+            before_b
+        );
+        assert!(!storage_mode(&database_a).unwrap().online);
+        assert!(!storage_mode(&database_b).unwrap().online);
+    }
+
+    #[test]
     fn authoritative_calendar_timer_replaces_conflicting_local_candidate_and_redirects_dependents()
     {
         let (_directory, database, cloud_workspace_id, local_workspace_id, _subject_id) =

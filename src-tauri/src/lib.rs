@@ -26,6 +26,7 @@ mod subject_work_schedules;
 mod subjects;
 mod supabase;
 mod tasks;
+mod time_allocation_export;
 mod time_tracking;
 mod today_overview;
 mod unassigned;
@@ -453,10 +454,13 @@ pub fn run() {
             time_tracking::timer_resume,
             time_tracking::timer_stop,
             time_tracking::time_entry_list,
+            time_tracking::time_entry_history_list,
             time_tracking::time_entry_create_manual,
             time_tracking::time_entry_update,
             time_tracking::time_entry_update_disposition,
             time_tracking::time_allocation_replace,
+            time_allocation_export::time_allocation_export_preview,
+            time_allocation_export::time_allocation_export_execute,
             unassigned::unassigned_get_state,
             unassigned::unassigned_get_state_snapshot,
             unassigned::unassigned_get_session,
