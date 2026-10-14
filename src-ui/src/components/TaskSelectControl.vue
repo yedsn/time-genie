@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onUnmounted, ref, watch } from "vue";
 import { ElMessage } from "element-plus";
 import { X } from "lucide-vue-next";
 import { useWorkdayStore, type Task } from "../store";
@@ -20,6 +20,7 @@ type TaskSuggestion = {
 
 type AutocompleteInstance = {
   getData: (query: string) => Promise<void>;
+  highlight: (index: number) => void;
   close: () => void;
   blur: () => void;
 };
@@ -174,8 +175,14 @@ function fetchSuggestions(query: string, callback: (items: TaskSuggestion[]) => 
         isMatch: !keyword || label.toLocaleLowerCase().includes(keyword),
         taskId: task.id
       };
-    })
-  callback(suggestions);
+    });
+  const visibleSuggestions = props.variant === "tray" && keyword
+    ? suggestions.filter((suggestion) => suggestion.isMatch)
+    : suggestions;
+  callback(visibleSuggestions);
+  if (props.variant === "tray" && visibleSuggestions.length > 0) {
+    void nextTick(() => autocompleteRef.value?.highlight(0));
+  }
 }
 
 function handleInput(value: string | number) {
@@ -202,8 +209,12 @@ function openTaskSuggestions(event: MouseEvent) {
 }
 
 function announceSuggestionsOpen(force = false) {
-  if (props.variant !== "tray" || suggestionsOpen) return;
+  if (props.variant !== "tray") return;
   if (!force && performance.now() < suppressFocusOpenUntil) return;
+  if (suggestionsOpen) {
+    if (force) showTaskSuggestions();
+    return;
+  }
   suggestionsOpen = true;
   emit("suggestions-open", showTaskSuggestions);
 }
@@ -322,7 +333,6 @@ defineExpose({ commit: commitText, closeSuggestions: closeTaskSuggestions });
       :fit-input-width="variant !== 'tray'"
       highlight-first-item
       select-when-unmatched
-      :trigger-on-focus="variant !== 'tray'"
       clearable
       :clear-icon="X"
       @input="handleInput"
