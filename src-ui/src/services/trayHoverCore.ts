@@ -1,9 +1,3 @@
-export type TrayTaskCandidate = {
-  id: string;
-  parentId?: string;
-  selectable: boolean;
-};
-
 export type TrayIdlePresentation = "timer" | "unassigned" | "idle";
 
 export function createSingleFlight<TArgs extends unknown[], TResult>(
@@ -18,17 +12,6 @@ export function createSingleFlight<TArgs extends unknown[], TResult>(
     }
     return active;
   };
-}
-
-export function reconcileTrayTaskSelection(
-  selectedTaskId: string,
-  tasks: TrayTaskCandidate[],
-): string {
-  if (!selectedTaskId) return "";
-  const selected = tasks.find((task) => task.id === selectedTaskId);
-  if (!selected?.selectable) return "";
-  if (tasks.some((task) => task.parentId === selectedTaskId)) return "";
-  return selectedTaskId;
 }
 
 export function trayIdlePresentation(input: {

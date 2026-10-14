@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from
 import { AlertTriangle, CalendarDays, CheckCircle2, Clock3, Copy, Database, FileText, Home, LoaderCircle, Minus, Pencil, Plus, RefreshCw, Save, Settings, Square, UserRound, X } from "lucide-vue-next";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useWorkdayStore, type Task } from "../store";
-import { checkAppUpdate, closeMainWindow, confirmObsidianPlan, configureCloud, downloadAndInstallUpdate, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listCloudSyncConflicts, listCloudSyncQueue, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onTrayCheckUpdate, previewObsidianPlan, previewSeaTableTaskSync, previewStorageMigration, registerCloudDevice, resetLocalCacheFromCloud, resolveAllCloudSyncConflicts, restartApp, resumeCloudSyncAfterReauth, retryFailedSeaTableSync, revokeCloudDevice, saveCloudSync, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudSessionSnapshot, type CloudSyncConflict, type CloudSyncQueueItem, type PlanImportPreviewResult, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
+import { checkAppUpdate, closeMainWindow, confirmObsidianPlan, configureCloud, downloadAndInstallUpdate, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listCloudSyncConflicts, listCloudSyncQueue, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onOpenTimerTaskSelection, onTrayCheckUpdate, previewObsidianPlan, previewSeaTableTaskSync, previewStorageMigration, registerCloudDevice, resetLocalCacheFromCloud, resolveAllCloudSyncConflicts, restartApp, resumeCloudSyncAfterReauth, retryFailedSeaTableSync, revokeCloudDevice, saveCloudSync, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudSessionSnapshot, type CloudSyncConflict, type CloudSyncQueueItem, type PlanImportPreviewResult, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
 import PlanListEditor from "../components/PlanListEditor.vue";
 import GlobalTimerBar from "../components/GlobalTimerBar.vue";
 import UnassignedTimeIndicator from "../components/UnassignedTimeIndicator.vue";
@@ -151,6 +151,7 @@ function handleSettingsScroll(event: Event) {
 }
 let unlistenWindowResize: (() => void) | undefined;
 let unlistenNavigatePage: (() => void) | undefined;
+let unlistenOpenTimerTaskSelection: (() => void) | undefined;
 let unlistenCloudSyncState: (() => void) | undefined;
 let unlistenTrayCheckUpdate: (() => void) | undefined;
 let unlistenAppUpdateEvent: (() => void) | undefined;
@@ -158,6 +159,7 @@ let cloudSaveSettledTimer: number | undefined;
 let cloudSavePendingSince = 0;
 const completingTaskIds = new Set<string>();
 const recentCompletedTaskId = ref("");
+const timeTrackingWorkspaceRef = ref<{ focusTaskSelector: () => Promise<void> }>();
 let recentCompletedTimer: number | undefined;
 
 const cloudSyncView = computed(() => cloudSyncPresentation(storageState.value, formatSyncTime));
@@ -936,6 +938,11 @@ onMounted(async () => {
   unlistenNavigatePage = await onNavigatePage((page) => {
     if (pages.some((item) => item.id === page)) store.activePage = page;
   });
+  unlistenOpenTimerTaskSelection = await onOpenTimerTaskSelection(async () => {
+    store.activePage = "timer";
+    await nextTick();
+    await timeTrackingWorkspaceRef.value?.focusTaskSelector();
+  });
   unlistenCloudSyncState = await onCloudSyncStateChanged((state) => {
     updateVisibleCloudSaveState(state);
     storageState.value = state;
@@ -950,6 +957,7 @@ onMounted(async () => {
 onUnmounted(() => {
   unlistenWindowResize?.();
   unlistenNavigatePage?.();
+  unlistenOpenTimerTaskSelection?.();
   unlistenCloudSyncState?.();
   unlistenTrayCheckUpdate?.();
   unlistenAppUpdateEvent?.();
@@ -1375,7 +1383,7 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
         />
       </section>
 
-      <TimeTrackingWorkspace v-else-if="store.activePage === 'timer'" />
+      <TimeTrackingWorkspace v-else-if="store.activePage === 'timer'" ref="timeTrackingWorkspaceRef" />
 
       <ReportWorkspace v-else-if="store.activePage === 'reports'" />
 

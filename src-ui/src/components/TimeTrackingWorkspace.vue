@@ -24,7 +24,10 @@ type TimeCorrectionDraft = {
   note: string;
 };
 
-type TaskSelectControlInstance = { commit: () => string | undefined };
+type TaskSelectControlInstance = {
+  commit: () => string | undefined;
+  focus: () => void;
+};
 
 const store = useWorkdayStore();
 const expandedEntryId = ref(store.selectedEntryId);
@@ -525,6 +528,14 @@ function errorText(error: unknown, fallback: string) {
   if (typeof error === "string" && error.trim()) return error;
   return error instanceof Error ? error.message : fallback;
 }
+
+async function focusTaskSelector() {
+  if (store.runningEntry) return;
+  await nextTick();
+  timerTaskControl.value?.focus();
+}
+
+defineExpose({ focusTaskSelector });
 </script>
 
 <template>

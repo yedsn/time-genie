@@ -1200,12 +1200,12 @@ export async function openMainOverview() {
   try { await invoke("window_open_main_overview"); } catch { await getCurrentWindow().show(); }
 }
 
-export async function openMainUnassignedResolution() {
-  try { await invoke("window_open_main_unassigned"); } catch { await getCurrentWindow().show(); }
+export async function openMainTimerTaskSelection() {
+  try { await invoke("window_open_main_timer_task_selection"); } catch { await getCurrentWindow().show(); }
 }
 
-export async function setHoverTaskSelectionMode(expanded: boolean) {
-  await invoke(expanded ? "window_expand_hover_for_task_selection" : "window_restore_hover_compact");
+export async function openMainUnassignedResolution() {
+  try { await invoke("window_open_main_unassigned"); } catch { await getCurrentWindow().show(); }
 }
 
 export async function closeMainWindow() {
@@ -1312,6 +1312,14 @@ export async function onTrayHoverShown(handler: () => void) {
 export async function onOpenUnassignedResolution(handler: () => void) {
   try {
     return await listen("open-unassigned-resolution", () => handler());
+  } catch {
+    return () => {};
+  }
+}
+
+export async function onOpenTimerTaskSelection(handler: () => void) {
+  try {
+    return await listen("open-timer-task-selection", () => handler());
   } catch {
     return () => {};
   }

@@ -1,18 +1,20 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { ArrowUpRight, Clock3, Pause, Play, RefreshCw, Square } from "lucide-vue-next";
 import { ElMessage } from "element-plus";
 import { useWorkdayStore } from "../store";
-import { notifyWorkDataChanged, onTrayHoverShown, openMainOverview, openMainUnassignedResolution, setHoverTaskSelectionMode } from "../services/tauri";
-import { createSingleFlight, reconcileTrayTaskSelection, trayIdlePresentation } from "../services/trayHoverCore";
-import TaskSelectControl from "../components/TaskSelectControl.vue";
+import {
+  notifyWorkDataChanged,
+  onTrayHoverShown,
+  openMainOverview,
+  openMainTimerTaskSelection,
+  openMainUnassignedResolution,
+} from "../services/tauri";
+import { createSingleFlight, trayIdlePresentation } from "../services/trayHoverCore";
 
 const store = useWorkdayStore();
 const busy = ref(false);
 const refreshing = ref(false);
-const selectionExpanded = ref(false);
-const taskSelectRef = ref<{ closeSuggestions: () => void }>();
-const selectedTaskId = ref(store.selectedTaskId);
 const entry = computed(() => store.runningEntry);
 const idlePresentation = computed(() => trayIdlePresentation({
   hasActiveEntry: Boolean(entry.value),
@@ -22,29 +24,22 @@ const idlePresentation = computed(() => trayIdlePresentation({
 const hasUnassignedTime = computed(() => idlePresentation.value === "unassigned");
 let unlistenTrayHoverShown: (() => void) | undefined;
 let unmounted = false;
-let selectionTransition = Promise.resolve(true);
 
-function formatDuration(seconds: number, includeSeconds = false) {
+function formatDuration(seconds: number) {
   const safeSeconds = Math.max(0, Math.floor(seconds));
   const hours = Math.floor(safeSeconds / 3600);
   const minutes = Math.floor((safeSeconds % 3600) / 60);
   const rest = safeSeconds % 60;
-  const base = String(hours).padStart(2, "0") + ":" + String(minutes).padStart(2, "0");
-  return includeSeconds ? base + ":" + String(rest).padStart(2, "0") : base;
+  return [hours, minutes, rest].map((value) => String(value).padStart(2, "0")).join(":");
 }
 
 const elapsed = computed(() => formatDuration(entry.value ? store.entryDurationSeconds(entry.value) : 0));
-const unassignedElapsed = computed(() => formatDuration(store.unassignedSeconds, true));
-
-function reconcileSelection() {
-  selectedTaskId.value = reconcileTrayTaskSelection(selectedTaskId.value, store.tasks);
-}
+const unassignedElapsed = computed(() => formatDuration(store.unassignedSeconds));
 
 const runRefreshSingleFlight = createSingleFlight(async () => {
   refreshing.value = true;
   try {
     const results = await Promise.all([store.loadWorkspaceData(), store.loadTimeData(), store.loadUnassignedState()]);
-    reconcileSelection();
     return results.every((result) => result !== false);
   } finally {
     refreshing.value = false;
@@ -60,34 +55,16 @@ async function refreshTrayData(manual = false) {
   return succeeded;
 }
 
-function setSelectionExpanded(expanded: boolean) {
-  selectionTransition = selectionTransition.then(async () => {
-    if (selectionExpanded.value === expanded) return true;
-    try {
-      await setHoverTaskSelectionMode(expanded);
-      selectionExpanded.value = expanded;
-      return true;
-    } catch (error) {
-      if (expanded) ElMessage.error(error instanceof Error ? error.message : "无法展开事项列表");
-      return false;
-    }
-  });
-  return selectionTransition;
-}
-
-async function openTaskSuggestions(showSuggestions: () => void) {
-  if (!(await setSelectionExpanded(true))) return;
-  showSuggestions();
-}
-
 async function openMain() {
-  await setSelectionExpanded(false);
   await openMainOverview();
+}
+
+async function openTimerSelection() {
+  await openMainTimerTaskSelection();
 }
 
 async function openUnassigned() {
   if (!hasUnassignedTime.value) return;
-  await setSelectionExpanded(false);
   await openMainUnassignedResolution();
 }
 
@@ -104,25 +81,14 @@ async function runTimerAction(action: () => Promise<unknown>, fallback: string) 
   }
 }
 
-async function startSelectedTimer() {
-  if (!selectedTaskId.value) return;
-  await setSelectionExpanded(false);
-  await store.startTimer(selectedTaskId.value);
-}
-
 async function stopTimerFromHover() {
   await store.stopTimer();
   await openMain();
 }
 
-watch(() => store.tasks.map((task) => [task.id, task.selectable, task.parentId ?? ""].join(":")).join("|"), reconcileSelection);
-
 onMounted(() => {
   void refreshTrayData();
   void onTrayHoverShown(() => {
-    taskSelectRef.value?.closeSuggestions();
-    selectionExpanded.value = false;
-    void setHoverTaskSelectionMode(false);
     void refreshTrayData();
   }).then((unlisten) => {
     if (unmounted) unlisten();
@@ -133,15 +99,20 @@ onMounted(() => {
 onUnmounted(() => {
   unmounted = true;
   unlistenTrayHoverShown?.();
-  if (selectionExpanded.value) void setHoverTaskSelectionMode(false);
 });
 </script>
 
 <template>
-  <section class="hover-panel-window" :class="{ 'is-selection-expanded': selectionExpanded }">
+  <section class="hover-panel-window">
     <div class="hover-panel">
       <header>
-        <div class="eyebrow"><span class="live-dot"></span>今日工作台</div>
+        <div class="hover-panel-heading">
+          <span class="live-dot" :class="{ paused: entry?.state === 'paused', idle: !entry }"></span>
+          <div>
+            <span>今日计时</span>
+            <small>{{ entry ? (entry.state === 'paused' ? '本段已暂停' : '本段记录中') : '快速状态' }}</small>
+          </div>
+        </div>
         <div class="hover-header-actions">
           <button class="icon-button" title="刷新托盘数据" :disabled="refreshing" @click="refreshTrayData(true)">
             <RefreshCw :size="15" :class="{ 'sync-spin': refreshing }" />
@@ -149,41 +120,34 @@ onUnmounted(() => {
           <button class="icon-button" title="打开主窗口" @click="openMain"><ArrowUpRight :size="16" /></button>
         </div>
       </header>
-      <div class="hover-timer" :class="{ 'is-idle': !entry }">
+
+      <div class="hover-timer" :class="{ 'is-idle': !entry, 'is-paused': entry?.state === 'paused' }">
         <template v-if="entry">
           <div class="timer-state">{{ entry.state === 'paused' ? '已暂停' : '正在记录' }}</div>
           <strong>{{ elapsed }}</strong>
           <div class="hover-task" :title="store.timeEntryLabel(entry)">{{ store.timeEntryLabel(entry) }}</div>
         </template>
         <template v-else>
-          <div class="hover-unassigned-summary" :class="{ 'is-empty': !hasUnassignedTime }">
-            <div>
-              <div class="timer-state">{{ hasUnassignedTime ? '未归属时间 · 正在累计' : '未归属时间' }}</div>
-              <strong>{{ hasUnassignedTime ? unassignedElapsed : '暂无' }}</strong>
-            </div>
-            <button v-if="hasUnassignedTime" class="text-action" @click="openUnassigned"><Clock3 :size="14" />处理未归属时间</button>
-          </div>
-          <div class="hover-task-select">
-            <TaskSelectControl
-              ref="taskSelectRef"
-              v-model="selectedTaskId"
-              variant="tray"
-              placeholder="选择要开始计时的事项"
-              aria-label="悬浮窗计时事项"
-              @suggestions-open="openTaskSuggestions"
-              @suggestions-close="setSelectionExpanded(false)"
-              @suggestion-selected="setSelectionExpanded(false)"
-            />
-          </div>
-          <p v-if="hasUnassignedTime" class="hover-unassigned-warning">开始事项计时会清除这段未归属时间，不会自动分配。</p>
+          <div class="timer-state">{{ hasUnassignedTime ? '未归属时间 · 正在累计' : '未归属时间' }}</div>
+          <strong>{{ hasUnassignedTime ? unassignedElapsed : '00:00:00' }}</strong>
+          <div class="hover-idle-note">{{ hasUnassignedTime ? '可进入主窗口分配、记为休息或丢弃' : '当前没有需要处理的未归属时间' }}</div>
         </template>
       </div>
-      <div class="hover-stats"><span>今日已记录 <b>{{ store.todayMinutes }} 分钟</b></span><span>待结算 <b class="accent-text">{{ store.pendingMinutes }} 分钟</b></span></div>
-      <div class="hover-actions">
-        <button v-if="!entry" class="primary-button" :disabled="busy || !selectedTaskId" @click="runTimerAction(startSelectedTimer, '开始计时失败')"><Play :size="15" fill="currentColor" /> 开始所选事项计时</button>
-        <button v-else-if="entry.state === 'running'" class="secondary-button" :disabled="busy" @click="runTimerAction(store.pauseTimer, '暂停计时失败')"><Pause :size="15" fill="currentColor" /> 暂停</button>
-        <button v-else class="secondary-button" :disabled="busy" @click="runTimerAction(store.resumeTimer, '继续计时失败')"><Play :size="15" fill="currentColor" /> 继续</button>
-        <button v-if="entry" class="danger-button" :disabled="busy" @click="runTimerAction(stopTimerFromHover, '结束计时失败')"><Square :size="14" fill="currentColor" /> 结束本段</button>
+
+      <div class="hover-stats" aria-label="今日时间摘要">
+        <span><small>今日已记录</small><b>{{ store.todayMinutes }} 分钟</b></span>
+        <span><small>待归属</small><b class="accent-text">{{ store.pendingMinutes }} 分钟</b></span>
+      </div>
+
+      <div v-if="entry" class="hover-actions">
+        <button v-if="entry.state === 'running'" class="secondary-button" :disabled="busy" @click="runTimerAction(store.pauseTimer, '暂停计时失败')"><Pause :size="15" fill="currentColor" />暂停</button>
+        <button v-else class="primary-button" :disabled="busy" @click="runTimerAction(store.resumeTimer, '继续计时失败')"><Play :size="15" fill="currentColor" />继续</button>
+        <button class="danger-button" :disabled="busy" @click="runTimerAction(stopTimerFromHover, '结束计时失败')"><Square :size="14" fill="currentColor" />结束并处理</button>
+      </div>
+      <div v-else class="hover-actions hover-idle-actions">
+        <button class="primary-button" @click="openTimerSelection"><Play :size="15" fill="currentColor" />选择事项并开始</button>
+        <button v-if="hasUnassignedTime" class="secondary-button" @click="openUnassigned"><Clock3 :size="14" />处理未归属时间</button>
+        <button v-else class="secondary-button" @click="openMain"><ArrowUpRight :size="14" />打开主窗口</button>
       </div>
     </div>
   </section>
