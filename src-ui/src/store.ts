@@ -1,4 +1,4 @@
-import { computed, reactive, ref } from "vue";
+import { computed, reactive, ref, watch } from "vue";
 import { defineStore } from "pinia";
 import {
   createSubject as createSubjectRecord,
@@ -14,6 +14,7 @@ import {
   getWorkspaceCalendarContext,
   getTimerState,
   getUnassignedStateSnapshot,
+  listCompletedTaskPage,
   listSubjects,
   listTasks,
   listTodayTasks,
@@ -66,6 +67,7 @@ import {
 import { TRANSIENT_MISSING_STATE_REFRESH_LIMIT, transientMissingStateResult } from "./services/transientStateGuard";
 import { canSubmitUnassignedResolution } from "./services/unassignedResolutionGuard";
 import { clampHistoryPage, collectTodayEntryTaskIds, findEntryInHistory, isTodayTimeEntry, timerStopHistoryTarget } from "./services/timeEntryHistoryCore";
+import { completedTaskHistoryFallbackPage, isCurrentCompletedTaskHistoryRequest } from "./services/completedTaskHistoryCore";
 
 export type TaskStatus = "open" | "done";
 
@@ -90,7 +92,9 @@ export type Task = {
   actual: number;
   status: TaskStatus;
   note?: string;
+  pathLabel?: string;
   sortOrder: number;
+  completedAt?: number;
   version: number;
   selectable: boolean;
   executionState: TaskRecord["executionState"];
@@ -143,6 +147,8 @@ export type TimeEntry = {
   previousEntryId?: string;
   splitBoundaryAt?: number;
 };
+
+export type PlanTaskTab = "active" | "completed";
 
 export type TimeEntryHistoryDay = Omit<TimeEntryHistoryDayRecord, "entries"> & {
   entries: TimeEntry[];
@@ -280,8 +286,9 @@ export const useWorkdayStore = defineStore("workday", () => {
   const visibleTasks = computed(() => {
     const childMap = new Map<string, Task[]>();
     const roots: Task[] = [];
+    const taskIds = new Set(tasks.map((task) => task.id));
     for (const task of tasks) {
-      if (task.parentId) {
+      if (task.parentId && taskIds.has(task.parentId)) {
         const children = childMap.get(task.parentId) ?? [];
         children.push(task);
         childMap.set(task.parentId, children);
@@ -294,6 +301,20 @@ export const useWorkdayStore = defineStore("workday", () => {
   });
   const selectedSubject = computed(() => subjects.find((subject) => subject.id === selectedSubjectId.value) ?? subjects[0]);
   const selectedSubjectTasks = computed(() => buildVisibleTaskList(tasks.filter((task) => task.subjectId === selectedSubjectId.value)));
+  const planTaskTab = ref<PlanTaskTab>("active");
+  const completedTasks = reactive<Task[]>([]);
+  const completedTasksSubjectId = ref("");
+  const completedTasksPage = ref(1);
+  const completedTasksPageSize = 20;
+  const completedTasksTotal = ref(0);
+  const completedTasksTotalPages = ref(0);
+  const completedTasksLoading = ref(false);
+  const completedTasksError = ref("");
+  const completedTasksStale = ref(true);
+  let completedTasksRequestSeq = 0;
+  watch(activePage, (page, previousPage) => {
+    if (page === "plan" && previousPage !== "plan") planTaskTab.value = "active";
+  });
   const todayOverviewSubject = computed(() => {
     if (!todayOverviewSubjectId.value) return undefined;
     return subjects.find((subject) => subject.id === todayOverviewSubjectId.value);
@@ -373,6 +394,12 @@ export const useWorkdayStore = defineStore("workday", () => {
         selectedTaskId.value = buildVisibleTaskList(tasks.filter((task) => task.subjectId === selectedSubjectId.value))[0]?.id ?? "";
       }
       workspaceLoaded.value = true;
+      if (planTaskTab.value === "completed" && selectedSubjectId.value) {
+        completedTasksStale.value = true;
+        void loadCompletedTasks(completedTasksPage.value);
+      } else {
+        completedTasksStale.value = true;
+      }
       return true;
     } catch (error) {
       console.error("加载工作台数据失败", error);
@@ -395,7 +422,9 @@ export const useWorkdayStore = defineStore("workday", () => {
       actual: task.totalMinutes,
       status: task.status,
       note: task.note,
+      pathLabel: task.pathLabel,
       sortOrder: task.sortOrder,
+      completedAt: task.completedAt,
       version: task.version,
       selectable: task.selectable,
       executionState: task.executionState,
@@ -679,12 +708,23 @@ export const useWorkdayStore = defineStore("workday", () => {
 
   function selectPage(page: string) {
     activePage.value = page;
+    if (page === "plan") planTaskTab.value = "active";
   }
 
   function selectSubject(subjectId: string) {
     if (!subjects.some((subject) => subject.id === subjectId)) return;
     selectedSubjectId.value = subjectId;
     activePage.value = "plan";
+    planTaskTab.value = "active";
+    completedTasksRequestSeq += 1;
+    completedTasks.splice(0);
+    completedTasksSubjectId.value = "";
+    completedTasksPage.value = 1;
+    completedTasksTotal.value = 0;
+    completedTasksTotalPages.value = 0;
+    completedTasksError.value = "";
+    completedTasksLoading.value = false;
+    completedTasksStale.value = true;
     const subjectTasks = buildVisibleTaskList(tasks.filter((task) => task.subjectId === subjectId));
     if (!subjectTasks.some((task) => task.id === selectedTaskId.value)) selectedTaskId.value = subjectTasks[0]?.id ?? "";
   }
@@ -735,6 +775,98 @@ export const useWorkdayStore = defineStore("workday", () => {
     if (!force && dismissedUnassignedSessionId.value === unassignedSessionId.value) return false;
     unassignedDialogOpen.value = true;
     return true;
+  }
+
+  async function loadCompletedTasks(page = completedTasksPage.value) {
+    const subjectId = selectedSubjectId.value;
+    if (!subjectId) return false;
+    const targetPage = Math.max(1, Math.round(page));
+    const sequence = ++completedTasksRequestSeq;
+    const request = { subjectId, page: targetPage, sequence };
+    completedTasksSubjectId.value = subjectId;
+    completedTasksPage.value = targetPage;
+    completedTasksLoading.value = true;
+    completedTasksError.value = "";
+    try {
+      const result = await listCompletedTaskPage(subjectId, targetPage, completedTasksPageSize);
+      if (!isCurrentCompletedTaskHistoryRequest(
+        request,
+        completedTasksSubjectId.value,
+        completedTasksPage.value,
+        completedTasksRequestSeq,
+      )) return false;
+      completedTasks.splice(0, completedTasks.length, ...result.tasks.map(toUiTask));
+      completedTasksPage.value = result.page;
+      completedTasksTotal.value = result.total;
+      completedTasksTotalPages.value = result.totalPages;
+      completedTasksStale.value = false;
+      const fallbackPage = completedTaskHistoryFallbackPage(result.page, result.tasks.length);
+      if (fallbackPage !== result.page) return await loadCompletedTasks(fallbackPage);
+      return true;
+    } catch (error) {
+      if (sequence !== completedTasksRequestSeq) return false;
+      completedTasks.splice(0);
+      completedTasksError.value = error instanceof Error ? error.message : String(error);
+      return false;
+    } finally {
+      if (sequence === completedTasksRequestSeq) completedTasksLoading.value = false;
+    }
+  }
+
+  async function selectPlanTaskTab(tab: PlanTaskTab) {
+    planTaskTab.value = tab;
+    if (tab === "active") return;
+    const subjectChanged = completedTasksSubjectId.value !== selectedSubjectId.value;
+    if (subjectChanged) completedTasksPage.value = 1;
+    if (subjectChanged || completedTasksStale.value || !completedTasks.length) {
+      await loadCompletedTasks(subjectChanged ? 1 : completedTasksPage.value);
+    }
+  }
+
+  async function selectCompletedTasksPage(page: number) {
+    if (completedTasksLoading.value || page === completedTasksPage.value) return;
+    await loadCompletedTasks(page);
+  }
+
+  function markCompletedTasksStale() {
+    completedTasksStale.value = true;
+    if (planTaskTab.value === "completed" && activePage.value === "plan") {
+      void loadCompletedTasks(completedTasksPage.value);
+    }
+  }
+
+  async function refreshCompletedTasksAfterMutation() {
+    await loadCompletedTasks(completedTasksPage.value);
+  }
+
+  async function reopenCompletedTask(task: Task) {
+    const result = await commitTaskToggle(task);
+    if (!result) return;
+    await Promise.all([loadWorkspaceData(), loadTodayOverview()]);
+    await refreshCompletedTasksAfterMutation();
+    return result;
+  }
+
+  async function saveCompletedTask(task: Task) {
+    await updateTaskRecord({
+      id: task.id,
+      expectedVersion: task.version,
+      title: task.title,
+      plannedDate: task.planDate ?? null,
+      estimateMinutes: task.estimate ?? null,
+      note: task.note ?? null,
+      projectName: task.project || null,
+    });
+    await Promise.all([loadWorkspaceData(), loadTimeData(), loadReports()]);
+    await loadTodayOverview();
+    await loadCompletedTasks(completedTasksPage.value);
+    return task.id;
+  }
+
+  async function deleteCompletedTask(task: Task) {
+    await deleteTaskSubtree(task.id, task.version);
+    await Promise.all([loadWorkspaceData(), loadTodayOverview()]);
+    await refreshCompletedTasksAfterMutation();
   }
 
   function dismissUnassignedResolution() {
@@ -1089,8 +1221,9 @@ export const useWorkdayStore = defineStore("workday", () => {
   function buildVisibleTaskList(source: Task[]) {
     const childMap = new Map<string, Task[]>();
     const roots: Task[] = [];
+    const taskIds = new Set(source.map((task) => task.id));
     for (const task of source) {
-      if (task.parentId) {
+      if (task.parentId && taskIds.has(task.parentId)) {
         const children = childMap.get(task.parentId) ?? [];
         children.push(task);
         childMap.set(task.parentId, children);
@@ -1504,11 +1637,12 @@ export const useWorkdayStore = defineStore("workday", () => {
 
   return {
     activePage, subjects, selectedSubjectId, selectedSubject, selectedSubjectTasks, tasks, todayTasks, visibleTasks, statusColors, entries, timeHistoryGroups, timeHistoryPage, timeHistoryTotalDays, timeHistoryTotalPages, timeHistoryLoading, timeHistoryRevision, reports, todayOverview, todayOverviewLoading, todayOverviewSubjectId, todayOverviewSubject, selectedTaskId, selectedEntryId, selectedEntry, runningEntry, timerStopConfirmationEntryId, timerStopConfirmationEntry, timerStopConfirmationSlices, timerStopConfirmation,
+    planTaskTab, completedTasks, completedTasksSubjectId, completedTasksPage, completedTasksPageSize, completedTasksTotal, completedTasksTotalPages, completedTasksLoading, completedTasksError, completedTasksStale,
     workspaceTimezone, workspaceToday, workspaceDayStartAt, workspaceDayEndAt, refreshWorkspaceCalendar,
     now, todayMinutes, allocatedMinutes, pendingMinutes, doneCount, todayCompletionDoneCount, todayCompletionTotalCount, todayCompletionPercent, unassignedSeconds, unassignedStartedAt,
     unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen, unassignedWorkDate, unassignedSessionId,
     unassignedCurrentSession,
-    workspaceLoaded, workspaceLoading, loadWorkspaceData, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addChildTask, saveTask, duplicateTask, deleteTask, moveTask, reorderTask,
+    workspaceLoaded, workspaceLoading, loadWorkspaceData, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addChildTask, saveTask, duplicateTask, deleteTask, moveTask, reorderTask,
     indentTask, outdentTask, startTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, adjustTimerStopAllocation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, loadReportTemplates, createReportTemplate, updateReportTemplate, duplicateReportTemplate, setDefaultReportTemplate, deleteReportTemplate, reorderReportTemplates, getReportTemplatePlaceholders, publicReportText, previewObsidianReport, writeObsidianReport,
     beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, dismissUnassignedResolution, resolveUnassignedTime
   };

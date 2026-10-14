@@ -29,7 +29,7 @@ const SYNC_SIGNAL_LOCAL_DIRTY: u8 = 1;
 const SYNC_SIGNAL_REMOTE_HINT: u8 = 1 << 1;
 const SYNC_SIGNAL_CONNECTION_READY: u8 = 1 << 2;
 const SYNC_SIGNAL_MANUAL_RETRY: u8 = 1 << 3;
-static TRACKING_LEASE_TOKEN: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static TRACKING_LEASE_TOKENS: OnceLock<Mutex<HashMap<(String, String), String>>> = OnceLock::new();
 static CLOUD_SYNC_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CLOUD_SYNC_WAKEUP: OnceLock<Arc<Notify>> = OnceLock::new();
 static CLOUD_MODE_WAKEUP: OnceLock<Arc<Notify>> = OnceLock::new();
@@ -97,7 +97,7 @@ pub(crate) fn disable_cloud_sync() {
     CLOUD_SAVE_ACTIVITY.store(0, Ordering::Release);
     CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
     CLOUD_SYNC_OBSERVED_REMOTE_SEQ.store(0, Ordering::Release);
-    clear_tracking_lease_token();
+    clear_tracking_lease_tokens();
     cloud_mode_wakeup().notify_waiters();
 }
 
@@ -219,7 +219,7 @@ fn spawn_tracking_lease_maintainer(database: Database, app: AppHandle) {
             let result = tauri::async_runtime::spawn_blocking(move || {
                 let state = storage_mode(&database_for_lease)?;
                 if state.mode != "cloud" || !state.online {
-                    clear_tracking_lease_token();
+                    clear_tracking_lease_token(&database_for_lease);
                     return Ok(());
                 }
                 acquire_or_renew_tracking_lease(&database_for_lease).map(|_| ())
@@ -233,7 +233,7 @@ fn spawn_tracking_lease_maintainer(database: Database, app: AppHandle) {
 }
 
 fn acquire_or_renew_tracking_lease(database: &Database) -> Result<Value, String> {
-    let token = current_tracking_lease_token();
+    let token = current_tracking_lease_token(database);
     let result = if let Some(token) = token {
         match renew_lease(
             database,
@@ -243,7 +243,7 @@ fn acquire_or_renew_tracking_lease(database: &Database) -> Result<Value, String>
         ) {
             Ok(value) => Ok(value),
             Err(_) => {
-                clear_tracking_lease_token();
+                clear_tracking_lease_token(database);
                 acquire_lease(database)
             }
         }
@@ -251,40 +251,71 @@ fn acquire_or_renew_tracking_lease(database: &Database) -> Result<Value, String>
         acquire_lease(database)
     };
     match &result {
-        Ok(value) => update_tracking_lease_token(value),
-        Err(_) => clear_tracking_lease_token(),
+        Ok(value) => {
+            // An expired-lease takeover is a business boundary, not a heartbeat.
+            // Adopt the server image before remembering the new token so every
+            // subsequent local transition starts from the authoritative version.
+            adopt_expired_lease_takeover(database, value)?;
+            update_tracking_lease_token(database, value);
+        }
+        Err(_) => clear_tracking_lease_token(database),
     }
     result
 }
 
-fn current_tracking_lease_token() -> Option<String> {
-    TRACKING_LEASE_TOKEN
-        .get_or_init(|| Mutex::new(None))
-        .lock()
+fn tracking_lease_key(database: &Database) -> Option<(String, String)> {
+    storage_mode(database)
         .ok()
-        .and_then(|token| token.clone())
+        .map(|state| (state.workspace_id, state.device_id))
 }
 
-fn update_tracking_lease_token(value: &Value) {
+fn current_tracking_lease_token(database: &Database) -> Option<String> {
+    let key = tracking_lease_key(database)?;
+    TRACKING_LEASE_TOKENS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|tokens| tokens.get(&key).cloned())
+}
+
+fn update_tracking_lease_token(database: &Database, value: &Value) {
     let next_token = value
         .get("leaseToken")
         .or_else(|| value.get("lease_token"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     if value.get("acquired").and_then(Value::as_bool) == Some(false) {
-        clear_tracking_lease_token();
+        clear_tracking_lease_token(database);
         return;
     }
-    if let Some(next_token) = next_token {
-        if let Ok(mut token) = TRACKING_LEASE_TOKEN.get_or_init(|| Mutex::new(None)).lock() {
-            *token = Some(next_token);
+    if let (Some(key), Some(next_token)) = (tracking_lease_key(database), next_token) {
+        if let Ok(mut tokens) = TRACKING_LEASE_TOKENS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+        {
+            tokens.insert(key, next_token);
         }
     }
 }
 
-fn clear_tracking_lease_token() {
-    if let Ok(mut token) = TRACKING_LEASE_TOKEN.get_or_init(|| Mutex::new(None)).lock() {
-        *token = None;
+fn clear_tracking_lease_token(database: &Database) {
+    let Some(key) = tracking_lease_key(database) else {
+        return;
+    };
+    if let Ok(mut tokens) = TRACKING_LEASE_TOKENS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        tokens.remove(&key);
+    }
+}
+
+fn clear_tracking_lease_tokens() {
+    if let Ok(mut tokens) = TRACKING_LEASE_TOKENS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        tokens.clear();
     }
 }
 
@@ -784,7 +815,11 @@ pub struct CloudSyncQueueItem {
     pub attempt_count: i64,
     pub error: Option<String>,
     pub coalesced_count: i64,
+    pub base_version: Option<i64>,
+    pub payload_version: Option<i64>,
     pub depends_on_operation_id: Option<String>,
+    pub recovery_kind: Option<String>,
+    pub recovery_context: Option<Value>,
     pub created_at: i64,
     pub last_attempt_at: Option<i64>,
 }
@@ -801,6 +836,7 @@ pub struct CloudSyncConflict {
     pub cloud_payload: Option<Value>,
     pub cloud_payload_error: Option<String>,
     pub error: Option<String>,
+    pub conflict_reason: Option<String>,
     pub attempt_count: i64,
     pub created_at: i64,
     pub last_attempt_at: Option<i64>,
@@ -830,6 +866,33 @@ struct OutboxOperation {
     coalesced_count: i64,
     depends_on_operation_id: Option<String>,
     payload: Value,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TimerSyncRecovery {
+    Acknowledged,
+    Rebased,
+    Retry,
+    Conflict(String),
+}
+
+pub(crate) fn stable_timer_operation_id(
+    entity_id: &str,
+    base_version: Option<i64>,
+    payload_version: i64,
+    operation_type: &str,
+) -> String {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_OID,
+        format!(
+            "timegenie:timer-operation:{entity_id}:{}:{payload_version}:{operation_type}",
+            base_version
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "new".to_string())
+        )
+        .as_bytes(),
+    )
+    .to_string()
 }
 
 struct ActiveTimerEntryOverlay {
@@ -955,7 +1018,7 @@ fn run_sync_coordinator_round(
     let state = storage_mode(database)?;
     if state.mode != "cloud" {
         CLOUD_SYNC_ENABLED.store(false, Ordering::Release);
-        clear_tracking_lease_token();
+        clear_tracking_lease_token(database);
         return Ok(SyncCoordinatorRoundResult {
             domains: Vec::new(),
             last_change_seq: state.last_change_seq,
@@ -2574,9 +2637,21 @@ pub(crate) fn enqueue_entity_in_transaction_with_dependency(
     }
     ensure_supported_cloud_entity_type(entity_type)?;
     let payload = entity_payload_from_connection(transaction, entity_type, entity_id)?;
-    let generated_operation_id = operation_id
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| Uuid::now_v7().to_string());
+    let payload_version = payload.get("version").and_then(Value::as_i64);
+    let generated_operation_id = if entity_type == "time_entry"
+        && payload.get("source_type").and_then(Value::as_str) == Some("timer")
+    {
+        stable_timer_operation_id(
+            entity_id.ok_or_else(|| "VALIDATION_ERROR: 计时同步缺少实体 ID".to_string())?,
+            base_version,
+            payload_version.ok_or_else(|| "VALIDATION_ERROR: 计时同步缺少目标版本".to_string())?,
+            operation_type,
+        )
+    } else {
+        operation_id
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| Uuid::now_v7().to_string())
+    };
     if entity_type == "time_entry" && depends_on_operation_id.is_none() {
         if let Some(existing_operation_id) = coalesce_pending_time_entry(
             transaction,
@@ -2607,7 +2682,6 @@ pub(crate) fn enqueue_entity_in_transaction_with_dependency(
             return Ok(Some(existing_operation_id));
         }
     }
-    let payload_version = payload.get("version").and_then(Value::as_i64);
     transaction
         .execute(
             "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, payload_version, depends_on_operation_id, state, attempt_count, created_at)
@@ -2794,6 +2868,17 @@ fn coalesce_pending_time_entry(
     if payload_version != Some(expected_version) {
         return Ok(None);
     }
+    let replacement_operation_id =
+        if payload.get("source_type").and_then(Value::as_str) == Some("timer") {
+            stable_timer_operation_id(
+                entity_id,
+                rows[0].4,
+                payload_version.unwrap_or_default(),
+                operation_type,
+            )
+        } else {
+            kept_operation_id.clone()
+        };
     transaction
         .execute(
             "UPDATE sync_outbox
@@ -2823,7 +2908,21 @@ fn coalesce_pending_time_entry(
             )
             .map_err(|error| error.to_string())?;
     }
-    Ok(Some(kept_operation_id))
+    if replacement_operation_id != kept_operation_id {
+        transaction
+            .execute(
+                "UPDATE sync_outbox SET operation_id=?1 WHERE operation_id=?2",
+                params![replacement_operation_id, kept_operation_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "UPDATE sync_outbox SET depends_on_operation_id=?1 WHERE depends_on_operation_id=?2",
+                params![replacement_operation_id, kept_operation_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(Some(replacement_operation_id))
 }
 
 // Lifecycle images may replace one another only while every earlier image is
@@ -2993,6 +3092,7 @@ fn push_outbox_locked(
 ) -> Result<CloudSyncPushResult, String> {
     let state = require_cloud(database)?;
     recover_interrupted_sending_operations(database, &state.workspace_id)?;
+    mark_historical_timer_recovery_candidates(database, &state.workspace_id)?;
     ensure_current_device_authorized(database).map_err(|error| {
         if error.starts_with("DEVICE_REVOKED:") {
             let _ = mark_auth_blocked(database, "device_revoked");
@@ -3014,6 +3114,35 @@ fn push_outbox_locked(
 
         let mut batch_stopped = false;
         for (index, operation) in operations.iter().enumerate() {
+            if operation.entity_type == "time_entry"
+                && operation.payload.get("source_type").and_then(Value::as_str) == Some("timer")
+                && current_tracking_lease_token(database).is_none()
+            {
+                let lease = acquire_or_renew_tracking_lease(database)?;
+                if lease.get("acquired").and_then(Value::as_bool) == Some(false) {
+                    mark_outbox_recovery_error(
+                        database,
+                        &operation.operation_id,
+                        "pending",
+                        "lease_wait",
+                        "正在等待当前计时设备释放写入权",
+                        Some(&lease),
+                    )?;
+                    release_unprocessed_claims(database, &operations[index + 1..])?;
+                    batch_stopped = true;
+                    break;
+                }
+                if lease.get("takeover").and_then(Value::as_bool) == Some(true) {
+                    // The lease helper has already adopted the authoritative
+                    // timer and generated any explicit recovery boundary. The
+                    // operations claimed before that adoption contain stale
+                    // payloads, so release the whole remaining batch and let
+                    // the next round claim the normalized queue.
+                    release_unprocessed_claims(database, &operations[index..])?;
+                    batch_stopped = true;
+                    break;
+                }
+            }
             let response = if operation.entity_type == "unassigned_session"
                 && operation.operation_type == "unassigned_session_create"
             {
@@ -3091,6 +3220,42 @@ fn push_outbox_locked(
             };
             match response {
                 Ok(value) => {
+                    if operation.entity_type == "time_entry"
+                        && operation.payload.get("source_type").and_then(Value::as_str)
+                            == Some("timer")
+                        && value.get("accepted").and_then(Value::as_bool) == Some(false)
+                    {
+                        match reconcile_timer_sync_context(database, &state, operation, &value)? {
+                            TimerSyncRecovery::Acknowledged => {
+                                delete_outbox(database, &operation.operation_id)?;
+                                pushed += 1;
+                                continue;
+                            }
+                            TimerSyncRecovery::Rebased => {
+                                release_unprocessed_claims(database, &operations[index + 1..])?;
+                                batch_stopped = true;
+                                break;
+                            }
+                            TimerSyncRecovery::Retry => {
+                                release_unprocessed_claims(database, &operations[index + 1..])?;
+                                batch_stopped = true;
+                                break;
+                            }
+                            TimerSyncRecovery::Conflict(reason) => {
+                                mark_outbox_recovery_error(
+                                    database,
+                                    &operation.operation_id,
+                                    "conflict",
+                                    "competing_edit",
+                                    &reason,
+                                    Some(&value),
+                                )?;
+                                release_unprocessed_claims(database, &operations[index + 1..])?;
+                                batch_stopped = true;
+                                break;
+                            }
+                        }
+                    }
                     if operation.entity_type == "unassigned_session"
                         && operation.operation_type == "unassigned_session_create"
                         && !value.is_null()
@@ -3134,6 +3299,32 @@ fn push_outbox_locked(
                     delete_outbox(database, &operation.operation_id)?;
                     pushed += 1;
                 }
+                Err(error)
+                    if is_conflict_error(&error) && operation.entity_type == "time_entry" =>
+                {
+                    let context = fetch_timer_sync_context(database, &state, operation)?;
+                    match reconcile_timer_sync_context(database, &state, operation, &context)? {
+                        TimerSyncRecovery::Acknowledged => {
+                            delete_outbox(database, &operation.operation_id)?;
+                            pushed += 1;
+                            continue;
+                        }
+                        TimerSyncRecovery::Rebased | TimerSyncRecovery::Retry => {}
+                        TimerSyncRecovery::Conflict(reason) => {
+                            mark_outbox_recovery_error(
+                                database,
+                                &operation.operation_id,
+                                "conflict",
+                                "competing_edit",
+                                &reason,
+                                Some(&context),
+                            )?;
+                        }
+                    }
+                    release_unprocessed_claims(database, &operations[index + 1..])?;
+                    batch_stopped = true;
+                    break;
+                }
                 Err(error) if is_conflict_error(&error) => {
                     mark_outbox_error(database, &operation.operation_id, "conflict", &error)?;
                     release_unprocessed_claims(database, &operations[index + 1..])?;
@@ -3165,6 +3356,361 @@ fn push_outbox_locked(
         pending,
         conflicts,
     })
+}
+
+fn fetch_timer_sync_context(
+    database: &Database,
+    state: &crate::supabase::StorageModeSnapshot,
+    operation: &OutboxOperation,
+) -> Result<Value, String> {
+    let session = current_session(database)?;
+    let request = json!({
+        "deviceId": state.device_id,
+        "entityType": operation.entity_type,
+        "entityId": operation.entity_id,
+        "baseVersion": operation.base_version,
+        "payloadVersion": operation.payload_version,
+        "coalescedCount": operation.coalesced_count,
+        "payload": operation.payload
+    });
+    client(database)?.rpc_for_database(
+        database,
+        "timer_sync_context_get",
+        json!({
+            "p_workspace_id": state.workspace_id,
+            "p_operation_id": operation.operation_id,
+            "p_entity_id": operation.entity_id,
+            "p_operation_type": operation.operation_type,
+            "p_request": request
+        }),
+        &session,
+    )
+}
+
+fn timer_context_error_code(context: &Value) -> Option<&str> {
+    context.pointer("/error/code").and_then(Value::as_str)
+}
+
+fn reconcile_timer_sync_context(
+    database: &Database,
+    state: &crate::supabase::StorageModeSnapshot,
+    operation: &OutboxOperation,
+    context: &Value,
+) -> Result<TimerSyncRecovery, String> {
+    if timer_context_error_code(context) == Some("LEASE_NOT_HELD") {
+        clear_tracking_lease_token(database);
+        mark_outbox_recovery_error(
+            database,
+            &operation.operation_id,
+            "pending",
+            "lease_wait",
+            "正在等待当前计时设备释放写入权",
+            Some(context),
+        )?;
+        return Ok(TimerSyncRecovery::Retry);
+    }
+
+    let processed = context
+        .get("processedOperation")
+        .filter(|value| !value.is_null());
+    if processed
+        .and_then(|value| value.get("matchesRequest"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        if let Some(result) = processed.and_then(|value| value.get("result")) {
+            adopt_authoritative_calendar_timer_result(database, operation, result)?;
+        }
+        return Ok(TimerSyncRecovery::Acknowledged);
+    }
+
+    let Some(entity_id) = operation.entity_id.as_deref() else {
+        return Ok(TimerSyncRecovery::Conflict(
+            "计时同步操作缺少实体标识".to_string(),
+        ));
+    };
+    let authoritative = context
+        .get("authoritative")
+        .filter(|value| !value.is_null());
+    let cloud_version = context
+        .get("currentVersion")
+        .and_then(Value::as_i64)
+        .or_else(|| authoritative?.get("version")?.as_i64());
+    let Some(cloud_version) = cloud_version else {
+        return Ok(TimerSyncRecovery::Conflict(
+            "云端计时记录已不存在，无法自动覆盖".to_string(),
+        ));
+    };
+    let Some(authoritative) = authoritative else {
+        return Ok(TimerSyncRecovery::Conflict(
+            "云端没有返回完整权威计时快照，无法证明自动恢复安全".to_string(),
+        ));
+    };
+    let chain = load_timer_entity_chain(database, &state.workspace_id, entity_id)?;
+    let Some(latest) = chain.last() else {
+        return Ok(TimerSyncRecovery::Acknowledged);
+    };
+    let latest_version = latest
+        .payload_version
+        .or_else(|| latest.payload.get("version").and_then(Value::as_i64))
+        .unwrap_or_default();
+    if cloud_version == latest_version {
+        if timer_business_images_equal(authoritative, &latest.payload) {
+            adopt_authoritative_timer_image(database, operation, authoritative)?;
+            return Ok(TimerSyncRecovery::Acknowledged);
+        }
+        return Ok(TimerSyncRecovery::Conflict(format!(
+            "云端与本机同为版本 {cloud_version}，但计时内容不同"
+        )));
+    }
+    if cloud_version > latest_version {
+        if timer_business_images_equal(authoritative, &latest.payload) {
+            adopt_authoritative_timer_image(database, operation, authoritative)?;
+            return Ok(TimerSyncRecovery::Acknowledged);
+        }
+        return Ok(TimerSyncRecovery::Conflict(format!(
+            "云端计时已推进到版本 {cloud_version}，超过本机最终版本 {latest_version}"
+        )));
+    }
+    if authoritative
+        .get("updated_by_device_id")
+        .and_then(Value::as_str)
+        .is_some_and(|device_id| device_id != state.device_id)
+    {
+        return Ok(TimerSyncRecovery::Conflict(
+            "云端计时包含另一台设备的修改，不能自动覆盖".to_string(),
+        ));
+    }
+    if !timer_chain_can_rebase(database, &state.workspace_id, &chain)? {
+        return Ok(TimerSyncRecovery::Conflict(
+            "计时链包含已经发送的跨实体副作用，不能自动压缩".to_string(),
+        ));
+    }
+    rebase_timer_entity_chain(
+        database,
+        &state.workspace_id,
+        entity_id,
+        cloud_version,
+        Some(authoritative),
+        &chain,
+    )?;
+    Ok(TimerSyncRecovery::Rebased)
+}
+
+fn load_timer_entity_chain(
+    database: &Database,
+    workspace_id: &str,
+    entity_id: &str,
+) -> Result<Vec<OutboxOperation>, String> {
+    let connection = database.open()?;
+    let mut statement = connection
+        .prepare(
+            "SELECT operation_id,operation_type,entity_type,entity_id,base_version,payload_version,coalesced_count,depends_on_operation_id,payload_json
+             FROM sync_outbox WHERE workspace_id=?1 AND entity_type='time_entry' AND entity_id=?2
+             ORDER BY created_at,rowid",
+        )
+        .map_err(|error| error.to_string())?;
+    let result = statement
+        .query_map(params![workspace_id, entity_id], |row| {
+            let payload: String = row.get(8)?;
+            Ok(OutboxOperation {
+                operation_id: row.get(0)?,
+                operation_type: row.get(1)?,
+                entity_type: row.get(2)?,
+                entity_id: row.get(3)?,
+                base_version: row.get(4)?,
+                payload_version: row.get(5)?,
+                coalesced_count: row.get(6)?,
+                depends_on_operation_id: row.get(7)?,
+                payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(result)
+}
+
+fn timer_chain_can_rebase(
+    database: &Database,
+    workspace_id: &str,
+    chain: &[OutboxOperation],
+) -> Result<bool, String> {
+    let operation_ids = chain
+        .iter()
+        .map(|operation| operation.operation_id.as_str())
+        .collect::<HashSet<_>>();
+    let connection = database.open()?;
+    let mut statement = connection
+        .prepare(
+            "SELECT depends_on_operation_id,state,attempt_count FROM sync_outbox
+             WHERE workspace_id=?1 AND entity_type<>'time_entry' AND depends_on_operation_id IS NOT NULL",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([workspace_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    for row in rows {
+        let (dependency, state, attempt_count) = row.map_err(|error| error.to_string())?;
+        if operation_ids.contains(dependency.as_str()) && (state != "pending" || attempt_count != 0)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn rebase_timer_entity_chain(
+    database: &Database,
+    workspace_id: &str,
+    entity_id: &str,
+    cloud_version: i64,
+    authoritative: Option<&Value>,
+    chain: &[OutboxOperation],
+) -> Result<(), String> {
+    let first = chain
+        .first()
+        .ok_or_else(|| "SYNC_ERROR: 计时同步链为空".to_string())?;
+    let latest = chain
+        .last()
+        .ok_or_else(|| "SYNC_ERROR: 计时同步链为空".to_string())?;
+    let next_version = cloud_version.saturating_add(1);
+    let mut payload = latest.payload.clone();
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("version".to_string(), json!(next_version));
+        object.insert("updated_at".to_string(), json!(now_millis()));
+    }
+    let replacement_id = stable_timer_operation_id(
+        entity_id,
+        Some(cloud_version),
+        next_version,
+        &latest.operation_type,
+    );
+    let chain_ids = chain
+        .iter()
+        .map(|operation| operation.operation_id.clone())
+        .collect::<Vec<_>>();
+    let recovery_context = json!({
+        "message": "已按云端权威版本自动压缩本机计时链",
+        "fromBaseVersion": first.base_version,
+        "cloudVersion": cloud_version,
+        "localFinalVersion": latest.payload_version,
+        "authoritative": authoritative
+    });
+    let mut connection = database.open()?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE sync_outbox SET operation_id=?1,operation_type=?2,base_version=?3,
+             payload_json=?4,payload_version=?5,coalesced_count=1,state='pending',
+             attempt_count=0,last_attempt_at=NULL,error_json=NULL,recovery_kind='rebased',
+             recovery_context_json=?6,recovery_updated_at=?7
+             WHERE workspace_id=?8 AND operation_id=?9",
+            params![
+                replacement_id,
+                latest.operation_type,
+                cloud_version,
+                payload.to_string(),
+                next_version,
+                recovery_context.to_string(),
+                now_millis(),
+                workspace_id,
+                first.operation_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    for operation_id in chain_ids.iter().skip(1) {
+        transaction
+            .execute(
+                "UPDATE sync_outbox SET depends_on_operation_id=?1 WHERE depends_on_operation_id=?2",
+                params![replacement_id, operation_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM sync_outbox WHERE operation_id=?1",
+                [operation_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction
+        .execute(
+            "UPDATE sync_outbox SET depends_on_operation_id=?1 WHERE depends_on_operation_id=?2",
+            params![replacement_id, first.operation_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE time_entries SET version=?1,updated_at=?2 WHERE id=?3",
+            params![next_version, now_millis(), entity_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn timer_business_images_equal(left: &Value, right: &Value) -> bool {
+    let keys = [
+        "id",
+        "work_date",
+        "kind",
+        "source_type",
+        "state",
+        "default_task_id",
+        "label_snapshot",
+        "started_at",
+        "ended_at",
+        "duration_seconds",
+        "note",
+        "origin_unassigned_session_id",
+        "timer_chain_id",
+        "previous_entry_id",
+        "split_boundary_at",
+        "last_continuous_at",
+        "segments",
+        "allocations",
+    ];
+    keys.iter().all(|key| left.get(*key) == right.get(*key))
+}
+
+fn mark_outbox_recovery_error(
+    database: &Database,
+    operation_id: &str,
+    state: &str,
+    recovery_kind: &str,
+    message: &str,
+    context: Option<&Value>,
+) -> Result<(), String> {
+    let recovery_context = json!({
+        "message": message,
+        "context": context
+    });
+    let error_json = (state == "conflict").then(|| json!({ "message": message }).to_string());
+    database
+        .open()?
+        .execute(
+            "UPDATE sync_outbox
+             SET state=?1,last_attempt_at=?2,error_json=?3,recovery_kind=?4,
+                 recovery_context_json=?5,recovery_updated_at=?2
+             WHERE operation_id=?6",
+            params![
+                state,
+                now_millis(),
+                error_json,
+                recovery_kind,
+                recovery_context.to_string(),
+                operation_id
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn adopt_authoritative_report_template_result(
@@ -3248,7 +3794,7 @@ fn adopt_authoritative_calendar_timer_result(
         .and_then(Value::as_str)
         .ok_or_else(|| "SYNC_ERROR: 权威计时切片缺少 ID".to_string())?;
     if authoritative_id == candidate_id {
-        return Ok(());
+        return adopt_authoritative_timer_image(database, operation, authoritative);
     }
     let mut connection = database.open()?;
     let local_workspace_id: String = connection
@@ -3300,6 +3846,90 @@ fn adopt_authoritative_calendar_timer_result(
         )
         .map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())
+}
+
+fn adopt_authoritative_timer_image(
+    database: &Database,
+    operation: &OutboxOperation,
+    authoritative: &Value,
+) -> Result<(), String> {
+    let candidate_id = operation
+        .entity_id
+        .as_deref()
+        .ok_or_else(|| "SYNC_ERROR: 权威计时结果缺少本地实体 ID".to_string())?;
+    let authoritative_id = authoritative
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "SYNC_ERROR: 权威计时结果缺少 ID".to_string())?;
+    if candidate_id != authoritative_id {
+        return Ok(());
+    }
+    let mut connection = database.open()?;
+    let local_workspace_id: String = connection
+        .query_row(
+            "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let cloud_workspace_id = storage_mode(database)?.workspace_id;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    apply_incremental_time_entry(&transaction, &local_workspace_id, authoritative)
+        .map_err(|error| error.to_string())?;
+    let authoritative_version = authoritative.get("version").and_then(Value::as_i64);
+    transaction
+        .execute(
+            "UPDATE sync_outbox SET base_version=?1 WHERE workspace_id=?2
+             AND entity_type='time_entry' AND entity_id=?3 AND operation_id<>?4
+             AND base_version IS NOT NULL AND base_version<?1",
+            params![
+                authoritative_version,
+                cloud_workspace_id,
+                candidate_id,
+                operation.operation_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn adopt_expired_lease_takeover(database: &Database, lease: &Value) -> Result<(), String> {
+    if lease.get("takeover").and_then(Value::as_bool) != Some(true) {
+        return Ok(());
+    }
+    let Some(authoritative) = lease
+        .get("authoritativeTimer")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(());
+    };
+    let entity_id = authoritative
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "SYNC_ERROR: 接管计时快照缺少 ID".to_string())?;
+    let operation = OutboxOperation {
+        operation_id: stable_timer_operation_id(
+            entity_id,
+            authoritative.get("version").and_then(Value::as_i64),
+            authoritative
+                .get("version")
+                .and_then(Value::as_i64)
+                .unwrap_or_default(),
+            "timer_takeover_recover",
+        ),
+        operation_type: "timer_takeover_recover".to_string(),
+        entity_type: "time_entry".to_string(),
+        entity_id: Some(entity_id.to_string()),
+        base_version: authoritative.get("version").and_then(Value::as_i64),
+        payload_version: authoritative.get("version").and_then(Value::as_i64),
+        coalesced_count: 1,
+        depends_on_operation_id: None,
+        payload: authoritative.clone(),
+    };
+    adopt_authoritative_timer_image(database, &operation, authoritative)?;
+    crate::time_tracking::coordinate_active_timer(database, now_millis())
 }
 
 fn is_shared_unassigned_lifecycle_operation(operation: &OutboxOperation) -> bool {
@@ -3587,7 +4217,7 @@ fn list_local_conflicts(
     let mut statement = connection
         .prepare(
             "SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json,
-                    error_json, attempt_count, created_at, last_attempt_at
+                    error_json, attempt_count, created_at, last_attempt_at,recovery_context_json
              FROM sync_outbox
              WHERE workspace_id = ?1 AND state = 'conflict'
              ORDER BY created_at, operation_id",
@@ -3597,6 +4227,10 @@ fn list_local_conflicts(
         .query_map([workspace_id], |row| {
             let payload: String = row.get(5)?;
             let error_json: Option<String> = row.get(6)?;
+            let recovery_context_json: Option<String> = row.get(10)?;
+            let recovery_context = recovery_context_json
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<Value>(value).ok());
             let error = error_json.and_then(|value| {
                 serde_json::from_str::<Value>(&value)
                     .ok()
@@ -3614,9 +4248,19 @@ fn list_local_conflicts(
                 entity_id: row.get(3)?,
                 base_version: row.get(4)?,
                 local_payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
-                cloud_payload: None,
+                cloud_payload: recovery_context
+                    .as_ref()
+                    .and_then(|value| value.pointer("/context/authoritative"))
+                    .filter(|value| !value.is_null())
+                    .cloned(),
                 cloud_payload_error: None,
                 error,
+                conflict_reason: recovery_context.as_ref().and_then(|value| {
+                    value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                }),
                 attempt_count: row.get(7)?,
                 created_at: row.get(8)?,
                 last_attempt_at: row.get(9)?,
@@ -5052,6 +5696,88 @@ fn recover_interrupted_sending_operations(
         .map_err(|error| error.to_string())
 }
 
+fn mark_historical_timer_recovery_candidates(
+    database: &Database,
+    workspace_id: &str,
+) -> Result<usize, String> {
+    let mut connection = database.open()?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let mut updated = transaction
+        .execute(
+            "UPDATE sync_outbox
+             SET recovery_kind=COALESCE(recovery_kind,'historical_candidate'),
+                 recovery_context_json=COALESCE(recovery_context_json,error_json),
+                 recovery_updated_at=?1
+             WHERE workspace_id=?2 AND entity_type='time_entry'
+               AND recovery_kind IS NULL
+               AND (error_json LIKE '%IDEMPOTENCY_CONFLICT%' OR error_json LIKE '%SYNC_CONFLICT%')",
+            params![now_millis(), workspace_id],
+        )
+        .map_err(|error| error.to_string())?;
+    let mut statement = transaction
+        .prepare(
+            "SELECT rowid,entity_id,base_version,payload_version,coalesced_count
+             FROM sync_outbox
+             WHERE workspace_id=?1 AND entity_type='time_entry' AND entity_id IS NOT NULL
+             ORDER BY entity_id,created_at,rowid",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([workspace_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    let mut previous_entity = None::<String>;
+    let mut expected_base = None::<i64>;
+    for (rowid, entity_id, base_version, payload_version, coalesced_count) in rows {
+        if previous_entity.as_deref() != Some(entity_id.as_str()) {
+            previous_entity = Some(entity_id);
+            expected_base = base_version;
+        }
+        let valid_span = match (base_version, payload_version) {
+            (None, Some(target)) => target == coalesced_count,
+            (Some(base), Some(target)) => target == base.saturating_add(coalesced_count),
+            _ => false,
+        };
+        let continuous = base_version == expected_base;
+        if !valid_span || !continuous {
+            updated += transaction
+                .execute(
+                    "UPDATE sync_outbox SET recovery_kind=COALESCE(recovery_kind,'historical_candidate'),
+                     recovery_context_json=COALESCE(recovery_context_json,?1),recovery_updated_at=?2
+                     WHERE rowid=?3 AND recovery_kind IS NULL",
+                    params![
+                        json!({
+                            "message": "检测到不连续的历史计时版本链",
+                            "expectedBaseVersion": expected_base,
+                            "actualBaseVersion": base_version,
+                            "payloadVersion": payload_version,
+                            "coalescedCount": coalesced_count
+                        })
+                        .to_string(),
+                        now_millis(),
+                        rowid
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        expected_base = payload_version;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(updated)
+}
+
 fn outbox_entity_key(operation: &OutboxOperation) -> Option<String> {
     Some(format!(
         "{}:{}",
@@ -5145,7 +5871,7 @@ fn list_sync_queue(
         .prepare(
             "SELECT operation_id, operation_type, entity_type, entity_id, state, payload_json,
                     attempt_count, error_json, coalesced_count, depends_on_operation_id,
-                    created_at, last_attempt_at
+                    created_at, last_attempt_at,base_version,payload_version,recovery_kind,recovery_context_json
              FROM sync_outbox
              WHERE workspace_id = ?1 AND state IN ('pending','sending','failed','conflict')
              ORDER BY created_at, rowid",
@@ -5155,6 +5881,7 @@ fn list_sync_queue(
         .query_map([workspace_id], |row| {
             let payload: String = row.get(5)?;
             let error_json: Option<String> = row.get(7)?;
+            let recovery_context_json: Option<String> = row.get(15)?;
             let error = error_json.and_then(|value| {
                 serde_json::from_str::<Value>(&value)
                     .ok()
@@ -5175,7 +5902,13 @@ fn list_sync_queue(
                 attempt_count: row.get(6)?,
                 error,
                 coalesced_count: row.get(8)?,
+                base_version: row.get(12)?,
+                payload_version: row.get(13)?,
                 depends_on_operation_id: row.get(9)?,
+                recovery_kind: row.get(14)?,
+                recovery_context: recovery_context_json
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str(value).ok()),
                 created_at: row.get(10)?,
                 last_attempt_at: row.get(11)?,
             })
@@ -7180,7 +7913,7 @@ mod tests {
         let _guard = CLOUD_SYNC_TEST_STATE_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
         CLOUD_SYNC_OBSERVED_REMOTE_SEQ.store(0, Ordering::Release);
         CLOUD_SYNC_ACTIVE.store(false, Ordering::Release);
@@ -7234,7 +7967,7 @@ mod tests {
         let _guard = CLOUD_SYNC_TEST_STATE_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
         CLOUD_SYNC_OBSERVED_REMOTE_SEQ.store(0, Ordering::Release);
         CLOUD_SYNC_ACTIVE.store(false, Ordering::Release);
@@ -7366,7 +8099,7 @@ mod tests {
         let _guard = CLOUD_SYNC_TEST_STATE_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         CLOUD_SYNC_ENABLED.store(true, Ordering::Release);
         CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
         let directory = tempdir().unwrap();
@@ -7389,7 +8122,7 @@ mod tests {
         let _guard = CLOUD_SYNC_TEST_STATE_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         disable_cloud_sync();
         let directory = tempdir().unwrap();
         let database =
@@ -8991,12 +9724,21 @@ mod tests {
         );
         CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
         CLOUD_SYNC_ACTIVE.store(false, Ordering::Release);
+        let queued_before: i64 = database
+            .open()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
         let refreshed = refresh_unassigned_state_for_cloud_mode(&database)
             .unwrap()
             .expect("后续读取应继续返回本地缓存");
         assert_eq!(refreshed.session_id, state.session_id);
-        assert_eq!(CLOUD_SYNC_SIGNALS.load(Ordering::Acquire), 0);
-        assert!(!CLOUD_SYNC_ACTIVE.load(Ordering::Acquire));
+        let queued_after: i64 = database
+            .open()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(queued_after, queued_before);
         CLOUD_SYNC_ENABLED.store(false, Ordering::Release);
     }
 
@@ -9331,7 +10073,10 @@ mod tests {
             .unwrap();
         assert_eq!(outbox.len(), 1);
         let timer = outbox.iter().find(|row| row.2 == "time_entry").unwrap();
-        assert_eq!(timer.0, start_operation_id);
+        assert_eq!(
+            timer.0,
+            stable_timer_operation_id(&started.id, None, stopped.version, "timer_stop")
+        );
         assert_eq!(timer.1, "timer_stop");
         assert_eq!(timer.3.as_deref(), Some(started.id.as_str()));
         assert_eq!(timer.4, None);
@@ -10175,6 +10920,94 @@ mod tests {
             claim_pending_operations_with_retry_mode(&database, &workspace_id, true).unwrap();
         assert_eq!(manual.len(), 1);
         assert_eq!(manual[0].operation_id, operation_id);
+    }
+
+    #[test]
+    fn timer_idempotency_conflict_repair_marks_candidate_without_mutating_chain() {
+        let (_directory, database, workspace_id) =
+            cloud_database_with_outbox_state("timer-idempotency-repair.sqlite3", "pending");
+        let connection = database.open().unwrap();
+        connection
+            .execute(
+                "DELETE FROM sync_outbox WHERE workspace_id=?1",
+                [&workspace_id],
+            )
+            .unwrap();
+        let device_id = storage_mode(&database).unwrap().device_id;
+        let operation_id = Uuid::now_v7().to_string();
+        let dependent_id = Uuid::now_v7().to_string();
+        let payload = json!({ "id": "entry-1", "version": 2 });
+        connection
+            .execute(
+                "INSERT INTO sync_outbox(
+                   operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,
+                   base_version,payload_json,payload_version,state,attempt_count,created_at,error_json
+                 ) VALUES (?1,?2,?3,'timer_continuity_close','time_entry','entry-1',1,?4,2,'pending',28,1,?5)",
+                params![
+                    &operation_id,
+                    &workspace_id,
+                    &device_id,
+                    payload.to_string(),
+                    json!({
+                        "message": "CLOUD_REQUEST_FAILED: IDEMPOTENCY_CONFLICT: operation_id was already used for different content"
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sync_outbox(
+                   operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,
+                   payload_json,depends_on_operation_id,state,attempt_count,created_at
+                 ) VALUES (?1,?2,?3,'timer_rollover_create','time_entry','entry-2','{}',?4,'pending',0,2)",
+                params![&dependent_id, &workspace_id, &device_id, &operation_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            mark_historical_timer_recovery_candidates(&database, &workspace_id).unwrap(),
+            2
+        );
+
+        let connection = database.open().unwrap();
+        let repaired: (String, String, i64, Option<i64>, Option<String>, String, Option<String>) = connection
+            .query_row(
+                "SELECT operation_id,state,attempt_count,last_attempt_at,error_json,payload_json,recovery_kind
+                 FROM sync_outbox WHERE entity_id='entry-1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(repaired.0, operation_id);
+        assert_eq!(repaired.1, "pending");
+        assert_eq!(repaired.2, 28);
+        assert_eq!(repaired.3, None);
+        assert!(repaired
+            .4
+            .as_deref()
+            .is_some_and(|value| value.contains("IDEMPOTENCY_CONFLICT")));
+        assert_eq!(repaired.5, payload.to_string());
+        assert_eq!(repaired.6.as_deref(), Some("historical_candidate"));
+        let dependency: String = connection
+            .query_row(
+                "SELECT depends_on_operation_id FROM sync_outbox WHERE operation_id=?1",
+                [&dependent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dependency, operation_id);
     }
 
     #[test]
@@ -11684,5 +12517,592 @@ mod tests {
             )
             .unwrap();
         assert_eq!(name, "local only");
+    }
+
+    fn timer_recovery_fixture(
+        file_name: &str,
+    ) -> (tempfile::TempDir, Database, String, String, String, String) {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(directory.path().join(file_name)).unwrap();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id.clone()),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let local_workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id = storage_mode(&database).unwrap().device_id;
+        let task_id = Uuid::now_v7().to_string();
+        let entry_id = Uuid::now_v7().to_string();
+        connection.execute(
+            "INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version)
+             VALUES (?1,?2,?3,'恢复事项','open','manual',10,1000,1000,1)",
+            params![task_id, local_workspace_id, subject_id],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,default_task_id,label_snapshot,started_at,ended_at,duration_seconds,note,created_at,updated_at,version,created_by_device_id,updated_by_device_id,timer_chain_id,last_continuous_at)
+             VALUES (?1,?2,'2026-10-14','work','timer','ended',?3,'恢复事项',1000,361000,360,'最终本地状态',1000,361000,8,?4,?4,?1,361000)",
+            params![entry_id, local_workspace_id, task_id, device_id],
+        ).unwrap();
+        for sequence in 1..=6_i64 {
+            let started_at = 1000 + (sequence - 1) * 60_000;
+            connection.execute(
+                "INSERT INTO time_segments(id,workspace_id,entry_id,sequence_no,started_at,ended_at,duration_seconds)
+                 VALUES (?1,?2,?3,?4,?5,?6,60)",
+                params![Uuid::now_v7().to_string(), local_workspace_id, entry_id, sequence, started_at, started_at + 60_000],
+            ).unwrap();
+        }
+        connection.execute(
+            "INSERT INTO time_allocations(id,workspace_id,entry_id,task_id,minutes,note,created_at,updated_at,version)
+             VALUES (?1,?2,?3,?4,6,'最终分配',361000,361000,1)",
+            params![Uuid::now_v7().to_string(), local_workspace_id, entry_id, task_id],
+        ).unwrap();
+        drop(connection);
+        (
+            directory,
+            database,
+            cloud_workspace_id,
+            local_workspace_id,
+            device_id,
+            entry_id,
+        )
+    }
+
+    fn insert_timer_version_chain(
+        database: &Database,
+        cloud_workspace_id: &str,
+        device_id: &str,
+        entry_id: &str,
+    ) -> Vec<String> {
+        let final_payload = entity_payload(database, "time_entry", Some(entry_id)).unwrap();
+        let connection = database.open().unwrap();
+        let mut operation_ids = Vec::new();
+        for (index, version) in (5_i64..=8).enumerate() {
+            let operation_type = match version {
+                5 | 6 => "timer_continuity_close",
+                7 => "timer_stop",
+                _ => "time_allocation_replace",
+            };
+            let operation_id =
+                stable_timer_operation_id(entry_id, Some(version - 1), version, operation_type);
+            let mut payload = final_payload.clone();
+            payload["version"] = json!(version);
+            connection.execute(
+                "INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,base_version,payload_json,payload_version,state,attempt_count,created_at)
+                 VALUES (?1,?2,?3,?4,'time_entry',?5,?6,?7,?8,'pending',0,?9)",
+                params![operation_id,cloud_workspace_id,device_id,operation_type,entry_id,version-1,payload.to_string(),version,index as i64 + 1],
+            ).unwrap();
+            operation_ids.push(operation_id);
+        }
+        operation_ids
+    }
+
+    #[test]
+    fn stable_timer_operation_ids_bind_the_complete_transition() {
+        let same_a = stable_timer_operation_id("entry", Some(4), 5, "timer_stop");
+        let same_b = stable_timer_operation_id("entry", Some(4), 5, "timer_stop");
+        assert_eq!(same_a, same_b);
+        assert_ne!(
+            same_a,
+            stable_timer_operation_id("entry", Some(3), 5, "timer_stop")
+        );
+        assert_ne!(
+            same_a,
+            stable_timer_operation_id("entry", Some(4), 6, "timer_stop")
+        );
+        assert_ne!(
+            same_a,
+            stable_timer_operation_id("entry", Some(4), 5, "timer_pause")
+        );
+        assert_ne!(
+            same_a,
+            stable_timer_operation_id("other", Some(4), 5, "timer_stop")
+        );
+    }
+
+    #[test]
+    fn timer_chain_rebase_collapses_4_to_8_onto_cloud_6_and_is_repeatable() {
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, device_id, entry_id) =
+            timer_recovery_fixture("timer-chain-rebase.sqlite3");
+        let old_ids =
+            insert_timer_version_chain(&database, &cloud_workspace_id, &device_id, &entry_id);
+        let dependent_id = Uuid::now_v7().to_string();
+        database.open().unwrap().execute(
+            "INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,base_version,payload_json,depends_on_operation_id,state,attempt_count,created_at)
+             VALUES (?1,?2,?3,'task_set_completed_from_allocation','task','dependent-task',1,'{}',?4,'pending',0,10)",
+            params![dependent_id,cloud_workspace_id,device_id,old_ids[3]],
+        ).unwrap();
+        let chain = load_timer_entity_chain(&database, &cloud_workspace_id, &entry_id).unwrap();
+        rebase_timer_entity_chain(&database, &cloud_workspace_id, &entry_id, 6, None, &chain)
+            .unwrap();
+        let replacement_id =
+            stable_timer_operation_id(&entry_id, Some(6), 7, "time_allocation_replace");
+        let connection = database.open().unwrap();
+        let row: (i64,i64,i64,String,Option<String>,String) = connection.query_row(
+            "SELECT base_version,payload_version,coalesced_count,state,error_json,recovery_kind FROM sync_outbox WHERE entity_type='time_entry' AND entity_id=?1",
+            [&entry_id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+        ).unwrap();
+        assert_eq!(
+            row,
+            (6, 7, 1, "pending".to_string(), None, "rebased".to_string())
+        );
+        let payload_text: String = connection
+            .query_row(
+                "SELECT payload_json FROM sync_outbox WHERE operation_id=?1",
+                [&replacement_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_str(&payload_text).unwrap();
+        assert_eq!(payload["version"], 7);
+        assert_eq!(payload["segments"].as_array().unwrap().len(), 6);
+        assert_eq!(payload["allocations"].as_array().unwrap().len(), 1);
+        let dependency: String = connection
+            .query_row(
+                "SELECT depends_on_operation_id FROM sync_outbox WHERE operation_id=?1",
+                [&dependent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dependency, replacement_id);
+        drop(connection);
+        let rebased_chain =
+            load_timer_entity_chain(&database, &cloud_workspace_id, &entry_id).unwrap();
+        rebase_timer_entity_chain(
+            &database,
+            &cloud_workspace_id,
+            &entry_id,
+            6,
+            None,
+            &rebased_chain,
+        )
+        .unwrap();
+        let count: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE entity_type='time_entry' AND entity_id=?1",
+                [&entry_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn timer_recovery_classifier_covers_ack_rebase_and_competing_edits() {
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, device_id, entry_id) =
+            timer_recovery_fixture("timer-recovery-classifier.sqlite3");
+        insert_timer_version_chain(&database, &cloud_workspace_id, &device_id, &entry_id);
+        let state = storage_mode(&database).unwrap();
+        let operation = load_timer_entity_chain(&database, &cloud_workspace_id, &entry_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            reconcile_timer_sync_context(
+                &database,
+                &state,
+                &operation,
+                &json!({
+                    "processedOperation": {"matchesRequest": true, "result": null}
+                })
+            )
+            .unwrap(),
+            TimerSyncRecovery::Acknowledged
+        );
+        let local_final = load_timer_entity_chain(&database, &cloud_workspace_id, &entry_id)
+            .unwrap()
+            .last()
+            .unwrap()
+            .payload
+            .clone();
+        let mut same_version = local_final.clone();
+        same_version["updated_by_device_id"] = json!(device_id);
+        assert_eq!(
+            reconcile_timer_sync_context(
+                &database,
+                &state,
+                &operation,
+                &json!({
+                    "currentVersion": 8, "authoritative": same_version
+                })
+            )
+            .unwrap(),
+            TimerSyncRecovery::Acknowledged
+        );
+
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, device_id, entry_id) =
+            timer_recovery_fixture("timer-recovery-rebase-classifier.sqlite3");
+        insert_timer_version_chain(&database, &cloud_workspace_id, &device_id, &entry_id);
+        let state = storage_mode(&database).unwrap();
+        let operation = load_timer_entity_chain(&database, &cloud_workspace_id, &entry_id)
+            .unwrap()
+            .remove(0);
+        let mut authoritative = operation.payload.clone();
+        authoritative["version"] = json!(6);
+        authoritative["updated_by_device_id"] = json!(device_id);
+        assert_eq!(
+            reconcile_timer_sync_context(
+                &database,
+                &state,
+                &operation,
+                &json!({
+                    "currentVersion": 6, "authoritative": authoritative
+                })
+            )
+            .unwrap(),
+            TimerSyncRecovery::Rebased
+        );
+
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, device_id, entry_id) =
+            timer_recovery_fixture("timer-recovery-conflict-classifier.sqlite3");
+        insert_timer_version_chain(&database, &cloud_workspace_id, &device_id, &entry_id);
+        let state = storage_mode(&database).unwrap();
+        let operation = load_timer_entity_chain(&database, &cloud_workspace_id, &entry_id)
+            .unwrap()
+            .remove(0);
+        let mut authoritative = operation.payload.clone();
+        authoritative["version"] = json!(6);
+        authoritative["updated_by_device_id"] = json!(Uuid::now_v7().to_string());
+        assert!(matches!(
+            reconcile_timer_sync_context(
+                &database,
+                &state,
+                &operation,
+                &json!({
+                    "currentVersion": 6, "authoritative": authoritative
+                })
+            )
+            .unwrap(),
+            TimerSyncRecovery::Conflict(_)
+        ));
+        let mut newer = operation.payload.clone();
+        newer["version"] = json!(9);
+        newer["note"] = json!("另一份最终状态");
+        newer["updated_by_device_id"] = json!(device_id);
+        assert!(matches!(
+            reconcile_timer_sync_context(
+                &database,
+                &state,
+                &operation,
+                &json!({
+                    "currentVersion": 9, "authoritative": newer
+                })
+            )
+            .unwrap(),
+            TimerSyncRecovery::Conflict(_)
+        ));
+    }
+
+    #[test]
+    fn authoritative_timer_adoption_replaces_full_aggregate_and_server_version() {
+        let (_directory, database, cloud_workspace_id, local_workspace_id, device_id, entry_id) =
+            timer_recovery_fixture("timer-authoritative-adoption.sqlite3");
+        insert_timer_version_chain(&database, &cloud_workspace_id, &device_id, &entry_id);
+        let operation = load_timer_entity_chain(&database, &cloud_workspace_id, &entry_id)
+            .unwrap()
+            .remove(0);
+        let following_operation_id = Uuid::now_v7().to_string();
+        database.open().unwrap().execute(
+            "INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,base_version,payload_json,payload_version,state,attempt_count,created_at)
+             VALUES (?1,?2,?3,'timer_followup','time_entry',?4,5,'{}',8,'pending',0,20)",
+            params![following_operation_id,cloud_workspace_id,device_id,entry_id],
+        ).unwrap();
+        let task_id: String = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM tasks WHERE title='恢复事项'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let authoritative = json!({
+            "id":entry_id,"work_date":"2026-10-14","kind":"work","source_type":"timer",
+            "state":"ended","default_task_id":task_id,"label_snapshot":"云端权威状态",
+            "started_at":1000,"ended_at":181000,"duration_seconds":180,"note":"权威结果",
+            "origin_unassigned_session_id":null,"created_at":1000,"updated_at":181000,"version":7,
+            "deleted_at":null,"timer_chain_id":entry_id,"previous_entry_id":null,"split_boundary_at":null,
+            "last_continuous_at":181000,
+            "segments":[{"id":Uuid::now_v7().to_string(),"sequence_no":1,"started_at":1000,"ended_at":181000,"duration_seconds":180}],
+            "allocations":[{"id":Uuid::now_v7().to_string(),"task_id":task_id,"minutes":3,"note":"云端分配","created_at":181000,"updated_at":181000,"version":1}]
+        });
+        adopt_authoritative_timer_image(&database, &operation, &authoritative).unwrap();
+        let connection = database.open().unwrap();
+        let saved: (i64,String,i64) = connection.query_row(
+            "SELECT version,label_snapshot,duration_seconds FROM time_entries WHERE workspace_id=?1 AND id=?2",
+            params![local_workspace_id,entry_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(saved, (7, "云端权威状态".to_string(), 180));
+        let children: (i64,i64,i64) = connection.query_row(
+            "SELECT (SELECT COUNT(*) FROM time_segments WHERE entry_id=?1),(SELECT COUNT(*) FROM time_allocations WHERE entry_id=?1),(SELECT minutes FROM time_allocations WHERE entry_id=?1)",
+            [&entry_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(children, (1, 1, 3));
+        let following_base: i64 = connection
+            .query_row(
+                "SELECT base_version FROM sync_outbox WHERE operation_id=?1",
+                [&following_operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(following_base, 7);
+    }
+
+    #[test]
+    fn lease_renewal_without_takeover_does_not_mutate_the_local_timer() {
+        let (_directory, database, _cloud_workspace_id, _local_workspace_id, _device_id, entry_id) =
+            timer_recovery_fixture("timer-lease-renewal-no-takeover.sqlite3");
+
+        adopt_expired_lease_takeover(
+            &database,
+            &json!({
+                "acquired": true,
+                "takeover": false,
+                "authoritativeTimer": {"id": entry_id, "version": 6}
+            }),
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let saved: (String, i64, String) = connection
+            .query_row(
+                "SELECT state,version,label_snapshot FROM time_entries WHERE id=?1",
+                [&entry_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(saved, ("ended".to_string(), 8, "恢复事项".to_string()));
+        let queued: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE entity_id=?1",
+                [&entry_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(queued, 0);
+    }
+
+    #[test]
+    fn expired_lease_takeover_adopts_server_timer_before_creating_recovery_transition() {
+        let (_directory, database, cloud_workspace_id, local_workspace_id, device_id, entry_id) =
+            timer_recovery_fixture("timer-expired-lease-takeover.sqlite3");
+        let task_id: String = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM tasks WHERE title='恢复事项'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let now = now_millis();
+        let work_date =
+            crate::work_calendar::work_date_at("Asia/Shanghai".parse().unwrap(), now).unwrap();
+        let started_at = now - 300_000;
+        let last_continuous_at = now - 120_000;
+        let authoritative = json!({
+            "id":entry_id,"work_date":work_date,"kind":"work","source_type":"timer",
+            "state":"running","default_task_id":task_id,"label_snapshot":"接管前云端状态",
+            "started_at":started_at,"ended_at":null,"duration_seconds":0,"note":"云端接管基线",
+            "origin_unassigned_session_id":null,"created_at":started_at,"updated_at":last_continuous_at,
+            "version":6,"deleted_at":null,"timer_chain_id":entry_id,"previous_entry_id":null,
+            "split_boundary_at":null,"last_continuous_at":last_continuous_at,
+            "created_by_device_id":device_id,"updated_by_device_id":device_id,
+            "segments":[{
+                "id":Uuid::now_v7().to_string(),"sequence_no":1,"started_at":started_at,
+                "ended_at":null,"duration_seconds":0
+            }],
+            "allocations":[]
+        });
+
+        adopt_expired_lease_takeover(
+            &database,
+            &json!({
+                "acquired": true,
+                "takeover": true,
+                "previousHolderDeviceId": Uuid::now_v7().to_string(),
+                "authoritativeTimer": authoritative
+            }),
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let saved: (String, i64, String, i64) = connection
+            .query_row(
+                "SELECT state,version,label_snapshot,duration_seconds FROM time_entries WHERE workspace_id=?1 AND id=?2",
+                params![local_workspace_id,entry_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(saved.0, "running");
+        assert_eq!(saved.1, 7);
+        assert_eq!(saved.2, "接管前云端状态");
+        assert_eq!(saved.3, 180);
+        let segments: (i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*),SUM(CASE WHEN ended_at IS NULL THEN 1 ELSE 0 END) FROM time_segments WHERE entry_id=?1",
+                [&entry_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(segments, (2, 1));
+        let queued: (String, i64, i64, i64) = connection
+            .query_row(
+                "SELECT operation_type,base_version,payload_version,coalesced_count FROM sync_outbox WHERE workspace_id=?1 AND entity_id=?2",
+                params![cloud_workspace_id,entry_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(queued, ("timer_continuity_close".to_string(), 6, 7, 1));
+    }
+
+    #[test]
+    fn timer_rebase_rejects_attempted_cross_entity_side_effect_but_redirects_unattempted_one() {
+        for (state_name, attempt_count, expected) in [("pending", 0, true), ("sending", 1, false)] {
+            let file_name = format!("timer-side-effect-{state_name}.sqlite3");
+            let (
+                _directory,
+                database,
+                cloud_workspace_id,
+                _local_workspace_id,
+                device_id,
+                entry_id,
+            ) = timer_recovery_fixture(&file_name);
+            let ids =
+                insert_timer_version_chain(&database, &cloud_workspace_id, &device_id, &entry_id);
+            database.open().unwrap().execute(
+                "INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,base_version,payload_json,depends_on_operation_id,state,attempt_count,created_at)
+                 VALUES (?1,?2,?3,'task_set_completed_from_allocation','task','side-effect-task',1,'{}',?4,?5,?6,20)",
+                params![Uuid::now_v7().to_string(),cloud_workspace_id,device_id,ids[3],state_name,attempt_count],
+            ).unwrap();
+            let chain = load_timer_entity_chain(&database, &cloud_workspace_id, &entry_id).unwrap();
+            assert_eq!(
+                timer_chain_can_rebase(&database, &cloud_workspace_id, &chain).unwrap(),
+                expected
+            );
+            if expected {
+                rebase_timer_entity_chain(
+                    &database,
+                    &cloud_workspace_id,
+                    &entry_id,
+                    6,
+                    None,
+                    &chain,
+                )
+                .unwrap();
+                let replacement =
+                    stable_timer_operation_id(&entry_id, Some(6), 7, "time_allocation_replace");
+                let dependency: String = database.open().unwrap().query_row(
+                    "SELECT depends_on_operation_id FROM sync_outbox WHERE entity_type='task' AND entity_id='side-effect-task'",
+                    [],|row|row.get(0),
+                ).unwrap();
+                assert_eq!(dependency, replacement);
+            }
+        }
+    }
+
+    #[test]
+    fn historical_scan_marks_conflicts_and_version_gaps_without_deleting_offline_data() {
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, device_id, entry_id) =
+            timer_recovery_fixture("timer-historical-scan.sqlite3");
+        let ids = insert_timer_version_chain(&database, &cloud_workspace_id, &device_id, &entry_id);
+        let connection = database.open().unwrap();
+        connection
+            .execute(
+                "UPDATE sync_outbox SET error_json=?1 WHERE operation_id=?2",
+                params![
+                    json!({"message":"SYNC_CONFLICT: expected version 4, current version 6"})
+                        .to_string(),
+                    ids[0]
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sync_outbox SET base_version=99 WHERE operation_id=?1",
+                [&ids[2]],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(
+            mark_historical_timer_recovery_candidates(&database, &cloud_workspace_id).unwrap() >= 2
+        );
+        let connection = database.open().unwrap();
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sync_outbox WHERE entity_type='time_entry' AND recovery_kind='historical_candidate'",[],|row|row.get(0),
+        ).unwrap();
+        assert!(count >= 2);
+        let aggregate: (String,i64,i64,i64) = connection.query_row(
+            "SELECT state,duration_seconds,(SELECT COUNT(*) FROM time_segments WHERE entry_id=?1),(SELECT COUNT(*) FROM time_allocations WHERE entry_id=?1) FROM time_entries WHERE id=?1",
+            [&entry_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).unwrap();
+        assert_eq!(aggregate, ("ended".to_string(), 360, 6, 1));
+        drop(connection);
+        assert_eq!(
+            mark_historical_timer_recovery_candidates(&database, &cloud_workspace_id).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn recovery_metadata_does_not_increase_conflicts_until_safety_is_unproven() {
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, device_id, entry_id) =
+            timer_recovery_fixture("timer-recovery-status.sqlite3");
+        let ids = insert_timer_version_chain(&database, &cloud_workspace_id, &device_id, &entry_id);
+        mark_outbox_recovery_error(
+            &database,
+            &ids[0],
+            "pending",
+            "lease_wait",
+            "等待租约",
+            Some(&json!({"holderDeviceId":"other"})),
+        )
+        .unwrap();
+        assert_eq!(outbox_counts(&database, &cloud_workspace_id).unwrap().1, 0);
+        let queue = list_sync_queue(&database, &cloud_workspace_id).unwrap();
+        let waiting = queue
+            .iter()
+            .find(|item| item.operation_id == ids[0])
+            .unwrap();
+        assert_eq!(waiting.base_version, Some(4));
+        assert_eq!(waiting.payload_version, Some(5));
+        assert_eq!(waiting.recovery_kind.as_deref(), Some("lease_wait"));
+        mark_outbox_recovery_error(
+            &database,
+            &ids[0],
+            "conflict",
+            "competing_edit",
+            "另一设备修改了计时",
+            Some(&json!({"authoritative":{"id":entry_id,"version":6}})),
+        )
+        .unwrap();
+        assert_eq!(outbox_counts(&database, &cloud_workspace_id).unwrap().1, 1);
+        let conflicts = list_local_conflicts(&database, &cloud_workspace_id).unwrap();
+        assert_eq!(
+            conflicts[0].conflict_reason.as_deref(),
+            Some("另一设备修改了计时")
+        );
+        assert_eq!(conflicts[0].cloud_payload.as_ref().unwrap()["version"], 6);
     }
 }

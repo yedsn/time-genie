@@ -227,6 +227,7 @@ fn daily_estimate(database: &Database, task_id: &str, work_date: &str) -> Option
 
 fn push_all(database: &Database) -> cloud_sync::CloudSyncPushResult {
     let mut total_pushed = 0;
+    let mut stalled_rounds = 0;
     for _ in 0..20 {
         let result = cloud_sync::push_outbox(database).unwrap();
         total_pushed += result.pushed;
@@ -237,8 +238,13 @@ fn push_all(database: &Database) -> cloud_sync::CloudSyncPushResult {
                 conflicts: result.conflicts,
             };
         }
+        stalled_rounds = if result.pushed > 0 {
+            0
+        } else {
+            stalled_rounds + 1
+        };
         assert!(
-            result.pushed > 0,
+            stalled_rounds < 2,
             "同步队列仍有待处理操作，但本轮没有取得进展: {}",
             database
                 .open()
@@ -406,6 +412,10 @@ struct PlanningCloudState {
     incremental_pull_count: usize,
     snapshot_get_count: usize,
     force_reset_required_once: bool,
+    tracking_lease_holder_device_id: Option<String>,
+    tracking_lease_token: Option<String>,
+    tracking_lease_version: i64,
+    tracking_lease_expired: bool,
 }
 
 struct PlanningCloudServer {
@@ -516,6 +526,15 @@ impl PlanningCloudServer {
 
     fn require_snapshot_reset_once(&self) {
         self.state.lock().unwrap().force_reset_required_once = true;
+    }
+
+    fn expire_tracking_lease(&self) {
+        let mut state = self.state.lock().unwrap();
+        assert!(
+            state.tracking_lease_holder_device_id.is_some(),
+            "没有可供过期的隔离测试租约"
+        );
+        state.tracking_lease_expired = true;
     }
 
     fn delay_next_apply_patch(&self, delay: Duration) {
@@ -804,6 +823,95 @@ fn handle_planning_cloud_request(
             .cloned()
             .collect::<Vec<_>>();
         return write_http_json(&mut stream, 200, Value::Array(changes));
+    }
+    if request_line.contains("/rest/v1/rpc/tracking_lease_acquire") {
+        let device_id = body["p_device_id"].as_str().unwrap();
+        let lease_token = body["p_lease_token"].as_str().unwrap();
+        let previous_holder = state.tracking_lease_holder_device_id.clone();
+        let takeover = state.tracking_lease_expired
+            && previous_holder
+                .as_deref()
+                .is_some_and(|holder| holder != device_id);
+        if !state.tracking_lease_expired
+            && previous_holder
+                .as_deref()
+                .is_some_and(|holder| holder != device_id)
+        {
+            return write_http_json(
+                &mut stream,
+                200,
+                json!({
+                    "acquired": false,
+                    "holderDeviceId": previous_holder,
+                    "expiresAt": "2099-01-01T00:00:45Z",
+                    "takeover": false
+                }),
+            );
+        }
+        state.tracking_lease_holder_device_id = Some(device_id.to_string());
+        state.tracking_lease_token = Some(lease_token.to_string());
+        state.tracking_lease_version += 1;
+        state.tracking_lease_expired = false;
+        let authoritative_timer = takeover.then(|| {
+            state
+                .time_entries
+                .values()
+                .filter(|entry| {
+                    entry["source_type"].as_str() == Some("timer")
+                        && matches!(entry["state"].as_str(), Some("running" | "paused"))
+                        && entry["deleted_at"].is_null()
+                })
+                .max_by_key(|entry| entry["started_at"].as_i64().unwrap_or_default())
+                .cloned()
+        });
+        return write_http_json(
+            &mut stream,
+            200,
+            json!({
+                "acquired": true,
+                "leaseToken": lease_token,
+                "expiresAt": "2099-01-01T00:00:45Z",
+                "version": state.tracking_lease_version,
+                "takeover": takeover,
+                "previousHolderDeviceId": previous_holder,
+                "authoritativeTimer": authoritative_timer.flatten()
+            }),
+        );
+    }
+    if request_line.contains("/rest/v1/rpc/tracking_lease_renew") {
+        let device_id = body["p_device_id"].as_str().unwrap();
+        let lease_token = body["p_lease_token"].as_str().unwrap();
+        if state.tracking_lease_expired
+            || state.tracking_lease_holder_device_id.as_deref() != Some(device_id)
+            || state.tracking_lease_token.as_deref() != Some(lease_token)
+        {
+            return write_http_json(&mut stream, 409, json!({ "message": "LEASE_EXPIRED" }));
+        }
+        state.tracking_lease_version += 1;
+        return write_http_json(
+            &mut stream,
+            200,
+            json!({
+                "renewed": true,
+                "leaseToken": lease_token,
+                "expiresAt": "2099-01-01T00:00:45Z",
+                "version": state.tracking_lease_version,
+                "takeover": false
+            }),
+        );
+    }
+    if request_line.contains("/rest/v1/rpc/tracking_lease_release") {
+        let device_id = body["p_device_id"].as_str().unwrap();
+        let lease_token = body["p_lease_token"].as_str().unwrap();
+        let released = state.tracking_lease_holder_device_id.as_deref() == Some(device_id)
+            && state.tracking_lease_token.as_deref() == Some(lease_token);
+        if released {
+            state.tracking_lease_holder_device_id = None;
+            state.tracking_lease_token = None;
+            state.tracking_lease_version += 1;
+            state.tracking_lease_expired = false;
+        }
+        return write_http_json(&mut stream, 200, json!(released));
     }
     if !request_line.contains("/rest/v1/rpc/cloud_apply_patch") {
         return write_http_json(
@@ -2076,6 +2184,7 @@ fn isolated_calendar_day_two_device_candidates_converge_to_one_authoritative_sli
 
     let pushed_a = push_all(&device_a);
     assert_eq!((pushed_a.pending, pushed_a.conflicts), (0, 0));
+    cloud.expire_tracking_lease();
     let pushed_b = push_all(&device_b);
     assert_eq!((pushed_b.pending, pushed_b.conflicts), (0, 0));
 

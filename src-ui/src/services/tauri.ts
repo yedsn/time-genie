@@ -150,6 +150,7 @@ export type CloudSyncConflict = {
   cloudPayload?: Record<string, unknown> | null;
   cloudPayloadError?: string;
   error?: string;
+  conflictReason?: string;
   attemptCount: number;
   createdAt: number;
   lastAttemptAt?: number;
@@ -165,7 +166,11 @@ export type CloudSyncQueueItem = {
   attemptCount: number;
   error?: string;
   coalescedCount: number;
+  baseVersion?: number;
+  payloadVersion?: number;
   dependsOnOperationId?: string;
+  recoveryKind?: string;
+  recoveryContext?: Record<string, unknown> | null;
   createdAt: number;
   lastAttemptAt?: number;
 };
@@ -197,6 +202,7 @@ export type TaskRecord = {
   projectName?: string;
   solutionName?: string;
   sortOrder: number;
+  completedAt?: number;
   depth: number;
   pathLabel: string;
   selectable: boolean;
@@ -224,6 +230,14 @@ export type RecurrenceRuleRecord = {
 export type TaskListResult = {
   tasks: TaskRecord[];
   revision: number;
+};
+
+export type CompletedTaskPageResult = {
+  tasks: TaskRecord[];
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
 };
 
 export type PlanImportPreviewItem = {
@@ -569,7 +583,13 @@ export async function saveSubjectWorkSchedule(subjectId: string, days: SubjectWo
 
 export async function listTasks(subjectId?: string, plannedDate?: string, dailyEstimateDate?: string): Promise<TaskListResult> {
   return await invoke<TaskListResult>("task_list", {
-    request: { subjectId, includeCompleted: true, plannedDate, todayDate: dailyEstimateDate, todayOnly: false, dailyEstimateDate, query: null },
+    request: { subjectId, includeCompleted: false, plannedDate, todayDate: dailyEstimateDate, todayOnly: false, dailyEstimateDate, query: null },
+  });
+}
+
+export async function listCompletedTaskPage(subjectId: string, page = 1, pageSize = 20): Promise<CompletedTaskPageResult> {
+  return await invoke<CompletedTaskPageResult>("task_list_completed_page", {
+    request: { subjectId, page, pageSize },
   });
 }
 

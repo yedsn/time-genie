@@ -24,6 +24,7 @@ pub struct TaskDto {
     pub project_name: Option<String>,
     pub solution_name: Option<String>,
     pub sort_order: i64,
+    pub completed_at: Option<i64>,
     pub depth: usize,
     pub path_label: String,
     pub selectable: bool,
@@ -42,6 +43,24 @@ pub struct TaskDto {
 pub struct TaskListResult {
     pub tasks: Vec<TaskDto>,
     pub revision: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletedTaskPageRequest {
+    pub subject_id: String,
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletedTaskPageResult {
+    pub tasks: Vec<TaskDto>,
+    pub page: i64,
+    pub page_size: i64,
+    pub total: i64,
+    pub total_pages: i64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -281,7 +300,7 @@ pub fn list_tasks(database: &Database, request: TaskListRequest) -> Result<TaskL
     let mut statement = connection
         .prepare(
             "SELECT id, subject_id, parent_id, title, status, planned_date,
-                    estimate_minutes, note, project_name, solution_name, sort_order, version
+                    estimate_minutes, note, project_name, solution_name, sort_order, completed_at, version
              FROM tasks
              WHERE workspace_id = ?1 AND deleted_at IS NULL
                AND (?2 IS NULL OR subject_id = ?2)
@@ -343,6 +362,71 @@ pub fn list_tasks(database: &Database, request: TaskListRequest) -> Result<TaskL
     Ok(TaskListResult {
         tasks: rows,
         revision,
+    })
+}
+
+pub fn list_completed_task_page(
+    database: &Database,
+    request: CompletedTaskPageRequest,
+) -> Result<CompletedTaskPageResult, String> {
+    let page = request.page.unwrap_or(1);
+    if page < 1 {
+        return Err("VALIDATION_ERROR: 页码必须大于等于 1".to_string());
+    }
+    let page_size = request.page_size.unwrap_or(20);
+    if !(1..=100).contains(&page_size) {
+        return Err("VALIDATION_ERROR: 每页条数必须在 1 到 100 之间".to_string());
+    }
+
+    let connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    ensure_subject(&connection, &workspace_id, &request.subject_id)?;
+    let total: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE workspace_id = ?1 AND subject_id = ?2
+               AND status = 'done' AND deleted_at IS NULL",
+            params![workspace_id, request.subject_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let total_pages = if total == 0 {
+        0
+    } else {
+        (total + page_size - 1) / page_size
+    };
+    let mut statement = connection
+        .prepare(
+            "SELECT id, subject_id, parent_id, title, status, planned_date,
+                    estimate_minutes, note, project_name, solution_name, sort_order, completed_at, version
+             FROM tasks
+             WHERE workspace_id = ?1 AND subject_id = ?2
+               AND status = 'done' AND deleted_at IS NULL
+             ORDER BY completed_at DESC, id DESC
+             LIMIT ?3 OFFSET ?4",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut tasks = statement
+        .query_map(
+            params![
+                workspace_id,
+                request.subject_id,
+                page_size,
+                (page - 1) * page_size
+            ],
+            task_from_row,
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    enrich_completed_task_page(&connection, &workspace_id, &request.subject_id, &mut tasks)?;
+
+    Ok(CompletedTaskPageResult {
+        tasks,
+        page,
+        page_size,
+        total,
+        total_pages,
     })
 }
 
@@ -1266,6 +1350,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskDto> {
         project_name: row.get(8)?,
         solution_name: row.get(9)?,
         sort_order: row.get(10)?,
+        completed_at: row.get(11)?,
         depth: 0,
         path_label: String::new(),
         selectable: true,
@@ -1276,8 +1361,185 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskDto> {
         occurrence_date: None,
         occurrence_origin: None,
         occurrence_version: None,
-        version: row.get(11)?,
+        version: row.get(12)?,
     })
+}
+
+fn enrich_completed_task_page(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    tasks: &mut [TaskDto],
+) -> Result<(), String> {
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    let page_task_ids = tasks.iter().map(|task| task.id.clone()).collect::<Vec<_>>();
+    let hierarchy = completed_task_hierarchy(connection, workspace_id, subject_id, &page_task_ids)?;
+    let nodes = hierarchy
+        .iter()
+        .map(|(id, parent_id, title)| (id.clone(), (parent_id.clone(), title.clone())))
+        .collect::<HashMap<_, _>>();
+    let mut children = HashMap::<Option<String>, Vec<String>>::new();
+    for (id, parent_id, _) in &hierarchy {
+        children
+            .entry(parent_id.clone())
+            .or_default()
+            .push(id.clone());
+    }
+    let mut relevant_ids = HashSet::new();
+    for task in tasks.iter() {
+        collect_descendant_ids(&task.id, &children, &mut relevant_ids);
+    }
+    let relevant_task_ids = relevant_ids.into_iter().collect::<Vec<_>>();
+    let direct_minutes = completed_task_minutes(connection, workspace_id, &relevant_task_ids)?;
+
+    for task in tasks {
+        let path = completed_task_path(&task.id, &nodes);
+        task.depth = path.len().saturating_sub(1);
+        task.path_label = path.join(" / ");
+        task.direct_minutes = *direct_minutes.get(&task.id).unwrap_or(&0);
+        task.total_minutes = subtree_minutes(&task.id, &children, &direct_minutes);
+        task.selectable = !children.contains_key(&Some(task.id.clone()));
+        task.execution_state = "done".to_string();
+    }
+    Ok(())
+}
+
+fn completed_task_hierarchy(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    task_ids: &[String],
+) -> Result<Vec<(String, Option<String>, String)>, String> {
+    if task_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = (0..task_ids.len())
+        .map(|index| format!("?{}", index + 3))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "WITH RECURSIVE
+         ancestors(id, parent_id, title) AS (
+           SELECT id, parent_id, title FROM tasks
+           WHERE workspace_id = ?1 AND subject_id = ?2 AND deleted_at IS NULL
+             AND id IN ({placeholders})
+           UNION
+           SELECT parent.id, parent.parent_id, parent.title
+           FROM tasks parent
+           JOIN ancestors child ON child.parent_id = parent.id
+           WHERE parent.workspace_id = ?1 AND parent.subject_id = ?2
+             AND parent.deleted_at IS NULL
+         ),
+         descendants(id, parent_id, title) AS (
+           SELECT id, parent_id, title FROM tasks
+           WHERE workspace_id = ?1 AND subject_id = ?2 AND deleted_at IS NULL
+             AND id IN ({placeholders})
+           UNION
+           SELECT child.id, child.parent_id, child.title
+           FROM tasks child
+           JOIN descendants parent ON child.parent_id = parent.id
+           WHERE child.workspace_id = ?1 AND child.subject_id = ?2
+             AND child.deleted_at IS NULL
+         )
+         SELECT id, parent_id, title FROM ancestors
+         UNION
+         SELECT id, parent_id, title FROM descendants"
+    );
+    let mut values = Vec::<rusqlite::types::Value>::with_capacity(task_ids.len() + 2);
+    values.push(workspace_id.to_string().into());
+    values.push(subject_id.to_string().into());
+    values.extend(task_ids.iter().cloned().map(Into::into));
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| error.to_string())?;
+    let result = statement
+        .query_map(rusqlite::params_from_iter(values), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string());
+    result
+}
+
+fn completed_task_minutes(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    task_ids: &[String],
+) -> Result<HashMap<String, i64>, String> {
+    if task_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = (0..task_ids.len())
+        .map(|index| format!("?{}", index + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT a.task_id, COALESCE(SUM(a.minutes), 0)
+         FROM time_allocations a
+         JOIN time_entries e ON e.id = a.entry_id
+         WHERE a.workspace_id = ?1 AND e.deleted_at IS NULL
+           AND a.task_id IN ({placeholders})
+         GROUP BY a.task_id"
+    );
+    let mut values = Vec::<rusqlite::types::Value>::with_capacity(task_ids.len() + 1);
+    values.push(workspace_id.to_string().into());
+    values.extend(task_ids.iter().cloned().map(Into::into));
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| error.to_string())?;
+    let result = statement
+        .query_map(rusqlite::params_from_iter(values), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(|error| error.to_string());
+    result
+}
+
+fn collect_descendant_ids(
+    task_id: &str,
+    children: &HashMap<Option<String>, Vec<String>>,
+    output: &mut HashSet<String>,
+) {
+    if !output.insert(task_id.to_string()) {
+        return;
+    }
+    for child_id in children
+        .get(&Some(task_id.to_string()))
+        .into_iter()
+        .flatten()
+    {
+        collect_descendant_ids(child_id, children, output);
+    }
+}
+
+fn completed_task_path(
+    task_id: &str,
+    nodes: &HashMap<String, (Option<String>, String)>,
+) -> Vec<String> {
+    let mut path = Vec::new();
+    let mut current_id = Some(task_id.to_string());
+    let mut visited = HashSet::new();
+    while let Some(id) = current_id {
+        if !visited.insert(id.clone()) {
+            break;
+        }
+        let Some((parent_id, title)) = nodes.get(&id) else {
+            break;
+        };
+        path.push(title.clone());
+        current_id = parent_id.clone();
+    }
+    path.reverse();
+    path
 }
 
 fn apply_recurrence_context(
@@ -1569,7 +1831,7 @@ fn load_task(connection: &rusqlite::Connection, id: &str) -> Result<TaskDto, Str
     connection
         .query_row(
             "SELECT id, subject_id, parent_id, title, status, planned_date,
-                    estimate_minutes, note, project_name, solution_name, sort_order, version
+                    estimate_minutes, note, project_name, solution_name, sort_order, completed_at, version
              FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
             [id],
             task_from_row,
@@ -1734,6 +1996,14 @@ pub fn task_list(
     request: TaskListRequest,
 ) -> Result<TaskListResult, String> {
     list_tasks(&database, request)
+}
+
+#[tauri::command]
+pub fn task_list_completed_page(
+    database: tauri::State<'_, Database>,
+    request: CompletedTaskPageRequest,
+) -> Result<CompletedTaskPageResult, String> {
+    list_completed_task_page(&database, request)
 }
 
 #[tauri::command]
@@ -2586,12 +2856,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status_events, 1);
+        let completed = list_completed_task_page(
+            &database,
+            CompletedTaskPageRequest {
+                subject_id: done.subject_id.clone(),
+                page: Some(1),
+                page_size: Some(20),
+            },
+        )
+        .unwrap();
+        assert!(completed.tasks.iter().any(|item| item.id == task.id));
+        let reopened = set_task_status(
+            &database,
+            TaskStatusRequest {
+                id: task.id.clone(),
+                expected_version: done.version,
+                done: false,
+                occurrence_date: None,
+                occurrence_expected_version: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(reopened.id, task.id);
+        assert_eq!(reopened.status, "open");
+        let count: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id = ?1",
+                [&task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let completed = list_completed_task_page(
+            &database,
+            CompletedTaskPageRequest {
+                subject_id: reopened.subject_id.clone(),
+                page: Some(1),
+                page_size: Some(20),
+            },
+        )
+        .unwrap();
+        assert!(!completed.tasks.iter().any(|item| item.id == task.id));
         assert!(set_task_status(
             &database,
             TaskStatusRequest {
                 id: task.id,
-                expected_version: cleared.version,
-                done: false,
+                expected_version: done.version,
+                done: true,
                 occurrence_date: None,
                 occurrence_expected_version: None,
             }
@@ -2831,6 +3144,78 @@ mod tests {
     }
 
     #[test]
+    fn open_task_list_keeps_hierarchy_and_minutes_without_completed_rows() {
+        let database = database();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let root = create_test_task(&database, &subject_id, None, "进行中父项");
+        let child = create_test_task(&database, &subject_id, Some(root.id.clone()), "进行中子项");
+        let completed = create_test_task(&database, &subject_id, None, "已完成事项");
+        let connection = database.open().unwrap();
+        let now = now_millis();
+        let entry_id = Uuid::now_v7().to_string();
+        connection
+            .execute(
+                "INSERT INTO time_entries(id, workspace_id, work_date, kind, source_type, state, label_snapshot, started_at, ended_at, duration_seconds, created_at, updated_at, version)
+                 VALUES (?1, ?2, '2026-10-14', 'work', 'manual', 'ended', '进行中子项', ?3, ?3, 1500, ?3, ?3, 1)",
+                params![entry_id, workspace_id, now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO time_allocations(id, workspace_id, entry_id, task_id, minutes, created_at, updated_at, version)
+                 VALUES (?1, ?2, ?3, ?4, 25, ?5, ?5, 1)",
+                params![Uuid::now_v7().to_string(), workspace_id, entry_id, child.id, now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE tasks SET status = 'done', completed_at = ?1 WHERE id = ?2",
+                params![now, completed.id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let result = list_tasks(
+            &database,
+            TaskListRequest {
+                subject_id: Some(subject_id),
+                include_completed: Some(false),
+                planned_date: None,
+                today_date: None,
+                today_only: Some(false),
+                daily_estimate_date: None,
+                query: None,
+            },
+        )
+        .unwrap();
+        let root_index = result
+            .tasks
+            .iter()
+            .position(|task| task.id == root.id)
+            .unwrap();
+        let child_index = result
+            .tasks
+            .iter()
+            .position(|task| task.id == child.id)
+            .unwrap();
+        assert_eq!(child_index, root_index + 1);
+        assert!(!result.tasks.iter().any(|task| task.id == completed.id));
+        assert_eq!(result.tasks[root_index].total_minutes, 25);
+        assert_eq!(
+            result.tasks[child_index].path_label,
+            "进行中父项 / 进行中子项"
+        );
+        assert!(result.tasks.iter().all(|task| task.status == "open"));
+    }
+
+    #[test]
     fn regular_task_list_keeps_undated_new_tasks_when_today_context_is_present() {
         let database = database();
         let connection = database.open().unwrap();
@@ -2884,6 +3269,185 @@ mod tests {
             .collect::<HashSet<_>>();
         assert!(!today_ids.contains(root.id.as_str()));
         assert!(!today_ids.contains(child.id.as_str()));
+    }
+
+    #[test]
+    fn completed_task_page_is_stable_paginated_and_subject_scoped() {
+        let database = database();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let other_subject_id = Uuid::now_v7().to_string();
+        connection
+            .execute(
+                "INSERT INTO subjects(id, workspace_id, name, sort_order, created_at, updated_at, version)
+                 VALUES (?1, ?2, '其他主体', 20, 1, 1, 1)",
+                params![other_subject_id, workspace_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut expected = Vec::new();
+        for index in 0..25 {
+            let task = create_test_task(&database, &subject_id, None, &format!("完成事项 {index}"));
+            let completed_at = if index < 2 { 5_000 } else { 1_000 + index };
+            database
+                .open()
+                .unwrap()
+                .execute(
+                    "UPDATE tasks SET status = 'done', completed_at = ?1 WHERE id = ?2",
+                    params![completed_at, task.id],
+                )
+                .unwrap();
+            expected.push((task.id, completed_at));
+        }
+        let other_task = create_test_task(&database, &other_subject_id, None, "其他主体已完成");
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'done', completed_at = 9000 WHERE id = ?1",
+                [&other_task.id],
+            )
+            .unwrap();
+        expected.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| right.0.cmp(&left.0)));
+
+        let first = list_completed_task_page(
+            &database,
+            CompletedTaskPageRequest {
+                subject_id: subject_id.clone(),
+                page: None,
+                page_size: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(first.page, 1);
+        assert_eq!(first.page_size, 20);
+        assert_eq!(first.total, 25);
+        assert_eq!(first.total_pages, 2);
+        assert_eq!(first.tasks.len(), 20);
+        assert_eq!(
+            first
+                .tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            expected[..20]
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(first
+            .tasks
+            .iter()
+            .all(|task| task.subject_id == subject_id && task.completed_at.is_some()));
+
+        let second = list_completed_task_page(
+            &database,
+            CompletedTaskPageRequest {
+                subject_id,
+                page: Some(2),
+                page_size: Some(20),
+            },
+        )
+        .unwrap();
+        assert_eq!(second.tasks.len(), 5);
+        assert_eq!(
+            second
+                .tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            expected[20..]
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn completed_task_page_keeps_path_and_excludes_recurring_occurrences() {
+        let database = database();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+
+        let parent = create_test_task(&database, &subject_id, None, "历史父项");
+        let child = create_test_task(&database, &subject_id, Some(parent.id.clone()), "历史子项");
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'done', completed_at = 3000 WHERE id = ?1",
+                [&child.id],
+            )
+            .unwrap();
+
+        let recurring = create_test_task(&database, &subject_id, None, "每日重复事项");
+        let occurrence_date = "2026-10-14";
+        crate::recurring::save_rule(
+            &database,
+            crate::recurring::RecurrenceSaveRequest {
+                task_id: recurring.id.clone(),
+                task_expected_version: recurring.version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: occurrence_date.to_string(),
+                rule_expected_version: None,
+            },
+        )
+        .unwrap();
+        let mut connection = database.open().unwrap();
+        let transaction = connection.transaction().unwrap();
+        crate::recurring::ensure_occurrence(
+            &transaction,
+            &workspace_id,
+            &recurring.id,
+            occurrence_date,
+            1000,
+        )
+        .unwrap();
+        transaction
+            .execute(
+                "UPDATE task_occurrences SET status = 'done', completed_at = 4000
+                 WHERE task_id = ?1 AND occurrence_date = ?2",
+                params![recurring.id, occurrence_date],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let result = list_completed_task_page(
+            &database,
+            CompletedTaskPageRequest {
+                subject_id,
+                page: Some(1),
+                page_size: Some(20),
+            },
+        )
+        .unwrap();
+        assert_eq!(result.total, 1);
+        assert_eq!(result.tasks.len(), 1);
+        assert_eq!(result.tasks[0].id, child.id);
+        assert_eq!(result.tasks[0].path_label, "历史父项 / 历史子项");
+        let recurring_status: String = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                [&recurring.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recurring_status, "open");
     }
 
     #[test]

@@ -2,14 +2,14 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import Sortable, { MultiDrag } from "sortablejs";
-import { CalendarDays, CheckCircle2, ChevronDown, ChevronRight, Circle, Copy, CornerDownRight, DatabaseZap, FileInput, GripVertical, IndentDecrease, IndentIncrease, Play, Plus, Radio, Repeat2, TimerReset, Trash2 } from "lucide-vue-next";
+import { CalendarDays, CheckCircle2, Circle, Copy, CornerDownRight, DatabaseZap, FileInput, GripVertical, IndentDecrease, IndentIncrease, Play, Plus, Radio, Repeat2, TimerReset, Trash2 } from "lucide-vue-next";
 import type { Task } from "../store";
+import { isActivePlanTask } from "../services/completedTaskHistoryCore";
 
 const props = defineProps<{
   tasks: Task[];
   subjectName: string;
   selectedId: string;
-  recentCompletedId?: string;
   runningTaskId?: string;
   formatMinutes: (minutes: number) => string;
   todayDate: string;
@@ -37,7 +37,6 @@ const rowsRef = ref<HTMLElement | null>(null);
 const editingEstimateId = ref("");
 const editingTodayEstimateId = ref("");
 const levelChangedId = ref("");
-const completedExpanded = ref(true);
 const isSorting = ref(false);
 const temporaryTaskId = ref("");
 const listRenderVersion = ref(0);
@@ -56,8 +55,10 @@ if (!sortableWithPlugins.treeMultiDragMounted) {
 }
 
 const flatRows = computed(() => props.tasks.map((task) => ({ task, depth: getDepth(task) })));
-const pendingRows = computed(() => flatRows.value.filter((row) => row.task.status !== "done"));
-const completedRows = computed(() => flatRows.value.filter((row) => row.task.status === "done"));
+const pendingRows = computed(() => flatRows.value.filter((row) => isActivePlanTask({
+  status: row.task.status,
+  recurring: Boolean(row.task.recurrence),
+})));
 
 function getDepth(task: Task) {
   let depth = 0;
@@ -83,32 +84,11 @@ function getRootTask(task: Task) {
   return root;
 }
 
-function getAncestorPath(task: Task) {
-  const ancestors: Task[] = [];
-  const visited = new Set<string>();
-  let parentId = task.parentId;
-  while (parentId && !visited.has(parentId)) {
-    visited.add(parentId);
-    const parent = props.tasks.find((item) => item.id === parentId);
-    if (!parent) break;
-    ancestors.unshift(parent);
-    parentId = parent.parentId;
-  }
-  return ancestors;
-}
-
-function completedPathLabel(task: Task) {
-  const ancestors = getAncestorPath(task);
-  return ancestors.length
-    ? ancestors.map((item) => item.title.trim() || "未命名事项").join(" / ")
-    : "顶层事项";
-}
-
 function childPlaceholderParent(rowIndex: number) {
   const row = pendingRows.value[rowIndex];
   if (!row) return;
   const root = getRootTask(row.task);
-  if (root.status === "done") return;
+  if (root.status === "done" && !root.recurrence) return;
   if (root.recurrence) return;
   const nextRow = pendingRows.value[rowIndex + 1];
   if (nextRow && getRootTask(nextRow.task).id === root.id) return;
@@ -430,8 +410,9 @@ onBeforeUnmount(() => {
           @click="selectTask(row.task)"
         >
           <button class="drag-handle" :title="getSubtreeIds(row.task.id).size > 1 ? `拖动整组（共 ${getSubtreeIds(row.task.id).size} 项）` : '拖动排序'" @pointerdown="prepareSubtreeDrag(row.task.id)"><GripVertical :size="14" /></button>
-          <button class="check-button" :title="row.task.recurrence ? '完成今天这一轮' : '标记为完成'" @click.stop="emit('toggle', row.task, $event)">
-            <Circle :size="18" />
+          <button class="check-button" :class="{ completed: row.task.status === 'done' }" :title="row.task.recurrence ? (row.task.status === 'done' ? '恢复今天这一轮' : '完成今天这一轮') : '标记为完成'" @click.stop="emit('toggle', row.task, $event)">
+            <CheckCircle2 v-if="row.task.status === 'done'" :size="18" />
+            <Circle v-else :size="18" />
           </button>
           <div class="reminder-main">
             <input :data-task-input="row.task.id" v-model="row.task.title" :placeholder="row.depth ? '新子项' : '新待办'" @focus="selectTask(row.task)" @blur="finishTaskEdit(row.task)" @keydown.tab="handleTitleTab($event, row.task)" />
@@ -518,87 +499,6 @@ onBeforeUnmount(() => {
         <span class="placeholder-input" aria-hidden="true"></span>
       </button>
     </div>
-
-    <section class="completed-reminders" :class="{ expanded: completedExpanded }">
-      <button class="completed-reminders-toggle" type="button" @click="completedExpanded = !completedExpanded">
-        <ChevronDown v-if="completedExpanded" :size="15" />
-        <ChevronRight v-else :size="15" />
-        <span>已完成</span>
-        <strong data-completed-count>{{ completedRows.length }}</strong>
-      </button>
-
-      <div v-if="completedExpanded" class="completed-reminder-list">
-        <div
-          v-for="row in completedRows"
-          :key="row.task.id"
-          class="reminder-row completed"
-          :class="{ selected: row.task.id === selectedId, 'completion-new': row.task.id === recentCompletedId }"
-          :data-task-id="row.task.id"
-          @click="selectTask(row.task)"
-        >
-          <span class="drag-handle-spacer" aria-hidden="true"></span>
-          <button class="check-button" title="恢复为未完成" @click.stop="emit('toggle', row.task, $event)">
-            <CheckCircle2 :size="18" />
-          </button>
-          <div class="reminder-main">
-            <input :data-task-input="row.task.id" v-model="row.task.title" placeholder="已完成事项" @focus="selectTask(row.task)" @blur="finishTaskEdit(row.task)" />
-            <div class="reminder-meta">
-              <span class="completed-path" :title="completedPathLabel(row.task)">
-                <CornerDownRight :size="12" />{{ completedPathLabel(row.task) }}
-              </span>
-              <span class="meta-picker" :class="{ filled: row.task.planDate }" title="设置预计开始日期" @click.stop="openNativePicker(row.task.id)">
-                <input :data-date-input="row.task.id" v-model="row.task.planDate" aria-label="预计开始日期" tabindex="-1" type="date" @change="emit('save', row.task.id)" />
-                <CalendarDays :size="12" />{{ row.task.planDate || '未设置开始日期' }}
-              </span>
-              <span class="meta-picker estimate-picker" :class="{ filled: row.task.estimate }" :title="row.task.recurrence ? '设置每次预计用时' : '设置整体预计用时'" @click.stop="openEstimateEditor(row.task.id)">
-                <TimerReset :size="12" />{{ row.task.estimate ? (row.task.recurrence ? '每次预计 ' : '整体预计 ') + formatMinutes(row.task.estimate) : (row.task.recurrence ? '未填每次预计' : '未填整体预计') }}
-                <input
-                  v-if="editingEstimateId === row.task.id"
-                  :data-estimate-input="row.task.id"
-                  v-model.number="row.task.estimate"
-                  min="0"
-                  placeholder="分钟"
-                  type="number"
-                  @blur="finishEstimateEditor(row.task)"
-                  @click.stop
-                  @keydown.enter.prevent="finishEstimateEditor(row.task)"
-                  @keydown.esc.prevent="closeEstimateEditor"
-                />
-              </span>
-              <span class="meta-picker estimate-picker today-estimate-picker" :class="{ filled: row.task.todayEstimate }" title="设置今日预计用时" @click.stop="openTodayEstimateEditor(row.task.id)">
-                <TimerReset :size="12" />{{ row.task.todayEstimate ? '今日预计 ' + formatMinutes(row.task.todayEstimate) : '未填今日预计' }}
-                <input
-                  v-if="editingTodayEstimateId === row.task.id"
-                  :data-today-estimate-input="row.task.id"
-                  v-model.number="row.task.todayEstimate"
-                  min="0"
-                  placeholder="分钟"
-                  type="number"
-                  @blur="finishTodayEstimateEditor(row.task)"
-                  @click.stop
-                  @keydown.enter.prevent="finishTodayEstimateEditor(row.task)"
-                  @keydown.esc.prevent="closeTodayEstimateEditor"
-                />
-              </span>
-            </div>
-          </div>
-          <div class="reminder-inline-controls">
-            <button
-              class="icon-button subtle hover-row-action task-timer-action"
-              :class="{ active: runningTaskId === row.task.id }"
-              :title="runningTaskId === row.task.id ? '当前事项正在计时' : runningTaskId ? '结束当前计时并切换到此事项' : '继续执行并开始计时'"
-              @click.stop="emit('startTimer', row.task.id)"
-            >
-              <Radio v-if="runningTaskId === row.task.id" :size="14" />
-              <Play v-else :size="14" fill="currentColor" />
-            </button>
-            <button class="icon-button subtle hover-row-action" title="复制事项" @click.stop="duplicateTask(row.task)"><Copy :size="14" /></button>
-            <button class="icon-button subtle hover-row-action" title="删除" @click.stop="confirmDelete(row.task)"><Trash2 :size="14" /></button>
-          </div>
-        </div>
-        <p v-if="!completedRows.length" class="completed-reminders-empty">还没有已完成事项</p>
-      </div>
-    </section>
 
     <el-dialog v-model="recurrenceDialogOpen" class="recurrence-dialog" title="重复设置" width="min(430px, 92vw)" append-to-body destroy-on-close>
       <div class="recurrence-form">

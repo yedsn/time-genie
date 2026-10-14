@@ -50,6 +50,8 @@ end $$;
 \ir 20261008_timegenie_simplified_unassigned_anchor.sql
 \ir 20261013_timegenie_unassigned_lease_continuity_fix.sql
 \ir 20261013_timegenie_unassigned_lease_continuity_fix.sql
+\ir 20261014_timegenie_timer_sync_authority.sql
+\ir 20261014_timegenie_timer_sync_authority.sql
 
 do $$
 begin
@@ -100,6 +102,21 @@ begin
   end if;
   if not has_function_privilege('authenticated', 'timegenie.cloud_apply_patch(uuid, uuid, uuid, text, text, text, bigint, bigint, bigint, jsonb)', 'execute') then
     raise exception 'authenticated is missing coalesced timer apply RPC execute privilege';
+  end if;
+  if not has_function_privilege('authenticated', 'timegenie.timer_sync_context_get(uuid, uuid, uuid)', 'execute')
+     or not has_function_privilege('authenticated', 'timegenie.timer_sync_context_get(uuid, uuid, uuid, text, jsonb)', 'execute') then
+    raise exception 'authenticated is missing timer sync context privileges';
+  end if;
+  if not has_function_privilege('authenticated', 'timegenie.tracking_lease_acquire(uuid, uuid, uuid)', 'execute')
+     or not has_function_privilege('authenticated', 'timegenie.tracking_lease_renew(uuid, uuid, uuid)', 'execute')
+     or not has_function_privilege('authenticated', 'timegenie.tracking_lease_release(uuid, uuid, uuid)', 'execute')
+     or not has_function_privilege('authenticated', 'timegenie.unassigned_tick(uuid, uuid, uuid)', 'execute') then
+    raise exception 'authenticated is missing tracking lease RPC privileges';
+  end if;
+  if has_function_privilege('authenticated', 'timegenie.apply_calendar_time_entry(uuid, uuid, uuid, text, text, bigint, jsonb, jsonb)', 'execute')
+     or has_function_privilege('authenticated', 'timegenie.apply_calendar_time_entry_pre_timer_authority(uuid, uuid, uuid, text, text, bigint, jsonb, jsonb)', 'execute')
+     or has_function_privilege('authenticated', 'timegenie.timer_write_lease_context(uuid, uuid)', 'execute') then
+    raise exception 'authenticated can execute an internal timer authority helper';
   end if;
   if not has_function_privilege('authenticated', 'timegenie.device_authorize(uuid, uuid, text, text, text)', 'execute')
      or not has_function_privilege('authenticated', 'timegenie.device_authorization_get(uuid, uuid)', 'execute')
@@ -1576,9 +1593,20 @@ end $$;
 -- Coalesced timer snapshots may jump only across the exact number of local
 -- operations declared by the client. The final image is applied once and the
 -- original operation id remains the sole idempotency boundary.
+reset role;
+update timegenie.tracking_leases set expires_at=clock_timestamp()-interval '1 second'
+where workspace_id='20000000-0000-0000-0000-000000000001';
+set local role authenticated;
+select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
 do $$
 declare timer_payload jsonb; first_result jsonb; retry_result jsonb; timer_change_count bigint;
+declare sync_context jsonb; rejected jsonb;
 begin
+  perform timegenie.tracking_lease_acquire(
+    '20000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '49000000-0000-0000-0000-000000000001'
+  );
   timer_payload := jsonb_build_object(
     'id', '70000000-0000-0000-0000-000000000099',
     'work_date', '2026-09-30',
@@ -1635,6 +1663,44 @@ begin
   if first_result is distinct from retry_result then
     raise exception 'coalesced timer retry returned a different result';
   end if;
+  sync_context:=timegenie.timer_sync_context_get(
+    '20000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000090',
+    '70000000-0000-0000-0000-000000000099',
+    'timer_stop',
+    jsonb_build_object(
+      'deviceId','30000000-0000-0000-0000-000000000001',
+      'entityType','time_entry',
+      'entityId','70000000-0000-0000-0000-000000000099',
+      'baseVersion',null,
+      'payloadVersion',3,
+      'coalescedCount',3,
+      'payload',timer_payload
+    )
+  );
+  if sync_context->'processedOperation'->>'operationType'<>'timer_stop'
+     or not coalesce((sync_context->'processedOperation'->>'matchesRequest')::boolean,false)
+     or (sync_context->>'currentVersion')::bigint<>3 then
+    raise exception 'timer sync context did not confirm the processed operation: %',sync_context;
+  end if;
+  sync_context:=timegenie.timer_sync_context_get(
+    '20000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000090',
+    '70000000-0000-0000-0000-000000000099',
+    'timer_stop',
+    jsonb_build_object(
+      'deviceId','30000000-0000-0000-0000-000000000001',
+      'entityType','time_entry',
+      'entityId','70000000-0000-0000-0000-000000000099',
+      'baseVersion',null,
+      'payloadVersion',3,
+      'coalescedCount',3,
+      'payload',jsonb_set(timer_payload,'{note}','"different request"'::jsonb,true)
+    )
+  );
+  if coalesce((sync_context->'processedOperation'->>'matchesRequest')::boolean,true) then
+    raise exception 'timer sync context accepted different content for an existing operation id';
+  end if;
   if (select version from timegenie.time_entries where id = '70000000-0000-0000-0000-000000000099') <> 3 then
     raise exception 'coalesced timer final image was not applied at version 3';
   end if;
@@ -1644,7 +1710,10 @@ begin
       and entity_type = 'time_entries'
       and entity_id = '70000000-0000-0000-0000-000000000099'
   ) <> timer_change_count + 1 then
-    raise exception 'coalesced timer retry created duplicate cloud writes';
+    raise exception 'coalesced timer retry created duplicate cloud writes: before %, after %, first %, retry %',
+      timer_change_count,
+      (select count(*) from timegenie.workspace_changes where workspace_id='20000000-0000-0000-0000-000000000001' and entity_type='time_entries' and entity_id='70000000-0000-0000-0000-000000000099'),
+      first_result,retry_result;
   end if;
 
   begin
@@ -1685,8 +1754,7 @@ begin
       if sqlerrm not like '%VERSION_CONFLICT%' then raise; end if;
   end;
 
-  begin
-    perform timegenie.cloud_apply_patch(
+  rejected:=timegenie.cloud_apply_patch(
       '20000000-0000-0000-0000-000000000001',
       '30000000-0000-0000-0000-000000000002',
       '40000000-0000-0000-0000-000000000092',
@@ -1698,11 +1766,10 @@ begin
       2,
       jsonb_set(timer_payload, '{version}', '4'::jsonb, true)
     );
-    raise exception 'coalesced timer overwrote an unknown cloud version';
-  exception
-    when others then
-      if sqlerrm not like '%SYNC_CONFLICT%' then raise; end if;
-  end;
+  if rejected->'error'->>'code'<>'LEASE_NOT_HELD'
+     or (rejected->>'currentVersion')::bigint<>3 then
+    raise exception 'non-holder timer write did not return structured authority context: %',rejected;
+  end if;
 
   begin
     perform timegenie.cloud_apply_patch(
@@ -1729,6 +1796,88 @@ begin
     when others then
       if sqlerrm not like '%VERSION_CONFLICT%' then raise; end if;
   end;
+end $$;
+
+-- Lease acquire/renew/release and unassigned ticks must never mutate an
+-- ordinary timer. The holder can heartbeat repeatedly without changing the
+-- timer image, while a live lease still blocks another device.
+reset role;
+do $$
+declare timer_id uuid:='70000000-0000-0000-0000-000000000098'; timer_version bigint;
+declare timer_updated timestamptz; segment_image jsonb; lease_result jsonb;
+begin
+  delete from timegenie.time_segments where entry_id=timer_id;
+  delete from timegenie.time_entries where id=timer_id;
+  insert into timegenie.time_entries(
+    id,workspace_id,work_date,kind,source_type,state,default_task_id,label_snapshot,
+    started_at,duration_seconds,created_at,updated_at,version,created_by_device_id,
+    updated_by_device_id,timer_chain_id,last_continuous_at
+  ) values(
+    timer_id,'20000000-0000-0000-0000-000000000001',timegenie.workspace_work_date(
+      '20000000-0000-0000-0000-000000000001',clock_timestamp()
+    ),'work','timer','running','60000000-0000-0000-0000-000000000002',
+    '租约心跳不修改计时',clock_timestamp()-interval '10 minutes',0,clock_timestamp()-interval '10 minutes',
+    clock_timestamp()-interval '2 minutes',7,'30000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',timer_id,clock_timestamp()-interval '2 minutes'
+  );
+  insert into timegenie.time_segments(
+    id,workspace_id,entry_id,sequence_no,started_at,duration_seconds
+  ) values(
+    '73000000-0000-0000-0000-000000000098',
+    '20000000-0000-0000-0000-000000000001',timer_id,1,clock_timestamp()-interval '10 minutes',0
+  );
+  select version,updated_at into timer_version,timer_updated from timegenie.time_entries where id=timer_id;
+  select jsonb_agg(to_jsonb(segment) order by sequence_no) into segment_image
+  from timegenie.time_segments segment where entry_id=timer_id;
+  perform set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+  set local role authenticated;
+  lease_result:=timegenie.tracking_lease_acquire(
+    '20000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '49000000-0000-0000-0000-000000000098'
+  );
+  if not coalesce((lease_result->>'acquired')::boolean,false) then
+    raise exception 'timer holder failed to acquire lease for heartbeat isolation test';
+  end if;
+  perform timegenie.tracking_lease_renew(
+    '20000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '49000000-0000-0000-0000-000000000098'
+  );
+  perform timegenie.unassigned_tick(
+    '20000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '49000000-0000-0000-0000-000000000098'
+  );
+  reset role;
+  if not exists(
+    select 1 from timegenie.time_entries where id=timer_id
+      and version=timer_version and updated_at=timer_updated and state='running'
+  ) or (
+    select jsonb_agg(to_jsonb(segment) order by sequence_no)
+    from timegenie.time_segments segment where entry_id=timer_id
+  ) is distinct from segment_image then
+    raise exception 'lease heartbeat mutated the ordinary timer image';
+  end if;
+  set local role authenticated;
+  if coalesce((timegenie.tracking_lease_acquire(
+    '20000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000002',
+    '49000000-0000-0000-0000-000000000099'
+  )->>'acquired')::boolean,false) then
+    raise exception 'live timer lease was stolen by another device';
+  end if;
+  perform timegenie.tracking_lease_release(
+    '20000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '49000000-0000-0000-0000-000000000098'
+  );
+  reset role;
+  if not exists(select 1 from timegenie.time_entries where id=timer_id and version=timer_version) then
+    raise exception 'lease release mutated the ordinary timer version';
+  end if;
+  delete from timegenie.time_segments where entry_id=timer_id;
+  delete from timegenie.time_entries where id=timer_id;
 end $$;
 
 -- Only one global timer may exist. Either registered device can control the
@@ -1889,11 +2038,19 @@ begin
 end $$;
 
 -- The same timer chain/date candidate converges to one authoritative row.
+reset role;
+update timegenie.tracking_leases set expires_at=clock_timestamp()-interval '1 second'
+where workspace_id='20000000-0000-0000-0000-000000000001';
 set local role authenticated;
 select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
 do $$
 declare first_result jsonb; second_result jsonb; chain_id uuid:='74000000-0000-0000-0000-000000000001';
 begin
+  perform timegenie.tracking_lease_acquire(
+    '20000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '49000000-0000-0000-0000-000000000097'
+  );
   first_result:=timegenie.cloud_apply_patch(
     '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
     '44000000-0000-0000-0000-000000000001','timer_rollover_create','time_entry',
@@ -1903,7 +2060,7 @@ begin
       'updated_at',1791216060000,'version',1,'timer_chain_id',chain_id::text,'last_continuous_at',1791216060000,'segments','[]'::jsonb,'allocations','[]'::jsonb)
   );
   second_result:=timegenie.cloud_apply_patch(
-    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002',
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
     '44000000-0000-0000-0000-000000000002','timer_rollover_create','time_entry',
     '74100000-0000-0000-0000-000000000002',null,
     jsonb_build_object('id','74100000-0000-0000-0000-000000000002','work_date','2026-10-06','kind','work','source_type','timer','state','ended',
@@ -1912,7 +2069,7 @@ begin
   );
   if not coalesce((second_result->>'superseded')::boolean,false)
      or second_result->'authoritative'->>'id'<>'74100000-0000-0000-0000-000000000001' then
-    raise exception 'timer chain/date candidates did not converge to the first authoritative row';
+    raise exception 'timer chain/date candidates did not converge to the first authoritative row: first %, second %',first_result,second_result;
   end if;
   if (select count(*) from timegenie.time_entries where timer_chain_id=chain_id and work_date='2026-10-06')<>1 then
     raise exception 'timer chain/date uniqueness was not preserved';
@@ -2212,6 +2369,11 @@ end $$;
 do $$
 declare start_payload jsonb; stop_payload jsonb; first_stop jsonb; retry_stop jsonb; active_anchor jsonb; start_millis bigint; stop_millis bigint;
 begin
+  perform timegenie.tracking_lease_acquire(
+    '20000000-0000-0000-0000-000000000002',
+    '30000000-0000-0000-0000-000000000003',
+    '49000000-0000-0000-0000-000000000096'
+  );
   start_millis:=floor(extract(epoch from clock_timestamp())*1000)::bigint;
   stop_millis:=start_millis+60000;
   start_payload:=jsonb_build_object(

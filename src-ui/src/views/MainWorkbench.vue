@@ -5,6 +5,7 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { useWorkdayStore, type Task } from "../store";
 import { checkAppUpdate, closeMainWindow, confirmObsidianPlan, configureCloud, downloadAndInstallUpdate, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listCloudSyncConflicts, listCloudSyncQueue, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onOpenTimerTaskSelection, onTrayCheckUpdate, previewObsidianPlan, previewSeaTableTaskSync, previewStorageMigration, registerCloudDevice, resetLocalCacheFromCloud, resolveAllCloudSyncConflicts, restartApp, resumeCloudSyncAfterReauth, retryFailedSeaTableSync, revokeCloudDevice, saveCloudSync, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudSessionSnapshot, type CloudSyncConflict, type CloudSyncQueueItem, type PlanImportPreviewResult, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
 import PlanListEditor from "../components/PlanListEditor.vue";
+import CompletedTaskHistory from "../components/CompletedTaskHistory.vue";
 import GlobalTimerBar from "../components/GlobalTimerBar.vue";
 import UnassignedTimeIndicator from "../components/UnassignedTimeIndicator.vue";
 import UnassignedTimeDialog from "../components/UnassignedTimeDialog.vue";
@@ -17,6 +18,7 @@ import appIconUrl from "../../../src-tauri/icons/icon.svg";
 import { cloudSaveStatusLabel, cloudSyncPresentation } from "../services/cloudSyncPresentation";
 import { cloudSessionLabel, cloudSessionNeedsPassword } from "../services/cloudSessionPresentation";
 import { cloudDeviceActionDisabled, cloudDeviceActionLabel, cloudDeviceKind, runConfirmedCloudAction } from "../services/cloudDevicePresentation";
+import { timerSyncRecoveryDetail, timerSyncRecoveryLabel } from "../services/timerSyncRecoveryPresentation";
 import { isCompletionFeedbackEnabled, playCompletionFeedback, setCompletionFeedbackEnabled, setCompletionFeedbackSoundEnabled } from "../services/completionFeedback";
 import { remainingOpenTaskCount } from "../services/completionFeedbackCore";
 import { APP_THEMES, applyAppTheme, isAppTheme, type AppTheme } from "../services/theme";
@@ -331,6 +333,14 @@ function cloudQueueTitle(item: CloudSyncQueueItem) {
 function cloudQueueStateLabel(state: string) {
   const labels: Record<string, string> = { pending: "等待同步", sending: "正在同步", failed: "同步失败", conflict: "存在冲突" };
   return labels[state] ?? state;
+}
+
+function cloudQueueRecoveryLabel(item: CloudSyncQueueItem) {
+  return timerSyncRecoveryLabel(item);
+}
+
+function cloudQueueRecoveryDetail(item: CloudSyncQueueItem) {
+  return timerSyncRecoveryDetail(item);
 }
 
 function formatQueueTime(value: number) {
@@ -1280,6 +1290,33 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
     completingTaskIds.delete(task.id);
   }
 }
+
+async function handleCompletedTaskSave(task: Task) {
+  try {
+    await store.saveCompletedTask(task);
+  } catch (error) {
+    ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "事项保存失败");
+    await store.loadCompletedTasks(store.completedTasksPage);
+  }
+}
+
+async function handleCompletedTaskReopen(task: Task) {
+  try {
+    await store.reopenCompletedTask(task);
+    ElMessage.success("事项已恢复到进行中");
+  } catch (error) {
+    ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "恢复事项失败");
+  }
+}
+
+async function handleCompletedTaskDelete(task: Task) {
+  try {
+    await store.deleteCompletedTask(task);
+    ElMessage.success("事项已删除");
+  } catch (error) {
+    ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "删除事项失败");
+  }
+}
 </script>
 
 <template>
@@ -1358,11 +1395,19 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
         />
 
       <section v-else-if="store.activePage === 'plan'" class="plan-edit-layout">
+        <div class="plan-task-tabs" role="tablist" aria-label="事项状态">
+          <button type="button" role="tab" :aria-selected="store.planTaskTab === 'active'" :class="{ active: store.planTaskTab === 'active' }" @click="store.selectPlanTaskTab('active')">
+            <span>进行中</span><strong>{{ store.selectedSubjectTasks.length }}</strong>
+          </button>
+          <button type="button" role="tab" :aria-selected="store.planTaskTab === 'completed'" :class="{ active: store.planTaskTab === 'completed' }" @click="store.selectPlanTaskTab('completed')">
+            <span>已完成</span><strong v-if="!store.completedTasksStale" data-completed-count>{{ store.completedTasksTotal }}</strong>
+          </button>
+        </div>
         <PlanListEditor
+          v-if="store.planTaskTab === 'active'"
           :tasks="store.selectedSubjectTasks"
           :subject-name="store.selectedSubject?.name ?? '待办'"
           :selected-id="store.selectedTaskId"
-          :recent-completed-id="recentCompletedTaskId"
           :running-task-id="store.runningEntry?.defaultTask"
           :format-minutes="formatMinutes"
           :today-date="store.workspaceToday"
@@ -1380,6 +1425,22 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           @start-timer="startTimerForTask"
           @reorder="store.reorderTask"
           @set-recurrence="handleTaskRecurrence"
+        />
+        <CompletedTaskHistory
+          v-else
+          :tasks="store.completedTasks"
+          :subject-name="store.selectedSubject?.name ?? '待办'"
+          :page="store.completedTasksPage"
+          :total="store.completedTasksTotal"
+          :total-pages="store.completedTasksTotalPages"
+          :loading="store.completedTasksLoading"
+          :error="store.completedTasksError"
+          :format-minutes="formatMinutes"
+          @refresh="store.loadCompletedTasks(store.completedTasksPage)"
+          @page="store.selectCompletedTasksPage"
+          @reopen="handleCompletedTaskReopen"
+          @save="handleCompletedTaskSave"
+          @delete="handleCompletedTaskDelete"
         />
       </section>
 
@@ -1592,8 +1653,10 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           <span class="cloud-sync-queue-state">{{ cloudQueueStateLabel(item.state) }}</span>
           <div>
             <strong>{{ cloudQueueTitle(item) }}</strong>
-            <span>{{ cloudConflictEntityLabel(item.entityType) }} · {{ cloudConflictActionLabel(item.operationType) }}<template v-if="item.coalescedCount > 1"> · 合并 {{ item.coalescedCount }} 次修改</template></span>
+            <span>{{ cloudConflictEntityLabel(item.entityType) }} · {{ cloudConflictActionLabel(item.operationType) }}<template v-if="item.baseVersion !== undefined || item.payloadVersion !== undefined"> · 版本 {{ item.baseVersion ?? '新建' }} → {{ item.payloadVersion ?? '?' }}</template><template v-if="item.coalescedCount > 1"> · 合并 {{ item.coalescedCount }} 次修改</template></span>
             <small>{{ formatQueueTime(item.createdAt) }}<template v-if="item.attemptCount"> · 已尝试 {{ item.attemptCount }} 次</template><template v-if="item.dependsOnOperationId"> · 等待前置内容</template></small>
+            <small v-if="cloudQueueRecoveryLabel(item)">{{ cloudQueueRecoveryLabel(item) }}</small>
+            <small v-if="cloudQueueRecoveryDetail(item)">{{ cloudQueueRecoveryDetail(item) }}</small>
             <p v-if="item.error">{{ item.error }}</p>
           </div>
         </article>
@@ -1640,7 +1703,7 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
           <div class="cloud-conflict-copy">
             <strong>{{ cloudConflictTitle(conflict) }}</strong>
             <span>{{ cloudConflictEntityLabel(conflict.entityType) }} · {{ cloudConflictActionLabel(conflict.operationType) }} · 本地基础版本 {{ conflict.baseVersion ?? '新建' }}</span>
-            <small>{{ conflict.error || '云端内容已在其他设备变化' }}</small>
+            <small>{{ conflict.conflictReason || conflict.error || '云端内容已在其他设备变化' }}</small>
           </div>
           <div class="cloud-conflict-comparison">
             <div class="cloud-conflict-side local"><strong>本机内容</strong><span>将要上传的修改</span></div>

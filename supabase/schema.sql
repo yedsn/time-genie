@@ -3266,3 +3266,7 @@ grant execute on function timegenie.cloud_apply_patch(uuid,uuid,uuid,text,text,t
 grant execute on function timegenie.migration_import_snapshot(uuid,uuid,uuid,jsonb) to authenticated;
 
 notify pgrst, 'reload schema';
+
+-- Ordinary timer sync authority. Keep this final override after every wrapper
+-- above so lease traffic cannot re-enable server-side timer coordination.
+\ir 20261014_timegenie_timer_sync_authority.sql

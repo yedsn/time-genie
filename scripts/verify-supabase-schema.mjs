@@ -22,6 +22,7 @@ const calendarDayPatchFile = path.join(repoRoot, "supabase", "20261006b_timegeni
 const unassignedSegmentBoundaryPatchFile = path.join(repoRoot, "supabase", "20261007_timegenie_unassigned_segment_boundary_fix.sql");
 const simplifiedUnassignedAnchorPatchFile = path.join(repoRoot, "supabase", "20261008_timegenie_simplified_unassigned_anchor.sql");
 const unassignedLeaseContinuityPatchFile = path.join(repoRoot, "supabase", "20261013_timegenie_unassigned_lease_continuity_fix.sql");
+const timerSyncAuthorityPatchFile = path.join(repoRoot, "supabase", "20261014_timegenie_timer_sync_authority.sql");
 
 const binaryNames = process.platform === "win32"
   ? {
@@ -91,6 +92,7 @@ function verifyStaticSchemaInvariants() {
   const unassignedSegmentBoundaryPatch = fs.readFileSync(unassignedSegmentBoundaryPatchFile, "utf8");
   const simplifiedUnassignedAnchorPatch = fs.readFileSync(simplifiedUnassignedAnchorPatchFile, "utf8");
   const unassignedLeaseContinuityPatch = fs.readFileSync(unassignedLeaseContinuityPatchFile, "utf8");
+  const timerSyncAuthorityPatch = fs.readFileSync(timerSyncAuthorityPatchFile, "utf8");
   const schemaIntegrationTest = fs.readFileSync(schemaTestFile, "utf8");
   const importStart = schema.indexOf("create or replace function timegenie.migration_import_snapshot");
   const applyPatchStart = schema.indexOf("create or replace function timegenie.cloud_apply_patch");
@@ -186,6 +188,34 @@ function verifyStaticSchemaInvariants() {
   }
   if ((schemaIntegrationTest.match(/\\ir 20261013_timegenie_unassigned_lease_continuity_fix\.sql/g) ?? []).length < 2) {
     throw new Error("The schema integration test must prove the unassigned lease continuity patch is idempotent.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261014_timegenie_timer_sync_authority\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the timer sync authority patch is idempotent.");
+  }
+  const authorityTickStart = timerSyncAuthorityPatch.indexOf("create or replace function timegenie.unassigned_tick");
+  const authorityTickEnd = timerSyncAuthorityPatch.indexOf("end $$;", authorityTickStart);
+  const authorityTick = timerSyncAuthorityPatch.slice(authorityTickStart, authorityTickEnd);
+  if (authorityTickStart < 0 || authorityTick.includes("coordinate_timer_calendar_day")) {
+    throw new Error("Tracking lease heartbeats must not coordinate ordinary timers.");
+  }
+  for (const expected of [
+    "create or replace function timegenie.timer_sync_context_get",
+    "matchesRequest",
+    "'code','IDEMPOTENCY_CONFLICT'",
+    "'code','SYNC_CONFLICT'",
+    "'code','LEASE_NOT_HELD'",
+    "'authoritativeTimer',authoritative_timer",
+    "grant execute on function timegenie.timer_sync_context_get(uuid,uuid,uuid) to authenticated",
+    "grant execute on function timegenie.timer_sync_context_get(uuid,uuid,uuid,text,jsonb) to authenticated",
+    "revoke execute on function timegenie.apply_calendar_time_entry(uuid,uuid,uuid,text,text,bigint,jsonb,jsonb) from public,anon,authenticated",
+    "grant execute on function timegenie.unassigned_tick(uuid,uuid,uuid) to authenticated",
+    "grant execute on function timegenie.tracking_lease_acquire(uuid,uuid,uuid) to authenticated",
+    "grant execute on function timegenie.tracking_lease_renew(uuid,uuid,uuid) to authenticated",
+    "grant execute on function timegenie.tracking_lease_release(uuid,uuid,uuid) to authenticated",
+  ]) {
+    if (!timerSyncAuthorityPatch.replaceAll(" ", "").toLowerCase().includes(expected.replaceAll(" ", "").toLowerCase())) {
+      throw new Error(`The timer sync authority patch must include: ${expected}`);
+    }
   }
   for (const expected of [
     "create or replace function timegenie.unassigned_anchor_reset",

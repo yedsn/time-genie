@@ -2016,10 +2016,19 @@ fn coordinate_active_timer_in_transaction(
     Ok(Some(previous_id))
 }
 
-fn stable_calendar_operation_id(chain_id: &str, work_date: &str, action: &str) -> String {
+fn stable_calendar_operation_id(
+    chain_id: &str,
+    work_date: &str,
+    entry_id: &str,
+    base_version: i64,
+    action: &str,
+) -> String {
     Uuid::new_v5(
         &Uuid::NAMESPACE_OID,
-        format!("timegenie:calendar-timer:{chain_id}:{work_date}:{action}").as_bytes(),
+        format!(
+            "timegenie:calendar-timer:{chain_id}:{work_date}:{entry_id}:{base_version}:{action}"
+        )
+        .as_bytes(),
     )
     .to_string()
 }
@@ -2042,11 +2051,17 @@ fn enqueue_timer_coordination_rows(
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|error| error.to_string())?;
-        let operation_id = stable_calendar_operation_id(&chain_id, &work_date, operation_type);
+        let operation_id = stable_calendar_operation_id(
+            &chain_id,
+            &work_date,
+            entry_id,
+            *base_version,
+            operation_type,
+        );
         let dependency = predecessor_id
             .and_then(|id| operation_by_entry.get(id))
             .map(String::as_str);
-        crate::cloud_sync::enqueue_entity_in_transaction_with_dependency(
+        let actual_operation_id = crate::cloud_sync::enqueue_entity_in_transaction_with_dependency(
             transaction,
             cloud_state,
             operation_type,
@@ -2055,8 +2070,9 @@ fn enqueue_timer_coordination_rows(
             (*base_version > 0).then_some(*base_version),
             Some(&operation_id),
             dependency,
-        )?;
-        operation_by_entry.insert((*entry_id).to_string(), operation_id);
+        )?
+        .ok_or_else(|| "SYNC_ERROR: 云端计时操作未成功入队".to_string())?;
+        operation_by_entry.insert((*entry_id).to_string(), actual_operation_id);
     }
     Ok(())
 }
@@ -3342,7 +3358,15 @@ mod tests {
 
         assert_eq!(outbox.len(), 1);
         let timer = outbox.iter().find(|row| row.2 == "time_entry").unwrap();
-        assert_eq!(timer.0, start_operation_id);
+        assert_eq!(
+            timer.0,
+            crate::cloud_sync::stable_timer_operation_id(
+                &started.id,
+                None,
+                resumed.version + 1,
+                "timer_stop"
+            )
+        );
         assert_eq!(timer.1, "timer_stop");
         assert_eq!(timer.4, None);
         assert_eq!(timer.6, Some(4));
@@ -3354,6 +3378,132 @@ mod tests {
         assert_eq!(value["version"], resumed.version + 1);
         assert_eq!(value["segments"].as_array().map(Vec::len), Some(2));
         assert!(outbox.iter().all(|row| row.2 != "unassigned_session"));
+    }
+
+    #[test]
+    fn offline_timer_lifecycle_keeps_one_contiguous_chain_through_allocation() {
+        let (database, _workspace_id, task_id) = setup();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id.clone()),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let state = crate::supabase::storage_mode(&database).unwrap();
+        let start_operation_id = Uuid::now_v7().to_string();
+        let started = start_timer_with_cloud_operation(
+            &database,
+            TimerStartRequest {
+                task_id: Some(task_id.clone()),
+                note: Some("离线完整生命周期".to_string()),
+                client_request_id: start_operation_id.clone(),
+            },
+            Some((&state, "timer_start", Some(start_operation_id.as_str()))),
+        )
+        .unwrap();
+
+        let recovery_at = now_millis();
+        let original_started_at = recovery_at - 600_000;
+        let original_last_continuous_at = recovery_at - 120_000;
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE time_entries SET started_at=?1,last_continuous_at=?2,updated_at=?2 WHERE id=?3",
+                params![original_started_at, original_last_continuous_at, started.id],
+            )
+            .unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE time_segments SET started_at=?1 WHERE entry_id=?2 AND ended_at IS NULL",
+                params![original_started_at, started.id],
+            )
+            .unwrap();
+        coordinate_active_timer(&database, recovery_at).unwrap();
+
+        let recovered = get_time_entry_by_id(&database, &started.id).unwrap();
+        assert_eq!(recovered.version, 2);
+        let paused = pause_timer_with_cloud_operation(
+            &database,
+            TimerVersionRequest {
+                entry_id: started.id.clone(),
+                expected_version: recovered.version,
+            },
+            Some((&state, "timer_pause")),
+        )
+        .unwrap();
+        let resume_operation_id = Uuid::now_v7().to_string();
+        let resumed = resume_timer_with_cloud_operation(
+            &database,
+            TimerResumeRequest {
+                entry_id: started.id.clone(),
+                expected_version: paused.version,
+                operation_id: resume_operation_id.clone(),
+            },
+            Some((&state, "timer_resume", Some(resume_operation_id.as_str()))),
+        )
+        .unwrap();
+        let stopped = stop_timer_with_cloud_operation(
+            &database,
+            TimerStopRequest {
+                entry_id: started.id.clone(),
+                expected_version: resumed.version,
+                create_default_allocation: false,
+            },
+            Some((&state, "timer_stop")),
+        )
+        .unwrap();
+        let allocated = replace_allocations_with_cloud_operation(
+            &database,
+            AllocationReplaceRequest {
+                entry_id: started.id.clone(),
+                expected_version: stopped.version,
+                allocations: vec![AllocationInput {
+                    task_id: task_id.clone(),
+                    minutes: stopped.settlement_minutes,
+                    note: Some("离线结束后分配".to_string()),
+                    complete_task: false,
+                    task_expected_version: None,
+                }],
+            },
+            Some((&state, "time_allocation_replace")),
+        )
+        .unwrap();
+
+        assert_eq!(allocated.version, 6);
+        assert_eq!(allocated.allocations.len(), 1);
+        let connection = database.open().unwrap();
+        let queued: (String, Option<i64>, i64, i64, String) = connection
+            .query_row(
+                "SELECT operation_type,base_version,payload_version,coalesced_count,payload_json FROM sync_outbox WHERE workspace_id=?1 AND entity_id=?2",
+                params![cloud_workspace_id,started.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(queued.0, "time_allocation_replace");
+        assert_eq!(queued.1, None);
+        assert_eq!(queued.2, 6);
+        assert_eq!(queued.3, 6);
+        let payload: Value = serde_json::from_str(&queued.4).unwrap();
+        assert_eq!(payload["version"], 6);
+        assert_eq!(payload["state"], "ended");
+        assert_eq!(payload["segments"].as_array().map(Vec::len), Some(3));
+        assert_eq!(payload["allocations"].as_array().map(Vec::len), Some(1));
     }
 
     #[test]
@@ -4590,6 +4740,86 @@ mod tests {
             segments,
             vec![(started_at, Some(last_continuous), 60), (now, None, 0)]
         );
+    }
+
+    #[test]
+    fn repeated_continuity_closes_use_distinct_operation_ids() {
+        let (database, workspace_id, task_id) = setup();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(cloud_workspace_id.clone()),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let started_at = shanghai_millis("2026-10-06 09:00:00");
+        let first_recovery = shanghai_millis("2026-10-06 10:00:00");
+        let second_recovery = shanghai_millis("2026-10-06 11:00:00");
+        let entry_id = seed_active_timer_at(
+            &database,
+            &workspace_id,
+            &task_id,
+            "running",
+            started_at,
+            started_at + 60_000,
+        );
+
+        coordinate_active_timer(&database, first_recovery).unwrap();
+        let first_operation_id: String = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT operation_id FROM sync_outbox
+                 WHERE workspace_id=?1 AND operation_type='timer_continuity_close'",
+                [&cloud_workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "DELETE FROM sync_outbox WHERE operation_id=?1",
+                [&first_operation_id],
+            )
+            .unwrap();
+
+        coordinate_active_timer(&database, second_recovery).unwrap();
+        let (second_operation_id, base_version): (String, i64) = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT operation_id,base_version FROM sync_outbox
+                 WHERE workspace_id=?1 AND operation_type='timer_continuity_close'",
+                [&cloud_workspace_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_ne!(first_operation_id, second_operation_id);
+        assert_eq!(base_version, 2);
+        let version: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT version FROM time_entries WHERE id=?1",
+                [&entry_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 3);
     }
 
     #[test]

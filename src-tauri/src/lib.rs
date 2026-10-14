@@ -456,6 +456,7 @@ pub fn run() {
             subject_work_schedules::subject_work_schedule_get,
             subject_work_schedules::subject_work_schedule_save,
             tasks::task_list,
+            tasks::task_list_completed_page,
             tasks::task_daily_estimate_set,
             tasks::task_create,
             tasks::task_create_quick,

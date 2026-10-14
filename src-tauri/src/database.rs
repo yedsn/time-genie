@@ -90,6 +90,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "subject_work_schedules",
         sql: include_str!("../migrations/0015_subject_work_schedules.sql"),
     },
+    Migration {
+        version: 16,
+        name: "timer_sync_recovery",
+        sql: include_str!("../migrations/0016_timer_sync_recovery.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -531,7 +536,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let database = Database::initialize_at(directory.path().join("test.sqlite3")).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 15);
+        assert_eq!(status.schema_version, 16);
         for table in REQUIRED_TABLES {
             assert!(
                 status.tables.iter().any(|value| value == table),
@@ -571,8 +576,99 @@ mod tests {
         let workspace_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migration_count, 15);
+        assert_eq!(migration_count, 16);
         assert_eq!(workspace_count, 1);
+    }
+
+    #[test]
+    fn timer_sync_recovery_upgrade_marks_legacy_conflict_without_mutating_local_history() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("timer-sync-recovery-upgrade.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+               version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL
+             );",
+            )
+            .unwrap();
+        for migration in &MIGRATIONS[..15] {
+            let transaction = connection.transaction().unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version,name,applied_at) VALUES (?1,?2,1)",
+                    params![migration.version, migration.name],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        connection.execute_batch(
+            "INSERT INTO workspaces(id,name,timezone,storage_mode,created_at,updated_at,version)
+               VALUES ('timer-ws','计时恢复','Asia/Shanghai','cloud',1,1,1);
+             INSERT INTO devices(id,workspace_id,device_name,platform,app_version,last_seen_at,created_at)
+               VALUES ('timer-device','timer-ws','旧设备','test','1',1,1);
+             INSERT INTO subjects(id,workspace_id,name,sort_order,created_at,updated_at,version)
+               VALUES ('timer-subject','timer-ws','默认',10,1,1,1);
+             INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version)
+               VALUES ('timer-task','timer-ws','timer-subject','故障事项','open','manual',10,1,1,1);
+             INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,default_task_id,label_snapshot,started_at,ended_at,duration_seconds,note,created_at,updated_at,version,created_by_device_id,updated_by_device_id,timer_chain_id,last_continuous_at)
+               VALUES ('timer-entry','timer-ws','2026-10-14','work','timer','ended','timer-task','故障事项',1000,361000,360,'必须保留',1000,361000,8,'timer-device','timer-device','timer-entry',361000);
+             INSERT INTO time_segments(id,workspace_id,entry_id,sequence_no,started_at,ended_at,duration_seconds) VALUES
+               ('segment-1','timer-ws','timer-entry',1,1000,61000,60),
+               ('segment-2','timer-ws','timer-entry',2,61000,121000,60),
+               ('segment-3','timer-ws','timer-entry',3,121000,181000,60),
+               ('segment-4','timer-ws','timer-entry',4,181000,241000,60),
+               ('segment-5','timer-ws','timer-entry',5,241000,301000,60),
+               ('segment-6','timer-ws','timer-entry',6,301000,361000,60);
+             INSERT INTO time_allocations(id,workspace_id,entry_id,task_id,minutes,note,created_at,updated_at,version)
+               VALUES ('allocation-1','timer-ws','timer-entry','timer-task',6,'最终分配',361000,361000,1);",
+        ).unwrap();
+        let payload = serde_json::json!({
+            "id": "timer-entry",
+            "source_type": "timer",
+            "state": "ended",
+            "ended_at": 361000,
+            "duration_seconds": 360,
+            "version": 8,
+            "segments": [1, 2, 3, 4, 5, 6],
+            "allocations": [{"task_id": "timer-task", "minutes": 6}]
+        })
+        .to_string();
+        let error = serde_json::json!({
+            "message": "CLOUD_REQUEST_FAILED: IDEMPOTENCY_CONFLICT: operation_id was already used for different content"
+        }).to_string();
+        connection.execute(
+            "INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,base_version,payload_json,payload_version,depends_on_operation_id,state,attempt_count,created_at,last_attempt_at,error_json,coalesced_count)
+             VALUES ('legacy-timer-op','cloud-timer-ws','timer-device','timer_continuity_close','time_entry','timer-entry',4,?1,8,NULL,'conflict',28,10,20,?2,4)",
+            params![payload, error],
+        ).unwrap();
+        drop(connection);
+
+        let database = Database::initialize_at(path).unwrap();
+        assert_eq!(database.status().unwrap().schema_version, 16);
+        let connection = database.open().unwrap();
+        let queue: (String,String,i64,String,String,i64,Option<String>,String,Option<String>) = connection.query_row(
+            "SELECT operation_id,state,attempt_count,payload_json,error_json,coalesced_count,depends_on_operation_id,recovery_kind,recovery_context_json FROM sync_outbox WHERE operation_id='legacy-timer-op'",
+            [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
+        ).unwrap();
+        assert_eq!(queue.0, "legacy-timer-op");
+        assert_eq!(queue.1, "conflict");
+        assert_eq!(queue.2, 28);
+        assert_eq!(queue.3, payload);
+        assert_eq!(queue.4, error);
+        assert_eq!(queue.5, 4);
+        assert_eq!(queue.6, None);
+        assert_eq!(queue.7, "historical_candidate");
+        assert_eq!(queue.8.as_deref(), Some(queue.4.as_str()));
+        let aggregate: (String,i64,i64,i64,i64) = connection.query_row(
+            "SELECT state,ended_at,duration_seconds,(SELECT COUNT(*) FROM time_segments WHERE entry_id='timer-entry'),(SELECT minutes FROM time_allocations WHERE entry_id='timer-entry') FROM time_entries WHERE id='timer-entry'",
+            [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).unwrap();
+        assert_eq!(aggregate, ("ended".to_string(), 361000, 360, 6, 6));
     }
 
     #[test]
@@ -778,7 +874,7 @@ mod tests {
         assert_eq!(task_title, "升级前事项");
         assert_eq!(queued, 1);
         assert_eq!(deferred_table, 6);
-        assert_eq!(database.status().unwrap().schema_version, 15);
+        assert_eq!(database.status().unwrap().schema_version, 16);
     }
 
     #[test]
@@ -1218,7 +1314,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outbox_operations, vec!["keep-op", "sending-op"]);
-        assert_eq!(database.status().unwrap().schema_version, 15);
+        assert_eq!(database.status().unwrap().schema_version, 16);
 
         // Deployment rollback keeps the migrated database in place. Rehearse
         // the previous client's read path against that database and verify
@@ -1305,7 +1401,7 @@ mod tests {
         drop(connection);
 
         let database = Database::initialize_at(path).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 15);
+        assert_eq!(database.status().unwrap().schema_version, 16);
         let connection = database.open().unwrap();
 
         let stale_index_count: i64 = connection
@@ -1651,7 +1747,7 @@ mod tests {
 
         let database = Database::initialize_at(path).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 15);
+        assert_eq!(status.schema_version, 16);
         assert!(status.tables.iter().any(|table| table == "device_hooks"));
         assert!(status
             .tables
