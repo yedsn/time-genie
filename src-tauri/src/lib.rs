@@ -35,15 +35,25 @@ mod work_calendar;
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 #[cfg(target_os = "windows")]
+use windows_sys::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject, SetWindowRgn};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+};
+#[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetCursorPos, GetWindowRect, GetWindowThreadProcessId, SetForegroundWindow,
-    ShowWindow, SW_RESTORE,
+    SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE,
 };
 
 const HOVER_SHOW_DELAY: Duration = Duration::from_millis(300);
 const HOVER_HIDE_DELAY: Duration = Duration::from_secs(3);
-const HOVER_POSITION_CHECK_INTERVAL: Duration = Duration::from_millis(150);
+const HOVER_POSITION_CHECK_INTERVAL: Duration = Duration::from_millis(25);
 const HOVER_WINDOW_GAP: i32 = 8;
+const HOVER_WINDOW_LOGICAL_WIDTH: f64 = 420.0;
+const HOVER_WINDOW_LOGICAL_HEIGHT: f64 = 360.0;
+const HOVER_SELECTION_LOGICAL_WIDTH: f64 = 720.0;
+const HOVER_SELECTION_LOGICAL_HEIGHT: f64 = 520.0;
 const TRAY_MENU_SUPPRESS: Duration = Duration::from_millis(1200);
 const UPDATE_CHECK_MENU_LABEL: &str = "检查更新";
 const APP_UPDATE_EVENT: &str = "app-update-event";
@@ -60,6 +70,18 @@ struct HoverState {
     pending: bool,
     shown: bool,
     suppress_until: Instant,
+    tray_bounds: Option<PhysicalBounds>,
+    window_bounds: Option<PhysicalBounds>,
+    compact_bounds: Option<PhysicalBounds>,
+    surface_bounds: Option<PhysicalBounds>,
+    mode: HoverWindowMode,
+    interaction_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HoverWindowMode {
+    Compact,
+    TaskSelection,
 }
 
 #[derive(Clone)]
@@ -125,12 +147,27 @@ impl Drop for UpdateCheckPermit {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PhysicalBounds {
     x: i32,
     y: i32,
     width: u32,
     height: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PointerButtonState {
+    left: bool,
+    middle: bool,
+    right: bool,
+}
+
+impl PointerButtonState {
+    fn pressed_after(self, previous: Self) -> bool {
+        (self.left && !previous.left)
+            || (self.middle && !previous.middle)
+            || (self.right && !previous.right)
+    }
 }
 
 impl PhysicalBounds {
@@ -144,6 +181,15 @@ impl PhysicalBounds {
             && y >= top
             && y < top + i64::from(self.height)
     }
+}
+
+fn pointer_inside_hover_regions(
+    point: PhysicalPosition<i32>,
+    tray_bounds: Option<PhysicalBounds>,
+    window_bounds: Option<PhysicalBounds>,
+) -> bool {
+    tray_bounds.is_some_and(|bounds| bounds.contains(point))
+        || window_bounds.is_some_and(|bounds| bounds.contains(point))
 }
 
 fn hover_window_position(
@@ -182,6 +228,27 @@ fn hover_window_position(
     )
 }
 
+fn hover_window_expanded_position(
+    compact_bounds: PhysicalBounds,
+    window_size: tauri::PhysicalSize<u32>,
+    work_area: PhysicalBounds,
+) -> PhysicalPosition<i32> {
+    let width = i64::from(window_size.width);
+    let height = i64::from(window_size.height);
+    let min_x = i64::from(work_area.x);
+    let min_y = i64::from(work_area.y);
+    let max_x = min_x + i64::from(work_area.width) - width;
+    let max_y = min_y + i64::from(work_area.height) - height;
+    let compact_right = i64::from(compact_bounds.x) + i64::from(compact_bounds.width);
+    let compact_bottom = i64::from(compact_bounds.y) + i64::from(compact_bounds.height);
+    let preferred_x = compact_right - width;
+    let preferred_y = compact_bottom - height;
+    PhysicalPosition::new(
+        clamp_coordinate(preferred_x, min_x, max_x),
+        clamp_coordinate(preferred_y, min_y, max_y),
+    )
+}
+
 fn bounds_contain_window(bounds: PhysicalBounds, x: i64, y: i64, width: i64, height: i64) -> bool {
     let left = i64::from(bounds.x);
     let top = i64::from(bounds.y);
@@ -193,20 +260,6 @@ fn bounds_contain_window(bounds: PhysicalBounds, x: i64, y: i64, width: i64, hei
 
 fn clamp_coordinate(value: i64, min: i64, max: i64) -> i32 {
     value.clamp(min, max.max(min)) as i32
-}
-
-fn window_size_for_scale(
-    size: tauri::PhysicalSize<u32>,
-    current_scale: f64,
-    target_scale: f64,
-) -> tauri::PhysicalSize<u32> {
-    if current_scale <= 0.0 || target_scale <= 0.0 {
-        return size;
-    }
-    tauri::PhysicalSize::new(
-        (f64::from(size.width) / current_scale * target_scale).round() as u32,
-        (f64::from(size.height) / current_scale * target_scale).round() as u32,
-    )
 }
 
 pub fn run() {
@@ -236,6 +289,12 @@ pub fn run() {
                 pending: false,
                 shown: false,
                 suppress_until: Instant::now(),
+                tray_bounds: None,
+                window_bounds: None,
+                compact_bounds: None,
+                surface_bounds: None,
+                mode: HoverWindowMode::Compact,
+                interaction_revision: 0,
             }));
             let _ = HOVER_STATE.set(Arc::clone(&state));
             let show_main = MenuItem::with_id(app, "show_main", "打开工作台", true, None::<&str>)?;
@@ -345,6 +404,9 @@ pub fn run() {
                         TrayIconEvent::Enter { position, rect, .. } => {
                             schedule_hover(tray.app_handle().clone(), state.clone(), rect, position)
                         }
+                        TrayIconEvent::Move { position, rect, .. } => {
+                            schedule_hover(tray.app_handle().clone(), state.clone(), rect, position)
+                        }
                         TrayIconEvent::Leave { .. } => cancel_pending_hover(&state),
                         _ => {}
                     }
@@ -368,7 +430,10 @@ pub fn run() {
             window_toggle_maximize_main,
             window_is_main_maximized,
             window_open_main_overview,
+            window_open_main_unassigned,
             window_hide_hover_after_keyboard_close,
+            window_expand_hover_for_task_selection,
+            window_restore_hover_compact,
             get_app_version,
             check_app_update,
             download_and_install_update,
@@ -610,9 +675,26 @@ fn window_open_main_overview(app: AppHandle) {
 }
 
 #[tauri::command]
+fn window_open_main_unassigned(app: AppHandle) {
+    hide(&app, "hover");
+    show(&app, "main");
+    let _ = app.emit("open-unassigned-resolution", ());
+}
+
+#[tauri::command]
 fn window_hide_hover_after_keyboard_close(app: AppHandle) {
     suppress_hover();
     hide(&app, "hover");
+}
+
+#[tauri::command]
+fn window_expand_hover_for_task_selection(app: AppHandle) -> Result<(), String> {
+    set_hover_window_mode(&app, HoverWindowMode::TaskSelection)
+}
+
+#[tauri::command]
+fn window_restore_hover_compact(app: AppHandle) -> Result<(), String> {
+    set_hover_window_mode(&app, HoverWindowMode::Compact)
 }
 
 #[tauri::command]
@@ -1084,6 +1166,7 @@ fn force_show_main_window(_: &tauri::WebviewWindow) -> bool {
 
 fn hide(app: &AppHandle, label: &str) {
     if label == "hover" {
+        let _ = restore_hover_compact_window(app);
         mark_hover_hidden();
     }
     if let Some(window) = app.get_webview_window(label) {
@@ -1105,6 +1188,12 @@ fn cancel_hover(state: &Arc<Mutex<HoverState>>) {
         state.generation = state.generation.wrapping_add(1);
         state.pending = false;
         state.shown = false;
+        state.tray_bounds = None;
+        state.window_bounds = None;
+        state.compact_bounds = None;
+        state.surface_bounds = None;
+        state.mode = HoverWindowMode::Compact;
+        state.interaction_revision = state.interaction_revision.wrapping_add(1);
     }
 }
 
@@ -1120,9 +1209,152 @@ fn suppress_hover() {
             state.generation = state.generation.wrapping_add(1);
             state.pending = false;
             state.shown = false;
+            state.tray_bounds = None;
+            state.window_bounds = None;
+            state.compact_bounds = None;
+            state.surface_bounds = None;
+            state.mode = HoverWindowMode::Compact;
+            state.interaction_revision = state.interaction_revision.wrapping_add(1);
             state.suppress_until = Instant::now() + TRAY_MENU_SUPPRESS;
         }
     }
+}
+
+fn restore_hover_compact_window(app: &AppHandle) -> Result<(), String> {
+    let Some(state) = HOVER_STATE.get() else {
+        return Ok(());
+    };
+    let (compact_bounds, surface_bounds) = state
+        .lock()
+        .map(|hover| (hover.compact_bounds, hover.surface_bounds))
+        .map_err(|_| "无法恢复托盘紧凑状态".to_string())?;
+    if let (Some(compact_bounds), Some(surface_bounds)) = (compact_bounds, surface_bounds) {
+        if let Some(window) = app.get_webview_window("hover") {
+            set_hover_window_region(&window, surface_bounds, compact_bounds)?;
+        }
+        let mut hover = state
+            .lock()
+            .map_err(|_| "无法恢复托盘紧凑状态".to_string())?;
+        hover.mode = HoverWindowMode::Compact;
+        hover.window_bounds = Some(compact_bounds);
+        hover.interaction_revision = hover.interaction_revision.wrapping_add(1);
+        return Ok(());
+    }
+    let Some(window) = app.get_webview_window("hover") else {
+        return Ok(());
+    };
+    let scale = window.scale_factor().unwrap_or(1.0);
+    window
+        .set_size(tauri::PhysicalSize::new(
+            (HOVER_WINDOW_LOGICAL_WIDTH * scale).round() as u32,
+            (HOVER_WINDOW_LOGICAL_HEIGHT * scale).round() as u32,
+        ))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn set_hover_window_region(
+    window: &tauri::WebviewWindow,
+    surface_bounds: PhysicalBounds,
+    visible_bounds: PhysicalBounds,
+) -> Result<(), String> {
+    let hwnd = window.hwnd().map_err(|error| error.to_string())?;
+    let left = visible_bounds.x - surface_bounds.x;
+    let top = visible_bounds.y - surface_bounds.y;
+    let right = left + visible_bounds.width as i32;
+    let bottom = top + visible_bounds.height as i32;
+    let region = unsafe { CreateRectRgn(left, top, right, bottom) };
+    if region.is_null() {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if unsafe { SetWindowRgn(hwnd.0 as HWND, region, 0) } == 0 {
+        unsafe { DeleteObject(region) };
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_hover_window_region(
+    _: &tauri::WebviewWindow,
+    _: PhysicalBounds,
+    _: PhysicalBounds,
+) -> Result<(), String> {
+    Ok(())
+}
+
+fn set_hover_window_bounds(
+    window: &tauri::WebviewWindow,
+    bounds: PhysicalBounds,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let hwnd = window.hwnd().map_err(|error| error.to_string())?;
+        let succeeded = unsafe {
+            SetWindowPos(
+                hwnd.0 as HWND,
+                std::ptr::null_mut(),
+                bounds.x,
+                bounds.y,
+                bounds.width as i32,
+                bounds.height as i32,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            )
+        };
+        if succeeded == 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        return Ok(());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        window
+            .set_size(tauri::PhysicalSize::new(bounds.width, bounds.height))
+            .map_err(|error| error.to_string())?;
+        window
+            .set_position(PhysicalPosition::new(bounds.x, bounds.y))
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn set_hover_window_mode(app: &AppHandle, mode: HoverWindowMode) -> Result<(), String> {
+    let state = HOVER_STATE
+        .get()
+        .ok_or_else(|| "托盘悬浮状态尚未初始化".to_string())?;
+    let (shown, compact_bounds, surface_bounds, generation) = state
+        .lock()
+        .map(|state| {
+            (
+                state.shown,
+                state.compact_bounds,
+                state.surface_bounds,
+                state.generation,
+            )
+        })
+        .map_err(|_| "无法读取托盘悬浮状态".to_string())?;
+    if !shown {
+        return Ok(());
+    }
+    let compact_bounds = compact_bounds.ok_or_else(|| "缺少紧凑面板边界".to_string())?;
+    let surface_bounds = surface_bounds.ok_or_else(|| "缺少托盘窗口表面边界".to_string())?;
+    let visible_bounds = match mode {
+        HoverWindowMode::Compact => compact_bounds,
+        HoverWindowMode::TaskSelection => surface_bounds,
+    };
+    let window = app
+        .get_webview_window("hover")
+        .ok_or_else(|| "找不到托盘悬浮窗口".to_string())?;
+    set_hover_window_region(&window, surface_bounds, visible_bounds)?;
+    let mut hover = state
+        .lock()
+        .map_err(|_| "无法更新托盘悬浮状态".to_string())?;
+    if hover.generation != generation || !hover.shown {
+        return Ok(());
+    }
+    hover.mode = mode;
+    hover.window_bounds = Some(visible_bounds);
+    hover.interaction_revision = hover.interaction_revision.wrapping_add(1);
+    Ok(())
 }
 
 fn schedule_hover(
@@ -1144,167 +1376,255 @@ fn schedule_hover(
     };
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(HOVER_SHOW_DELAY).await;
-        if let Some(window) = app.get_webview_window("hover") {
-            let scale_factor = window.scale_factor().unwrap_or(1.0);
-            let anchor = rect.position.to_physical::<i32>(scale_factor);
-            let anchor_size = rect.size.to_physical::<u32>(scale_factor);
-            let tray_bounds = if anchor_size.width > 0 && anchor_size.height > 0 {
-                PhysicalBounds {
-                    x: anchor.x,
-                    y: anchor.y,
-                    width: anchor_size.width,
-                    height: anchor_size.height,
-                }
-            } else {
-                PhysicalBounds {
-                    x: fallback.x as i32 - 16,
-                    y: fallback.y as i32 - 16,
-                    width: 32,
-                    height: 32,
-                }
-            };
-
-            if cursor_position().is_some_and(|position| !tray_bounds.contains(position)) {
-                cancel_pending_hover(&state);
-                return;
+        let Some(window) = app.get_webview_window("hover") else {
+            cancel_pending_hover(&state);
+            return;
+        };
+        let monitor = window
+            .monitor_from_point(fallback.x, fallback.y)
+            .ok()
+            .flatten()
+            .or_else(|| window.primary_monitor().ok().flatten());
+        let tray_scale_factor = monitor
+            .as_ref()
+            .map(|monitor| monitor.scale_factor())
+            .unwrap_or(window.scale_factor().unwrap_or(1.0));
+        let anchor = rect.position.to_physical::<i32>(tray_scale_factor);
+        let anchor_size = rect.size.to_physical::<u32>(tray_scale_factor);
+        let tray_bounds = if anchor_size.width > 0 && anchor_size.height > 0 {
+            PhysicalBounds {
+                x: anchor.x,
+                y: anchor.y,
+                width: anchor_size.width,
+                height: anchor_size.height,
             }
-
-            let current_window_size = window.outer_size().unwrap_or_else(|_| {
-                tauri::PhysicalSize::new(
-                    (380.0 * scale_factor).round() as u32,
-                    (300.0 * scale_factor).round() as u32,
-                )
-            });
-            let monitor = window
-                .monitor_from_point(
-                    f64::from(tray_bounds.x) + f64::from(tray_bounds.width) / 2.0,
-                    f64::from(tray_bounds.y) + f64::from(tray_bounds.height) / 2.0,
-                )
-                .ok()
-                .flatten()
-                .or_else(|| window.primary_monitor().ok().flatten());
-            let position = monitor
-                .map(|monitor| {
-                    let work_area = monitor.work_area();
-                    let window_size = window_size_for_scale(
-                        current_window_size,
-                        scale_factor,
-                        monitor.scale_factor(),
-                    );
-                    hover_window_position(
-                        tray_bounds,
-                        window_size,
-                        PhysicalBounds {
-                            x: work_area.position.x,
-                            y: work_area.position.y,
-                            width: work_area.size.width,
-                            height: work_area.size.height,
-                        },
-                    )
-                })
-                .unwrap_or_else(|| {
-                    PhysicalPosition::new(
-                        tray_bounds.x - current_window_size.width as i32,
-                        tray_bounds.y - current_window_size.height as i32 - HOVER_WINDOW_GAP,
-                    )
-                });
-            let _ = window.set_position(position);
-
-            let should_show = state
-                .lock()
-                .map(|mut state| {
-                    let valid = state.generation == generation && state.pending;
-                    state.pending = false;
-                    state.shown = valid;
-                    valid
-                })
-                .unwrap_or(false);
-            if !should_show {
-                return;
+        } else {
+            PhysicalBounds {
+                x: fallback.x as i32 - 16,
+                y: fallback.y as i32 - 16,
+                width: 32,
+                height: 32,
             }
+        };
 
-            let _ = window.show();
-            monitor_hover_position(app, state, generation, tray_bounds);
+        if cursor_position().is_some_and(|position| !tray_bounds.contains(position)) {
+            cancel_pending_hover(&state);
+            return;
         }
+
+        let compact_window_size = tauri::PhysicalSize::new(
+            (HOVER_WINDOW_LOGICAL_WIDTH * tray_scale_factor).round() as u32,
+            (HOVER_WINDOW_LOGICAL_HEIGHT * tray_scale_factor).round() as u32,
+        );
+        let mut surface_window_size = tauri::PhysicalSize::new(
+            (HOVER_SELECTION_LOGICAL_WIDTH * tray_scale_factor).round() as u32,
+            (HOVER_SELECTION_LOGICAL_HEIGHT * tray_scale_factor).round() as u32,
+        );
+        let (compact_position, surface_position) = monitor
+            .map(|monitor| {
+                let work_area = monitor.work_area();
+                surface_window_size.width = surface_window_size.width.min(work_area.size.width);
+                surface_window_size.height = surface_window_size.height.min(work_area.size.height);
+                let work_bounds = PhysicalBounds {
+                    x: work_area.position.x,
+                    y: work_area.position.y,
+                    width: work_area.size.width,
+                    height: work_area.size.height,
+                };
+                let compact_position =
+                    hover_window_position(tray_bounds, compact_window_size, work_bounds);
+                let compact_bounds = PhysicalBounds {
+                    x: compact_position.x,
+                    y: compact_position.y,
+                    width: compact_window_size.width,
+                    height: compact_window_size.height,
+                };
+                (
+                    compact_position,
+                    hover_window_expanded_position(
+                        compact_bounds,
+                        surface_window_size,
+                        work_bounds,
+                    ),
+                )
+            })
+            .unwrap_or_else(|| {
+                let compact = PhysicalPosition::new(
+                    tray_bounds.x - compact_window_size.width as i32,
+                    tray_bounds.y - compact_window_size.height as i32 - HOVER_WINDOW_GAP,
+                );
+                let surface = PhysicalPosition::new(
+                    compact.x + compact_window_size.width as i32 - surface_window_size.width as i32,
+                    compact.y + compact_window_size.height as i32
+                        - surface_window_size.height as i32,
+                );
+                (compact, surface)
+            });
+        let compact_bounds = PhysicalBounds {
+            x: compact_position.x,
+            y: compact_position.y,
+            width: compact_window_size.width,
+            height: compact_window_size.height,
+        };
+        let surface_bounds = PhysicalBounds {
+            x: surface_position.x,
+            y: surface_position.y,
+            width: surface_window_size.width,
+            height: surface_window_size.height,
+        };
+        if let Err(error) = set_hover_window_bounds(&window, surface_bounds) {
+            #[cfg(debug_assertions)]
+            eprintln!("取消托盘面板显示：设置窗口边界失败：{error}");
+            cancel_pending_hover(&state);
+            return;
+        }
+        if let Err(error) = set_hover_window_region(&window, surface_bounds, compact_bounds) {
+            #[cfg(debug_assertions)]
+            eprintln!("取消托盘面板显示：设置紧凑裁剪失败：{error}");
+            cancel_pending_hover(&state);
+            return;
+        }
+
+        let should_show = state
+            .lock()
+            .map(|state| state.generation == generation && state.pending)
+            .unwrap_or(false);
+        if !should_show {
+            return;
+        }
+
+        let show_succeeded = window.show().is_ok();
+        let keep_visible = state
+            .lock()
+            .map(|mut state| {
+                let valid = state.generation == generation && state.pending;
+                if valid {
+                    state.pending = false;
+                    state.shown = show_succeeded;
+                    state.tray_bounds = show_succeeded.then_some(tray_bounds);
+                    state.window_bounds = show_succeeded.then_some(compact_bounds);
+                    state.compact_bounds = show_succeeded.then_some(compact_bounds);
+                    state.surface_bounds = show_succeeded.then_some(surface_bounds);
+                    state.mode = HoverWindowMode::Compact;
+                    state.interaction_revision = state.interaction_revision.wrapping_add(1);
+                }
+                valid && show_succeeded
+            })
+            .unwrap_or(false);
+        if !keep_visible {
+            let _ = window.hide();
+            return;
+        }
+        let _ = app.emit("tray-hover-shown", ());
+        monitor_hover_position(app, state, generation);
     });
 }
 
-fn monitor_hover_position(
-    app: AppHandle,
-    state: Arc<Mutex<HoverState>>,
-    generation: u64,
-    tray_bounds: PhysicalBounds,
-) {
+fn monitor_hover_position(app: AppHandle, state: Arc<Mutex<HoverState>>, generation: u64) {
     tauri::async_runtime::spawn(async move {
+        let mut generation = generation;
         let mut outside_since = None;
+        let mut previous_buttons = pointer_button_state();
+        let Some(window) = app.get_webview_window("hover") else {
+            mark_hover_hidden();
+            return;
+        };
+        let mut interaction_revision = 0;
         loop {
-            tokio::time::sleep(HOVER_POSITION_CHECK_INTERVAL).await;
-
-            let active = state
+            let snapshot = state
                 .lock()
-                .map(|state| state.generation == generation && state.shown)
-                .unwrap_or(false);
-            if !active {
+                .map(|state| {
+                    (
+                        state.generation == generation && state.shown,
+                        state.tray_bounds,
+                        state.window_bounds,
+                        state.interaction_revision,
+                    )
+                })
+                .unwrap_or((false, None, None, interaction_revision));
+            if !snapshot.0 {
                 return;
             }
-
-            let Some(window) = app.get_webview_window("hover") else {
-                mark_hover_hidden();
-                return;
-            };
-            if !window.is_visible().unwrap_or(false) {
-                mark_hover_hidden();
-                return;
+            if snapshot.3 != interaction_revision {
+                interaction_revision = snapshot.3;
+                outside_since = None;
+                previous_buttons = pointer_button_state();
+                tokio::time::sleep(HOVER_POSITION_CHECK_INTERVAL).await;
+                continue;
             }
 
             let Some(cursor_position) = cursor_position() else {
                 outside_since = None;
+                previous_buttons = pointer_button_state();
+                tokio::time::sleep(HOVER_POSITION_CHECK_INTERVAL).await;
                 continue;
             };
-            let pointer_is_inside = {
-                let position = cursor_position;
-                tray_bounds.contains(position)
-                    || hover_window_bounds(&window).is_some_and(|bounds| bounds.contains(position))
-            };
+            let current_buttons = pointer_button_state();
+            let pointer_was_pressed = current_buttons.pressed_after(previous_buttons);
+            previous_buttons = current_buttons;
+            let pointer_is_inside =
+                pointer_inside_hover_regions(cursor_position, snapshot.1, snapshot.2);
 
             if pointer_is_inside {
                 outside_since = None;
+                tokio::time::sleep(HOVER_POSITION_CHECK_INTERVAL).await;
                 continue;
             }
 
             let started_at = outside_since.get_or_insert_with(Instant::now);
-            if started_at.elapsed() < HOVER_HIDE_DELAY {
+            let remaining = HOVER_HIDE_DELAY.saturating_sub(started_at.elapsed());
+            if !pointer_was_pressed && !remaining.is_zero() {
+                tokio::time::sleep(remaining.min(HOVER_POSITION_CHECK_INTERVAL)).await;
                 continue;
             }
 
-            let should_hide = state
+            let hide_generation = state
                 .lock()
                 .map(|mut state| {
                     if state.generation != generation || !state.shown {
-                        return false;
+                        return None;
                     }
                     state.generation = state.generation.wrapping_add(1);
                     state.shown = false;
+                    Some(state.generation)
+                })
+                .unwrap_or(None);
+            let Some(next_generation) = hide_generation else {
+                return;
+            };
+            if window.hide().is_ok() {
+                let _ = restore_hover_compact_window(&app);
+                if let Ok(mut hidden) = state.lock() {
+                    if hidden.generation == next_generation && !hidden.shown {
+                        hidden.tray_bounds = None;
+                        hidden.window_bounds = None;
+                        hidden.compact_bounds = None;
+                        hidden.surface_bounds = None;
+                        hidden.mode = HoverWindowMode::Compact;
+                        hidden.interaction_revision = hidden.interaction_revision.wrapping_add(1);
+                    }
+                }
+                return;
+            }
+
+            let restored = state
+                .lock()
+                .map(|mut state| {
+                    if state.generation != next_generation || state.pending {
+                        return false;
+                    }
+                    state.shown = true;
                     true
                 })
                 .unwrap_or(false);
-            if should_hide {
-                let _ = window.hide();
+            if !restored {
+                return;
             }
-            return;
+            generation = next_generation;
+            outside_since = Some(Instant::now() - HOVER_HIDE_DELAY);
+            tokio::time::sleep(HOVER_POSITION_CHECK_INTERVAL).await;
         }
     });
-}
-
-fn hover_window_bounds(window: &tauri::WebviewWindow) -> Option<PhysicalBounds> {
-    let position = window.outer_position().ok()?;
-    let size = window.outer_size().ok()?;
-    Some(PhysicalBounds {
-        x: position.x,
-        y: position.y,
-        width: size.width,
-        height: size.height,
-    })
 }
 
 #[cfg(target_os = "windows")]
@@ -1316,9 +1636,27 @@ fn cursor_position() -> Option<PhysicalPosition<i32>> {
     Some(PhysicalPosition::new(point.x, point.y))
 }
 
+#[cfg(target_os = "windows")]
+fn pointer_button_state() -> PointerButtonState {
+    fn is_pressed(key: u16) -> bool {
+        (unsafe { GetAsyncKeyState(i32::from(key)) }) < 0
+    }
+
+    PointerButtonState {
+        left: is_pressed(VK_LBUTTON),
+        middle: is_pressed(VK_MBUTTON),
+        right: is_pressed(VK_RBUTTON),
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 fn cursor_position() -> Option<PhysicalPosition<i32>> {
     None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn pointer_button_state() -> PointerButtonState {
+    PointerButtonState::default()
 }
 
 #[cfg(test)]
@@ -1350,7 +1688,7 @@ mod tests {
                 width: 24,
                 height: 24,
             },
-            tauri::PhysicalSize::new(380, 300),
+            tauri::PhysicalSize::new(420, 360),
             PhysicalBounds {
                 x: 0,
                 y: 0,
@@ -1358,7 +1696,7 @@ mod tests {
                 height: 1040,
             },
         );
-        assert_eq!(position, PhysicalPosition::new(1540, 732));
+        assert_eq!(position, PhysicalPosition::new(1500, 672));
     }
 
     #[test]
@@ -1376,24 +1714,119 @@ mod tests {
                 width: 24,
                 height: 24,
             },
-            tauri::PhysicalSize::new(380, 300),
+            tauri::PhysicalSize::new(420, 360),
             work_area,
         );
         assert!(bounds_contain_window(
             work_area,
             i64::from(position.x),
             i64::from(position.y),
-            380,
-            300,
+            420,
+            360,
         ));
     }
 
     #[test]
-    fn window_size_is_adjusted_for_target_monitor_scale() {
+    fn hover_window_selection_grows_left_and_up_inside_negative_monitor() {
+        let work_area = PhysicalBounds {
+            x: -1920,
+            y: -200,
+            width: 1920,
+            height: 1080,
+        };
+        let compact = PhysicalBounds {
+            x: -440,
+            y: 480,
+            width: 420,
+            height: 360,
+        };
+        let size = tauri::PhysicalSize::new(720, 520);
+        let position = hover_window_expanded_position(compact, size, work_area);
+        assert!(bounds_contain_window(
+            work_area,
+            i64::from(position.x),
+            i64::from(position.y),
+            i64::from(size.width),
+            i64::from(size.height),
+        ));
+        assert!(position.x < compact.x);
+        assert!(position.y < compact.y);
         assert_eq!(
-            window_size_for_scale(tauri::PhysicalSize::new(380, 300), 1.0, 1.5),
-            tauri::PhysicalSize::new(570, 450),
+            position.x + size.width as i32,
+            compact.x + compact.width as i32
         );
+        assert_eq!(
+            position.y + size.height as i32,
+            compact.y + compact.height as i32
+        );
+    }
+
+    #[test]
+    fn hover_window_selection_keeps_compact_panel_anchor_fixed() {
+        let compact = PhysicalBounds {
+            x: 1500,
+            y: 672,
+            width: 420,
+            height: 360,
+        };
+        let size = tauri::PhysicalSize::new(720, 520);
+        let position = hover_window_expanded_position(
+            compact,
+            size,
+            PhysicalBounds {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1040,
+            },
+        );
+        assert_eq!(position, PhysicalPosition::new(1200, 512));
+        assert_eq!(
+            position.x + size.width as i32,
+            compact.x + compact.width as i32
+        );
+        assert_eq!(
+            position.y + size.height as i32,
+            compact.y + compact.height as i32
+        );
+    }
+
+    #[test]
+    fn hover_window_dynamic_regions_include_expanded_window_only() {
+        let tray = PhysicalBounds {
+            x: 1880,
+            y: 1040,
+            width: 24,
+            height: 24,
+        };
+        let compact = PhysicalBounds {
+            x: 1500,
+            y: 672,
+            width: 420,
+            height: 360,
+        };
+        let expanded = PhysicalBounds {
+            x: 1200,
+            y: 512,
+            width: 720,
+            height: 520,
+        };
+        let selection_point = PhysicalPosition::new(1250, 540);
+        assert!(!pointer_inside_hover_regions(
+            selection_point,
+            Some(tray),
+            Some(compact)
+        ));
+        assert!(pointer_inside_hover_regions(
+            selection_point,
+            Some(tray),
+            Some(expanded)
+        ));
+        assert!(!pointer_inside_hover_regions(
+            PhysicalPosition::new(900, 400),
+            Some(tray),
+            Some(expanded)
+        ));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onUnmounted, ref, watch } from "vue";
 import { ElMessage } from "element-plus";
 import { X } from "lucide-vue-next";
 import { useWorkdayStore, type Task } from "../store";
@@ -20,20 +20,27 @@ type TaskSuggestion = {
 
 type AutocompleteInstance = {
   getData: (query: string) => Promise<void>;
+  close: () => void;
+  blur: () => void;
 };
 
 const props = withDefaults(defineProps<{
   modelValue: string;
   placeholder?: string;
   ariaLabel?: string;
-  variant?: "default" | "focus" | "compact";
+  variant?: "default" | "focus" | "compact" | "tray";
 }>(), {
   placeholder: "选择或输入临时事项",
   ariaLabel: "选择事项",
   variant: "default"
 });
 
-const emit = defineEmits<{ "update:modelValue": [value: string] }>();
+const emit = defineEmits<{
+  "update:modelValue": [value: string];
+  "suggestions-open": [showSuggestions: () => void];
+  "suggestions-close": [];
+  "suggestion-selected": [];
+}>();
 const store = useWorkdayStore();
 const allSubjectsValue = "__all_subjects__";
 const inputText = ref("");
@@ -42,6 +49,8 @@ const selectedSubjectId = ref(allSubjectsValue);
 const autocompleteRef = ref<AutocompleteInstance>();
 let lastQuery = "";
 let blurTimer: number | undefined;
+let suggestionsOpen = false;
+let suppressFocusOpenUntil = 0;
 
 const selectedTask = computed(() => store.tasks.find((task) => task.id === props.modelValue));
 const selectedTaskPath = computed(() => selectedTask.value ? store.taskPathLabel(selectedTask.value) : "");
@@ -57,8 +66,15 @@ const allSubjectTasks = computed(() => {
 const inputClass = computed(() => [
   "task-autocomplete",
   props.variant === "focus" && "task-autocomplete--focus",
-  props.variant === "compact" && "task-autocomplete--compact"
+  props.variant === "compact" && "task-autocomplete--compact",
+  props.variant === "tray" && "task-autocomplete--tray"
 ]);
+const subjectPopperClass = computed(() => props.variant === "tray"
+  ? "task-subject-popper hover-task-subject-popper"
+  : "task-subject-popper");
+const autocompletePopperClass = computed(() => props.variant === "tray"
+  ? "task-autocomplete-popper hover-task-autocomplete-popper"
+  : "task-autocomplete-popper");
 
 watch([() => props.modelValue, selectedTaskPath], () => {
   if (!dirty.value) inputText.value = selectedTaskPath.value;
@@ -154,7 +170,7 @@ function fetchSuggestions(query: string, callback: (items: TaskSuggestion[]) => 
         stateClass: state.className,
         spentLabel: `已用 ${formatSpentMinutes(spentMinutes)}`,
         recurrenceLabel: task.recurrence?.summary ?? "",
-        selectable: descendants.length === 0,
+        selectable: task.selectable !== false && descendants.length === 0,
         isMatch: !keyword || label.toLocaleLowerCase().includes(keyword),
         taskId: task.id
       };
@@ -178,7 +194,41 @@ function clearSelectedTask() {
 function openTaskSuggestions(event: MouseEvent) {
   const target = event.target as HTMLElement | null;
   if (target?.closest(".el-input__clear")) return;
+  if (props.variant === "tray") {
+    announceSuggestionsOpen(true);
+    return;
+  }
+  showTaskSuggestions();
+}
+
+function announceSuggestionsOpen(force = false) {
+  if (props.variant !== "tray" || suggestionsOpen) return;
+  if (!force && performance.now() < suppressFocusOpenUntil) return;
+  suggestionsOpen = true;
+  emit("suggestions-open", showTaskSuggestions);
+}
+
+function handleTaskFocus() {
+  announceSuggestionsOpen();
+}
+
+function showTaskSuggestions() {
+  if (props.variant === "tray" && !suggestionsOpen) return;
   void autocompleteRef.value?.getData(inputText.value);
+}
+
+function announceSuggestionsClose() {
+  if (props.variant !== "tray" || !suggestionsOpen) return;
+  suggestionsOpen = false;
+  emit("suggestions-close");
+}
+
+function closeTaskSuggestions() {
+  if (blurTimer) window.clearTimeout(blurTimer);
+  suppressFocusOpenUntil = performance.now() + 300;
+  suggestionsOpen = false;
+  autocompleteRef.value?.close();
+  autocompleteRef.value?.blur();
 }
 
 function selectSuggestion(item: TaskSuggestion) {
@@ -192,7 +242,10 @@ function selectSuggestion(item: TaskSuggestion) {
   inputText.value = item.pathLabel.trim();
   if (item.taskId) {
     // Selecting another concrete item replaces the previous association immediately.
+    suppressFocusOpenUntil = performance.now() + 300;
     emit("update:modelValue", item.taskId);
+    emit("suggestion-selected");
+    announceSuggestionsClose();
     return;
   }
   commitText();
@@ -237,18 +290,26 @@ function commitText() {
 function scheduleCommit() {
   blurTimer = window.setTimeout(() => {
     if (dirty.value) commitText();
-  }, 120);
+    announceSuggestionsClose();
+  }, 160);
 }
 
-defineExpose({ commit: commitText });
+onUnmounted(() => {
+  if (blurTimer) window.clearTimeout(blurTimer);
+  announceSuggestionsClose();
+});
+
+defineExpose({ commit: commitText, closeSuggestions: closeTaskSuggestions });
 </script>
 
 <template>
   <div class="task-select-composite" :class="inputClass">
-    <el-select v-model="selectedSubjectId" class="task-subject-select" aria-label="选择主体" popper-class="task-subject-popper">
+    <span v-if="variant === 'tray'" class="task-select-field-label">主体</span>
+    <el-select v-model="selectedSubjectId" class="task-subject-select" aria-label="选择主体" :popper-class="subjectPopperClass">
       <el-option label="全部主体" :value="allSubjectsValue" />
       <el-option v-for="subject in store.subjects" :key="subject.id" :label="subject.name" :value="subject.id" />
     </el-select>
+    <span v-if="variant === 'tray'" class="task-select-field-label">事项</span>
     <el-autocomplete
       ref="autocompleteRef"
       v-model="inputText"
@@ -256,14 +317,16 @@ defineExpose({ commit: commitText });
       :fetch-suggestions="fetchSuggestions"
       :placeholder="placeholder"
       :aria-label="ariaLabel"
-      popper-class="task-autocomplete-popper"
-      fit-input-width
+      :popper-class="autocompletePopperClass"
+      :placement="variant === 'tray' ? 'top-end' : 'bottom-start'"
+      :fit-input-width="variant !== 'tray'"
       highlight-first-item
       select-when-unmatched
-      :trigger-on-focus="true"
+      :trigger-on-focus="variant !== 'tray'"
       clearable
       :clear-icon="X"
       @input="handleInput"
+      @focus="handleTaskFocus"
       @click="openTaskSuggestions"
       @clear="clearSelectedTask"
       @select="selectSuggestion"

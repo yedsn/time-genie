@@ -1,6 +1,7 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
+import { workDataChangeDomainsForMutation } from "./workDataRefresh";
 
 export type SettingsScope = "shared" | "device";
 export type SettingsSnapshot = {
@@ -547,11 +548,15 @@ export async function listSubjects(): Promise<SubjectRecord[]> {
 }
 
 export async function createSubject(name: string): Promise<{ subject: SubjectRecord; alreadyExists: boolean }> {
-  return await invoke("subject_create", { request: { name } });
+  const result = await invoke<{ subject: SubjectRecord; alreadyExists: boolean }>("subject_create", { request: { name } });
+  if (!result.alreadyExists) await notifyWorkDataChanged(workDataChangeDomainsForMutation("subject"), "subject-create");
+  return result;
 }
 
 export async function renameSubject(subjectId: string, name: string, expectedVersion: number): Promise<SubjectRecord> {
-  return await invoke<SubjectRecord>("subject_rename", { request: { subjectId, name, expectedVersion } });
+  const result = await invoke<SubjectRecord>("subject_rename", { request: { subjectId, name, expectedVersion } });
+  await notifyWorkDataChanged(workDataChangeDomainsForMutation("subject"), "subject-rename");
+  return result;
 }
 
 export async function getSubjectWorkSchedule(subjectId: string): Promise<SubjectWorkScheduleDay[]> {
@@ -576,6 +581,7 @@ export async function listTodayTasks(subjectId?: string, todayDate?: string): Pr
 
 export async function setTaskDailyEstimate(taskId: string, workDate: string, estimateMinutes?: number): Promise<void> {
   await invoke("task_daily_estimate_set", { request: { taskId, workDate, estimateMinutes } });
+  await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-daily-estimate");
 }
 
 export async function createQuickTask(request: {
@@ -588,7 +594,9 @@ export async function createQuickTask(request: {
   projectName?: string;
   solutionName?: string;
 }): Promise<TaskRecord> {
-  return await invoke<TaskRecord>("task_create_quick", { request });
+  const result = await invoke<TaskRecord>("task_create_quick", { request });
+  await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-create-quick");
+  return result;
 }
 
 export async function createTask(request: {
@@ -601,7 +609,9 @@ export async function createTask(request: {
   projectName?: string;
   solutionName?: string;
 }): Promise<TaskRecord> {
-  return await invoke<TaskRecord>("task_create", { request });
+  const result = await invoke<TaskRecord>("task_create", { request });
+  await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-create");
+  return result;
 }
 
 export async function updateTask(request: {
@@ -615,7 +625,9 @@ export async function updateTask(request: {
   projectName?: string | null;
   solutionName?: string | null;
 }): Promise<TaskRecord> {
-  return await invoke<TaskRecord>("task_update", { request });
+  const result = await invoke<TaskRecord>("task_update", { request });
+  await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-update");
+  return result;
 }
 
 export async function setTaskCompleted(
@@ -625,9 +637,11 @@ export async function setTaskCompleted(
   occurrenceDate?: string,
   occurrenceExpectedVersion?: number,
 ): Promise<TaskRecord> {
-  return await invoke<TaskRecord>("task_set_completed", {
+  const result = await invoke<TaskRecord>("task_set_completed", {
     request: { id, expectedVersion, done, occurrenceDate, occurrenceExpectedVersion },
   });
+  await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-completion");
+  return result;
 }
 
 export async function saveTaskRecurrence(request: {
@@ -638,7 +652,9 @@ export async function saveTaskRecurrence(request: {
   effectiveStart: string;
   ruleExpectedVersion?: number;
 }): Promise<RecurrenceRuleRecord> {
-  return await invoke("task_recurrence_save", { request });
+  const result = await invoke<RecurrenceRuleRecord>("task_recurrence_save", { request });
+  await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-recurrence-save");
+  return result;
 }
 
 export async function closeTaskRecurrence(request: {
@@ -648,22 +664,30 @@ export async function closeTaskRecurrence(request: {
   ruleExpectedVersion: number;
 }): Promise<void> {
   await invoke("task_recurrence_close", { request });
+  await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-recurrence-close");
 }
 
 export async function deleteTaskSubtree(id: string, expectedVersion: number): Promise<void> {
   await invoke("task_delete_subtree", { request: { id, expectedVersion } });
+  await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-delete");
 }
 
 export async function reorderTaskSubtree(id: string, expectedVersion: number, parentId: string | undefined, sortOrder: number): Promise<TaskRecord> {
-  return await invoke<TaskRecord>("task_reorder_subtree", { request: { id, expectedVersion, parentId, sortOrder } });
+  const result = await invoke<TaskRecord>("task_reorder_subtree", { request: { id, expectedVersion, parentId, sortOrder } });
+  await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-reorder");
+  return result;
 }
 
 export async function changeTaskParent(id: string, expectedVersion: number, newParentId?: string, sortOrder?: number): Promise<TaskRecord> {
-  return await invoke<TaskRecord>("task_change_parent", { request: { id, expectedVersion, newParentId, sortOrder } });
+  const result = await invoke<TaskRecord>("task_change_parent", { request: { id, expectedVersion, newParentId, sortOrder } });
+  await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-parent");
+  return result;
 }
 
 export async function duplicateTaskSubtree(id: string, expectedVersion: number): Promise<{ rootId: string; tasks: TaskRecord[] }> {
-  return await invoke("task_duplicate_subtree", { request: { id, expectedVersion } });
+  const result = await invoke<{ rootId: string; tasks: TaskRecord[] }>("task_duplicate_subtree", { request: { id, expectedVersion } });
+  await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-duplicate");
+  return result;
 }
 
 export async function previewObsidianPlan(sourceDate: string, targetDate: string, subjectId: string): Promise<PlanImportPreviewResult> {
@@ -677,7 +701,9 @@ export async function confirmObsidianPlan(
   items: Array<{ importItemId: string; selected: boolean; title: string; estimateMinutes?: number }>,
   expectedVersion: number,
 ): Promise<{ batchId: string; tasks: TaskRecord[]; alreadyConfirmed: boolean }> {
-  return await invoke("obsidian_plan_import_confirm", { request: { batchId, items, expectedVersion } });
+  const result = await invoke<{ batchId: string; tasks: TaskRecord[]; alreadyConfirmed: boolean }>("obsidian_plan_import_confirm", { request: { batchId, items, expectedVersion } });
+  if (!result.alreadyConfirmed) await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-plan-import");
+  return result;
 }
 
 export async function getTimerState(): Promise<TimeEntryRecord | null> {
@@ -1174,6 +1200,14 @@ export async function openMainOverview() {
   try { await invoke("window_open_main_overview"); } catch { await getCurrentWindow().show(); }
 }
 
+export async function openMainUnassignedResolution() {
+  try { await invoke("window_open_main_unassigned"); } catch { await getCurrentWindow().show(); }
+}
+
+export async function setHoverTaskSelectionMode(expanded: boolean) {
+  await invoke(expanded ? "window_expand_hover_for_task_selection" : "window_restore_hover_compact");
+}
+
 export async function closeMainWindow() {
   try { await invoke("window_close_main"); } catch { await getCurrentWindow().hide(); }
 }
@@ -1264,6 +1298,30 @@ export async function onCloudSyncStateChanged(handler: (payload: StorageModeSnap
     });
   } catch {
     return () => {};
+  }
+}
+
+export async function onTrayHoverShown(handler: () => void) {
+  try {
+    return await listen("tray-hover-shown", () => handler());
+  } catch {
+    return () => {};
+  }
+}
+
+export async function onOpenUnassignedResolution(handler: () => void) {
+  try {
+    return await listen("open-unassigned-resolution", () => handler());
+  } catch {
+    return () => {};
+  }
+}
+
+export async function notifyWorkDataChanged(domains: string[], source = "frontend") {
+  try {
+    await emit("work-data-changed", { revision: 0, domains, source });
+  } catch {
+    // The calling window already owns the successful mutation; synchronization is best-effort.
   }
 }
 

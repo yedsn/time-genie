@@ -63,7 +63,7 @@ import {
   type UnassignedStateRecord,
   type RecurrenceRuleRecord,
 } from "./services/tauri";
-import { transientMissingStateResult } from "./services/transientStateGuard";
+import { TRANSIENT_MISSING_STATE_REFRESH_LIMIT, transientMissingStateResult } from "./services/transientStateGuard";
 import { canSubmitUnassignedResolution } from "./services/unassignedResolutionGuard";
 import { clampHistoryPage, collectTodayEntryTaskIds, findEntryInHistory, isTodayTimeEntry, timerStopHistoryTarget } from "./services/timeEntryHistoryCore";
 
@@ -353,7 +353,7 @@ export const useWorkdayStore = defineStore("workday", () => {
         listTasks(undefined, undefined, todayDate),
         listTodayTasks(undefined, todayDate),
       ]);
-      if (requestSeq !== workspaceRequestSeq) return;
+      if (requestSeq !== workspaceRequestSeq) return true;
       subjects.splice(0, subjects.length, ...subjectRecords.map((subject) => ({
         id: subject.id,
         name: subject.name,
@@ -373,8 +373,10 @@ export const useWorkdayStore = defineStore("workday", () => {
         selectedTaskId.value = buildVisibleTaskList(tasks.filter((task) => task.subjectId === selectedSubjectId.value))[0]?.id ?? "";
       }
       workspaceLoaded.value = true;
+      return true;
     } catch (error) {
       console.error("加载工作台数据失败", error);
+      return false;
     } finally {
       if (requestSeq === workspaceRequestSeq) workspaceLoading.value = false;
     }
@@ -481,7 +483,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       const previousActiveEntry = runningEntry.value ? cloneTimeEntry(runningEntry.value) : undefined;
       const workDate = await ensureWorkspaceCalendar();
       const [result, activeEntry] = await Promise.all([listTimeEntries(workDate), getTimerState()]);
-      if (requestSeq !== timeDataRequestSeq || mutationSeq !== timeDataMutationSeq) return;
+      if (requestSeq !== timeDataRequestSeq || mutationSeq !== timeDataMutationSeq) return true;
       const records = result.entries.slice();
       if (activeEntry) {
         const activeIndex = records.findIndex((entry) => entry.id === activeEntry.id);
@@ -509,8 +511,10 @@ export const useWorkdayStore = defineStore("workday", () => {
       if (!entries.some((entry) => entry.id === selectedEntryId.value)) {
         if (!findTimeEntry(selectedEntryId.value)) selectedEntryId.value = entries[0]?.id ?? "";
       }
+      return true;
     } catch (error) {
       console.error("加载计时数据失败", error);
+      return false;
     }
   }
 
@@ -570,16 +574,21 @@ export const useWorkdayStore = defineStore("workday", () => {
     };
   }
 
-  async function loadUnassignedState() {
+  async function loadUnassignedState(authoritative = false) {
     const requestSeq = ++unassignedStateRequestSeq;
     const mutationSeq = unassignedStateMutationSeq;
     try {
       const snapshot = await getUnassignedStateSnapshot();
-      if (requestSeq !== unassignedStateRequestSeq || mutationSeq !== unassignedStateMutationSeq) return;
+      if (requestSeq !== unassignedStateRequestSeq || mutationSeq !== unassignedStateMutationSeq) return true;
       unassignedCurrentSession.value = snapshot.current;
+      if (authoritative && !snapshot.current) {
+        unassignedStateMissingRefreshes = TRANSIENT_MISSING_STATE_REFRESH_LIMIT;
+      }
       applyUnassignedState(snapshot.current ?? null);
+      return true;
     } catch (error) {
       console.error("加载未归属时间失败", error);
+      return false;
     }
   }
 

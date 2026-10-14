@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted } from "vue";
 import MainWorkbench from "./views/MainWorkbench.vue";
 import HoverPanel from "./views/HoverPanel.vue";
-import { hideHoverAfterKeyboardClose, closeMainWindow, getSettings, isCurrentWindowFocused, onCurrentWindowFocusChanged, onWorkDataChanged } from "./services/tauri";
+import { hideHoverAfterKeyboardClose, closeMainWindow, getSettings, isCurrentWindowFocused, onCurrentWindowFocusChanged, onOpenUnassignedResolution, onWorkDataChanged } from "./services/tauri";
 import { useWorkdayStore } from "./store";
 import { stopCompletionFeedback } from "./services/completionFeedback";
 import { applyAppTheme, getCachedAppTheme, isAppTheme } from "./services/theme";
@@ -16,6 +16,7 @@ const params = new URLSearchParams(window.location.search);
 const view = computed(() => params.get("view") ?? "main");
 let unlistenWindowFocus: (() => void) | undefined;
 let unlistenWorkDataChanged: (() => void) | undefined;
+let unlistenOpenUnassignedResolution: (() => void) | undefined;
 let unmounted = false;
 let mainWindowFocused = false;
 let activationCheckArmed = true;
@@ -98,7 +99,7 @@ onMounted(() => {
     const theme = settings.device.app_theme;
     applyAppTheme(isAppTheme(theme) ? theme : "forest", true);
   }).catch(() => undefined);
-  store.startClock(view.value === "main");
+  store.startClock(true);
   void onWorkDataChanged((payload) => {
     scheduleDomainRefresh(payload.domains, payload.timerStoppedEntryId);
   }).then((unlisten) => {
@@ -107,6 +108,13 @@ onMounted(() => {
   });
   window.addEventListener("keydown", onKeydown);
   if (view.value === "main") {
+    void onOpenUnassignedResolution(async () => {
+      await store.loadUnassignedState(true);
+      if (store.unassignedSessionId && store.unassignedSeconds > 0) store.promptUnassignedResolution(true);
+    }).then((unlisten) => {
+      if (unmounted) unlisten();
+      else unlistenOpenUnassignedResolution = unlisten;
+    });
     void onCurrentWindowFocusChanged(handleMainWindowFocus).then((unlisten) => {
       if (unmounted) unlisten();
       else unlistenWindowFocus = unlisten;
@@ -121,6 +129,7 @@ onUnmounted(() => {
   unmounted = true;
   unlistenWindowFocus?.();
   unlistenWorkDataChanged?.();
+  unlistenOpenUnassignedResolution?.();
   if (refreshTimer) window.clearTimeout(refreshTimer);
   store.stopClock();
   window.removeEventListener("keydown", onKeydown);

@@ -13,6 +13,7 @@
         "test:report-template-editor": "tsc src-ui/src/services/reportTemplateEditorCore.ts --outDir .tmp-report-template-editor-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-report-template-editor.mjs",
         "test:cloud-sync-presentation": "tsc src-ui/src/services/cloudSyncPresentation.ts --outDir .tmp-cloud-sync-presentation-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-cloud-sync-presentation.mjs",
         "test:work-data-refresh": "tsc src-ui/src/services/workDataRefresh.ts --outDir .tmp-work-data-refresh-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-work-data-refresh.mjs",
+        "test:tray-hover": "tsc src-ui/src/services/trayHoverCore.ts --outDir .tmp-tray-hover-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-tray-hover.mjs",
         "test:time-entry-history": "tsc src-ui/src/services/timeEntryHistoryCore.ts --outDir .tmp-time-entry-history-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-time-entry-history.mjs",
         "test:time-allocation-export": "tsc src-ui/src/services/timeAllocationExportCore.ts --outDir .tmp-time-allocation-export-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-time-allocation-export.mjs",
         "test:time-allocation-export-ui": "node scripts/verify-time-allocation-export-ui.mjs",
