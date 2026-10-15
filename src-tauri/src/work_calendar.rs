@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use crate::database::Database;
 
+#[cfg(test)]
 pub const DEFAULT_TIMEZONE: &str = "Asia/Shanghai";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

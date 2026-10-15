@@ -29,6 +29,7 @@ mod tasks;
 mod time_allocation_export;
 mod time_tracking;
 mod today_overview;
+mod tray_presentation;
 mod unassigned;
 mod work_calendar;
 
@@ -80,6 +81,9 @@ struct TrayTimerMenu {
 
 struct AppTrayIcon {
     _icon: TrayIcon<tauri::Wry>,
+    default_icon: tauri::image::Image<'static>,
+    timer_menu: TrayTimerMenu,
+    last_presentation_key: Mutex<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -287,20 +291,26 @@ pub fn run() {
                     &quit,
                 ],
             )?;
-            refresh_tray_timer_menu(&database, &timer_menu);
-            spawn_tray_timer_menu_refresh(database.clone(), timer_menu.clone());
-            let tray_icon_image = app
+            let default_tray_icon = app
                 .default_window_icon()
                 .cloned()
                 .ok_or_else(|| std::io::Error::other("应用默认图标未配置"))?;
+            let initial_timer = time_tracking::get_timer_state(&database).ok().flatten();
+            let initial_style = settings::tray_icon_style(&database);
+            let initial_presentation = tray_presentation::TrayPresentation::from_timer(
+                initial_timer.as_ref(),
+                Some(&initial_style),
+            );
+            let tray_icon_image = initial_presentation
+                .image()
+                .unwrap_or_else(|| default_tray_icon.clone());
             let tray_icon = TrayIconBuilder::with_id("timegenie")
                 .icon(tray_icon_image)
                 .menu(&menu)
-                .tooltip("TimeGenie")
+                .tooltip(&initial_presentation.tooltip)
                 .show_menu_on_left_click(false)
                 .on_menu_event({
                     let database = database.clone();
-                    let timer_menu = timer_menu.clone();
                     let check_update = check_update.clone();
                     move |app, event| {
                         suppress_hover();
@@ -313,25 +323,21 @@ pub fn run() {
                             "start_timer" => run_tray_timer_action(
                                 app.clone(),
                                 database.clone(),
-                                timer_menu.clone(),
                                 TrayTimerAction::Start,
                             ),
                             "pause_timer" => run_tray_timer_action(
                                 app.clone(),
                                 database.clone(),
-                                timer_menu.clone(),
                                 TrayTimerAction::Pause,
                             ),
                             "resume_timer" => run_tray_timer_action(
                                 app.clone(),
                                 database.clone(),
-                                timer_menu.clone(),
                                 TrayTimerAction::Resume,
                             ),
                             "stop_timer" => run_tray_timer_action(
                                 app.clone(),
                                 database.clone(),
-                                timer_menu.clone(),
                                 TrayTimerAction::Stop,
                             ),
                             "quit" => app.exit(0),
@@ -355,9 +361,9 @@ pub fn run() {
                             button: MouseButton::Right,
                             ..
                         } => {
-                            refresh_tray_timer_menu(
+                            let _ = refresh_tray_presentation(
+                                tray.app_handle(),
                                 tray.app_handle().state::<Database>().inner(),
-                                &timer_menu,
                             );
                             suppress_hover();
                             hide(tray.app_handle(), "hover");
@@ -373,7 +379,14 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
-            app.manage(AppTrayIcon { _icon: tray_icon });
+            app.manage(AppTrayIcon {
+                _icon: tray_icon,
+                default_icon: default_tray_icon.to_owned(),
+                timer_menu,
+                last_presentation_key: Mutex::new(initial_presentation.cache_key()),
+            });
+            let _ = refresh_tray_presentation(app.handle(), &database);
+            spawn_tray_presentation_refresh(app.handle().clone(), database.clone());
             retry_tray_registration(app.handle().clone());
             #[cfg(target_os = "windows")]
             native_tray::start_if_tauri_tray_missing(app.handle().clone());
@@ -458,12 +471,15 @@ pub fn run() {
             tasks::task_list,
             tasks::task_list_completed_page,
             tasks::task_daily_estimate_set,
+            tasks::task_recurring_estimate_set,
             tasks::task_create,
+            tasks::task_create_positioned,
             tasks::task_create_quick,
             tasks::task_update,
             tasks::task_set_completed,
             tasks::task_delete_subtree,
             tasks::task_reorder_subtree,
+            tasks::task_move,
             tasks::task_change_parent,
             tasks::task_duplicate_subtree,
             today_overview::today_work_overview_get,
@@ -908,39 +924,69 @@ async fn download_and_install_update_impl(app: &AppHandle) -> Result<(), String>
     Ok(())
 }
 
-fn spawn_tray_timer_menu_refresh(database: Database, menu: TrayTimerMenu) {
+fn spawn_tray_presentation_refresh(app: AppHandle, database: Database) {
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            refresh_tray_timer_menu(&database, &menu);
+            let _ = refresh_tray_presentation(&app, &database);
         }
     });
 }
 
-fn refresh_tray_timer_menu(database: &Database, menu: &TrayTimerMenu) {
-    let state = time_tracking::get_timer_state(database)
-        .ok()
-        .flatten()
-        .map(|entry| entry.state);
-    let running = state.as_deref() == Some("running");
-    let paused = state.as_deref() == Some("paused");
-    let _ = menu.start.set_enabled(state.is_none());
-    let _ = menu.pause.set_enabled(running);
-    let _ = menu.resume.set_enabled(paused);
-    let _ = menu.stop.set_enabled(running || paused);
+pub(crate) fn refresh_tray_presentation(
+    app: &AppHandle,
+    database: &Database,
+) -> Result<(), String> {
+    let timer_result = time_tracking::get_timer_state(database);
+    let style = settings::tray_icon_style(database);
+    let presentation =
+        tray_presentation::TrayPresentation::from_timer_result(timer_result.clone(), Some(&style))?;
+    let timer = timer_result?;
+    let Some(managed) = app.try_state::<AppTrayIcon>() else {
+        #[cfg(target_os = "windows")]
+        native_tray::update_presentation(&presentation);
+        return Ok(());
+    };
+
+    let _ = managed.timer_menu.start.set_enabled(timer.is_none());
+    let _ = managed.timer_menu.pause.set_enabled(presentation.running);
+    let _ = managed.timer_menu.resume.set_enabled(presentation.paused);
+    let _ = managed
+        .timer_menu
+        .stop
+        .set_enabled(presentation.running || presentation.paused);
+
+    let key = presentation.cache_key();
+    let mut last_key = managed
+        .last_presentation_key
+        .lock()
+        .map_err(|_| "托盘展示缓存已损坏".to_string())?;
+    if *last_key != key {
+        let tray = app
+            .tray_by_id("timegenie")
+            .ok_or_else(|| "托盘对象不存在".to_string())?;
+        let icon = presentation
+            .image()
+            .unwrap_or_else(|| managed.default_icon.clone());
+        tray.set_icon(Some(icon))
+            .map_err(|error| format!("更新托盘图标失败: {error}"))?;
+        tray.set_tooltip(Some(&presentation.tooltip))
+            .map_err(|error| format!("更新托盘提示失败: {error}"))?;
+        *last_key = key;
+    }
+    drop(last_key);
+    #[cfg(target_os = "windows")]
+    native_tray::update_presentation(&presentation);
+
+    Ok(())
 }
 
-fn run_tray_timer_action(
-    app: AppHandle,
-    database: Database,
-    menu: TrayTimerMenu,
-    action: TrayTimerAction,
-) {
+fn run_tray_timer_action(app: AppHandle, database: Database, action: TrayTimerAction) {
     tauri::async_runtime::spawn_blocking(move || {
         let result = execute_tray_timer_action(&database, action);
-        refresh_tray_timer_menu(&database, &menu);
         match result {
             Ok(timer) => {
+                let _ = refresh_tray_presentation(&app, &database);
                 if matches!(action, TrayTimerAction::Stop) {
                     show(&app, "main");
                 }
@@ -973,6 +1019,7 @@ fn run_native_tray_timer_action(app: &AppHandle, action: TrayTimerAction) {
     tauri::async_runtime::spawn_blocking(move || {
         match execute_tray_timer_action(&database, action) {
             Ok(timer) => {
+                let _ = refresh_tray_presentation(&app, &database);
                 if matches!(action, TrayTimerAction::Stop) {
                     show(&app, "main");
                 }
@@ -1554,9 +1601,22 @@ mod tests {
 
         let started = execute_tray_timer_action(&database, TrayTimerAction::Start).unwrap();
         assert_eq!(started["state"], "running");
+        let running = tray_presentation::TrayPresentation::from_timer(
+            time_tracking::get_timer_state(&database).unwrap().as_ref(),
+            Some("status-orb"),
+        );
+        assert_eq!(running.state, tray_presentation::TrayTimerState::Running);
 
         let paused = execute_tray_timer_action(&database, TrayTimerAction::Pause).unwrap();
         assert_eq!(paused["state"], "paused");
+        let paused_presentation = tray_presentation::TrayPresentation::from_timer(
+            time_tracking::get_timer_state(&database).unwrap().as_ref(),
+            Some("status-orb"),
+        );
+        assert_eq!(
+            paused_presentation.state,
+            tray_presentation::TrayTimerState::Paused
+        );
 
         let resumed = execute_tray_timer_action(&database, TrayTimerAction::Resume).unwrap();
         assert_eq!(resumed["state"], "running");
@@ -1565,6 +1625,8 @@ mod tests {
         assert_eq!(stopped["state"], "ended");
         assert_eq!(stopped["allocatedMinutes"], 0);
         assert!(time_tracking::get_timer_state(&database).unwrap().is_none());
+        let idle = tray_presentation::TrayPresentation::from_timer(None, Some("status-orb"));
+        assert_eq!(idle.state, tray_presentation::TrayTimerState::Idle);
     }
 
     #[test]

@@ -83,6 +83,15 @@ pub struct TaskDailyEstimateSetRequest {
     pub estimate_minutes: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecurringTaskEstimateSetRequest {
+    pub task_id: String,
+    pub expected_version: i64,
+    pub work_date: String,
+    pub estimate_minutes: i64,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskDailyEstimateDto {
@@ -240,6 +249,31 @@ pub struct TaskReorderRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TaskMoveRequest {
+    pub id: String,
+    pub expected_version: i64,
+    pub parent_id: Option<String>,
+    pub previous_sibling_id: Option<String>,
+    pub next_sibling_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCreatePositionedRequest {
+    pub subject_id: String,
+    pub parent_id: Option<String>,
+    pub title: String,
+    pub planned_date: Option<String>,
+    pub estimate_minutes: Option<i64>,
+    pub note: Option<String>,
+    pub project_name: Option<String>,
+    pub solution_name: Option<String>,
+    pub previous_sibling_id: Option<String>,
+    pub next_sibling_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskChangeParentRequest {
     pub id: String,
     pub expected_version: i64,
@@ -333,6 +367,11 @@ pub fn list_tasks(database: &Database, request: TaskListRequest) -> Result<TaskL
         request.today_date.as_deref(),
         &mut rows,
     )?;
+    for task in &mut rows {
+        if task.recurrence.is_some() && task.today_estimate_minutes.is_none() {
+            task.today_estimate_minutes = task.estimate_minutes;
+        }
+    }
     enrich_and_order_tasks(
         &connection,
         &workspace_id,
@@ -430,6 +469,7 @@ pub fn list_completed_task_page(
     })
 }
 
+#[cfg(test)]
 pub fn set_task_daily_estimate(
     database: &Database,
     request: TaskDailyEstimateSetRequest,
@@ -591,6 +631,102 @@ fn set_task_daily_estimate_with_cloud_operation(
     })
 }
 
+fn set_recurring_task_estimate_with_cloud_operation(
+    database: &Database,
+    request: RecurringTaskEstimateSetRequest,
+    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+) -> Result<TaskDto, String> {
+    validate_date(&request.work_date)?;
+    validate_estimate(Some(request.estimate_minutes))?;
+    let mut connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    let current = load_task(&connection, &request.task_id)?;
+    if current.version != request.expected_version {
+        return Err("VERSION_CONFLICT: 事项已被其他窗口或设备更新".to_string());
+    }
+    if crate::recurring::get_rule_for_date(
+        &connection,
+        &workspace_id,
+        &request.task_id,
+        &request.work_date,
+    )?
+    .is_none()
+    {
+        return Err("VALIDATION_ERROR: 当前日期不是重复事项的有效轮次".to_string());
+    }
+    let now = now_millis();
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let previous_estimate: Option<(i64, i64)> = transaction
+        .query_row(
+            "SELECT version,created_at FROM task_daily_estimates WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3",
+            params![workspace_id, request.task_id, request.work_date],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let changed = transaction
+        .execute(
+            "UPDATE tasks SET estimate_minutes=?1,updated_at=?2,version=version+1
+             WHERE id=?3 AND workspace_id=?4 AND version=?5 AND deleted_at IS NULL",
+            params![
+                request.estimate_minutes,
+                now,
+                request.task_id,
+                workspace_id,
+                request.expected_version
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err("VERSION_CONFLICT: 事项已被其他窗口或设备更新".to_string());
+    }
+    transaction
+        .execute(
+            "INSERT INTO task_daily_estimates(workspace_id,task_id,work_date,estimate_minutes,created_at,updated_at,version)
+             VALUES(?1,?2,?3,?4,?5,?5,1) ON CONFLICT(task_id,work_date) DO UPDATE SET
+             estimate_minutes=excluded.estimate_minutes,updated_at=excluded.updated_at,version=task_daily_estimates.version+1",
+            params![workspace_id, request.task_id, request.work_date, request.estimate_minutes, now],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err("VERSION_CONFLICT: 事项已被其他窗口或设备更新".to_string());
+    }
+    bump_revision(&transaction)?;
+    if let Some(state) = cloud_state {
+        let task_operation = crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            "task_recurring_estimate_set",
+            "task",
+            Some(&request.task_id),
+            Some(request.expected_version),
+            None,
+        )?;
+        let row: (i64, i64, i64) = transaction.query_row(
+            "SELECT estimate_minutes,created_at,version FROM task_daily_estimates WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3",
+            params![workspace_id, request.task_id, request.work_date],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).map_err(|error| error.to_string())?;
+        let entity_id = format!("{}|{}", request.task_id, request.work_date);
+        crate::cloud_sync::enqueue_payload_in_transaction(
+            &transaction,
+            state,
+            "task_daily_estimate_set",
+            "task_daily_estimate",
+            &entity_id,
+            previous_estimate.map(|value| value.0),
+            &json!({"task_id":request.task_id,"work_date":request.work_date,"estimate_minutes":row.0,"created_at":row.1,"updated_at":now,"version":row.2}),
+            None,
+            task_operation.as_deref(),
+        )?;
+    }
+    let result = load_task(&transaction, &request.task_id)?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(result)
+}
+
 #[cfg(test)]
 pub(crate) fn set_task_daily_estimate_for_cloud_test(
     database: &Database,
@@ -681,6 +817,78 @@ fn create_task_with_source(
     Ok(result)
 }
 
+fn create_positioned_task_with_cloud_operation(
+    database: &Database,
+    request: TaskCreatePositionedRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+) -> Result<TaskDto, String> {
+    validate_title(&request.title)?;
+    validate_estimate(request.estimate_minutes)?;
+    let mut connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    ensure_subject(&connection, &workspace_id, &request.subject_id)?;
+    if let Some(parent_id) = request.parent_id.as_deref() {
+        ensure_parent(&connection, &workspace_id, parent_id, &request.subject_id)?;
+        let parent_parent: Option<String> = connection
+            .query_row(
+                "SELECT parent_id FROM tasks WHERE id=?1 AND workspace_id=?2 AND deleted_at IS NULL",
+                params![parent_id, workspace_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if parent_parent.is_some() {
+            return Err("TASK_DEPTH_LIMIT: 待办事项最多支持两级".to_string());
+        }
+        ensure_no_direct_time(&connection, parent_id)?;
+        ensure_not_recurring(&connection, &workspace_id, parent_id)?;
+    }
+    let id = Uuid::now_v7().to_string();
+    let now = now_millis();
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let sort_result = sibling_sort_order(
+        &transaction,
+        &workspace_id,
+        &request.subject_id,
+        request.parent_id.as_deref(),
+        None,
+        request.previous_sibling_id.as_deref(),
+        request.next_sibling_id.as_deref(),
+    )?;
+    transaction.execute(
+        "INSERT INTO tasks(id,workspace_id,subject_id,parent_id,title,status,planned_date,estimate_minutes,note,project_name,solution_name,source_type,sort_order,created_at,updated_at,version)
+         VALUES(?1,?2,?3,?4,?5,'open',?6,?7,?8,?9,?10,'manual',?11,?12,?12,1)",
+        params![id,workspace_id,request.subject_id,request.parent_id,request.title.trim(),request.planned_date,request.estimate_minutes,request.note,request.project_name,request.solution_name,sort_result.sort_order,now],
+    ).map_err(|error| error.to_string())?;
+    bump_revision(&transaction)?;
+    if let Some((state, operation_type)) = cloud_operation {
+        for (sibling_id, base_version) in &sort_result.normalized_siblings {
+            crate::cloud_sync::enqueue_entity_in_transaction(
+                &transaction,
+                state,
+                "task_order_normalize",
+                "task",
+                Some(sibling_id),
+                Some(*base_version),
+                None,
+            )?;
+        }
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "task",
+            Some(&id),
+            None,
+            None,
+        )?;
+    }
+    let result = load_task(&transaction, &id)?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(result)
+}
+
 #[cfg(test)]
 pub fn update_task(database: &Database, request: TaskUpdateRequest) -> Result<TaskDto, String> {
     update_task_with_cloud_operation(database, request, None)
@@ -688,9 +896,15 @@ pub fn update_task(database: &Database, request: TaskUpdateRequest) -> Result<Ta
 
 fn update_task_with_cloud_operation(
     database: &Database,
-    request: TaskUpdateRequest,
+    mut request: TaskUpdateRequest,
     cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<TaskDto, String> {
+    if let Some(note) = request.note.as_mut() {
+        *note = note.take().and_then(|value| {
+            let normalized = value.trim().to_string();
+            (!normalized.is_empty()).then_some(normalized)
+        });
+    }
     if let Some(title) = &request.title {
         validate_title(title)?;
     }
@@ -1009,6 +1223,192 @@ fn reorder_task_with_cloud_operation(
     }
     bump_revision(&transaction)?;
     if let Some((state, operation_type)) = cloud_operation {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            &transaction,
+            state,
+            operation_type,
+            "task",
+            Some(&request.id),
+            Some(request.expected_version),
+            None,
+        )?;
+    }
+    let result = load_task(&transaction, &request.id)?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(result)
+}
+
+struct SiblingSortResult {
+    sort_order: i64,
+    normalized_siblings: Vec<(String, i64)>,
+}
+
+fn sibling_sort_order(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    subject_id: &str,
+    parent_id: Option<&str>,
+    moving_id: Option<&str>,
+    previous_sibling_id: Option<&str>,
+    next_sibling_id: Option<&str>,
+) -> Result<SiblingSortResult, String> {
+    if previous_sibling_id.is_some_and(|id| Some(id) == moving_id)
+        || next_sibling_id.is_some_and(|id| Some(id) == moving_id)
+    {
+        return Err("VALIDATION_ERROR: 排序锚点不能是移动事项自身".to_string());
+    }
+    let load_anchor = |id: &str| -> Result<i64, String> {
+        transaction
+            .query_row(
+                "SELECT sort_order FROM tasks WHERE id=?1 AND workspace_id=?2 AND subject_id=?3
+                 AND deleted_at IS NULL AND ((parent_id=?4) OR (parent_id IS NULL AND ?4 IS NULL))",
+                params![id, workspace_id, subject_id, parent_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "VALIDATION_ERROR: 排序锚点不属于目标层级".to_string())
+    };
+    let previous = previous_sibling_id.map(load_anchor).transpose()?;
+    let next = next_sibling_id.map(load_anchor).transpose()?;
+    if previous.is_some_and(|value| next.is_some_and(|next| value >= next)) {
+        return Err("VALIDATION_ERROR: 排序锚点顺序无效".to_string());
+    }
+    let has_room = match (previous, next) {
+        (Some(before), Some(after)) => after - before > 1,
+        _ => true,
+    };
+    if !has_room {
+        let now = now_millis();
+        let mut statement = transaction
+            .prepare(
+                "SELECT id,version FROM tasks WHERE workspace_id=?1 AND subject_id=?2 AND deleted_at IS NULL
+                 AND ((parent_id=?3) OR (parent_id IS NULL AND ?3 IS NULL))
+                 AND (?4 IS NULL OR id<>?4) ORDER BY sort_order,id",
+            )
+            .map_err(|error| error.to_string())?;
+        let ids = statement
+            .query_map(
+                params![workspace_id, subject_id, parent_id, moving_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        drop(statement);
+        for (index, (id, version)) in ids.iter().enumerate() {
+            transaction
+                .execute(
+                    "UPDATE tasks SET sort_order=?1,updated_at=?2,version=version+1 WHERE id=?3 AND version=?4",
+                    params![(index as i64 + 1) * 10, now, id, version],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        let mut result = sibling_sort_order(
+            transaction,
+            workspace_id,
+            subject_id,
+            parent_id,
+            moving_id,
+            previous_sibling_id,
+            next_sibling_id,
+        )?;
+        result.normalized_siblings = ids;
+        return Ok(result);
+    }
+    Ok(SiblingSortResult {
+        sort_order: match (previous, next) {
+            (Some(before), Some(after)) => before + (after - before) / 2,
+            (Some(before), None) => before + 10,
+            (None, Some(after)) => after - 10,
+            (None, None) => 10,
+        },
+        normalized_siblings: Vec::new(),
+    })
+}
+
+fn move_task_with_cloud_operation(
+    database: &Database,
+    request: TaskMoveRequest,
+    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+) -> Result<TaskDto, String> {
+    let mut connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    let current = load_task(&connection, &request.id)?;
+    if current.version != request.expected_version {
+        return Err("VERSION_CONFLICT: 事项已被其他窗口或设备更新".to_string());
+    }
+    if let Some(parent_id) = request.parent_id.as_deref() {
+        ensure_parent(&connection, &workspace_id, parent_id, &current.subject_id)?;
+        let parent: Option<String> = connection
+            .query_row(
+                "SELECT parent_id FROM tasks WHERE id=?1 AND workspace_id=?2 AND deleted_at IS NULL",
+                params![parent_id, workspace_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .flatten();
+        if parent.is_some() {
+            return Err("TASK_DEPTH_LIMIT: 待办事项最多支持两级".to_string());
+        }
+        if parent_id == request.id || is_descendant(&connection, &request.id, parent_id)? {
+            return Err("TASK_TREE_CYCLE: 事项层级不能形成循环".to_string());
+        }
+        let child_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE parent_id=?1 AND deleted_at IS NULL",
+                [&request.id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if child_count > 0 {
+            return Err("TASK_DEPTH_LIMIT: 包含子事项的事项不能变为二级".to_string());
+        }
+        ensure_no_direct_time(&connection, parent_id)?;
+        ensure_not_recurring(&connection, &workspace_id, parent_id)?;
+    }
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let sort_result = sibling_sort_order(
+        &transaction,
+        &workspace_id,
+        &current.subject_id,
+        request.parent_id.as_deref(),
+        Some(&request.id),
+        request.previous_sibling_id.as_deref(),
+        request.next_sibling_id.as_deref(),
+    )?;
+    let now = now_millis();
+    let changed = transaction
+        .execute(
+            "UPDATE tasks SET parent_id=?1,sort_order=?2,updated_at=?3,version=version+1
+             WHERE id=?4 AND workspace_id=?5 AND version=?6 AND deleted_at IS NULL",
+            params![
+                request.parent_id,
+                sort_result.sort_order,
+                now,
+                request.id,
+                workspace_id,
+                request.expected_version
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err("VERSION_CONFLICT: 事项已被其他窗口或设备更新".to_string());
+    }
+    bump_revision(&transaction)?;
+    if let Some((state, operation_type)) = cloud_operation {
+        for (sibling_id, base_version) in &sort_result.normalized_siblings {
+            crate::cloud_sync::enqueue_entity_in_transaction(
+                &transaction,
+                state,
+                "task_order_normalize",
+                "task",
+                Some(sibling_id),
+                Some(*base_version),
+                None,
+            )?;
+        }
         crate::cloud_sync::enqueue_entity_in_transaction(
             &transaction,
             state,
@@ -2019,6 +2419,19 @@ pub fn task_daily_estimate_set(
 }
 
 #[tauri::command]
+pub fn task_recurring_estimate_set(
+    database: tauri::State<'_, Database>,
+    request: RecurringTaskEstimateSetRequest,
+) -> Result<TaskDto, String> {
+    crate::supabase::ensure_repository_write_mode(&database)?;
+    let state = crate::supabase::storage_mode(&database)?;
+    let result =
+        set_recurring_task_estimate_with_cloud_operation(&database, request, Some(&state))?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
+}
+
+#[tauri::command]
 pub fn task_create(
     database: tauri::State<'_, Database>,
     request: TaskCreateRequest,
@@ -2027,6 +2440,22 @@ pub fn task_create(
     let state = crate::supabase::storage_mode(&database)?;
     let result =
         create_task_with_source(&database, request, "manual", Some((&state, "task_create")))?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn task_create_positioned(
+    database: tauri::State<'_, Database>,
+    request: TaskCreatePositionedRequest,
+) -> Result<TaskDto, String> {
+    crate::supabase::ensure_repository_write_mode(&database)?;
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = create_positioned_task_with_cloud_operation(
+        &database,
+        request,
+        Some((&state, "task_create_positioned")),
+    )?;
     crate::cloud_sync::flush_if_online(&database)?;
     Ok(result)
 }
@@ -2104,6 +2533,18 @@ pub fn task_reorder_subtree(
     let state = crate::supabase::storage_mode(&database)?;
     let result =
         reorder_task_with_cloud_operation(&database, request, Some((&state, "task_reorder")))?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn task_move(
+    database: tauri::State<'_, Database>,
+    request: TaskMoveRequest,
+) -> Result<TaskDto, String> {
+    crate::supabase::ensure_repository_write_mode(&database)?;
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = move_task_with_cloud_operation(&database, request, Some((&state, "task_move")))?;
     crate::cloud_sync::flush_if_online(&database)?;
     Ok(result)
 }
@@ -3393,7 +3834,7 @@ mod tests {
             .unwrap();
 
         let recurring = create_test_task(&database, &subject_id, None, "每日重复事项");
-        let occurrence_date = "2026-10-14";
+        let occurrence_date = Local::now().format("%Y-%m-%d").to_string();
         crate::recurring::save_rule(
             &database,
             crate::recurring::RecurrenceSaveRequest {
@@ -3401,7 +3842,7 @@ mod tests {
                 task_expected_version: recurring.version,
                 frequency: "daily".to_string(),
                 weekdays_mask: None,
-                effective_start: occurrence_date.to_string(),
+                effective_start: occurrence_date.clone(),
                 rule_expected_version: None,
             },
         )
@@ -3412,7 +3853,7 @@ mod tests {
             &transaction,
             &workspace_id,
             &recurring.id,
-            occurrence_date,
+            &occurrence_date,
             1000,
         )
         .unwrap();
@@ -3597,6 +4038,511 @@ mod tests {
         assert!(ids.contains(quick.id.as_str()));
         assert!(!ids.contains(future.id.as_str()));
         assert!(!ids.contains(ordinary_without_date.id.as_str()));
+    }
+
+    #[test]
+    fn atomic_move_supports_first_position_and_two_level_changes() {
+        let database = database();
+        let subject_id: String = database
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let root = create_test_task(&database, &subject_id, None, "父事项");
+        let first = create_test_task(&database, &subject_id, Some(root.id.clone()), "第一项");
+        let second = create_test_task(&database, &subject_id, Some(root.id.clone()), "第二项");
+        let other = create_test_task(&database, &subject_id, None, "另一项");
+
+        let moved = move_task_with_cloud_operation(
+            &database,
+            TaskMoveRequest {
+                id: second.id.clone(),
+                expected_version: second.version,
+                parent_id: Some(root.id.clone()),
+                previous_sibling_id: None,
+                next_sibling_id: Some(first.id.clone()),
+            },
+            None,
+        )
+        .unwrap();
+        let listed = list_tasks(
+            &database,
+            TaskListRequest {
+                subject_id: Some(subject_id.clone()),
+                include_completed: Some(false),
+                planned_date: None,
+                today_date: None,
+                today_only: Some(false),
+                daily_estimate_date: None,
+                query: None,
+            },
+        )
+        .unwrap();
+        let child_ids = listed
+            .tasks
+            .iter()
+            .filter(|task| task.parent_id.as_deref() == Some(root.id.as_str()))
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(child_ids, vec![second.id.as_str(), first.id.as_str()]);
+
+        let promoted = move_task_with_cloud_operation(
+            &database,
+            TaskMoveRequest {
+                id: moved.id.clone(),
+                expected_version: moved.version,
+                parent_id: None,
+                previous_sibling_id: Some(other.id.clone()),
+                next_sibling_id: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(promoted.parent_id, None);
+        let demoted = move_task_with_cloud_operation(
+            &database,
+            TaskMoveRequest {
+                id: other.id.clone(),
+                expected_version: other.version,
+                parent_id: Some(root.id.clone()),
+                previous_sibling_id: Some(first.id.clone()),
+                next_sibling_id: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(demoted.parent_id.as_deref(), Some(root.id.as_str()));
+        assert!(move_task_with_cloud_operation(
+            &database,
+            TaskMoveRequest {
+                id: root.id.clone(),
+                expected_version: root.version,
+                parent_id: Some(promoted.id),
+                previous_sibling_id: None,
+                next_sibling_id: None,
+            },
+            None,
+        )
+        .unwrap_err()
+        .contains("包含子事项"));
+    }
+
+    #[test]
+    fn atomic_move_rejects_cross_subject_cycle_recurring_and_direct_time_parent() {
+        let database = database();
+        let subject_id: String = database
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let other_subject = crate::subjects::create_subject(
+            &database,
+            crate::subjects::SubjectCreateRequest {
+                name: "其他主体".to_string(),
+            },
+        )
+        .unwrap()
+        .subject;
+        let root = create_test_task(&database, &subject_id, None, "根事项");
+        let child = create_test_task(&database, &subject_id, Some(root.id.clone()), "子事项");
+        let cross_parent = create_test_task(&database, &other_subject.id, None, "跨主体父项");
+        let cross_error = move_task_with_cloud_operation(
+            &database,
+            TaskMoveRequest {
+                id: child.id.clone(),
+                expected_version: child.version,
+                parent_id: Some(cross_parent.id),
+                previous_sibling_id: None,
+                next_sibling_id: None,
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(cross_error.contains("主体"));
+        let cycle_error = move_task_with_cloud_operation(
+            &database,
+            TaskMoveRequest {
+                id: root.id.clone(),
+                expected_version: root.version,
+                parent_id: Some(child.id.clone()),
+                previous_sibling_id: None,
+                next_sibling_id: None,
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(cycle_error.contains("两级") || cycle_error.contains("循环"));
+
+        let recurring_parent = create_test_task(&database, &subject_id, None, "重复父项");
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        crate::recurring::save_rule(
+            &database,
+            crate::recurring::RecurrenceSaveRequest {
+                task_id: recurring_parent.id.clone(),
+                task_expected_version: recurring_parent.version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: today,
+                rule_expected_version: None,
+            },
+        )
+        .unwrap();
+        let leaf = create_test_task(&database, &subject_id, None, "待移动");
+        assert!(move_task_with_cloud_operation(
+            &database,
+            TaskMoveRequest {
+                id: leaf.id.clone(),
+                expected_version: leaf.version,
+                parent_id: Some(recurring_parent.id),
+                previous_sibling_id: None,
+                next_sibling_id: None,
+            },
+            None
+        )
+        .unwrap_err()
+        .contains("重复"));
+
+        let timed_parent = create_test_task(&database, &subject_id, None, "直接计时父项");
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let entry_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        connection.execute("INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,label_snapshot,started_at,ended_at,duration_seconds,created_at,updated_at,version) VALUES(?1,?2,'2026-10-15','work','manual','ended','直接计时',?3,?3,60,?3,?3,1)", params![entry_id,workspace_id,now]).unwrap();
+        connection.execute("INSERT INTO time_allocations(id,workspace_id,entry_id,task_id,minutes,created_at,updated_at,version) VALUES(?1,?2,?3,?4,1,?5,?5,1)", params![Uuid::now_v7().to_string(),workspace_id,entry_id,timed_parent.id,now]).unwrap();
+        drop(connection);
+        assert!(move_task_with_cloud_operation(
+            &database,
+            TaskMoveRequest {
+                id: leaf.id,
+                expected_version: leaf.version,
+                parent_id: Some(timed_parent.id),
+                previous_sibling_id: None,
+                next_sibling_id: None,
+            },
+            None
+        )
+        .unwrap_err()
+        .contains("工时"));
+    }
+
+    #[test]
+    fn dense_sibling_order_is_normalized_and_queued_with_move() {
+        let database = database();
+        let subject_id: String = database
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let first = create_test_task(&database, &subject_id, None, "甲");
+        let second = create_test_task(&database, &subject_id, None, "乙");
+        let moving = create_test_task(&database, &subject_id, None, "丙");
+        let connection = database.open().unwrap();
+        connection
+            .execute("UPDATE tasks SET sort_order=10 WHERE id=?1", [&first.id])
+            .unwrap();
+        connection
+            .execute("UPDATE tasks SET sort_order=11 WHERE id=?1", [&second.id])
+            .unwrap();
+        drop(connection);
+        let state = configure_cloud_mode(&database);
+        let result = move_task_with_cloud_operation(
+            &database,
+            TaskMoveRequest {
+                id: moving.id.clone(),
+                expected_version: moving.version,
+                parent_id: None,
+                previous_sibling_id: Some(first.id.clone()),
+                next_sibling_id: Some(second.id.clone()),
+            },
+            Some((&state, "task_move")),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let orders = connection
+            .prepare("SELECT id,sort_order,version FROM tasks WHERE id IN (?1,?2,?3) ORDER BY sort_order")
+            .unwrap()
+            .query_map(params![first.id, second.id, moving.id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(orders[1].0, result.id);
+        assert!(orders[0].1 < result.sort_order && result.sort_order < orders[2].1);
+        assert_eq!(
+            orders.iter().map(|row| row.1).collect::<HashSet<_>>().len(),
+            3
+        );
+        assert_eq!(
+            orders.iter().map(|row| row.2).collect::<Vec<_>>(),
+            vec![2, 2, 2]
+        );
+        let queued: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE entity_type='task'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(queued >= 3);
+    }
+
+    #[test]
+    fn positioned_create_inserts_at_requested_root_and_child_locations() {
+        let database = database();
+        let subject_id: String = database
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let root = create_test_task(&database, &subject_id, None, "根");
+        let after = create_test_task(&database, &subject_id, None, "后项");
+        let inserted = create_positioned_task_with_cloud_operation(
+            &database,
+            TaskCreatePositionedRequest {
+                subject_id: subject_id.clone(),
+                parent_id: None,
+                title: "中间项".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+                previous_sibling_id: Some(root.id.clone()),
+                next_sibling_id: Some(after.id.clone()),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(root.sort_order < inserted.sort_order && inserted.sort_order < after.sort_order);
+        let child = create_positioned_task_with_cloud_operation(
+            &database,
+            TaskCreatePositionedRequest {
+                subject_id: subject_id.clone(),
+                parent_id: Some(root.id.clone()),
+                title: "子项".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+                previous_sibling_id: None,
+                next_sibling_id: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(child.parent_id.as_deref(), Some(root.id.as_str()));
+        assert!(create_positioned_task_with_cloud_operation(
+            &database,
+            TaskCreatePositionedRequest {
+                subject_id,
+                parent_id: Some(child.id),
+                title: "非法三级".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+                previous_sibling_id: None,
+                next_sibling_id: None,
+            },
+            None,
+        )
+        .unwrap_err()
+        .contains("最多支持两级"));
+    }
+
+    #[test]
+    fn task_note_update_normalizes_clear_and_preserves_cloud_payload() {
+        let database = database();
+        let task = create_leaf_task(&database, "备注事项");
+        let state = configure_cloud_mode(&database);
+        let added = update_task_with_cloud_operation(
+            &database,
+            TaskUpdateRequest {
+                id: task.id.clone(),
+                expected_version: task.version,
+                title: None,
+                parent_id: None,
+                planned_date: None,
+                estimate_minutes: None,
+                note: Some(Some("完整备注".to_string())),
+                project_name: None,
+                solution_name: None,
+            },
+            Some((&state, "task_update")),
+        )
+        .unwrap();
+        assert_eq!(added.note.as_deref(), Some("完整备注"));
+        assert!(update_task_with_cloud_operation(
+            &database,
+            TaskUpdateRequest {
+                id: task.id.clone(),
+                expected_version: task.version,
+                title: None,
+                parent_id: None,
+                planned_date: None,
+                estimate_minutes: None,
+                note: Some(Some("旧版本".to_string())),
+                project_name: None,
+                solution_name: None,
+            },
+            None,
+        )
+        .unwrap_err()
+        .contains("VERSION_CONFLICT"));
+        let cleared = update_task_with_cloud_operation(
+            &database,
+            TaskUpdateRequest {
+                id: task.id.clone(),
+                expected_version: added.version,
+                title: None,
+                parent_id: None,
+                planned_date: None,
+                estimate_minutes: None,
+                note: Some(None),
+                project_name: None,
+                solution_name: None,
+            },
+            Some((&state, "task_update")),
+        )
+        .unwrap();
+        assert_eq!(cleared.note, None);
+        let payloads = database
+            .open()
+            .unwrap()
+            .prepare("SELECT payload_json FROM sync_outbox WHERE entity_id=?1 ORDER BY rowid")
+            .unwrap()
+            .query_map([task.id], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&payloads[0]).unwrap()["note"],
+            "完整备注"
+        );
+        assert!(serde_json::from_str::<Value>(&payloads[1]).unwrap()["note"].is_null());
+    }
+
+    #[test]
+    fn recurring_estimate_updates_template_daily_override_and_dependency() {
+        let database = database();
+        let task = create_leaf_task(&database, "重复预计");
+        let first_date = "2026-10-15".to_string();
+        crate::recurring::save_rule(
+            &database,
+            crate::recurring::RecurrenceSaveRequest {
+                task_id: task.id.clone(),
+                task_expected_version: task.version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: first_date.clone(),
+                rule_expected_version: None,
+            },
+        )
+        .unwrap();
+        let current = load_task(&database.open().unwrap(), &task.id).unwrap();
+        let state = configure_cloud_mode(&database);
+        let saved = set_recurring_task_estimate_with_cloud_operation(
+            &database,
+            RecurringTaskEstimateSetRequest {
+                task_id: task.id.clone(),
+                expected_version: current.version,
+                work_date: first_date.clone(),
+                estimate_minutes: 10,
+            },
+            Some(&state),
+        )
+        .unwrap();
+        assert_eq!(saved.estimate_minutes, Some(10));
+        let next_day = list_tasks(
+            &database,
+            TaskListRequest {
+                subject_id: Some(task.subject_id.clone()),
+                include_completed: Some(false),
+                planned_date: None,
+                today_date: Some("2026-10-16".to_string()),
+                today_only: Some(false),
+                daily_estimate_date: Some("2026-10-16".to_string()),
+                query: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            next_day
+                .tasks
+                .iter()
+                .find(|item| item.id == task.id)
+                .unwrap()
+                .today_estimate_minutes,
+            Some(10)
+        );
+        assert!(set_recurring_task_estimate_with_cloud_operation(
+            &database,
+            RecurringTaskEstimateSetRequest {
+                task_id: task.id.clone(),
+                expected_version: current.version,
+                work_date: "2026-10-16".to_string(),
+                estimate_minutes: 20,
+            },
+            None,
+        )
+        .unwrap_err()
+        .contains("VERSION_CONFLICT"));
+        let row: (Option<i64>, i64) = database.open().unwrap().query_row(
+            "SELECT estimate_minutes,(SELECT COUNT(*) FROM task_daily_estimates WHERE task_id=?1 AND work_date='2026-10-16') FROM tasks WHERE id=?1",
+            [&task.id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(row, (Some(10), 0));
+        let updated = set_recurring_task_estimate_with_cloud_operation(
+            &database,
+            RecurringTaskEstimateSetRequest {
+                task_id: task.id.clone(),
+                expected_version: saved.version,
+                work_date: "2026-10-16".to_string(),
+                estimate_minutes: 20,
+            },
+            Some(&state),
+        )
+        .unwrap();
+        assert_eq!(updated.estimate_minutes, Some(20));
+        let later = list_tasks(
+            &database,
+            TaskListRequest {
+                subject_id: Some(task.subject_id.clone()),
+                include_completed: Some(false),
+                planned_date: None,
+                today_date: Some("2026-10-17".to_string()),
+                today_only: Some(false),
+                daily_estimate_date: Some("2026-10-17".to_string()),
+                query: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            later
+                .tasks
+                .iter()
+                .find(|item| item.id == task.id)
+                .unwrap()
+                .today_estimate_minutes,
+            Some(20)
+        );
+        let operations = database.open().unwrap()
+            .prepare("SELECT operation_id,entity_type,depends_on_operation_id FROM sync_outbox ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)))
+            .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(operations.len(), 4);
+        assert_eq!(operations[0].1, "task");
+        assert_eq!(operations[1].1, "task_daily_estimate");
+        assert_eq!(operations[1].2.as_deref(), Some(operations[0].0.as_str()));
+        assert_eq!(operations[2].1, "task");
+        assert_eq!(operations[3].1, "task_daily_estimate");
+        assert_eq!(operations[3].2.as_deref(), Some(operations[2].0.as_str()));
     }
 
     fn create_test_task(

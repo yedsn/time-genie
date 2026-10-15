@@ -376,6 +376,10 @@ fn seed_local_workspace(transaction: &Transaction<'_>) -> Result<(), String> {
         ("device_name", serde_json::json!("当前设备")),
         ("tray_hover_enabled", serde_json::json!(true)),
         ("tray_menu_suppress_hover", serde_json::json!(true)),
+        (
+            "tray_icon_style",
+            serde_json::json!(crate::tray_presentation::DEFAULT_TRAY_ICON_STYLE),
+        ),
         ("start_minimized", serde_json::json!(false)),
         ("obsidian_root_path", serde_json::json!("")),
         (

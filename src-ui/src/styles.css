@@ -1669,6 +1669,18 @@ pre {
 .reminder-row.sortable-tree-selected + .reminder-row.sortable-tree-selected { border-top-color: transparent; }
 .reminder-row.sortable-ghost { border-color: rgba(201,239,143,0.38); background: rgba(201,239,143,0.12); opacity: 0.5; }
 .reminder-row.sortable-drag { box-shadow: 0 12px 30px rgba(0,0,0,0.3); }
+.reminder-list[data-drop-depth="0"] .sortable-ghost { box-shadow: inset 0 3px 0 var(--accent); }
+.reminder-list[data-drop-depth="1"] .sortable-ghost { box-shadow: inset 24px 3px 0 var(--accent); }
+.reminder-list.drop-invalid .sortable-ghost { border-color: var(--danger); box-shadow: inset 0 0 0 1px var(--danger); }
+.note-picker.filled { color: var(--accent); }
+.task-note-dialog textarea { width: 100%; resize: vertical; min-height: 150px; padding: 12px; color: var(--text); border: 1px solid var(--line); border-radius: 9px; outline: none; background: var(--panel-2); font: inherit; line-height: 1.6; box-sizing: border-box; }
+.task-note-dialog textarea:focus { border-color: rgba(201,239,143,0.55); box-shadow: 0 0 0 3px rgba(201,239,143,0.08); }
+.plan-task-context-menu { position: fixed; z-index: 5000; width: 190px; padding: 6px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); box-shadow: 0 18px 48px rgba(0,0,0,0.32); }
+.plan-task-context-menu button { display: flex; width: 100%; min-height: 34px; align-items: center; padding: 0 10px; color: var(--text); border: 0; border-radius: 7px; background: transparent; font: inherit; text-align: left; cursor: pointer; }
+.plan-task-context-menu button:hover:not(:disabled) { background: var(--surface-soft); }
+.plan-task-context-menu button:disabled { color: var(--muted); cursor: not-allowed; opacity: 0.55; }
+.plan-task-context-menu button.danger { color: var(--danger); }
+.plan-task-context-divider { display: block; height: 1px; margin: 5px 4px; background: var(--line); }
 .reminder-placeholder-row {
   min-height: 32px;
   display: grid;
@@ -1933,10 +1945,24 @@ pre {
 .reminder-inline-controls .hover-row-action { opacity: 0; pointer-events: none; transition: opacity 120ms ease; }
 .reminder-row:hover .reminder-inline-controls .hover-row-action,
 .reminder-row.selected .reminder-inline-controls .hover-row-action { opacity: 1; pointer-events: auto; }
-.recurrence-picker { border: 0; font: inherit; }
+.recurrence-picker,
+.note-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  font: inherit;
+  line-height: inherit;
+  white-space: nowrap;
+}
 .recurrence-picker,
 .recurrence-picker:hover,
-.recurrence-picker:focus-visible {
+.recurrence-picker:focus-visible,
+.note-picker,
+.note-picker:hover,
+.note-picker:focus-visible {
   border: 0;
   outline: 0;
   background: transparent !important;
@@ -2217,6 +2243,7 @@ pre {
 }
 .settings-choice-field { display: grid; gap: 7px; color: var(--muted); font-size: 12px; }
 .settings-segmented { width: max-content; display: inline-grid; grid-template-columns: repeat(2, 104px); gap: 3px; padding: 3px; border-radius: 6px; background: var(--surface-inset); }
+.settings-segmented-three { grid-template-columns: repeat(3, 104px); }
 .settings-segmented button { min-height: 38px; display: grid; grid-template-columns: auto auto; align-items: center; justify-content: center; gap: 7px; border: 0; border-radius: 4px; color: var(--muted); background: transparent; }
 .settings-segmented button:hover:not(:disabled) { color: var(--text); background: var(--surface-soft); }
 .settings-segmented button.active { color: var(--accent-ink); background: var(--accent); }

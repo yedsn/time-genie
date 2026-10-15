@@ -253,6 +253,7 @@ pub fn set_occurrence_status(
         .ok_or_else(|| "INTERNAL_ERROR: 重复事项轮次不存在".to_string())
 }
 
+#[cfg(test)]
 pub fn save_rule(
     database: &Database,
     request: RecurrenceSaveRequest,
@@ -387,6 +388,7 @@ pub(crate) fn save_rule_for_cloud_test(
     save_rule_with_cloud_operation(database, request, Some(cloud_state))
 }
 
+#[cfg(test)]
 pub fn close_rule(database: &Database, request: RecurrenceCloseRequest) -> Result<(), String> {
     close_rule_with_cloud_operation(database, request, None)
 }

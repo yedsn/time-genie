@@ -726,6 +726,41 @@ export async function confirmObsidianPlan(
   return result;
 }
 
+export async function setRecurringTaskEstimate(taskId: string, expectedVersion: number, workDate: string, estimateMinutes: number): Promise<TaskRecord> {
+  const result = await invoke<TaskRecord>("task_recurring_estimate_set", { request: { taskId, expectedVersion, workDate, estimateMinutes } });
+  await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-recurring-estimate");
+  return result;
+}
+
+export async function moveTaskRecord(request: {
+  id: string;
+  expectedVersion: number;
+  parentId?: string;
+  previousSiblingId?: string;
+  nextSiblingId?: string;
+}): Promise<TaskRecord> {
+  const result = await invoke<TaskRecord>("task_move", { request });
+  await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-move");
+  return result;
+}
+
+export async function createPositionedTask(request: {
+  subjectId: string;
+  parentId?: string;
+  title: string;
+  plannedDate?: string;
+  estimateMinutes?: number;
+  note?: string;
+  projectName?: string;
+  solutionName?: string;
+  previousSiblingId?: string;
+  nextSiblingId?: string;
+}): Promise<TaskRecord> {
+  const result = await invoke<TaskRecord>("task_create_positioned", { request });
+  await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-create-positioned");
+  return result;
+}
+
 export async function getTimerState(): Promise<TimeEntryRecord | null> {
   return await invoke<TimeEntryRecord | null>("timer_get_state");
 }

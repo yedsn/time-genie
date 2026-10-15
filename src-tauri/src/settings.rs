@@ -4,6 +4,7 @@ use keyring::Entry;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tauri::AppHandle;
 
 use crate::database::Database;
 
@@ -538,6 +539,7 @@ fn validate_setting_key(scope: &SettingsScope, key: &str) -> Result<(), String> 
         SettingsScope::Device => [
             "tray_hover_enabled",
             "tray_menu_suppress_hover",
+            "tray_icon_style",
             "start_minimized",
             "completion_feedback_enabled",
             "completion_feedback_sound_enabled",
@@ -585,7 +587,30 @@ fn validate_setting_value(key: &str, value: &Value) -> Result<(), String> {
     {
         return Err("主题只能是 forest、graphite、ocean、ember、paper 或 mist".to_string());
     }
+    if key == "tray_icon_style"
+        && !matches!(value.as_str(), Some("status-orb" | "minimal" | "app-icon"))
+    {
+        return Err("托盘图标样式只能是 status-orb、minimal 或 app-icon".to_string());
+    }
     Ok(())
+}
+
+pub(crate) fn tray_icon_style(database: &Database) -> String {
+    database
+        .open()
+        .ok()
+        .and_then(|connection| {
+            read_device_value(&connection, "tray_icon_style")
+                .ok()
+                .flatten()
+        })
+        .and_then(|value| value.as_str().map(str::to_string))
+        .map(|value| {
+            crate::tray_presentation::TrayIconStyle::parse(Some(&value))
+                .as_str()
+                .to_string()
+        })
+        .unwrap_or_else(|| crate::tray_presentation::DEFAULT_TRAY_ICON_STYLE.to_string())
 }
 
 fn credential_entry(provider: &str, workspace_id: &str) -> Result<Entry, String> {
@@ -632,15 +657,21 @@ pub fn settings_get(database: tauri::State<'_, Database>) -> Result<SettingsSnap
 
 #[tauri::command]
 pub fn settings_update(
+    app: AppHandle,
     database: tauri::State<'_, Database>,
     request: SettingsUpdate,
 ) -> Result<SettingsSnapshot, String> {
     crate::supabase::ensure_repository_write_mode(&database)?;
     let state = crate::supabase::storage_mode(&database)?;
     let is_shared = matches!(&request.scope, SettingsScope::Shared);
+    let refresh_tray =
+        matches!(&request.scope, SettingsScope::Device) && request.key == "tray_icon_style";
     let result = update_setting_with_cloud_operation(&database, request, Some(&state))?;
     if is_shared {
         crate::cloud_sync::flush_if_online(&database)?;
+    }
+    if refresh_tray {
+        let _ = crate::refresh_tray_presentation(&app, &database);
     }
     Ok(result)
 }
@@ -794,6 +825,15 @@ mod tests {
             },
         )
         .unwrap();
+        update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "tray_icon_style".to_string(),
+                value: serde_json::json!("minimal"),
+            },
+        )
+        .unwrap();
         let snapshot = get_settings(&database).unwrap();
         assert_eq!(
             snapshot.shared["salary_hourly_rate"],
@@ -812,6 +852,10 @@ mod tests {
             serde_json::json!(false)
         );
         assert_eq!(snapshot.device["app_theme"], serde_json::json!("ocean"));
+        assert_eq!(
+            snapshot.device["tray_icon_style"],
+            serde_json::json!("minimal")
+        );
         update_setting(
             &database,
             SettingsUpdate {
@@ -848,6 +892,15 @@ mod tests {
             SettingsUpdate {
                 scope: SettingsScope::Device,
                 key: "app_theme".to_string(),
+                value: serde_json::json!("unknown"),
+            },
+        )
+        .is_err());
+        assert!(update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "tray_icon_style".to_string(),
                 value: serde_json::json!("unknown"),
             },
         )

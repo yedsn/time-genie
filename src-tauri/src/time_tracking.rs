@@ -2466,6 +2466,7 @@ pub fn timer_get_state(
 
 #[tauri::command]
 pub fn timer_start(
+    app: tauri::AppHandle,
     database: tauri::State<'_, Database>,
     request: TimerStartRequest,
 ) -> Result<TimeEntryDto, String> {
@@ -2477,11 +2478,13 @@ pub fn timer_start(
         Some((&state, "timer_start", Some(operation_id.as_str()))),
     )?;
     crate::cloud_sync::flush_if_online(&database)?;
+    let _ = crate::refresh_tray_presentation(&app, &database);
     Ok(result)
 }
 
 #[tauri::command]
 pub fn timer_pause(
+    app: tauri::AppHandle,
     database: tauri::State<'_, Database>,
     request: TimerVersionRequest,
 ) -> Result<TimeEntryDto, String> {
@@ -2490,12 +2493,14 @@ pub fn timer_pause(
     let result =
         pause_timer_with_cloud_operation(&database, request, Some((&state, "timer_pause")))?;
     crate::cloud_sync::flush_if_online(&database)?;
+    let _ = crate::refresh_tray_presentation(&app, &database);
     let _ = expected_version;
     Ok(result)
 }
 
 #[tauri::command]
 pub fn timer_resume(
+    app: tauri::AppHandle,
     database: tauri::State<'_, Database>,
     request: TimerResumeRequest,
 ) -> Result<TimeEntryDto, String> {
@@ -2508,12 +2513,14 @@ pub fn timer_resume(
         Some((&state, "timer_resume", Some(operation_id.as_str()))),
     )?;
     crate::cloud_sync::flush_if_online(&database)?;
+    let _ = crate::refresh_tray_presentation(&app, &database);
     let _ = expected_version;
     Ok(result)
 }
 
 #[tauri::command]
 pub fn timer_stop(
+    app: tauri::AppHandle,
     database: tauri::State<'_, Database>,
     request: TimerStopRequest,
 ) -> Result<TimerStopResultDto, String> {
@@ -2525,6 +2532,7 @@ pub fn timer_stop(
         Some((&state, "timer_stop")),
     )?;
     crate::cloud_sync::flush_if_online(&database)?;
+    let _ = crate::refresh_tray_presentation(&app, &database);
     let _ = expected_version;
     timer_chain_result(&database, result)
 }

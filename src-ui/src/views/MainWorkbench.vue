@@ -107,6 +107,7 @@ const settingsDraft = reactive({
   completionFeedbackSoundEnabled: true,
   trayHoverEnabled: true,
   trayMenuSuppressHover: true,
+  trayIconStyle: "status-orb" as "status-orb" | "minimal" | "app-icon",
   startMinimized: false,
   storageMode: "local" as "local" | "cloud",
   supabaseProjectUrl: "",
@@ -446,6 +447,8 @@ async function loadSettings() {
     setCompletionFeedbackSoundEnabled(settingsDraft.completionFeedbackSoundEnabled);
     settingsDraft.trayHoverEnabled = settingBoolean("device", "tray_hover_enabled", true);
     settingsDraft.trayMenuSuppressHover = settingBoolean("device", "tray_menu_suppress_hover", true);
+    const trayIconStyle = settingString("device", "tray_icon_style", "status-orb");
+    settingsDraft.trayIconStyle = trayIconStyle === "minimal" || trayIconStyle === "app-icon" ? trayIconStyle : "status-orb";
     settingsDraft.startMinimized = settingBoolean("device", "start_minimized");
     settingsDraft.storageMode = settingsSnapshot.value.storageMode;
     settingsDraft.supabaseProjectUrl = settingString("device", "supabase_project_url");
@@ -467,6 +470,7 @@ async function saveSettings() {
     await updateSetting("device", "obsidian_daily_path_pattern", settingsDraft.obsidianDailyPathPattern);
     await updateSetting("device", "tray_hover_enabled", settingsDraft.trayHoverEnabled);
     await updateSetting("device", "tray_menu_suppress_hover", settingsDraft.trayMenuSuppressHover);
+    await updateSetting("device", "tray_icon_style", settingsDraft.trayIconStyle);
     await updateSetting("device", "start_minimized", settingsDraft.startMinimized);
     await updateSetting("device", "completion_feedback_enabled", settingsDraft.completionFeedbackEnabled);
     setCompletionFeedbackEnabled(settingsDraft.completionFeedbackEnabled);
@@ -1291,6 +1295,31 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
   }
 }
 
+async function handleTaskMove(taskId: string, parentId?: string, previousSiblingId?: string, nextSiblingId?: string) {
+  try {
+    await store.movePlanTask(taskId, parentId, previousSiblingId, nextSiblingId);
+  } catch (error) {
+    await store.loadWorkspaceData();
+    ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "事项移动失败");
+  }
+}
+
+async function handleTaskNoteSave(taskId: string, note: string) {
+  try {
+    await store.saveTaskNote(taskId, note);
+  } catch (error) {
+    ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "备注保存失败");
+  }
+}
+
+async function handleTodayEstimateSave(taskId: string, estimateMinutes?: number) {
+  try {
+    await store.saveTaskTodayEstimate(taskId, estimateMinutes);
+  } catch (error) {
+    ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "今日预计保存失败");
+  }
+}
+
 async function handleCompletedTaskSave(task: Task) {
   try {
     await store.saveCompletedTask(task);
@@ -1414,7 +1443,10 @@ async function handleCompletedTaskDelete(task: Task) {
           @select="store.selectedTaskId = $event"
           @add="store.addTask('', store.selectedSubjectId)"
           @add-child="store.addChildTask"
+          @add-relative="store.addTaskRelative"
           @save="handleTaskSave"
+          @save-note="handleTaskNoteSave"
+          @save-today-estimate="handleTodayEstimateSave"
           @import-plan="openPlanImport"
           @sync-sea-table="openSeaTableSync"
           @duplicate="store.duplicateTask"
@@ -1423,7 +1455,7 @@ async function handleCompletedTaskDelete(task: Task) {
           @indent="store.indentTask"
           @outdent="store.outdentTask"
           @start-timer="startTimerForTask"
-          @reorder="store.reorderTask"
+          @move="handleTaskMove"
           @set-recurrence="handleTaskRecurrence"
         />
         <CompletedTaskHistory
@@ -1597,6 +1629,15 @@ async function handleCompletedTaskDelete(task: Task) {
 
         <div id="settings-tray" data-settings-section="tray" class="work-panel settings-panel">
           <div class="panel-title"><h2>托盘行为</h2><span>当前设备独立设置</span></div>
+          <div class="settings-choice-field">
+            <span>托盘图标样式</span>
+            <div class="settings-segmented settings-segmented-three" role="radiogroup" aria-label="托盘图标样式">
+              <button type="button" role="radio" :aria-checked="settingsDraft.trayIconStyle === 'status-orb'" :class="{ active: settingsDraft.trayIconStyle === 'status-orb' }" :disabled="!settingsLoaded" @click="settingsDraft.trayIconStyle = 'status-orb'"><strong>状态圆标</strong><small>推荐</small></button>
+              <button type="button" role="radio" :aria-checked="settingsDraft.trayIconStyle === 'minimal'" :class="{ active: settingsDraft.trayIconStyle === 'minimal' }" :disabled="!settingsLoaded" @click="settingsDraft.trayIconStyle = 'minimal'"><strong>极简色块</strong><small>紧凑</small></button>
+              <button type="button" role="radio" :aria-checked="settingsDraft.trayIconStyle === 'app-icon'" :class="{ active: settingsDraft.trayIconStyle === 'app-icon' }" :disabled="!settingsLoaded" @click="settingsDraft.trayIconStyle = 'app-icon'"><strong>应用图标</strong><small>静态</small></button>
+            </div>
+            <small class="settings-hint">状态圆标与极简色块会用不同图形和颜色展示执行中、已暂停和无当前事项。</small>
+          </div>
           <label class="switch-line"><input v-model="settingsDraft.trayHoverEnabled" :disabled="!settingsLoaded" type="checkbox" />鼠标停留后显示悬浮面板</label>
           <label class="switch-line"><input v-model="settingsDraft.trayMenuSuppressHover" :disabled="!settingsLoaded" type="checkbox" />右键菜单打开时抑制悬浮面板</label>
           <label class="switch-line"><input v-model="settingsDraft.startMinimized" :disabled="!settingsLoaded" type="checkbox" />开机后最小化启动</label>

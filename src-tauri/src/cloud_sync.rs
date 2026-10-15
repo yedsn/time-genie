@@ -3331,6 +3331,88 @@ fn push_outbox_locked(
                     batch_stopped = true;
                     break;
                 }
+                Err(error)
+                    if operation.entity_type == "unassigned_session"
+                        && operation.operation_type == "unassigned_discard"
+                        && is_missing_shared_unassigned_session_error(&error) =>
+                {
+                    let recovery = api
+                        .rpc_for_database(
+                            database,
+                            "unassigned_get_or_create_shared",
+                            json!({
+                                "p_workspace_id": state.workspace_id,
+                                "p_device_id": state.device_id,
+                                "p_candidate": operation.payload,
+                                "p_predecessor_session_id": operation
+                                    .payload
+                                    .get("predecessor_session_id"),
+                                "p_started_at": Value::Null
+                            }),
+                            &session,
+                        )
+                        .and_then(|authoritative| {
+                            let authoritative_id =
+                                authoritative.get("id").and_then(Value::as_str).ok_or_else(
+                                    || "VALIDATION_ERROR: 权威未归属会话缺少 ID".to_string(),
+                                )?;
+                            if operation.entity_id.as_deref() == Some(authoritative_id) {
+                                api.rpc_for_database(
+                                    database,
+                                    "unassigned_resolve_shared",
+                                    json!({
+                                        "p_workspace_id": state.workspace_id,
+                                        "p_device_id": state.device_id,
+                                        "p_operation_id": operation.operation_id,
+                                        "p_session_id": operation.entity_id,
+                                        "p_expected_version": operation.base_version,
+                                        "p_resolution_type": "discard",
+                                        "p_payload": operation.payload
+                                    }),
+                                    &session,
+                                )
+                                .and_then(|value| {
+                                    adopt_shared_unassigned_resolution_result(
+                                        database, operation, &value,
+                                    )
+                                })
+                            } else {
+                                recover_orphaned_shared_unassigned_discard(
+                                    database,
+                                    operation,
+                                    &authoritative,
+                                )
+                            }
+                        });
+                    match recovery {
+                        Ok(()) => {
+                            delete_outbox(database, &operation.operation_id)?;
+                            pushed += 1;
+                            continue;
+                        }
+                        Err(recovery_error) => {
+                            let combined_error = format!(
+                                "{error}; ORPHANED_UNASSIGNED_RECOVERY_FAILED: {recovery_error}"
+                            );
+                            mark_outbox_error(
+                                database,
+                                &operation.operation_id,
+                                "pending",
+                                &combined_error,
+                            )?;
+                            release_unprocessed_claims(database, &operations[index + 1..])?;
+                            update_sync_state(
+                                database,
+                                &state.workspace_id,
+                                &state.device_id,
+                                state.last_change_seq,
+                                Some(&combined_error),
+                            )?;
+                            batch_stopped = true;
+                            break;
+                        }
+                    }
+                }
                 Err(error) => {
                     mark_outbox_error(database, &operation.operation_id, "pending", &error)?;
                     release_unprocessed_claims(database, &operations[index + 1..])?;
@@ -4029,79 +4111,7 @@ fn adopt_shared_unassigned_resolution_result(
     }
     adopt_shared_unassigned_rpc_result(database, session)?;
     if !accepted {
-        let mut connection = database.open()?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| error.to_string())?;
-        let mut pending = vec![operation.operation_id.clone()];
-        let mut dependent_ids = HashSet::<String>::new();
-        while let Some(parent_id) = pending.pop() {
-            let children = transaction
-                .prepare("SELECT operation_id FROM sync_outbox WHERE depends_on_operation_id=?1")
-                .and_then(|mut statement| {
-                    statement
-                        .query_map([parent_id.as_str()], |row| row.get::<_, String>(0))?
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .map_err(|error| error.to_string())?;
-            for child_id in children {
-                if dependent_ids.insert(child_id.clone()) {
-                    pending.push(child_id);
-                }
-            }
-        }
-        let mut dependent_operations = Vec::<OutboxOperation>::new();
-        for dependent_id in &dependent_ids {
-            let dependent = transaction
-                .query_row(
-                    "SELECT operation_id,operation_type,entity_type,entity_id,base_version,payload_version,coalesced_count,depends_on_operation_id,payload_json
-                     FROM sync_outbox WHERE operation_id=?1",
-                    [dependent_id],
-                    |row| {
-                        let payload: String = row.get(8)?;
-                        Ok(OutboxOperation {
-                            operation_id: row.get(0)?,
-                            operation_type: row.get(1)?,
-                            entity_type: row.get(2)?,
-                            entity_id: row.get(3)?,
-                            base_version: row.get(4)?,
-                            payload_version: row.get(5)?,
-                            coalesced_count: row.get(6)?,
-                            depends_on_operation_id: row.get(7)?,
-                            payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
-                        })
-                    },
-                )
-                .map_err(|error| error.to_string())?;
-            dependent_operations.push(dependent);
-        }
-        for dependent in &dependent_operations {
-            rollback_losing_unassigned_dependent(&transaction, dependent)?;
-        }
-        for dependent_id in dependent_ids {
-            transaction
-                .execute(
-                    "DELETE FROM sync_outbox WHERE operation_id=?1",
-                    [dependent_id],
-                )
-                .map_err(|error| error.to_string())?;
-        }
-        if let Some(entry_id) = operation
-            .payload
-            .get("generated_entry_id")
-            .and_then(Value::as_str)
-        {
-            transaction
-                .execute("DELETE FROM time_allocations WHERE entry_id=?1", [entry_id])
-                .map_err(|error| error.to_string())?;
-            transaction
-                .execute("DELETE FROM time_segments WHERE entry_id=?1", [entry_id])
-                .map_err(|error| error.to_string())?;
-            transaction
-                .execute("DELETE FROM time_entries WHERE id=?1", [entry_id])
-                .map_err(|error| error.to_string())?;
-        }
-        transaction.commit().map_err(|error| error.to_string())?;
+        rollback_losing_unassigned_resolution(database, operation)?;
     }
     if let Some(next_session) = value
         .get("nextSession")
@@ -4112,6 +4122,133 @@ fn adopt_shared_unassigned_resolution_result(
         queue_next_shared_unassigned_candidate(database, session)?;
     }
     Ok(())
+}
+
+fn is_missing_shared_unassigned_session_error(error: &str) -> bool {
+    error
+        .to_ascii_lowercase()
+        .contains("not_found: shared unassigned session")
+}
+
+fn recover_orphaned_shared_unassigned_discard(
+    database: &Database,
+    operation: &OutboxOperation,
+    authoritative: &Value,
+) -> Result<(), String> {
+    if operation.operation_type != "unassigned_discard" {
+        return Err("VALIDATION_ERROR: 只能自动收敛丢弃未归属时间操作".to_string());
+    }
+    if !authoritative.is_null() {
+        let authoritative_id = authoritative
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "VALIDATION_ERROR: 权威未归属会话缺少 ID".to_string())?;
+        if operation.entity_id.as_deref() == Some(authoritative_id) {
+            return Err("SYNC_ERROR: 云端重新采用了孤儿未归属会话，需保留原操作重试".to_string());
+        }
+        adopt_shared_unassigned_rpc_result(database, authoritative)?;
+    }
+    rollback_losing_unassigned_resolution(database, operation)?;
+    if let Some(session_id) = operation.entity_id.as_deref() {
+        database
+            .open()?
+            .execute(
+                "UPDATE unassigned_sessions
+                 SET migration_state='superseded'
+                 WHERE id=?1 AND resolution_operation_id=?2",
+                params![session_id, operation.operation_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn rollback_losing_unassigned_resolution(
+    database: &Database,
+    operation: &OutboxOperation,
+) -> Result<(), String> {
+    let mut connection = database.open()?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let mut pending = vec![operation.operation_id.clone()];
+    let mut dependent_ids = HashSet::<String>::new();
+    while let Some(parent_id) = pending.pop() {
+        let children = transaction
+            .prepare("SELECT operation_id FROM sync_outbox WHERE depends_on_operation_id=?1")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([parent_id.as_str()], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|error| error.to_string())?;
+        for child_id in children {
+            if dependent_ids.insert(child_id.clone()) {
+                pending.push(child_id);
+            }
+        }
+    }
+    let mut dependent_operations = Vec::<OutboxOperation>::new();
+    for dependent_id in &dependent_ids {
+        let dependent = transaction
+            .query_row(
+                "SELECT operation_id,operation_type,entity_type,entity_id,base_version,payload_version,coalesced_count,depends_on_operation_id,payload_json
+                 FROM sync_outbox WHERE operation_id=?1",
+                [dependent_id],
+                |row| {
+                    let payload: String = row.get(8)?;
+                    Ok(OutboxOperation {
+                        operation_id: row.get(0)?,
+                        operation_type: row.get(1)?,
+                        entity_type: row.get(2)?,
+                        entity_id: row.get(3)?,
+                        base_version: row.get(4)?,
+                        payload_version: row.get(5)?,
+                        coalesced_count: row.get(6)?,
+                        depends_on_operation_id: row.get(7)?,
+                        payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+                    })
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        dependent_operations.push(dependent);
+    }
+    for dependent in &dependent_operations {
+        rollback_losing_unassigned_dependent(&transaction, dependent)?;
+    }
+    for dependent_id in dependent_ids {
+        transaction
+            .execute(
+                "DELETE FROM sync_outbox WHERE operation_id=?1",
+                [dependent_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(entry_id) = operation
+        .payload
+        .get("generated_entry_id")
+        .and_then(Value::as_str)
+    {
+        if let Some(session_id) = operation.entity_id.as_deref() {
+            transaction
+                .execute(
+                    "UPDATE unassigned_sessions SET generated_entry_id=NULL
+                     WHERE id=?1 AND generated_entry_id=?2",
+                    params![session_id, entry_id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction
+            .execute("DELETE FROM time_allocations WHERE entry_id=?1", [entry_id])
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute("DELETE FROM time_segments WHERE entry_id=?1", [entry_id])
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute("DELETE FROM time_entries WHERE id=?1", [entry_id])
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 fn rollback_losing_unassigned_dependent(
@@ -7110,10 +7247,13 @@ pub fn tracking_lease_get(database: tauri::State<'_, Database>) -> Result<Value,
 
 #[tauri::command]
 pub fn cloud_timer_start(
+    app: tauri::AppHandle,
     database: tauri::State<'_, Database>,
     request: CloudTimerStartRequest,
 ) -> Result<crate::time_tracking::TimeEntryDto, String> {
-    legacy_cloud_timer_start_local_first(&database, request)
+    let result = legacy_cloud_timer_start_local_first(&database, request)?;
+    let _ = crate::refresh_tray_presentation(&app, &database);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -7139,26 +7279,35 @@ pub fn cloud_time_entry_list(
 
 #[tauri::command]
 pub fn cloud_timer_pause(
+    app: tauri::AppHandle,
     database: tauri::State<'_, Database>,
     request: CloudTimerVersionRequest,
 ) -> Result<crate::time_tracking::TimeEntryDto, String> {
-    legacy_cloud_timer_pause_local_first(&database, request)
+    let result = legacy_cloud_timer_pause_local_first(&database, request)?;
+    let _ = crate::refresh_tray_presentation(&app, &database);
+    Ok(result)
 }
 
 #[tauri::command]
 pub fn cloud_timer_resume(
+    app: tauri::AppHandle,
     database: tauri::State<'_, Database>,
     request: CloudTimerVersionRequest,
 ) -> Result<crate::time_tracking::TimeEntryDto, String> {
-    legacy_cloud_timer_resume_local_first(&database, request)
+    let result = legacy_cloud_timer_resume_local_first(&database, request)?;
+    let _ = crate::refresh_tray_presentation(&app, &database);
+    Ok(result)
 }
 
 #[tauri::command]
 pub fn cloud_timer_stop(
+    app: tauri::AppHandle,
     database: tauri::State<'_, Database>,
     request: CloudTimerVersionRequest,
 ) -> Result<crate::time_tracking::TimeEntryDto, String> {
-    legacy_cloud_timer_stop_local_first(&database, request)
+    let result = legacy_cloud_timer_stop_local_first(&database, request)?;
+    let _ = crate::refresh_tray_presentation(&app, &database);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -9272,6 +9421,106 @@ mod tests {
                 winner_resolved_at
             )
         );
+    }
+
+    #[test]
+    fn missing_shared_discard_adopts_authoritative_anchor_and_removes_orphaned_entry() {
+        let (_directory, database, cloud_workspace_id, local_workspace_id, _subject_id) =
+            cloud_database_for_incremental_test("missing-shared-unassigned-discard.sqlite3");
+        let now = now_millis();
+        let orphan_session_id = Uuid::now_v7().to_string();
+        let orphan_entry_id = Uuid::now_v7().to_string();
+        let operation_id = Uuid::now_v7().to_string();
+        let connection = database.open().unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        connection.execute(
+            "INSERT INTO unassigned_sessions(id,workspace_id,work_date,state,threshold_seconds,duration_seconds,first_started_at,last_ended_at,resolution_type,resolved_at,created_at,updated_at,version,shared_source,migration_state,resolution_operation_id)
+             VALUES (?1,?2,'2026-10-14','discarded',300,60,?3,?4,'discard',?4,?3,?4,3,'cloud','candidate',?5)",
+            params![orphan_session_id,local_workspace_id,now-60_000,now,operation_id],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,label_snapshot,started_at,ended_at,duration_seconds,origin_unassigned_session_id,created_at,updated_at,version)
+             VALUES (?1,?2,'2026-10-14','break','unassigned','ended','无效时间',?3,?4,60,?5,?3,?4,1)",
+            params![orphan_entry_id,local_workspace_id,now-60_000,now,orphan_session_id],
+        ).unwrap();
+        connection
+            .execute(
+                "UPDATE unassigned_sessions SET generated_entry_id=?1 WHERE id=?2",
+                params![orphan_entry_id, orphan_session_id],
+            )
+            .unwrap();
+        connection.execute(
+            "INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,base_version,payload_json,payload_version,state,attempt_count,created_at)
+             VALUES (?1,?2,?3,'unassigned_discard','unassigned_session',?4,1,?5,3,'sending',135,?6)",
+            params![operation_id,cloud_workspace_id,device_id,orphan_session_id,json!({"generated_entry_id":orphan_entry_id}).to_string(),now],
+        ).unwrap();
+        drop(connection);
+
+        let authoritative_id = crate::unassigned::get_state(&database)
+            .unwrap()
+            .unwrap()
+            .session_id;
+        let authoritative =
+            entity_payload(&database, "unassigned_session", Some(&authoritative_id)).unwrap();
+        let operation = OutboxOperation {
+            operation_id: operation_id.clone(),
+            operation_type: "unassigned_discard".to_string(),
+            entity_type: "unassigned_session".to_string(),
+            entity_id: Some(orphan_session_id.clone()),
+            base_version: Some(1),
+            payload_version: Some(3),
+            coalesced_count: 1,
+            depends_on_operation_id: None,
+            payload: json!({"generated_entry_id":orphan_entry_id}),
+        };
+
+        recover_orphaned_shared_unassigned_discard(&database, &operation, &authoritative).unwrap();
+
+        let connection = database.open().unwrap();
+        let orphan: (Option<String>, String) = connection
+            .query_row(
+                "SELECT generated_entry_id,migration_state FROM unassigned_sessions WHERE id=?1",
+                [&orphan_session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(orphan, (None, "superseded".to_string()));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM time_entries WHERE id=?1",
+                    [&orphan_entry_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        let authoritative_source: (String, String) = connection
+            .query_row(
+                "SELECT shared_source,migration_state FROM unassigned_sessions WHERE id=?1",
+                [&authoritative_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            authoritative_source,
+            ("cloud".to_string(), "adopted".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_shared_unassigned_error_match_is_narrow() {
+        assert!(is_missing_shared_unassigned_session_error(
+            "CLOUD_REQUEST_FAILED: NOT_FOUND: shared unassigned session"
+        ));
+        assert!(!is_missing_shared_unassigned_session_error(
+            "NETWORK_ERROR: request timed out"
+        ));
+        assert!(!is_missing_shared_unassigned_session_error(
+            "CLOUD_REQUEST_FAILED: NOT_FOUND: task does not exist"
+        ));
     }
 
     #[test]

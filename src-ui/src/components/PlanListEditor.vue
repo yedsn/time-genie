@@ -2,9 +2,10 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import Sortable, { MultiDrag } from "sortablejs";
-import { CalendarDays, CheckCircle2, Circle, Copy, CornerDownRight, DatabaseZap, FileInput, GripVertical, IndentDecrease, IndentIncrease, Play, Plus, Radio, Repeat2, TimerReset, Trash2 } from "lucide-vue-next";
+import { CalendarDays, CheckCircle2, Circle, Copy, CornerDownRight, DatabaseZap, FileInput, GripVertical, IndentDecrease, IndentIncrease, MessageSquareText, Play, Plus, Radio, Repeat2, TimerReset, Trash2 } from "lucide-vue-next";
 import type { Task } from "../store";
 import { isActivePlanTask } from "../services/completedTaskHistoryCore";
+import { contextMenuPosition, planTaskMoveIntent, todayEstimateDraft } from "../services/planTaskInteractionCore";
 
 const props = defineProps<{
   tasks: Task[];
@@ -22,13 +23,16 @@ const emit = defineEmits<{
   syncSeaTable: [];
   add: [];
   addChild: [id: string];
+  addRelative: [id: string, placement: "before" | "after"];
   duplicate: [id: string];
   delete: [id: string];
   toggle: [task: Task, event: MouseEvent];
   indent: [id: string];
   outdent: [id: string];
   startTimer: [id: string];
-  reorder: [taskId: string, beforeId?: string, afterId?: string, parentId?: string];
+  move: [taskId: string, parentId?: string, previousSiblingId?: string, nextSiblingId?: string];
+  saveNote: [taskId: string, note: string];
+  saveTodayEstimate: [taskId: string, estimateMinutes?: number];
   setRecurrence: [taskId: string, recurrence?: { frequency: "daily" | "weekdays" | "weekly"; weekdaysMask?: number; effectiveStart: string }];
 }>();
 
@@ -36,6 +40,7 @@ const listRef = ref<HTMLElement | null>(null);
 const rowsRef = ref<HTMLElement | null>(null);
 const editingEstimateId = ref("");
 const editingTodayEstimateId = ref("");
+const todayEstimateDraftValue = ref<number>();
 const levelChangedId = ref("");
 const isSorting = ref(false);
 const temporaryTaskId = ref("");
@@ -45,6 +50,15 @@ const recurrenceTaskId = ref("");
 const recurrenceFrequency = ref<"none" | "daily" | "weekdays" | "weekly">("none");
 const recurrenceStart = ref(props.todayDate);
 const recurrenceWeekdays = ref<number[]>([]);
+const noteDialogOpen = ref(false);
+const noteTaskId = ref("");
+const noteDraft = ref("");
+const contextMenuOpen = ref(false);
+const contextTaskId = ref("");
+const contextMenuLeft = ref(0);
+const contextMenuTop = ref(0);
+const dragTargetDepth = ref<0 | 1>(0);
+const dragTargetInvalid = ref(false);
 let sortable: Sortable | undefined;
 let levelChangedTimer: number | undefined;
 
@@ -178,6 +192,17 @@ async function addChild(task: Task) {
   await focusTaskInput(taskId);
 }
 
+async function addRelative(task: Task, placement: "before" | "after") {
+  const existingIds = new Set(props.tasks.map((item) => item.id));
+  emit("addRelative", task.id, placement);
+  await nextTick();
+  const taskId = props.tasks.find((item) => !existingIds.has(item.id))?.id
+    ?? (!existingIds.has(props.selectedId) ? props.selectedId : "");
+  if (!taskId) return;
+  temporaryTaskId.value = taskId;
+  await focusTaskInput(taskId);
+}
+
 async function duplicateTask(task: Task) {
   emit("duplicate", task.id);
   await focusSelectedInput();
@@ -234,23 +259,78 @@ function finishEstimateEditor(task: Task) {
   emit("save", task.id);
 }
 
-async function openTodayEstimateEditor(taskId: string) {
-  editingTodayEstimateId.value = taskId;
+async function openTodayEstimateEditor(task: Task) {
+  editingTodayEstimateId.value = task.id;
+  todayEstimateDraftValue.value = todayEstimateDraft(task.todayEstimate, task.parentId);
   await nextTick();
-  const input = listRef.value?.querySelector<HTMLInputElement>(`[data-today-estimate-input="${taskId}"]`);
+  const input = listRef.value?.querySelector<HTMLInputElement>(`[data-today-estimate-input="${task.id}"]`);
   input?.focus();
   input?.select();
 }
 
 function closeTodayEstimateEditor() {
   editingTodayEstimateId.value = "";
+  todayEstimateDraftValue.value = undefined;
 }
 
 function finishTodayEstimateEditor(task: Task) {
   if (editingTodayEstimateId.value !== task.id) return;
-  task.todayEstimate = normalizeEstimate(task.todayEstimate);
+  const estimate = normalizeEstimate(todayEstimateDraftValue.value);
   closeTodayEstimateEditor();
-  emit("save", task.id);
+  emit("saveTodayEstimate", task.id, estimate);
+}
+
+function openNoteEditor(task: Task) {
+  closeContextMenu();
+  noteTaskId.value = task.id;
+  noteDraft.value = task.note ?? "";
+  noteDialogOpen.value = true;
+}
+
+function saveNote() {
+  if (!noteTaskId.value) return;
+  emit("saveNote", noteTaskId.value, noteDraft.value);
+  noteDialogOpen.value = false;
+}
+
+function contextTask() {
+  return props.tasks.find((task) => task.id === contextTaskId.value);
+}
+
+function openContextMenu(event: MouseEvent, task: Task) {
+  const target = event.target as HTMLElement;
+  if (target.closest("input, textarea")) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const position = contextMenuPosition(event.clientX, event.clientY, 190, 250, window.innerWidth, window.innerHeight);
+  contextTaskId.value = task.id;
+  contextMenuLeft.value = position.left;
+  contextMenuTop.value = position.top;
+  contextMenuOpen.value = true;
+}
+
+function closeContextMenu() {
+  contextMenuOpen.value = false;
+  contextTaskId.value = "";
+}
+
+function runContextCommand(command: "before" | "after" | "child" | "note" | "duplicate" | "delete") {
+  const task = contextTask();
+  closeContextMenu();
+  if (!task) return;
+  if (command === "before" || command === "after") void addRelative(task, command);
+  if (command === "child") void addChild(task);
+  if (command === "note") openNoteEditor(task);
+  if (command === "duplicate") void duplicateTask(task);
+  if (command === "delete") void confirmDelete(task);
+}
+
+function closeContextMenuForPointer(event: PointerEvent) {
+  if (!(event.target as HTMLElement).closest(".plan-task-context-menu")) closeContextMenu();
+}
+
+function closeContextMenuForKey(event: KeyboardEvent) {
+  if (event.key === "Escape") closeContextMenu();
 }
 
 function normalizeEstimate(value: number | undefined) {
@@ -326,7 +406,20 @@ function mountSortable() {
     chosenClass: "sortable-chosen",
     dragClass: "sortable-drag",
     onStart() {
+      closeContextMenu();
       isSorting.value = true;
+    },
+    onMove(event, originalEvent) {
+      const related = event.related as HTMLElement;
+      const relatedDepth = Number(related?.dataset.depth ?? 0);
+      const pointerX = originalEvent instanceof MouseEvent ? originalEvent.clientX : 0;
+      const listLeft = rowsRef.value?.getBoundingClientRect().left ?? 0;
+      dragTargetDepth.value = relatedDepth > 0 || pointerX > listLeft + 92 ? 1 : 0;
+      const taskId = (event.dragged as HTMLElement).dataset.taskId ?? "";
+      dragTargetInvalid.value = dragTargetDepth.value === 1 && getSubtreeIds(taskId).size > 1;
+      rowsRef.value?.setAttribute("data-drop-depth", String(dragTargetDepth.value));
+      rowsRef.value?.classList.toggle("drop-invalid", dragTargetInvalid.value);
+      return !dragTargetInvalid.value;
     },
     async onEnd(event) {
       const taskId = (event.item as HTMLElement).dataset.taskId;
@@ -337,21 +430,16 @@ function mountSortable() {
         return;
       }
       const movingIds = getSubtreeIds(taskId);
-      const movingIndexes = rows
-        .map((row, index) => movingIds.has(row.dataset.taskId ?? "") ? index : -1)
-        .filter((index) => index >= 0);
-      const blockStart = Math.min(...movingIndexes);
-      const blockEnd = Math.max(...movingIndexes);
-      const beforeRow = rows.slice(0, blockStart).reverse().find((row) => !movingIds.has(row.dataset.taskId ?? ""));
-      const afterRow = rows.slice(blockEnd + 1).find((row) => !movingIds.has(row.dataset.taskId ?? ""));
-      const currentDepth = Number((event.item as HTMLElement).dataset.depth ?? 0);
-      const parentRow = currentDepth > 0
-        ? rows.slice(0, blockStart).reverse().find((row) => !movingIds.has(row.dataset.taskId ?? "") && Number(row.dataset.depth ?? 0) === currentDepth - 1)
-        : undefined;
-      const currentTask = props.tasks.find((task) => task.id === taskId);
-      const parentId = currentDepth > 0 ? parentRow?.dataset.taskId ?? currentTask?.parentId : undefined;
-      emit("reorder", taskId, beforeRow?.dataset.taskId, afterRow?.dataset.taskId, parentId);
+      const orderedRows = rows.map((row) => {
+        const id = row.dataset.taskId ?? "";
+        return { id, parentId: props.tasks.find((task) => task.id === id)?.parentId };
+      });
+      const intent = planTaskMoveIntent(orderedRows, taskId, movingIds, dragTargetDepth.value, movingIds.size > 1);
+      if (intent) emit("move", taskId, intent.parentId, intent.previousSiblingId, intent.nextSiblingId);
+      else ElMessage.warning("该落点会产生三级事项，请选择一级或同级位置");
       clearSubtreeDrag(rows);
+      rowsRef.value?.removeAttribute("data-drop-depth");
+      rowsRef.value?.classList.remove("drop-invalid");
       await rebuildSortableList();
     }
   });
@@ -369,11 +457,17 @@ async function rebuildSortableList() {
 
 onMounted(() => {
   mountSortable();
+  document.addEventListener("pointerdown", closeContextMenuForPointer);
+  document.addEventListener("keydown", closeContextMenuForKey);
+  window.addEventListener("scroll", closeContextMenu, true);
 });
 
 onBeforeUnmount(() => {
   sortable?.destroy();
   sortable = undefined;
+  document.removeEventListener("pointerdown", closeContextMenuForPointer);
+  document.removeEventListener("keydown", closeContextMenuForKey);
+  window.removeEventListener("scroll", closeContextMenu, true);
   if (levelChangedTimer) window.clearTimeout(levelChangedTimer);
 });
 </script>
@@ -408,6 +502,7 @@ onBeforeUnmount(() => {
           :data-depth="row.depth"
           :style="{ '--child-indent': `${row.depth * 24}px` }"
           @click="selectTask(row.task)"
+          @contextmenu="openContextMenu($event, row.task)"
         >
           <button class="drag-handle" :title="getSubtreeIds(row.task.id).size > 1 ? `拖动整组（共 ${getSubtreeIds(row.task.id).size} 项）` : '拖动排序'" @pointerdown="prepareSubtreeDrag(row.task.id)"><GripVertical :size="14" /></button>
           <button class="check-button" :class="{ completed: row.task.status === 'done' }" :title="row.task.recurrence ? (row.task.status === 'done' ? '恢复今天这一轮' : '完成今天这一轮') : '标记为完成'" @click.stop="emit('toggle', row.task, $event)">
@@ -437,12 +532,12 @@ onBeforeUnmount(() => {
                   @keydown.esc.prevent="closeEstimateEditor"
                 />
               </span>
-              <span class="meta-picker estimate-picker today-estimate-picker" :class="{ filled: row.task.todayEstimate }" title="设置今日预计用时" @click.stop="openTodayEstimateEditor(row.task.id)">
+              <span class="meta-picker estimate-picker today-estimate-picker" :class="{ filled: row.task.todayEstimate }" title="设置今日预计用时" @click.stop="openTodayEstimateEditor(row.task)">
                 <TimerReset :size="12" />{{ row.task.todayEstimate ? '今日预计 ' + formatMinutes(row.task.todayEstimate) : '未填今日预计' }}
                 <input
                   v-if="editingTodayEstimateId === row.task.id"
                   :data-today-estimate-input="row.task.id"
-                  v-model.number="row.task.todayEstimate"
+                  v-model.number="todayEstimateDraftValue"
                   min="0"
                   placeholder="分钟"
                   type="number"
@@ -452,6 +547,16 @@ onBeforeUnmount(() => {
                   @keydown.esc.prevent="closeTodayEstimateEditor"
                 />
               </span>
+              <el-tooltip
+                :content="row.task.note?.trim() || '暂无备注，点击添加'"
+                effect="dark"
+                placement="top"
+                :show-after="280"
+              >
+                <button class="meta-picker note-picker" :class="{ filled: row.task.note?.trim() }" type="button" @click.stop="openNoteEditor(row.task)">
+                  <MessageSquareText :size="12" />{{ row.task.note?.trim() ? '有备注' : '备注' }}
+                </button>
+              </el-tooltip>
               <button
                 v-if="!hasChildren(row.task.id)"
                 class="meta-picker recurrence-picker"
@@ -524,5 +629,25 @@ onBeforeUnmount(() => {
         <button class="primary-button" type="button" @click="saveRecurrence">保存</button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="noteDialogOpen" class="recurrence-dialog task-note-dialog" title="事项备注" width="min(520px, 92vw)" append-to-body>
+      <textarea v-model="noteDraft" rows="8" placeholder="记录事项背景、注意点或下一步……"></textarea>
+      <template #footer>
+        <button class="secondary-button" type="button" @click="noteDialogOpen = false">取消</button>
+        <button class="primary-button" type="button" @click="saveNote">保存</button>
+      </template>
+    </el-dialog>
+
+    <Teleport to="body">
+      <div v-if="contextMenuOpen" class="plan-task-context-menu" role="menu" :style="{ left: `${contextMenuLeft}px`, top: `${contextMenuTop}px` }" @pointerdown.stop>
+        <button type="button" role="menuitem" @click="runContextCommand('before')">在上方新增</button>
+        <button type="button" role="menuitem" @click="runContextCommand('after')">在下方新增</button>
+        <button type="button" role="menuitem" :disabled="Boolean(contextTask()?.parentId || contextTask()?.recurrence || contextTask()?.directMinutes)" @click="runContextCommand('child')">新建子事项</button>
+        <span class="plan-task-context-divider"></span>
+        <button type="button" role="menuitem" @click="runContextCommand('note')">编辑备注</button>
+        <button type="button" role="menuitem" @click="runContextCommand('duplicate')">复制</button>
+        <button class="danger" type="button" role="menuitem" @click="runContextCommand('delete')">删除</button>
+      </div>
+    </Teleport>
   </div>
 </template>
