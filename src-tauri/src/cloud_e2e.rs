@@ -29,7 +29,8 @@ use crate::supabase::{
     MigrationExecuteRequest,
 };
 use crate::tasks::{
-    self, TaskCreateRequest, TaskDailyEstimateSetRequest, TaskListRequest, TaskUpdateRequest,
+    self, TaskCreateRequest, TaskDailyEstimateBatchItem, TaskDailyEstimateBatchSetRequest,
+    TaskDailyEstimateSetRequest, TaskListRequest, TaskUpdateRequest,
 };
 use crate::time_tracking::{self, ManualEntryRequest, TimeEntryListRequest};
 use crate::unassigned::{
@@ -222,6 +223,18 @@ fn daily_estimate(database: &Database, task_id: &str, work_date: &str) -> Option
             |row| row.get(0),
         )
         .optional()
+        .unwrap()
+}
+
+fn task_estimate(database: &Database, task_id: &str) -> Option<i64> {
+    database
+        .open()
+        .unwrap()
+        .query_row(
+            "SELECT estimate_minutes FROM tasks WHERE id=?1",
+            [task_id],
+            |row| row.get(0),
+        )
         .unwrap()
 }
 
@@ -1572,6 +1585,92 @@ fn isolated_supabase_planning_two_device_flow() {
         snapshots_after_incremental,
         snapshots_after_business_incremental
     );
+
+    let batch_task = create_task(&device_a, &task.subject_id, "批量普通事项");
+    let batch_recurring = create_task(&device_a, &task.subject_id, "批量重复事项");
+    for created in [&batch_task, &batch_recurring] {
+        cloud_sync::enqueue_entity(
+            &device_a,
+            "task_create",
+            "task",
+            Some(&created.id),
+            None,
+            None,
+        )
+        .unwrap();
+    }
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: None,
+        },
+    )
+    .unwrap();
+    let batch_rule = recurring::save_rule_for_cloud_test(
+        &device_a,
+        RecurrenceSaveRequest {
+            task_id: batch_recurring.id.clone(),
+            task_expected_version: task_version(&device_a, &batch_recurring.id),
+            frequency: "daily".to_string(),
+            weekdays_mask: None,
+            effective_start: today_text.clone(),
+            rule_expected_version: None,
+        },
+        &state_a,
+    )
+    .unwrap();
+    let batch_task = list_tasks(&device_a)
+        .into_iter()
+        .find(|candidate| candidate.id == batch_task.id)
+        .unwrap();
+    let batch_recurring = list_tasks(&device_a)
+        .into_iter()
+        .find(|candidate| candidate.id == batch_recurring.id)
+        .unwrap();
+    tasks::set_task_daily_estimate_batch_for_cloud_test(
+        &device_a,
+        TaskDailyEstimateBatchSetRequest {
+            subject_id: batch_task.subject_id.clone(),
+            work_date: today_text.clone(),
+            items: vec![
+                TaskDailyEstimateBatchItem {
+                    task_id: batch_task.id.clone(),
+                    expected_task_version: batch_task.version,
+                    expected_daily_estimate_version: batch_task.daily_estimate_version,
+                    estimate_minutes: Some(25),
+                },
+                TaskDailyEstimateBatchItem {
+                    task_id: batch_recurring.id.clone(),
+                    expected_task_version: batch_recurring.version,
+                    expected_daily_estimate_version: batch_recurring.daily_estimate_version,
+                    estimate_minutes: Some(35),
+                },
+            ],
+        },
+        &state_a,
+    )
+    .unwrap();
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        daily_estimate(&device_b, &batch_task.id, &today_text),
+        Some(25)
+    );
+    assert_eq!(
+        daily_estimate(&device_b, &batch_recurring.id, &today_text),
+        Some(35)
+    );
+    assert_eq!(task_estimate(&device_b, &batch_recurring.id), Some(35));
+    assert!(batch_rule.version > 0);
 
     let rule = recurring::save_rule_for_cloud_test(
         &device_a,

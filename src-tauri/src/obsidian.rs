@@ -643,6 +643,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskDto> {
         planned_date: row.get(5)?,
         estimate_minutes: row.get(6)?,
         today_estimate_minutes: None,
+        daily_estimate_version: None,
         note: row.get(7)?,
         project_name: row.get(8)?,
         solution_name: row.get(9)?,

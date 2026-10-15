@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::NaiveDate;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -20,6 +20,7 @@ pub struct TaskDto {
     pub planned_date: Option<String>,
     pub estimate_minutes: Option<i64>,
     pub today_estimate_minutes: Option<i64>,
+    pub daily_estimate_version: Option<i64>,
     pub note: Option<String>,
     pub project_name: Option<String>,
     pub solution_name: Option<String>,
@@ -98,6 +99,29 @@ pub struct TaskDailyEstimateDto {
     pub task_id: String,
     pub work_date: String,
     pub estimate_minutes: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskDailyEstimateBatchItem {
+    pub task_id: String,
+    pub expected_task_version: i64,
+    pub expected_daily_estimate_version: Option<i64>,
+    pub estimate_minutes: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskDailyEstimateBatchSetRequest {
+    pub subject_id: String,
+    pub work_date: String,
+    pub items: Vec<TaskDailyEstimateBatchItem>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskDailyEstimateBatchSetResult {
+    pub changed_count: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -502,18 +526,46 @@ fn set_task_daily_estimate_with_cloud_operation(
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
-    let previous_occurrence = crate::recurring::occurrence_for_date(
+    write_daily_estimate_in_transaction(
         &transaction,
         &workspace_id,
         &request.task_id,
         &request.work_date,
+        request.estimate_minutes,
+        now,
+        cloud_state,
+        None,
+        true,
     )?;
-    let occurrence = if request.estimate_minutes.is_some() {
+    bump_revision(&transaction)?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(TaskDailyEstimateDto {
+        task_id: request.task_id,
+        work_date: request.work_date,
+        estimate_minutes: request.estimate_minutes,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_daily_estimate_in_transaction(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    task_id: &str,
+    work_date: &str,
+    estimate_minutes: Option<i64>,
+    now: i64,
+    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+    dependency_operation_id: Option<&str>,
+    ensure_occurrence: bool,
+) -> Result<(), String> {
+    let previous_occurrence =
+        crate::recurring::occurrence_for_date(transaction, workspace_id, task_id, work_date)?;
+    let occurrence = if estimate_minutes.is_some() && ensure_occurrence {
         crate::recurring::ensure_occurrence_if_recurring(
-            &transaction,
-            &workspace_id,
-            &request.task_id,
-            &request.work_date,
+            transaction,
+            workspace_id,
+            task_id,
+            work_date,
             now,
         )?
     } else {
@@ -521,113 +573,227 @@ fn set_task_daily_estimate_with_cloud_operation(
     };
     let previous_estimate: Option<(i64, i64)> = transaction
         .query_row(
-            "SELECT version, created_at FROM task_daily_estimates
-             WHERE workspace_id = ?1 AND task_id = ?2 AND work_date = ?3",
-            params![workspace_id, request.task_id, request.work_date],
+            "SELECT version,created_at FROM task_daily_estimates
+             WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3",
+            params![workspace_id, task_id, work_date],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    if let Some(minutes) = request.estimate_minutes {
+    if let Some(minutes) = estimate_minutes {
         transaction
             .execute(
-                "INSERT INTO task_daily_estimates(
-                    workspace_id, task_id, work_date, estimate_minutes, created_at, updated_at, version
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1)
-                 ON CONFLICT(task_id, work_date) DO UPDATE SET
-                    estimate_minutes = excluded.estimate_minutes,
-                    updated_at = excluded.updated_at,
-                    version = task_daily_estimates.version + 1",
-                params![workspace_id, request.task_id, request.work_date, minutes, now],
+                "INSERT INTO task_daily_estimates(workspace_id,task_id,work_date,estimate_minutes,created_at,updated_at,version)
+                 VALUES(?1,?2,?3,?4,?5,?5,1) ON CONFLICT(task_id,work_date) DO UPDATE SET
+                 estimate_minutes=excluded.estimate_minutes,updated_at=excluded.updated_at,version=task_daily_estimates.version+1",
+                params![workspace_id, task_id, work_date, minutes, now],
             )
             .map_err(|error| error.to_string())?;
     } else {
         transaction
             .execute(
-                "DELETE FROM task_daily_estimates
-                 WHERE workspace_id = ?1 AND task_id = ?2 AND work_date = ?3",
-                params![workspace_id, request.task_id, request.work_date],
+                "DELETE FROM task_daily_estimates WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3",
+                params![workspace_id, task_id, work_date],
             )
             .map_err(|error| error.to_string())?;
     }
-    bump_revision(&transaction)?;
-    if let Some(state) = cloud_state {
-        let occurrence_operation_id = if previous_occurrence.is_none() {
-            if let Some(_occurrence) = occurrence.as_ref() {
-                crate::cloud_sync::enqueue_entity_in_transaction(
-                    &transaction,
-                    state,
-                    "task_occurrence_create_from_daily_estimate",
-                    "task_occurrence",
-                    Some(&crate::recurring::occurrence_entity_id(
-                        &request.task_id,
-                        &request.work_date,
-                    )),
-                    None,
-                    None,
-                )?
-            } else {
-                None
-            }
-        } else {
-            None
+    let Some(state) = cloud_state else {
+        return Ok(());
+    };
+    let occurrence_operation_id = if previous_occurrence.is_none() && occurrence.is_some() {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            transaction,
+            state,
+            "task_occurrence_create_from_daily_estimate",
+            "task_occurrence",
+            Some(&crate::recurring::occurrence_entity_id(task_id, work_date)),
+            None,
+            dependency_operation_id,
+        )?
+    } else {
+        dependency_operation_id.map(str::to_string)
+    };
+    let entity_id = format!("{task_id}|{work_date}");
+    if let Some(minutes) = estimate_minutes {
+        let row: (i64, i64, i64) = transaction
+            .query_row(
+                "SELECT estimate_minutes,created_at,version FROM task_daily_estimates
+                 WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3",
+                params![workspace_id, task_id, work_date],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        crate::cloud_sync::enqueue_payload_in_transaction(
+            transaction,
+            state,
+            "task_daily_estimate_set",
+            "task_daily_estimate",
+            &entity_id,
+            previous_estimate.map(|value| value.0),
+            &json!({"task_id":task_id,"work_date":work_date,"estimate_minutes":minutes,"created_at":row.1,"updated_at":now,"version":row.2}),
+            None,
+            occurrence_operation_id.as_deref(),
+        )?;
+    } else if let Some((previous_version, created_at)) = previous_estimate {
+        crate::cloud_sync::enqueue_payload_in_transaction(
+            transaction,
+            state,
+            "task_daily_estimate_clear",
+            "task_daily_estimate",
+            &entity_id,
+            Some(previous_version),
+            &json!({"task_id":task_id,"work_date":work_date,"deleted":true,"created_at":created_at,"updated_at":now,"version":previous_version + 1}),
+            None,
+            occurrence_operation_id.as_deref(),
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_recurring_estimate_in_transaction(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    task_id: &str,
+    expected_version: i64,
+    work_date: &str,
+    estimate_minutes: i64,
+    now: i64,
+    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+) -> Result<(), String> {
+    let changed = transaction
+        .execute(
+            "UPDATE tasks SET estimate_minutes=?1,updated_at=?2,version=version+1
+             WHERE id=?3 AND workspace_id=?4 AND version=?5 AND deleted_at IS NULL",
+            params![
+                estimate_minutes,
+                now,
+                task_id,
+                workspace_id,
+                expected_version
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err("VERSION_CONFLICT: 事项已被其他窗口或设备更新".to_string());
+    }
+    let task_operation = if let Some(state) = cloud_state {
+        crate::cloud_sync::enqueue_entity_in_transaction(
+            transaction,
+            state,
+            "task_recurring_estimate_set",
+            "task",
+            Some(task_id),
+            Some(expected_version),
+            None,
+        )?
+    } else {
+        None
+    };
+    write_daily_estimate_in_transaction(
+        transaction,
+        workspace_id,
+        task_id,
+        work_date,
+        Some(estimate_minutes),
+        now,
+        cloud_state,
+        task_operation.as_deref(),
+        false,
+    )
+}
+
+fn set_task_daily_estimate_batch_with_cloud_operation(
+    database: &Database,
+    request: TaskDailyEstimateBatchSetRequest,
+    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+) -> Result<TaskDailyEstimateBatchSetResult, String> {
+    validate_date(&request.work_date)?;
+    if request.items.is_empty() {
+        return Ok(TaskDailyEstimateBatchSetResult { changed_count: 0 });
+    }
+    let mut seen = HashSet::new();
+    for item in &request.items {
+        if !seen.insert(item.task_id.as_str()) {
+            return Err("VALIDATION_ERROR: 批量预计不能包含重复事项".to_string());
+        }
+        validate_estimate(item.estimate_minutes)?;
+        if item.estimate_minutes.is_some_and(|minutes| minutes > 1440) {
+            return Err("VALIDATION_ERROR: 单项预计不能超过 24 小时".to_string());
+        }
+    }
+    let mut connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    ensure_subject(&connection, &workspace_id, &request.subject_id)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let now = now_millis();
+
+    for item in &request.items {
+        let task: Option<(String, i64, Option<i64>, bool)> = transaction
+            .query_row(
+                "SELECT subject_id,version,estimate_minutes,
+                        EXISTS(SELECT 1 FROM task_recurrence_rules r WHERE r.task_id=tasks.id AND r.effective_start<=?3 AND (r.effective_end IS NULL OR r.effective_end>=?3))
+                 FROM tasks WHERE id=?1 AND workspace_id=?2 AND deleted_at IS NULL",
+                params![item.task_id, workspace_id, request.work_date],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, i64>(3)? != 0)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((subject_id, version, recurring_estimate, recurring)) = task else {
+            return Err("NOT_FOUND: 事项不存在".to_string());
         };
-        let entity_id = format!("{}|{}", request.task_id, request.work_date);
-        if let Some(minutes) = request.estimate_minutes {
-            let row: (i64, i64, i64) = transaction
-                .query_row(
-                    "SELECT estimate_minutes, created_at, version FROM task_daily_estimates
-                     WHERE workspace_id = ?1 AND task_id = ?2 AND work_date = ?3",
-                    params![workspace_id, request.task_id, request.work_date],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .map_err(|error| error.to_string())?;
-            let payload = json!({
-                "task_id": request.task_id,
-                "work_date": request.work_date,
-                "estimate_minutes": minutes,
-                "created_at": row.1,
-                "updated_at": now,
-                "version": row.2
-            });
-            crate::cloud_sync::enqueue_payload_in_transaction(
+        if subject_id != request.subject_id {
+            return Err("VALIDATION_ERROR: 事项不属于当前主体".to_string());
+        }
+        if version != item.expected_task_version {
+            return Err("VERSION_CONFLICT: 事项已被其他窗口或设备更新".to_string());
+        }
+        let current_daily_version: Option<i64> = transaction
+            .query_row(
+                "SELECT version FROM task_daily_estimates WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3",
+                params![workspace_id, item.task_id, request.work_date],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if current_daily_version != item.expected_daily_estimate_version {
+            return Err("VERSION_CONFLICT: 今日预计已被其他窗口或设备更新".to_string());
+        }
+        if recurring && item.estimate_minutes.is_none() && recurring_estimate.is_some() {
+            return Err("VALIDATION_ERROR: 重复事项仍有每次预计，请在单项编辑中调整".to_string());
+        }
+        if recurring && item.estimate_minutes.is_some() {
+            let minutes = item.estimate_minutes.unwrap_or_default();
+            write_recurring_estimate_in_transaction(
                 &transaction,
-                state,
-                "task_daily_estimate_set",
-                "task_daily_estimate",
-                &entity_id,
-                previous_estimate.map(|value| value.0),
-                &payload,
-                None,
-                occurrence_operation_id.as_deref(),
+                &workspace_id,
+                &item.task_id,
+                item.expected_task_version,
+                &request.work_date,
+                minutes,
+                now,
+                cloud_state,
             )?;
-        } else if let Some((previous_version, created_at)) = previous_estimate {
-            let payload = json!({
-                "task_id": request.task_id,
-                "work_date": request.work_date,
-                "deleted": true,
-                "created_at": created_at,
-                "updated_at": now,
-                "version": previous_version + 1
-            });
-            crate::cloud_sync::enqueue_payload_in_transaction(
+        } else {
+            write_daily_estimate_in_transaction(
                 &transaction,
-                state,
-                "task_daily_estimate_clear",
-                "task_daily_estimate",
-                &entity_id,
-                Some(previous_version),
-                &payload,
+                &workspace_id,
+                &item.task_id,
+                &request.work_date,
+                item.estimate_minutes,
+                now,
+                cloud_state,
                 None,
-                occurrence_operation_id.as_deref(),
+                true,
             )?;
         }
     }
+    bump_revision(&transaction)?;
     transaction.commit().map_err(|error| error.to_string())?;
-    Ok(TaskDailyEstimateDto {
-        task_id: request.task_id,
-        work_date: request.work_date,
-        estimate_minutes: request.estimate_minutes,
+    Ok(TaskDailyEstimateBatchSetResult {
+        changed_count: request.items.len(),
     })
 }
 
@@ -658,70 +824,17 @@ fn set_recurring_task_estimate_with_cloud_operation(
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
-    let previous_estimate: Option<(i64, i64)> = transaction
-        .query_row(
-            "SELECT version,created_at FROM task_daily_estimates WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3",
-            params![workspace_id, request.task_id, request.work_date],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?;
-    let changed = transaction
-        .execute(
-            "UPDATE tasks SET estimate_minutes=?1,updated_at=?2,version=version+1
-             WHERE id=?3 AND workspace_id=?4 AND version=?5 AND deleted_at IS NULL",
-            params![
-                request.estimate_minutes,
-                now,
-                request.task_id,
-                workspace_id,
-                request.expected_version
-            ],
-        )
-        .map_err(|error| error.to_string())?;
-    if changed == 0 {
-        return Err("VERSION_CONFLICT: 事项已被其他窗口或设备更新".to_string());
-    }
-    transaction
-        .execute(
-            "INSERT INTO task_daily_estimates(workspace_id,task_id,work_date,estimate_minutes,created_at,updated_at,version)
-             VALUES(?1,?2,?3,?4,?5,?5,1) ON CONFLICT(task_id,work_date) DO UPDATE SET
-             estimate_minutes=excluded.estimate_minutes,updated_at=excluded.updated_at,version=task_daily_estimates.version+1",
-            params![workspace_id, request.task_id, request.work_date, request.estimate_minutes, now],
-        )
-        .map_err(|error| error.to_string())?;
-    if changed == 0 {
-        return Err("VERSION_CONFLICT: 事项已被其他窗口或设备更新".to_string());
-    }
+    write_recurring_estimate_in_transaction(
+        &transaction,
+        &workspace_id,
+        &request.task_id,
+        request.expected_version,
+        &request.work_date,
+        request.estimate_minutes,
+        now,
+        cloud_state,
+    )?;
     bump_revision(&transaction)?;
-    if let Some(state) = cloud_state {
-        let task_operation = crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            "task_recurring_estimate_set",
-            "task",
-            Some(&request.task_id),
-            Some(request.expected_version),
-            None,
-        )?;
-        let row: (i64, i64, i64) = transaction.query_row(
-            "SELECT estimate_minutes,created_at,version FROM task_daily_estimates WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3",
-            params![workspace_id, request.task_id, request.work_date],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
-        ).map_err(|error| error.to_string())?;
-        let entity_id = format!("{}|{}", request.task_id, request.work_date);
-        crate::cloud_sync::enqueue_payload_in_transaction(
-            &transaction,
-            state,
-            "task_daily_estimate_set",
-            "task_daily_estimate",
-            &entity_id,
-            previous_estimate.map(|value| value.0),
-            &json!({"task_id":request.task_id,"work_date":request.work_date,"estimate_minutes":row.0,"created_at":row.1,"updated_at":now,"version":row.2}),
-            None,
-            task_operation.as_deref(),
-        )?;
-    }
     let result = load_task(&transaction, &request.task_id)?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
@@ -734,6 +847,15 @@ pub(crate) fn set_task_daily_estimate_for_cloud_test(
     cloud_state: &crate::supabase::StorageModeSnapshot,
 ) -> Result<TaskDailyEstimateDto, String> {
     set_task_daily_estimate_with_cloud_operation(database, request, Some(cloud_state))
+}
+
+#[cfg(test)]
+pub(crate) fn set_task_daily_estimate_batch_for_cloud_test(
+    database: &Database,
+    request: TaskDailyEstimateBatchSetRequest,
+    cloud_state: &crate::supabase::StorageModeSnapshot,
+) -> Result<TaskDailyEstimateBatchSetResult, String> {
+    set_task_daily_estimate_batch_with_cloud_operation(database, request, Some(cloud_state))
 }
 
 #[cfg(test)]
@@ -1746,6 +1868,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskDto> {
         planned_date: row.get(5)?,
         estimate_minutes: row.get(6)?,
         today_estimate_minutes: None,
+        daily_estimate_version: None,
         note: row.get(7)?,
         project_name: row.get(8)?,
         solution_name: row.get(9)?,
@@ -1996,19 +2119,28 @@ fn apply_daily_estimates(
     validate_date(work_date)?;
     let mut statement = connection
         .prepare(
-            "SELECT task_id, estimate_minutes FROM task_daily_estimates
+            "SELECT task_id, estimate_minutes, version FROM task_daily_estimates
              WHERE workspace_id = ?1 AND work_date = ?2",
         )
         .map_err(|error| error.to_string())?;
     let estimates = statement
         .query_map(params![workspace_id, work_date], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+            ))
         })
         .map_err(|error| error.to_string())?
         .collect::<Result<HashMap<_, _>, _>>()
         .map_err(|error| error.to_string())?;
     for task in tasks {
-        task.today_estimate_minutes = estimates.get(&task.id).copied();
+        if let Some((minutes, version)) = estimates.get(&task.id).copied() {
+            task.today_estimate_minutes = Some(minutes);
+            task.daily_estimate_version = Some(version);
+        } else {
+            task.today_estimate_minutes = None;
+            task.daily_estimate_version = None;
+        }
     }
     Ok(())
 }
@@ -2414,6 +2546,19 @@ pub fn task_daily_estimate_set(
     crate::supabase::ensure_repository_write_mode(&database)?;
     let state = crate::supabase::storage_mode(&database)?;
     let result = set_task_daily_estimate_with_cloud_operation(&database, request, Some(&state))?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn task_daily_estimate_batch_set(
+    database: tauri::State<'_, Database>,
+    request: TaskDailyEstimateBatchSetRequest,
+) -> Result<TaskDailyEstimateBatchSetResult, String> {
+    crate::supabase::ensure_repository_write_mode(&database)?;
+    let state = crate::supabase::storage_mode(&database)?;
+    let result =
+        set_task_daily_estimate_batch_with_cloud_operation(&database, request, Some(&state))?;
     crate::cloud_sync::flush_if_online(&database)?;
     Ok(result)
 }
@@ -3444,6 +3589,181 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn daily_estimate_list_exposes_record_version_without_faking_recurring_fallback() {
+        let database = database();
+        let task = create_leaf_task(&database, "版本预计");
+        set_task_daily_estimate(
+            &database,
+            TaskDailyEstimateSetRequest {
+                task_id: task.id.clone(),
+                work_date: "2026-10-20".to_string(),
+                estimate_minutes: Some(45),
+            },
+        )
+        .unwrap();
+        let listed = list_tasks(
+            &database,
+            TaskListRequest {
+                subject_id: Some(task.subject_id.clone()),
+                include_completed: Some(false),
+                planned_date: None,
+                today_date: Some("2026-10-20".to_string()),
+                today_only: Some(false),
+                daily_estimate_date: Some("2026-10-20".to_string()),
+                query: None,
+            },
+        )
+        .unwrap();
+        let row = listed.tasks.iter().find(|item| item.id == task.id).unwrap();
+        assert_eq!(row.today_estimate_minutes, Some(45));
+        assert_eq!(row.daily_estimate_version, Some(1));
+
+        let recurring_base = create_leaf_task(&database, "重复版本预计");
+        crate::recurring::save_rule(
+            &database,
+            crate::recurring::RecurrenceSaveRequest {
+                task_id: recurring_base.id.clone(),
+                task_expected_version: recurring_base.version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: "2026-10-20".to_string(),
+                rule_expected_version: None,
+            },
+        )
+        .unwrap();
+        let recurring = update_task(
+            &database,
+            TaskUpdateRequest {
+                id: recurring_base.id,
+                expected_version: recurring_base.version + 1,
+                title: None,
+                parent_id: None,
+                planned_date: None,
+                estimate_minutes: Some(Some(30)),
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let listed = list_tasks(
+            &database,
+            TaskListRequest {
+                subject_id: Some(task.subject_id),
+                include_completed: Some(false),
+                planned_date: None,
+                today_date: Some("2026-10-20".to_string()),
+                today_only: Some(false),
+                daily_estimate_date: Some("2026-10-20".to_string()),
+                query: None,
+            },
+        )
+        .unwrap();
+        let row = listed
+            .tasks
+            .iter()
+            .find(|item| item.id == recurring.id)
+            .unwrap();
+        assert_eq!(row.today_estimate_minutes, Some(30));
+        assert_eq!(row.daily_estimate_version, None);
+    }
+
+    #[test]
+    fn daily_estimate_batch_is_atomic_and_checks_versions() {
+        let database = database();
+        let first = create_leaf_task(&database, "批量一");
+        let second = create_leaf_task(&database, "批量二");
+        let saved = set_task_daily_estimate_batch_with_cloud_operation(
+            &database,
+            TaskDailyEstimateBatchSetRequest {
+                subject_id: first.subject_id.clone(),
+                work_date: "2026-10-21".to_string(),
+                items: vec![
+                    TaskDailyEstimateBatchItem {
+                        task_id: first.id.clone(),
+                        expected_task_version: first.version,
+                        expected_daily_estimate_version: None,
+                        estimate_minutes: Some(30),
+                    },
+                    TaskDailyEstimateBatchItem {
+                        task_id: second.id.clone(),
+                        expected_task_version: second.version,
+                        expected_daily_estimate_version: None,
+                        estimate_minutes: Some(60),
+                    },
+                ],
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(saved.changed_count, 2);
+
+        let error = set_task_daily_estimate_batch_with_cloud_operation(
+            &database,
+            TaskDailyEstimateBatchSetRequest {
+                subject_id: first.subject_id,
+                work_date: "2026-10-21".to_string(),
+                items: vec![
+                    TaskDailyEstimateBatchItem {
+                        task_id: first.id.clone(),
+                        expected_task_version: first.version,
+                        expected_daily_estimate_version: Some(1),
+                        estimate_minutes: Some(45),
+                    },
+                    TaskDailyEstimateBatchItem {
+                        task_id: second.id.clone(),
+                        expected_task_version: second.version + 1,
+                        expected_daily_estimate_version: Some(1),
+                        estimate_minutes: None,
+                    },
+                ],
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("VERSION_CONFLICT"));
+        let connection = database.open().unwrap();
+        let values = [&first.id, &second.id]
+            .into_iter()
+            .map(|task_id| {
+                connection
+                    .query_row(
+                        "SELECT estimate_minutes FROM task_daily_estimates WHERE task_id=?1 AND work_date='2026-10-21'",
+                        [task_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![30, 60]);
+
+        let duplicate_error = set_task_daily_estimate_batch_with_cloud_operation(
+            &database,
+            TaskDailyEstimateBatchSetRequest {
+                subject_id: second.subject_id,
+                work_date: "2026-10-22".to_string(),
+                items: vec![
+                    TaskDailyEstimateBatchItem {
+                        task_id: second.id.clone(),
+                        expected_task_version: second.version,
+                        expected_daily_estimate_version: None,
+                        estimate_minutes: Some(15),
+                    },
+                    TaskDailyEstimateBatchItem {
+                        task_id: second.id,
+                        expected_task_version: second.version,
+                        expected_daily_estimate_version: None,
+                        estimate_minutes: None,
+                    },
+                ],
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(duplicate_error.contains("重复事项"));
     }
 
     #[test]

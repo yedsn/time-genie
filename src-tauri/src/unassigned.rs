@@ -305,13 +305,6 @@ fn resolve_work_with_cloud_operation(
     if total <= 0 {
         return Err("VALIDATION_ERROR: 请至少分配 1 分钟到事项".to_string());
     }
-    if total > state.required_minutes {
-        return Err(format!(
-            "ALLOCATION_EXCEEDS_DURATION: 分配时间超出未归属时间 {} 分钟",
-            total - state.required_minutes
-        ));
-    }
-
     let entry_id = Uuid::now_v7().to_string();
     let completed_task_outbox = merged
         .iter()
@@ -1728,6 +1721,48 @@ mod tests {
         .unwrap();
         assert_eq!(result.resolution_type, "discard");
         assert!(result.generated_entry_id.is_some());
+    }
+
+    #[test]
+    fn allows_allocation_over_unassigned_duration() {
+        let (database, task_id) = setup();
+        let initial = get_state(&database).unwrap().unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE unassigned_segments SET started_at = started_at - 120000 WHERE session_id = ?1 AND ended_at IS NULL",
+                [&initial.session_id],
+            )
+            .unwrap();
+        let due = get_state(&database).unwrap().unwrap();
+        let allocated_minutes = due.required_minutes + 5;
+        let result = resolve_work(
+            &database,
+            ResolveWorkRequest {
+                session_id: due.session_id,
+                allocations: vec![UnassignedAllocationInput {
+                    task_id,
+                    minutes: allocated_minutes,
+                    complete_task: false,
+                    task_expected_version: None,
+                }],
+                expected_version: due.version,
+                operation_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        let entry_id = result.generated_entry_id.unwrap();
+        let saved_minutes: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(SUM(minutes), 0) FROM time_allocations WHERE entry_id = ?1",
+                [entry_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved_minutes, allocated_minutes);
     }
 
     #[test]

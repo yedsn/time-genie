@@ -51,6 +51,7 @@ import {
   saveTaskRecurrence,
   closeTaskRecurrence,
   setTaskDailyEstimate,
+  setTaskDailyEstimateBatch,
   setRecurringTaskEstimate,
   startTimerRecord,
   stopTimerRecord,
@@ -92,6 +93,7 @@ export type Task = {
   planDate?: string;
   estimate?: number;
   todayEstimate?: number;
+  dailyEstimateVersion?: number;
   actual: number;
   directMinutes: number;
   status: TaskStatus;
@@ -440,6 +442,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       planDate: task.plannedDate,
       estimate: task.estimateMinutes,
       todayEstimate: task.todayEstimateMinutes,
+      dailyEstimateVersion: task.dailyEstimateVersion,
       actual: task.totalMinutes,
       directMinutes: task.directMinutes,
       status: task.status,
@@ -1419,6 +1422,18 @@ export const useWorkdayStore = defineStore("workday", () => {
     await Promise.all([loadWorkspaceData(), loadTodayOverview()]);
   }
 
+  async function saveTaskEstimateBatch(items: Array<{
+    taskId: string;
+    expectedTaskVersion: number;
+    expectedDailyEstimateVersion?: number;
+    estimateMinutes?: number;
+  }>) {
+    if (!selectedSubjectId.value || !items.length) return;
+    const todayDate = await ensureWorkspaceCalendar();
+    await setTaskDailyEstimateBatch(selectedSubjectId.value, todayDate, items);
+    await Promise.all([loadWorkspaceData(), loadTodayOverview()]);
+  }
+
   async function openTimerStopConfirmation(entryId: string) {
     timerStopConfirmation.value = undefined;
     timerStopConfirmationEntryId.value = entryId;
@@ -1757,7 +1772,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     now, todayMinutes, allocatedMinutes, pendingMinutes, doneCount, todayCompletionDoneCount, todayCompletionTotalCount, todayCompletionPercent, unassignedSeconds, unassignedStartedAt,
     unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen, unassignedWorkDate, unassignedSessionId,
     unassignedCurrentSession,
-    workspaceLoaded, workspaceLoading, loadWorkspaceData, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addChildTask, addTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, duplicateTask, deleteTask, moveTask, reorderTask, movePlanTask,
+    workspaceLoaded, workspaceLoading, loadWorkspaceData, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addChildTask, addTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, duplicateTask, deleteTask, moveTask, reorderTask, movePlanTask,
     indentTask, outdentTask, startTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, adjustTimerStopAllocation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, loadReportTemplates, createReportTemplate, updateReportTemplate, duplicateReportTemplate, setDefaultReportTemplate, deleteReportTemplate, reorderReportTemplates, getReportTemplatePlaceholders, publicReportText, previewObsidianReport, writeObsidianReport,
     beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, dismissUnassignedResolution, resolveUnassignedTime
   };

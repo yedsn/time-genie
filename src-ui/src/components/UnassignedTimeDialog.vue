@@ -6,7 +6,7 @@ import { useWorkdayStore } from "../store";
 import TaskSelectControl from "./TaskSelectControl.vue";
 import { playCompletionFeedback } from "../services/completionFeedback";
 import { remainingOpenTaskCount } from "../services/completionFeedbackCore";
-import { clampPartialAllocationMinutes, partialAllocationMaximum } from "../services/allocationMath";
+import { clampPartialAllocationMinutes } from "../services/allocationMath";
 
 type TaskSelectControlInstance = { commit: () => string | undefined };
 type AllocationDraft = { id: string; taskId: string; minutes: number; completeTask: boolean };
@@ -89,17 +89,12 @@ function removeAllocation(id: string) {
   allocations.splice(index, 1);
 }
 
-function allocationInputMaximum(index: number) {
-  return partialAllocationMaximum(allocations.map((item) => item.minutes), index, requiredMinutes.value);
-}
-
 function updateAllocationMinutes(index: number, event: Event) {
   const input = event.currentTarget as HTMLInputElement;
   const nextMinutes = clampPartialAllocationMinutes(
     allocations.map((item) => item.minutes),
     index,
     input.value,
-    requiredMinutes.value,
   );
   nextMinutes.forEach((minutes, currentIndex) => allocations[currentIndex].minutes = minutes);
   input.value = String(nextMinutes[index]);
@@ -133,10 +128,6 @@ async function assignTime(event?: MouseEvent) {
   }
   if (positiveAllocations.some((allocation) => !allocation.taskId || !store.tasks.some((task) => task.id === allocation.taskId))) {
     ElMessage.warning("请为每一行选择一个具体事项");
-    return;
-  }
-  if (remainingMinutes.value < 0) {
-    ElMessage.warning(`分配时间超出 ${Math.abs(remainingMinutes.value)} 分钟`);
     return;
   }
   saving.value = true;
@@ -221,7 +212,7 @@ function errorText(error: unknown, fallback: string) {
     <section class="unassigned-allocation-editor">
       <div class="unassigned-allocation-head">
         <span>分配到事项</span>
-        <strong :class="{ invalid: remainingMinutes < 0 }">
+        <strong>
           {{ remainingMinutes === 0 ? `已分配 ${requiredMinutes} 分钟` : remainingMinutes > 0 ? `剩余 ${remainingMinutes} 分钟` : `超出 ${Math.abs(remainingMinutes)} 分钟` }}
         </strong>
       </div>
@@ -233,7 +224,7 @@ function errorText(error: unknown, fallback: string) {
           placeholder="选择或输入临时事项"
           aria-label="未归属时间对应事项"
         />
-        <label><input :value="allocation.minutes" min="0" :max="allocationInputMaximum(allocationIndex)" type="number" @input="updateAllocationMinutes(allocationIndex, $event)" /><span>分钟</span></label>
+        <label><input :value="allocation.minutes" min="0" type="number" @input="updateAllocationMinutes(allocationIndex, $event)" /><span>分钟</span></label>
         <label class="allocation-complete-toggle" title="保存工时时同时完成这个事项">
           <input v-model="allocation.completeTask" type="checkbox" />
           <span>同时完成</span>

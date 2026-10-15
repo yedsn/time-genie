@@ -457,12 +457,17 @@ mod tests {
                     render_icon_at_size(&presentation(state).rgba().unwrap(), size, background)
                 });
 
-                for pixels in &rendered {
+                for (state_index, pixels) in rendered.iter().enumerate() {
                     let visible = pixels
                         .iter()
                         .filter(|pixel| **pixel != background)
                         .collect::<Vec<_>>();
-                    assert!(visible.len() >= size * size / 2);
+                    let minimum_visible = if state_index == 2 {
+                        size * size / 4
+                    } else {
+                        size * size / 2
+                    };
+                    assert!(visible.len() >= minimum_visible);
                     let luminance = visible
                         .iter()
                         .map(|pixel| {
@@ -479,7 +484,7 @@ mod tests {
                 assert_ne!(rendered[1], rendered[2]);
                 assert_ne!(rendered[0], rendered[2]);
 
-                let average = rendered.map(|pixels| {
+                let average = rendered.each_ref().map(|pixels| {
                     let visible = pixels
                         .iter()
                         .filter(|pixel| **pixel != background)
@@ -494,9 +499,19 @@ mod tests {
                     let count = visible.len() as u32;
                     (sum.0 / count, sum.1 / count, sum.2 / count)
                 });
-                assert!(average[0].1 > average[0].0 + 25 && average[0].1 > average[0].2 + 10);
-                assert!(average[1].0 > average[1].2 + 50 && average[1].1 > average[1].2 + 45);
-                assert!(average[2].0 > 120 && average[2].1 > 130 && average[2].2 > 140);
+                assert!(
+                    u32::from(average[0].1) > u32::from(average[0].0) + 25
+                        && u32::from(average[0].1) > u32::from(average[0].2) + 10
+                );
+                assert!(
+                    u32::from(average[1].0) > u32::from(average[1].2) + 50
+                        && u32::from(average[1].1) > u32::from(average[1].2) + 45
+                );
+                let idle_pixels = &rendered[2];
+                assert!(idle_pixels.iter().any(|pixel| {
+                    u32::from(pixel.0) > u32::from(pixel.1) + 70
+                        && u32::from(pixel.0) > u32::from(pixel.2) + 60
+                }));
             }
         }
     }

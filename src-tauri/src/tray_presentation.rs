@@ -4,6 +4,20 @@ use crate::time_tracking::TimeEntryDto;
 
 pub const DEFAULT_TRAY_ICON_STYLE: &str = "status-orb";
 const ICON_SIZE: usize = 32;
+const ICON_PIXELS: usize = ICON_SIZE * ICON_SIZE;
+
+const PLAY_CIRCLE_MASK: &[u8; ICON_PIXELS] =
+    include_bytes!("../assets/tray-icons/material-symbols-play-circle-rounded.alpha");
+const PAUSE_CIRCLE_MASK: &[u8; ICON_PIXELS] =
+    include_bytes!("../assets/tray-icons/material-symbols-pause-circle-rounded.alpha");
+const STOP_CIRCLE_MASK: &[u8; ICON_PIXELS] =
+    include_bytes!("../assets/tray-icons/material-symbols-stop-circle-rounded.alpha");
+const PLAY_MASK: &[u8; ICON_PIXELS] =
+    include_bytes!("../assets/tray-icons/material-symbols-play-arrow-rounded.alpha");
+const PAUSE_MASK: &[u8; ICON_PIXELS] =
+    include_bytes!("../assets/tray-icons/material-symbols-pause-rounded.alpha");
+const STOP_MASK: &[u8; ICON_PIXELS] =
+    include_bytes!("../assets/tray-icons/material-symbols-stop-rounded.alpha");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayIconStyle {
@@ -142,125 +156,40 @@ fn state_color(state: TrayTimerState) -> (u8, u8, u8) {
     match state {
         TrayTimerState::Running => (25, 195, 125),
         TrayTimerState::Paused => (233, 185, 73),
-        TrayTimerState::Idle => (190, 202, 216),
-    }
-}
-
-fn state_mark_color(state: TrayTimerState) -> (u8, u8, u8) {
-    match state {
-        TrayTimerState::Idle => (72, 89, 108),
-        TrayTimerState::Running | TrayTimerState::Paused => (250, 252, 251),
+        TrayTimerState::Idle => (218, 58, 67),
     }
 }
 
 fn draw_status_orb(state: TrayTimerState) -> Vec<u8> {
-    let mut rgba = vec![0u8; ICON_SIZE * ICON_SIZE * 4];
-    let center = 15.5f64;
-    let radius = 15.15f64;
-    let color = state_color(state);
-    for y in 0..ICON_SIZE {
-        for x in 0..ICON_SIZE {
-            let dx = x as f64 - center;
-            let dy = y as f64 - center;
-            let distance = (dx * dx + dy * dy).sqrt();
-            if distance > radius {
-                continue;
-            }
-            let mut pixel = color;
-            if distance > radius - 2.0 {
-                pixel = if state == TrayTimerState::Idle {
-                    blend(pixel, state_mark_color(state), 0.18)
-                } else {
-                    blend(pixel, (245, 248, 247), 0.42)
-                };
-            } else if x < 12 && y < 12 {
-                pixel = blend(pixel, (255, 255, 255), 0.18);
-            }
-            set_pixel(&mut rgba, x, y, pixel, 255);
-        }
-    }
-    draw_state_mark(&mut rgba, state, state_mark_color(state), true);
-    rgba
+    render_icon_mask(circle_mask(state), state_color(state))
 }
 
 fn draw_minimal(state: TrayTimerState) -> Vec<u8> {
-    let mut rgba = vec![0u8; ICON_SIZE * ICON_SIZE * 4];
-    let color = state_color(state);
-    for y in 2..ICON_SIZE - 2 {
-        for x in 2..ICON_SIZE - 2 {
-            let border = x < 5 || x >= ICON_SIZE - 5 || y < 5 || y >= ICON_SIZE - 5;
-            set_pixel(
-                &mut rgba,
-                x,
-                y,
-                if border {
-                    if state == TrayTimerState::Idle {
-                        blend(color, state_mark_color(state), 0.16)
-                    } else {
-                        blend(color, (255, 255, 255), 0.28)
-                    }
-                } else {
-                    color
-                },
-                255,
-            );
-        }
-    }
-    draw_state_mark(&mut rgba, state, state_mark_color(state), false);
-    rgba
+    render_icon_mask(minimal_mask(state), state_color(state))
 }
 
-fn draw_state_mark(rgba: &mut [u8], state: TrayTimerState, mark: (u8, u8, u8), rounded_idle: bool) {
+fn circle_mask(state: TrayTimerState) -> &'static [u8; ICON_PIXELS] {
     match state {
-        TrayTimerState::Running => {
-            for y in 8..24 {
-                let half_width = if y <= 15 { y - 7 } else { 24 - y };
-                for x in 11..=11 + half_width {
-                    set_pixel(rgba, x, y, mark, 255);
-                }
-            }
-        }
-        TrayTimerState::Paused => {
-            for y in 8..24 {
-                for x in 9..14 {
-                    set_pixel(rgba, x, y, mark, 255);
-                }
-                for x in 18..23 {
-                    set_pixel(rgba, x, y, mark, 255);
-                }
-            }
-        }
-        TrayTimerState::Idle => {
-            for y in 7..25 {
-                for x in 7..25 {
-                    let dx = x as f64 - 15.5;
-                    let dy = y as f64 - 15.5;
-                    let distance = (dx * dx + dy * dy).sqrt();
-                    let on_ring = if rounded_idle {
-                        (6.1..=8.4).contains(&distance)
-                    } else {
-                        x == 7 || x == 24 || y == 7 || y == 24
-                    };
-                    if on_ring {
-                        set_pixel(rgba, x, y, mark, 255);
-                    }
-                }
-            }
-        }
+        TrayTimerState::Running => PLAY_CIRCLE_MASK,
+        TrayTimerState::Paused => PAUSE_CIRCLE_MASK,
+        TrayTimerState::Idle => STOP_CIRCLE_MASK,
     }
 }
 
-fn set_pixel(rgba: &mut [u8], x: usize, y: usize, color: (u8, u8, u8), alpha: u8) {
-    let index = (y * ICON_SIZE + x) * 4;
-    rgba[index] = color.0;
-    rgba[index + 1] = color.1;
-    rgba[index + 2] = color.2;
-    rgba[index + 3] = alpha;
+fn minimal_mask(state: TrayTimerState) -> &'static [u8; ICON_PIXELS] {
+    match state {
+        TrayTimerState::Running => PLAY_MASK,
+        TrayTimerState::Paused => PAUSE_MASK,
+        TrayTimerState::Idle => STOP_MASK,
+    }
 }
 
-fn blend(base: (u8, u8, u8), top: (u8, u8, u8), amount: f64) -> (u8, u8, u8) {
-    let mix = |a: u8, b: u8| (a as f64 + (b as f64 - a as f64) * amount) as u8;
-    (mix(base.0, top.0), mix(base.1, top.1), mix(base.2, top.2))
+fn render_icon_mask(mask: &[u8; ICON_PIXELS], color: (u8, u8, u8)) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(ICON_PIXELS * 4);
+    for alpha in mask {
+        rgba.extend_from_slice(&[color.0, color.1, color.2, *alpha]);
+    }
+    rgba
 }
 
 #[cfg(test)]
@@ -365,25 +294,18 @@ mod tests {
             TrayTimerState::Idle,
         ]
         .map(|state| {
-            let mark = state_mark_color(state);
             draw_status_orb(state)
                 .chunks_exact(4)
-                .map(|pixel| (pixel[0], pixel[1], pixel[2]) == mark)
+                .map(|pixel| pixel[3] > 127)
                 .collect::<Vec<_>>()
         });
 
         assert_ne!(silhouettes[0], silhouettes[1]);
         assert_ne!(silhouettes[1], silhouettes[2]);
         assert_ne!(silhouettes[0], silhouettes[2]);
-
-        let marked =
-            |state_index: usize, x: usize, y: usize| silhouettes[state_index][y * ICON_SIZE + x];
-        assert!(!marked(0, 9, 15));
-        assert!(marked(1, 9, 15));
-        assert!(marked(0, 16, 15));
-        assert!(!marked(1, 16, 15));
-        assert!(marked(2, 15, 8));
-        assert!(!marked(2, 15, 15));
+        assert!(!silhouettes[0][15 * ICON_SIZE + 15]);
+        assert!(silhouettes[1][15 * ICON_SIZE + 15]);
+        assert!(!silhouettes[2][15 * ICON_SIZE + 15]);
     }
 
     #[test]
@@ -413,16 +335,13 @@ mod tests {
     }
 
     #[test]
-    fn idle_status_orb_is_light_with_a_clear_dark_hollow_mark() {
+    fn idle_status_icon_uses_the_material_symbols_stop_circle_mask() {
         let rgba = draw_status_orb(TrayTimerState::Idle);
-        let pixel = |x: usize, y: usize| {
-            let index = (y * ICON_SIZE + x) * 4;
-            (rgba[index], rgba[index + 1], rgba[index + 2])
-        };
-        let fill = pixel(15, 15);
-        let mark = pixel(15, 8);
-
-        assert!(fill.0 >= 185 && fill.1 >= 195 && fill.2 >= 210);
-        assert!(mark.0 < fill.0 && mark.1 < fill.1 && mark.2 < fill.2);
+        assert!(rgba
+            .chunks_exact(4)
+            .zip(STOP_CIRCLE_MASK)
+            .all(|(pixel, alpha)| pixel == [218, 58, 67, *alpha]));
+        assert_eq!(rgba[(15 * ICON_SIZE + 15) * 4 + 3], 0);
+        assert!(rgba[(2 * ICON_SIZE + 15) * 4 + 3] > 0);
     }
 }

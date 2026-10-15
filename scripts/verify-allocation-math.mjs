@@ -8,7 +8,6 @@ const {
   normalizeAllocationMinutes,
   allocationMaximum,
   rebalanceAllocationMinutes,
-  partialAllocationMaximum,
   clampPartialAllocationMinutes,
 } = await import(pathToFileURL(modulePath));
 
@@ -26,17 +25,13 @@ assert.deepEqual(rebalanceAllocationMinutes([20, 10], 0, 15, 30), [15, 15]);
 assert.deepEqual(rebalanceAllocationMinutes([20, 10, 0], 0, 25, 30), [25, 5, 0]);
 assert.deepEqual(rebalanceAllocationMinutes([30], 0, 40, 30), [30]);
 
-assert.equal(partialAllocationMaximum([30, 0], 1, 30), 0);
-assert.equal(partialAllocationMaximum([20, 0], 1, 30), 10);
-assert.equal(partialAllocationMaximum([10, 20, 0], 2, 30), 0);
-
-assert.deepEqual(clampPartialAllocationMinutes([30, 0], 1, 10, 30), [30, 0]);
-assert.deepEqual(clampPartialAllocationMinutes([20, 0], 1, 10, 30), [20, 10]);
-assert.deepEqual(clampPartialAllocationMinutes([10, 20, 0], 2, 15, 30), [10, 20, 0]);
-assert.deepEqual(clampPartialAllocationMinutes([10, 5, 0], 2, 50, 30), [10, 5, 15]);
-assert.deepEqual(clampPartialAllocationMinutes([20, 10], 0, 15, 30), [15, 10]);
-assert.deepEqual(clampPartialAllocationMinutes([20, 10, 0], 0, 25, 30), [20, 10, 0]);
-assert.deepEqual(clampPartialAllocationMinutes([30], 0, 40, 30), [30]);
+assert.deepEqual(clampPartialAllocationMinutes([30, 0], 1, 10), [30, 10]);
+assert.deepEqual(clampPartialAllocationMinutes([20, 0], 1, 10), [20, 10]);
+assert.deepEqual(clampPartialAllocationMinutes([10, 20, 0], 2, 15), [10, 20, 15]);
+assert.deepEqual(clampPartialAllocationMinutes([10, 5, 0], 2, 50), [10, 5, 50]);
+assert.deepEqual(clampPartialAllocationMinutes([20, 10], 0, 15), [15, 10]);
+assert.deepEqual(clampPartialAllocationMinutes([20, 10, 0], 0, 25), [25, 10, 0]);
+assert.deepEqual(clampPartialAllocationMinutes([30], 0, 40), [40]);
 
 const temporaryOutput = resolve(".tmp-allocation-math-test");
 if (temporaryOutput.startsWith(resolve("."))) rmSync(temporaryOutput, { recursive: true, force: true });

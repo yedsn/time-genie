@@ -772,7 +772,7 @@ pub fn list_time_entries(
         entries,
         raw_minutes,
         allocated_minutes,
-        pending_minutes: raw_minutes - allocated_minutes,
+        pending_minutes: (raw_minutes - allocated_minutes).max(0),
         break_minutes,
         revision,
     })
@@ -1059,7 +1059,6 @@ fn update_time_entry_with_cloud_operation(
         return Err("VALIDATION_ERROR: 结束时间必须晚于开始时间".to_string());
     }
     let duration_seconds = (request.ended_at - request.started_at) / 1_000;
-    let minutes = settlement_minutes(duration_seconds);
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     let transaction = connection
@@ -1073,19 +1072,6 @@ fn update_time_entry_with_cloud_operation(
     )?;
     if state != "ended" {
         return Err("VALIDATION_ERROR: 只能修正已结束的时间记录".to_string());
-    }
-    let allocated: i64 = transaction
-        .query_row(
-            "SELECT COALESCE(SUM(minutes), 0) FROM time_allocations WHERE entry_id = ?1",
-            [&request.entry_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    if allocated > minutes {
-        return Err(format!(
-            "ALLOCATION_EXCEEDS_DURATION: 分配时间超出修正后的原始时间 {} 分钟",
-            allocated - minutes
-        ));
     }
     let now = now_millis();
     transaction
@@ -1274,12 +1260,6 @@ fn replace_allocations_with_cloud_operation(
         }
     }
     let total: i64 = merged.values().map(|(minutes, _, _, _)| *minutes).sum();
-    if total > current.settlement_minutes {
-        return Err(format!(
-            "ALLOCATION_EXCEEDS_DURATION: 分配时间超出原始时间 {} 分钟",
-            total - current.settlement_minutes
-        ));
-    }
     let completed_task_outbox = merged
         .iter()
         .filter_map(|(task_id, (_, _, complete_task, expected_version))| {
@@ -3849,7 +3829,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_entry_and_allocation_validation_work() {
+    fn manual_entry_allows_allocation_over_duration() {
         let (database, _, task_id) = setup();
         let manual = create_manual_entry(
             &database,
@@ -3883,7 +3863,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(allocated.allocated_minutes, 30);
-        assert!(replace_allocations(
+        let overallocated = replace_allocations(
             &database,
             AllocationReplaceRequest {
                 entry_id: manual.id,
@@ -3895,9 +3875,20 @@ mod tests {
                     task_expected_version: None,
                 }],
                 expected_version: allocated.version,
-            }
+            },
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(overallocated.settlement_minutes, 30);
+        assert_eq!(overallocated.allocated_minutes, 31);
+        let summary = list_time_entries(
+            &database,
+            TimeEntryListRequest {
+                work_date: test_work_date(),
+                include_breaks: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(summary.pending_minutes, 0);
     }
 
     #[test]
@@ -4423,7 +4414,7 @@ mod tests {
     }
 
     #[test]
-    fn corrected_entry_preserves_valid_reallocation() {
+    fn corrected_entry_preserves_allocation_over_corrected_duration() {
         let (database, _, task_id) = setup();
         let manual = create_manual_entry(
             &database,
@@ -4460,13 +4451,13 @@ mod tests {
             TimeEntryUpdateRequest {
                 entry_id: manual.id.clone(),
                 started_at: manual.started_at,
-                ended_at: manual.started_at + 25 * 60_000,
-                note: Some("修正为 25 分钟".to_string()),
+                ended_at: manual.started_at + 15 * 60_000,
+                note: Some("修正为 15 分钟".to_string()),
                 expected_version: allocated.version,
             },
         )
         .unwrap();
-        assert_eq!(corrected.settlement_minutes, 25);
+        assert_eq!(corrected.settlement_minutes, 15);
         assert_eq!(corrected.allocated_minutes, 20);
 
         let reallocated = replace_allocations(
@@ -4484,7 +4475,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(reallocated.settlement_minutes, 25);
+        assert_eq!(reallocated.settlement_minutes, 15);
         assert_eq!(reallocated.allocated_minutes, 25);
         assert_eq!(reallocated.allocations.len(), 1);
     }

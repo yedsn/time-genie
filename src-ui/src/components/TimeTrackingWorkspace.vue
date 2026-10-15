@@ -6,7 +6,7 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { useWorkdayStore, type TimeEntry, type TimeEntryHistoryDay } from "../store";
 import TaskSelectControl from "./TaskSelectControl.vue";
 import { playCompletionFeedback } from "../services/completionFeedback";
-import { clampPartialAllocationMinutes, partialAllocationMaximum } from "../services/allocationMath";
+import { clampPartialAllocationMinutes } from "../services/allocationMath";
 import { historyDateLabel, historyPaginationState } from "../services/timeEntryHistoryCore";
 import { executeTimeAllocationExport, previewTimeAllocationExport, type TimeAllocationExportPreview } from "../services/tauri";
 import { defaultExportDraft, ensureXlsxExtension, exportRangeError, LatestRequestGuard } from "../services/timeAllocationExportCore";
@@ -376,10 +376,6 @@ function removeAllocation(entry: TimeEntry, allocationId: string) {
   drafts.splice(index, 1);
 }
 
-function allocationInputMaximum(entry: TimeEntry, index: number) {
-  return partialAllocationMaximum(ensureDraft(entry).map((item) => item.minutes), index, entry.minutes);
-}
-
 function updateAllocationMinutes(entry: TimeEntry, index: number, event: Event) {
   const input = event.currentTarget as HTMLInputElement;
   const drafts = ensureDraft(entry);
@@ -387,7 +383,6 @@ function updateAllocationMinutes(entry: TimeEntry, index: number, event: Event) 
     drafts.map((item) => item.minutes),
     index,
     input.value,
-    entry.minutes,
   );
   nextMinutes.forEach((minutes, currentIndex) => drafts[currentIndex].minutes = minutes);
   input.value = String(nextMinutes[index]);
@@ -397,11 +392,6 @@ async function saveAllocation(entry: TimeEntry) {
   for (const draft of ensureDraft(entry)) {
     const taskId = allocationTaskControls.get(draft.id)?.commit();
     if (taskId) draft.taskId = taskId;
-  }
-  const total = allocationTotal(entry);
-  if (total > entry.minutes) {
-    ElMessage.warning(`分配时间超出 ${total - entry.minutes} 分钟`);
-    return;
   }
   allocationSavingId.value = entry.id;
   try {
@@ -651,7 +641,7 @@ defineExpose({ focusTaskSelector });
               </div>
               <div class="allocation-summary-line">
                 <span><Split :size="14" />分配 {{ allocationTotal(entry) }} / {{ entry.minutes }} 分钟</span>
-                <strong :class="{ invalid: allocationRemaining(entry) < 0 }">
+                <strong>
                   {{ allocationRemaining(entry) >= 0 ? `剩余 ${allocationRemaining(entry)} 分钟` : `超出 ${Math.abs(allocationRemaining(entry))} 分钟` }}
                 </strong>
               </div>
@@ -663,7 +653,7 @@ defineExpose({ focusTaskSelector });
                   placeholder="选择或输入临时事项"
                   aria-label="分配事项"
                 />
-                <label><input :value="allocation.minutes" min="0" :max="allocationInputMaximum(entry, allocationIndex)" type="number" @input="updateAllocationMinutes(entry, allocationIndex, $event)" /><span>分钟</span></label>
+                <label><input :value="allocation.minutes" min="0" type="number" @input="updateAllocationMinutes(entry, allocationIndex, $event)" /><span>分钟</span></label>
                 <label class="allocation-complete-toggle" title="保存工时时同时完成这个事项">
                   <input v-model="allocation.completeTask" type="checkbox" />
                   <span>同时完成</span>
@@ -679,7 +669,7 @@ defineExpose({ focusTaskSelector });
                 <div class="inline-allocation-primary-actions">
                   <button class="secondary-button compact" type="button" :disabled="allocationSavingId === entry.id || allocationTotal(entry) <= 0" @click="clearAllocation(entry)"><Eraser :size="14" />清空用时</button>
                   <button class="secondary-button compact" type="button" :disabled="allocationSavingId === entry.id" @click="ensureDraft(entry).forEach((draft) => draft.minutes = draft.taskId === (entry.defaultTask ?? store.selectedTaskId) ? entry.minutes : 0)"><RotateCcw :size="14" />填满用时</button>
-                  <button class="primary-button compact" type="button" :disabled="allocationRemaining(entry) < 0 || allocationSavingId === entry.id" @click="saveAllocation(entry)"><Check :size="14" />确认归属</button>
+                  <button class="primary-button compact" type="button" :disabled="allocationSavingId === entry.id" @click="saveAllocation(entry)"><Check :size="14" />确认归属</button>
                 </div>
               </div>
             </div>

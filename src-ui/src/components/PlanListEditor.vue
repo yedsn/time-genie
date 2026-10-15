@@ -2,18 +2,23 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import Sortable, { MultiDrag } from "sortablejs";
-import { CalendarDays, CheckCircle2, Circle, Copy, CornerDownRight, DatabaseZap, FileInput, GripVertical, IndentDecrease, IndentIncrease, MessageSquareText, Play, Plus, Radio, Repeat2, TimerReset, Trash2 } from "lucide-vue-next";
+import { CalendarDays, CheckCircle2, Circle, Clock3, Copy, CornerDownRight, DatabaseZap, FileInput, GripVertical, IndentDecrease, IndentIncrease, MessageSquareText, Minus, Play, Plus, Radio, Repeat2, TimerReset, Trash2 } from "lucide-vue-next";
 import type { Task } from "../store";
 import { isActivePlanTask } from "../services/completedTaskHistoryCore";
 import { contextMenuPosition, planTaskMoveIntent, todayEstimateDraft } from "../services/planTaskInteractionCore";
+import { getSubjectWorkSchedule, type SubjectWorkScheduleDay } from "../services/tauri";
+import { adjustQuickEstimateMinutes, allocatedMinutes, capacitySummary, changedEstimateDrafts, formatQuickEstimateHours, parseQuickDuration, parseQuickEstimateMinutes, quickEstimateRows, scheduleCapacity, weekdayIndexForDate, type QuickEstimateDraft } from "../services/quickPlanEstimateCore";
 
 const props = defineProps<{
   tasks: Task[];
+  subjectId: string;
   subjectName: string;
   selectedId: string;
   runningTaskId?: string;
   formatMinutes: (minutes: number) => string;
   todayDate: string;
+  timezone: string;
+  saveEstimateBatch: (items: Array<{ taskId: string; expectedTaskVersion: number; expectedDailyEstimateVersion?: number; estimateMinutes?: number }>) => Promise<void>;
 }>();
 
 const emit = defineEmits<{
@@ -59,6 +64,14 @@ const contextMenuLeft = ref(0);
 const contextMenuTop = ref(0);
 const dragTargetDepth = ref<0 | 1>(0);
 const dragTargetInvalid = ref(false);
+const quickEstimateOpen = ref(false);
+const quickEstimateSaving = ref(false);
+const quickEstimateDrafts = ref<QuickEstimateDraft[]>([]);
+const quickEstimateErrors = ref<Record<string, string>>({});
+const quickEstimateCapacityText = ref("");
+const quickEstimateCapacityMinutes = ref(0);
+const quickEstimateDoneFocus = ref(false);
+const quickEstimateConfirmingClose = ref(false);
 let sortable: Sortable | undefined;
 let levelChangedTimer: number | undefined;
 
@@ -73,6 +86,11 @@ const pendingRows = computed(() => flatRows.value.filter((row) => isActivePlanTa
   status: row.task.status,
   recurring: Boolean(row.task.recurrence),
 })));
+const quickRows = computed(() => quickEstimateRows(props.tasks));
+const quickAllocatableRows = computed(() => quickRows.value.filter((row) => row.allocatable));
+const quickAllocatedMinutes = computed(() => allocatedMinutes(quickEstimateDrafts.value));
+const quickCapacitySummary = computed(() => capacitySummary(quickAllocatedMinutes.value, quickEstimateCapacityMinutes.value));
+const quickEstimateDirty = computed(() => changedEstimateDrafts(quickEstimateDrafts.value).length > 0);
 
 function getDepth(task: Task) {
   let depth = 0;
@@ -338,6 +356,200 @@ function normalizeEstimate(value: number | undefined) {
   return Number.isFinite(minutes) && minutes > 0 ? Math.round(minutes) : undefined;
 }
 
+function formatQuickDraft(minutes?: number) {
+  return String(minutes ?? 0);
+}
+
+async function openQuickEstimate() {
+  const rows = quickAllocatableRows.value;
+  quickEstimateDrafts.value = rows.map(({ task }) => ({
+    taskId: task.id,
+    originalMinutes: task.todayEstimate,
+    minutes: task.todayEstimate,
+    text: formatQuickDraft(task.todayEstimate),
+    expectedTaskVersion: task.version,
+    expectedDailyEstimateVersion: task.dailyEstimateVersion,
+  }));
+  quickEstimateErrors.value = {};
+  quickEstimateDoneFocus.value = false;
+  try {
+    const schedule: SubjectWorkScheduleDay[] = await getSubjectWorkSchedule(props.subjectId);
+    const day = schedule.find((item) => item.weekday === weekdayIndexForDate(props.todayDate, props.timezone));
+    quickEstimateCapacityMinutes.value = day ? scheduleCapacity(day.segments, day.enabled) : 0;
+  } catch {
+    quickEstimateCapacityMinutes.value = 360;
+  }
+  quickEstimateCapacityText.value = `${quickEstimateCapacityMinutes.value}m`;
+  quickEstimateOpen.value = true;
+  await focusQuickEstimate(0);
+}
+
+function quickDraft(taskId: string) {
+  return quickEstimateDrafts.value.find((draft) => draft.taskId === taskId);
+}
+
+function updateQuickDraft(taskId: string, text: string, moveAfter = false) {
+  const draft = quickDraft(taskId);
+  if (!draft) return false;
+  const parsed = parseQuickEstimateMinutes(text);
+  if (!parsed.ok) {
+    quickEstimateErrors.value = { ...quickEstimateErrors.value, [taskId]: parsed.message };
+    return false;
+  }
+  draft.text = formatQuickDraft(parsed.minutes);
+  draft.minutes = parsed.minutes;
+  const nextErrors = { ...quickEstimateErrors.value };
+  delete nextErrors[taskId];
+  quickEstimateErrors.value = nextErrors;
+  if (moveAfter) moveQuickEstimateFocus(taskId, 1);
+  return true;
+}
+
+function inputQuickDraft(taskId: string, text: string) {
+  const draft = quickDraft(taskId);
+  if (!draft) return;
+  draft.text = text;
+  const parsed = parseQuickEstimateMinutes(text);
+  if (!parsed.ok) {
+    quickEstimateErrors.value = { ...quickEstimateErrors.value, [taskId]: parsed.message };
+    return;
+  }
+  draft.minutes = parsed.minutes;
+  const nextErrors = { ...quickEstimateErrors.value };
+  delete nextErrors[taskId];
+  quickEstimateErrors.value = nextErrors;
+}
+
+function setQuickMinutes(taskId: string, minutes?: number) {
+  const draft = quickDraft(taskId);
+  if (!draft) return;
+  draft.minutes = minutes;
+  draft.text = formatQuickDraft(minutes);
+  const nextErrors = { ...quickEstimateErrors.value };
+  delete nextErrors[taskId];
+  quickEstimateErrors.value = nextErrors;
+}
+
+function adjustQuickMinutes(taskId: string, delta: number) {
+  const draft = quickDraft(taskId);
+  if (!draft) return;
+  setQuickMinutes(taskId, adjustQuickEstimateMinutes(draft.minutes, delta));
+}
+
+function quickDraftHours(taskId: string) {
+  const draft = quickDraft(taskId);
+  if (!draft) return "0 小时";
+  const parsed = parseQuickEstimateMinutes(draft.text);
+  return parsed.ok ? formatQuickEstimateHours(parsed.minutes) : "—";
+}
+
+function applyQuickSuggestion(task: Task) {
+  if (task.estimate) setQuickMinutes(task.id, task.estimate);
+}
+
+async function focusQuickEstimate(index: number) {
+  const row = quickAllocatableRows.value[index];
+  if (!row) return;
+  await nextTick();
+  const input = document.querySelector<HTMLInputElement>(`[data-quick-estimate-input="${row.task.id}"]`);
+  input?.focus();
+  input?.select();
+}
+
+function moveQuickEstimateFocus(taskId: string, offset: number) {
+  const index = quickAllocatableRows.value.findIndex((row) => row.task.id === taskId);
+  const target = index + offset;
+  if (target >= 0 && target < quickAllocatableRows.value.length) {
+    void focusQuickEstimate(target);
+  } else if (offset > 0) {
+    quickEstimateDoneFocus.value = true;
+    void nextTick(() => document.querySelector<HTMLButtonElement>("[data-quick-estimate-submit]")?.focus());
+  }
+}
+
+function handleQuickKey(event: KeyboardEvent, taskId: string) {
+  const target = event.currentTarget as HTMLInputElement;
+  if (event.key === "Enter") {
+    event.preventDefault();
+    updateQuickDraft(taskId, target.value, true);
+  }
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    if (updateQuickDraft(taskId, target.value)) moveQuickEstimateFocus(taskId, 1);
+  }
+  if (event.key === "ArrowUp") {
+    event.preventDefault();
+    if (updateQuickDraft(taskId, target.value)) moveQuickEstimateFocus(taskId, -1);
+  }
+}
+
+function updateQuickCapacity() {
+  const parsed = parseQuickDuration(quickEstimateCapacityText.value);
+  if (parsed.ok && parsed.minutes !== undefined) quickEstimateCapacityMinutes.value = parsed.minutes;
+}
+
+async function requestCloseQuickEstimate(done: () => void) {
+  if (!quickEstimateDirty.value || quickEstimateConfirmingClose.value) {
+    done();
+    return;
+  }
+  quickEstimateConfirmingClose.value = true;
+  try {
+    await ElMessageBox.confirm("分配今日预计还有未保存修改，确定放弃吗？", "放弃修改", {
+      confirmButtonText: "放弃",
+      cancelButtonText: "继续编辑",
+      type: "warning",
+    });
+    done();
+  } catch {} finally {
+    quickEstimateConfirmingClose.value = false;
+  }
+}
+
+async function saveQuickEstimate() {
+  if (quickEstimateSaving.value) return;
+  for (const draft of quickEstimateDrafts.value) {
+    if (!updateQuickDraft(draft.taskId, draft.text)) {
+      await focusQuickEstimate(quickAllocatableRows.value.findIndex((row) => row.task.id === draft.taskId));
+      return;
+    }
+  }
+  const changes = changedEstimateDrafts(quickEstimateDrafts.value);
+  if (!changes.length) {
+    quickEstimateOpen.value = false;
+    return;
+  }
+  const recurringChanges = changes.filter((draft) => props.tasks.find((task) => task.id === draft.taskId)?.recurrence);
+  if (recurringChanges.some((draft) => draft.minutes === undefined && props.tasks.find((task) => task.id === draft.taskId)?.estimate !== undefined)) {
+    ElMessage.warning("有每次预计的重复事项不能在这里清空，请使用单项编辑");
+    return;
+  }
+  if (recurringChanges.length) {
+    try {
+      await ElMessageBox.confirm("重复事项的修改会同时更新后续每次预计，是否继续？", "更新重复预计", {
+        confirmButtonText: "继续保存",
+        cancelButtonText: "取消",
+        type: "info",
+      });
+    } catch { return; }
+  }
+  quickEstimateSaving.value = true;
+  try {
+    await props.saveEstimateBatch(changes.map((draft) => ({
+      taskId: draft.taskId,
+      expectedTaskVersion: draft.expectedTaskVersion,
+      expectedDailyEstimateVersion: draft.expectedDailyEstimateVersion,
+      estimateMinutes: draft.minutes,
+    })));
+    quickEstimateOpen.value = false;
+    ElMessage.success(`已保存 ${changes.length} 项今日预计`);
+  } catch (error) {
+    ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "今日预计保存失败");
+  } finally {
+    quickEstimateSaving.value = false;
+  }
+}
+
 function hasChildren(taskId: string) {
   return props.tasks.some((task) => task.parentId === taskId);
 }
@@ -480,6 +692,7 @@ onBeforeUnmount(() => {
         <span>{{ pendingRows.length }} 项待办 · 点击文字直接编辑</span>
       </div>
       <div class="plan-head-actions">
+        <button class="secondary-button quick-estimate-entry" type="button" title="连续分配今日预计" @click="openQuickEstimate"><Clock3 :size="14" />分配今日预计</button>
         <button class="icon-button subtle" type="button" title="同步到 SeaTable" aria-label="同步到 SeaTable" @click="emit('syncSeaTable')"><DatabaseZap :size="15" /></button>
         <button class="icon-button subtle plan-import-button" type="button" title="从昨日 Obsidian 日报导入计划" aria-label="导入计划" @click="emit('importPlan')"><FileInput :size="15" /></button>
       </div>
@@ -635,6 +848,71 @@ onBeforeUnmount(() => {
       <template #footer>
         <button class="secondary-button" type="button" @click="noteDialogOpen = false">取消</button>
         <button class="primary-button" type="button" @click="saveNote">保存</button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="quickEstimateOpen"
+      class="recurrence-dialog quick-estimate-dialog"
+      title="分配今日预计"
+      width="min(820px, 95vw)"
+      append-to-body
+      align-center
+      :close-on-click-modal="false"
+      :before-close="requestCloseQuickEstimate"
+    >
+      <div class="quick-estimate-toolbar">
+        <div>
+          <strong>{{ todayDate }}</strong>
+          <span>直接输入分钟数，或用左右按钮每次调整 15 分钟</span>
+        </div>
+        <label>当日容量<input v-model="quickEstimateCapacityText" @change="updateQuickCapacity" @blur="updateQuickCapacity" /></label>
+      </div>
+      <div class="quick-estimate-summary" :class="{ over: quickCapacitySummary.overMinutes > 0 }">
+        <span>已分配 <strong>{{ formatMinutes(quickCapacitySummary.allocatedMinutes) }}</strong></span>
+        <span>容量 {{ formatMinutes(quickCapacitySummary.capacityMinutes) }}</span>
+        <span v-if="quickCapacitySummary.overMinutes">超出 <strong>{{ formatMinutes(quickCapacitySummary.overMinutes) }}</strong></span>
+        <span v-else>剩余 <strong>{{ formatMinutes(quickCapacitySummary.remainingMinutes) }}</strong></span>
+      </div>
+      <div v-if="quickRows.length" class="quick-estimate-list">
+        <div v-for="row in quickRows" :key="row.task.id" class="quick-estimate-row" :class="{ group: !row.allocatable, child: row.task.parentId }">
+          <div class="quick-estimate-task">
+            <CornerDownRight v-if="row.task.parentId" :size="14" />
+            <strong>{{ row.task.title || '未命名事项' }}</strong>
+            <small v-if="!row.allocatable">作为分组，不参与合计<span v-if="row.task.todayEstimate"> · 已有 {{ formatMinutes(row.task.todayEstimate) }} 未修改</span></small>
+            <small v-else-if="row.task.recurrence">重复事项 · 保存后同步更新每次预计</small>
+          </div>
+          <template v-if="row.allocatable">
+            <button v-if="row.suggestion" class="quick-estimate-suggestion" type="button" @click="applyQuickSuggestion(row.task)">采用 {{ formatMinutes(row.suggestion) }}</button>
+            <div class="quick-estimate-input-wrap">
+              <div class="quick-estimate-editor">
+                <button type="button" title="减少 15 分钟" aria-label="减少 15 分钟" @click="adjustQuickMinutes(row.task.id, -15)"><Minus :size="14" /></button>
+                <label>
+                  <input
+                    :data-quick-estimate-input="row.task.id"
+                    :value="quickDraft(row.task.id)?.text"
+                    inputmode="numeric"
+                    placeholder="分钟"
+                    aria-label="预计分钟数"
+                    @input="inputQuickDraft(row.task.id, ($event.target as HTMLInputElement).value)"
+                    @blur="updateQuickDraft(row.task.id, ($event.target as HTMLInputElement).value)"
+                    @keydown="handleQuickKey($event, row.task.id)"
+                  />
+                  <span>分钟</span>
+                </label>
+                <button type="button" title="增加 15 分钟" aria-label="增加 15 分钟" @click="adjustQuickMinutes(row.task.id, 15)"><Plus :size="14" /></button>
+                <span class="quick-estimate-hours">{{ quickDraftHours(row.task.id) }}</span>
+              </div>
+              <small class="error" :class="{ visible: quickEstimateErrors[row.task.id] }">{{ quickEstimateErrors[row.task.id] || '&nbsp;' }}</small>
+            </div>
+            <button class="quick-estimate-clear" type="button" @click="setQuickMinutes(row.task.id)">清空</button>
+          </template>
+        </div>
+      </div>
+      <div v-else class="quick-estimate-empty">当前主体没有可分配的进行中事项。</div>
+      <template #footer>
+        <button class="secondary-button" type="button" :disabled="quickEstimateSaving" @click="requestCloseQuickEstimate(() => { quickEstimateOpen = false; })">取消</button>
+        <button data-quick-estimate-submit class="primary-button" :class="{ attention: quickEstimateDoneFocus }" type="button" :disabled="quickEstimateSaving || !quickAllocatableRows.length" @click="saveQuickEstimate">{{ quickEstimateSaving ? '保存中...' : '完成分配' }}</button>
       </template>
     </el-dialog>
 

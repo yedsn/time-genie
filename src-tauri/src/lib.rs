@@ -471,6 +471,7 @@ pub fn run() {
             tasks::task_list,
             tasks::task_list_completed_page,
             tasks::task_daily_estimate_set,
+            tasks::task_daily_estimate_batch_set,
             tasks::task_recurring_estimate_set,
             tasks::task_create,
             tasks::task_create_positioned,

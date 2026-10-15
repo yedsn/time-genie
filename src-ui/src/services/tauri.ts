@@ -198,6 +198,7 @@ export type TaskRecord = {
   plannedDate?: string;
   estimateMinutes?: number;
   todayEstimateMinutes?: number;
+  dailyEstimateVersion?: number;
   note?: string;
   projectName?: string;
   solutionName?: string;
@@ -723,6 +724,27 @@ export async function confirmObsidianPlan(
 ): Promise<{ batchId: string; tasks: TaskRecord[]; alreadyConfirmed: boolean }> {
   const result = await invoke<{ batchId: string; tasks: TaskRecord[]; alreadyConfirmed: boolean }>("obsidian_plan_import_confirm", { request: { batchId, items, expectedVersion } });
   if (!result.alreadyConfirmed) await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-plan-import");
+  return result;
+}
+
+export type TaskDailyEstimateBatchItem = {
+  taskId: string;
+  expectedTaskVersion: number;
+  expectedDailyEstimateVersion?: number;
+  estimateMinutes?: number;
+};
+
+export async function setTaskDailyEstimateBatch(
+  subjectId: string,
+  workDate: string,
+  items: TaskDailyEstimateBatchItem[],
+): Promise<{ changedCount: number }> {
+  const result = await invoke<{ changedCount: number }>("task_daily_estimate_batch_set", {
+    request: { subjectId, workDate, items },
+  });
+  if (result.changedCount) {
+    await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-daily-estimate-batch");
+  }
   return result;
 }
 
