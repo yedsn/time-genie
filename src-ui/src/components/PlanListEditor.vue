@@ -555,6 +555,14 @@ function updateActualDraft(taskId: string, text: string) {
 }
 function addActualNewTask() { actualAdjustmentNewTasks.value.push({ clientTaskId: crypto.randomUUID(), title: "", targetMinutes: 0, text: "0" }); }
 function removeActualNewTask(clientTaskId: string) { actualAdjustmentNewTasks.value = actualAdjustmentNewTasks.value.filter((item) => item.clientTaskId !== clientTaskId); const errors = { ...actualAdjustmentErrors.value }; delete errors[clientTaskId]; actualAdjustmentErrors.value = errors; }
+function updateActualNewTaskTitle(draft: ActualAdjustmentNewTaskDraft, title: string) {
+  draft.title = title;
+  if (title.trim() && actualAdjustmentErrors.value[draft.clientTaskId] === "事项名称不能为空") {
+    const errors = { ...actualAdjustmentErrors.value };
+    delete errors[draft.clientTaskId];
+    actualAdjustmentErrors.value = errors;
+  }
+}
 function updateActualNewTaskMinutes(draft: ActualAdjustmentNewTaskDraft, text: string) { draft.text = text; const parsed = parseActualMinutes(text); if (!parsed.ok) { actualAdjustmentErrors.value = { ...actualAdjustmentErrors.value, [draft.clientTaskId]: parsed.message }; return; } draft.targetMinutes = parsed.minutes; const errors = { ...actualAdjustmentErrors.value }; delete errors[draft.clientTaskId]; actualAdjustmentErrors.value = errors; }
 function setActualNewTaskParent(draft: ActualAdjustmentNewTaskDraft, parentId: string) { draft.parentId = parentId || undefined; draft.expectedParentVersion = actualAdjustmentParents.value.find((task) => task.id === parentId)?.version; }
 function actualParentTarget(parentId: string) { return parentTargetTotal(parentId, actualAdjustmentSnapshot.value?.tasks ?? [], actualAdjustmentDrafts.value, actualAdjustmentNewTasks.value); }
@@ -573,7 +581,10 @@ async function saveActualAdjustment() {
   for (const draft of actualAdjustmentDrafts.value) updateActualDraft(draft.taskId, draft.text);
   for (const draft of actualAdjustmentNewTasks.value) {
     updateActualNewTaskMinutes(draft, draft.text);
-    if (!draft.title.trim()) actualAdjustmentErrors.value = { ...actualAdjustmentErrors.value, [draft.clientTaskId]: "事项名称不能为空" };
+    const errors = { ...actualAdjustmentErrors.value };
+    if (!draft.title.trim()) errors[draft.clientTaskId] = "事项名称不能为空";
+    else if (errors[draft.clientTaskId] === "事项名称不能为空") delete errors[draft.clientTaskId];
+    actualAdjustmentErrors.value = errors;
   }
   if (Object.keys(actualAdjustmentErrors.value).length) return;
   const summary = actualAdjustmentSummaryValue.value;
@@ -1158,7 +1169,7 @@ onBeforeUnmount(() => {
           </div>
         </template>
         <div v-for="draft in actualAdjustmentNewTasks" :key="draft.clientTaskId" class="actual-adjustment-row new-task">
-          <div class="actual-new-task-fields"><input v-model="draft.title" placeholder="新增事项名称" /><select :value="draft.parentId ?? ''" @change="setActualNewTaskParent(draft, ($event.target as HTMLSelectElement).value)"><option value="">顶层事项</option><option v-for="parent in actualAdjustmentParents" :key="parent.id" :value="parent.id">{{ parent.title }} 下</option></select></div>
+          <div class="actual-new-task-fields"><input :value="draft.title" placeholder="新增事项名称" @input="updateActualNewTaskTitle(draft, ($event.target as HTMLInputElement).value)" /><select :value="draft.parentId ?? ''" @change="setActualNewTaskParent(draft, ($event.target as HTMLSelectElement).value)"><option value="">顶层事项</option><option v-for="parent in actualAdjustmentParents" :key="parent.id" :value="parent.id">{{ parent.title }} 下</option></select></div>
           <label><input :value="draft.text" inputmode="numeric" @input="updateActualNewTaskMinutes(draft, ($event.target as HTMLInputElement).value)" /><span>分钟</span></label>
           <button class="icon-button subtle" type="button" title="移除草稿" @click="removeActualNewTask(draft.clientTaskId)"><Trash2 :size="14" /></button>
           <small v-if="actualAdjustmentErrors[draft.clientTaskId]" class="error">{{ actualAdjustmentErrors[draft.clientTaskId] }}</small>

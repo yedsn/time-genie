@@ -52,6 +52,8 @@ end $$;
 \ir 20261013_timegenie_unassigned_lease_continuity_fix.sql
 \ir 20261014_timegenie_timer_sync_authority.sql
 \ir 20261014_timegenie_timer_sync_authority.sql
+\ir 20261015_timegenie_actual_adjustment_batch.sql
+\ir 20261015_timegenie_actual_adjustment_batch.sql
 
 do $$
 begin
@@ -148,6 +150,13 @@ begin
   end if;
   if has_function_privilege('authenticated', 'timegenie.record_processed_operation(uuid, uuid, uuid, text, jsonb, jsonb)', 'execute') then
     raise exception 'authenticated can execute internal idempotency helper';
+  end if;
+  if not has_function_privilege('authenticated', 'timegenie.actual_adjustment_batch_apply(uuid, uuid, uuid, jsonb)', 'execute') then
+    raise exception 'authenticated is missing actual adjustment batch RPC privileges';
+  end if;
+  if has_function_privilege('anon', 'timegenie.actual_adjustment_batch_apply(uuid, uuid, uuid, jsonb)', 'execute')
+     or has_function_privilege('authenticated', 'timegenie.actual_adjustment_fingerprint(uuid, uuid, date)', 'execute') then
+    raise exception 'actual adjustment internal privileges are too broad';
   end if;
   if has_function_privilege('authenticated', 'timegenie.unassigned_resolve_non_work(uuid, uuid, uuid, bigint, uuid, text)', 'execute') then
     raise exception 'authenticated can execute internal unassigned helper';
@@ -2499,6 +2508,143 @@ begin
     raise exception 'workspace_changes is not in the realtime publication';
   end if;
 end $$;
+
+-- Actual adjustment batches validate their complete task/adjustment image and
+-- commit atomically. Ordinary allocations do not change the adjustment
+-- fingerprint, while an adjustment created from the same old snapshot does.
+reset role;
+insert into timegenie.subjects(id,workspace_id,name,sort_order)
+values('51000000-0000-0000-0000-000000000095','20000000-0000-0000-0000-000000000001','实际调整批次',95);
+insert into timegenie.tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,version) values
+  ('61000000-0000-0000-0000-000000000095','20000000-0000-0000-0000-000000000001','51000000-0000-0000-0000-000000000095','已有叶子','open','manual',10,1),
+  ('61000000-0000-0000-0000-000000000096','20000000-0000-0000-0000-000000000001','51000000-0000-0000-0000-000000000095','父事项','open','manual',20,1);
+insert into timegenie.time_entries(id,workspace_id,work_date,kind,source_type,state,label_snapshot,started_at,ended_at,duration_seconds,created_at,updated_at,version)
+values('71000000-0000-0000-0000-000000000095','20000000-0000-0000-0000-000000000001','2026-10-15','work','manual','ended','已有叶子',to_timestamp(1791993600),to_timestamp(1791997200),3600,to_timestamp(1791993600),to_timestamp(1791997200),1);
+insert into timegenie.time_allocations(id,workspace_id,entry_id,task_id,minutes,created_at,updated_at,version)
+values('72000000-0000-0000-0000-000000000095','20000000-0000-0000-0000-000000000001','71000000-0000-0000-0000-000000000095','61000000-0000-0000-0000-000000000095',60,to_timestamp(1791997200),to_timestamp(1791997200),1);
+set role authenticated;
+select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+do $$
+declare empty_fingerprint text; first_result jsonb; retry_result jsonb; payload jsonb;
+begin
+  empty_fingerprint:='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+  if empty_fingerprint<>'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' then
+    raise exception 'empty adjustment fingerprint test vector changed';
+  end if;
+
+  payload:=jsonb_build_object(
+    'subjectId','51000000-0000-0000-0000-000000000095','workDate','2026-10-15',
+    'clientRequestId','40000000-0000-0000-0000-000000000195','batchId','41000000-0000-0000-0000-000000000195','note','批次核对',
+    'items',jsonb_build_array(jsonb_build_object(
+      'taskId','61000000-0000-0000-0000-000000000095','expectedTaskVersion',1,
+      'baselineMinutes',60,'targetMinutes',75,'deltaMinutes',15,'adjustmentFingerprint',empty_fingerprint
+    )),
+    'newTasks',jsonb_build_array(
+      jsonb_build_object('clientTaskId','draft-positive','title','新子项','parentId','61000000-0000-0000-0000-000000000096','expectedParentVersion',1,'targetMinutes',25),
+      jsonb_build_object('clientTaskId','draft-zero','title','仅建事项','parentId',null,'expectedParentVersion',null,'targetMinutes',0)
+    ),
+    'createdTasks',jsonb_build_array(
+      jsonb_build_object('clientTaskId','draft-positive','task',jsonb_build_object(
+        'id','61100000-0000-0000-0000-000000000095','subject_id','51000000-0000-0000-0000-000000000095','parent_id','61000000-0000-0000-0000-000000000096','title','新子项','status','open','planned_date','2026-10-15','planned_time',null,'estimate_minutes',null,'note',null,'project_name',null,'solution_name',null,'source_type','manual','source_ref','actual_adjustment_quick_create','sort_order',10,'created_at',1791997200000,'updated_at',1791997200000,'version',1,'deleted_at',null
+      )),
+      jsonb_build_object('clientTaskId','draft-zero','task',jsonb_build_object(
+        'id','61100000-0000-0000-0000-000000000096','subject_id','51000000-0000-0000-0000-000000000095','parent_id',null,'title','仅建事项','status','open','planned_date','2026-10-15','planned_time',null,'estimate_minutes',null,'note',null,'project_name',null,'solution_name',null,'source_type','manual','source_ref','actual_adjustment_quick_create','sort_order',30,'created_at',1791997200000,'updated_at',1791997200000,'version',1,'deleted_at',null
+      ))
+    ),
+    'adjustments',jsonb_build_array(
+      jsonb_build_object('id','81000000-0000-0000-0000-000000000095','subject_id','51000000-0000-0000-0000-000000000095','task_id','61000000-0000-0000-0000-000000000095','work_date','2026-10-15','delta_minutes',15,'baseline_minutes',60,'target_minutes',75,'note','批次核对','source_type','quick_actual_adjustment','batch_id','41000000-0000-0000-0000-000000000195','created_at',1791997200000,'updated_at',1791997200000,'version',1,'deleted_at',null),
+      jsonb_build_object('id','81000000-0000-0000-0000-000000000096','subject_id','51000000-0000-0000-0000-000000000095','task_id','61100000-0000-0000-0000-000000000095','work_date','2026-10-15','delta_minutes',25,'baseline_minutes',0,'target_minutes',25,'note','批次核对','source_type','quick_actual_adjustment','batch_id','41000000-0000-0000-0000-000000000195','created_at',1791997200000,'updated_at',1791997200000,'version',1,'deleted_at',null)
+    )
+  );
+  first_result:=timegenie.actual_adjustment_batch_apply('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002','40000000-0000-0000-0000-000000000195',payload);
+  retry_result:=timegenie.actual_adjustment_batch_apply('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002','40000000-0000-0000-0000-000000000195',payload);
+  if first_result is distinct from retry_result or (first_result->>'createdTaskCount')::integer<>2 or (first_result->>'createdAdjustmentCount')::integer<>2 then
+    raise exception 'actual adjustment batch retry changed result: % / %',first_result,retry_result;
+  end if;
+  reset role;
+  if (select count(*) from timegenie.tasks where id in('61100000-0000-0000-0000-000000000095','61100000-0000-0000-0000-000000000096'))<>2
+     or (select count(*) from timegenie.actual_time_adjustments where batch_id='41000000-0000-0000-0000-000000000195')<>2
+     or exists(select 1 from timegenie.actual_time_adjustments where task_id='61100000-0000-0000-0000-000000000096') then
+    raise exception 'actual adjustment batch did not create exact task/adjustment set';
+  end if;
+  set role authenticated;
+
+  -- A normal allocation changes current actual, but not the adjustment-set fingerprint.
+  reset role;
+  insert into timegenie.time_entries(id,workspace_id,work_date,kind,source_type,state,label_snapshot,started_at,ended_at,duration_seconds,created_at,updated_at,version)
+  values('71000000-0000-0000-0000-000000000096','20000000-0000-0000-0000-000000000001','2026-10-15','work','manual','ended','新计时',to_timestamp(1791997200),to_timestamp(1791997800),600,to_timestamp(1791997200),to_timestamp(1791997800),1);
+  insert into timegenie.time_allocations(id,workspace_id,entry_id,task_id,minutes,created_at,updated_at,version)
+  values('72000000-0000-0000-0000-000000000096','20000000-0000-0000-0000-000000000001','71000000-0000-0000-0000-000000000096','61000000-0000-0000-0000-000000000096',10,to_timestamp(1791997800),to_timestamp(1791997800),1);
+  set role authenticated;
+  begin
+    perform timegenie.actual_adjustment_batch_apply(
+      '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002','40000000-0000-0000-0000-000000000196',
+      jsonb_build_object('subjectId','51000000-0000-0000-0000-000000000095','workDate','2026-10-15','clientRequestId','40000000-0000-0000-0000-000000000196','batchId','41000000-0000-0000-0000-000000000196','items','[]'::jsonb,
+        'newTasks',jsonb_build_array(jsonb_build_object('clientTaskId','stale-parent','title','应整体失败','parentId','61000000-0000-0000-0000-000000000096','expectedParentVersion',1,'targetMinutes',5)),
+        'createdTasks',jsonb_build_array(jsonb_build_object('clientTaskId','stale-parent','task',jsonb_build_object('id','61100000-0000-0000-0000-000000000097','subject_id','51000000-0000-0000-0000-000000000095','parent_id','61000000-0000-0000-0000-000000000096','title','应整体失败','status','open','planned_date','2026-10-15','planned_time',null,'estimate_minutes',null,'note',null,'project_name',null,'solution_name',null,'source_type','manual','source_ref','actual_adjustment_quick_create','sort_order',20,'created_at',1791997800000,'updated_at',1791997800000,'version',1,'deleted_at',null))),
+        'adjustments',jsonb_build_array(jsonb_build_object('id','81000000-0000-0000-0000-000000000097','subject_id','51000000-0000-0000-0000-000000000095','task_id','61100000-0000-0000-0000-000000000097','work_date','2026-10-15','delta_minutes',5,'baseline_minutes',0,'target_minutes',5,'note',null,'source_type','quick_actual_adjustment','batch_id','41000000-0000-0000-0000-000000000196','created_at',1791997800000,'updated_at',1791997800000,'version',1,'deleted_at',null))
+      )
+    );
+    raise exception 'parent with direct actual accepted new child';
+  exception when others then if sqlerrm not like '%VERSION_CONFLICT%' then raise; end if; end;
+  reset role;
+  if exists(select 1 from timegenie.tasks where id='61100000-0000-0000-0000-000000000097')
+     or exists(select 1 from timegenie.actual_time_adjustments where id='81000000-0000-0000-0000-000000000097')
+     or exists(select 1 from timegenie.processed_operations where operation_id='40000000-0000-0000-0000-000000000196') then
+    raise exception 'failed actual adjustment batch left partial remote data';
+  end if;
+  set role authenticated;
+
+  -- The first successful batch changed the adjustment fingerprint, so a new
+  -- operation carrying the old empty fingerprint must be rejected atomically.
+  begin
+    perform timegenie.actual_adjustment_batch_apply(
+      '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002','40000000-0000-0000-0000-000000000197',
+      jsonb_build_object('subjectId','51000000-0000-0000-0000-000000000095','workDate','2026-10-15','clientRequestId','40000000-0000-0000-0000-000000000197','batchId','41000000-0000-0000-0000-000000000197',
+        'items',jsonb_build_array(jsonb_build_object('taskId','61000000-0000-0000-0000-000000000095','expectedTaskVersion',1,'baselineMinutes',60,'targetMinutes',55,'deltaMinutes',-5,'adjustmentFingerprint',empty_fingerprint)),
+        'newTasks','[]'::jsonb,'createdTasks','[]'::jsonb,
+        'adjustments',jsonb_build_array(jsonb_build_object('id','81000000-0000-0000-0000-000000000098','subject_id','51000000-0000-0000-0000-000000000095','task_id','61000000-0000-0000-0000-000000000095','work_date','2026-10-15','delta_minutes',-5,'baseline_minutes',60,'target_minutes',55,'note',null,'source_type','quick_actual_adjustment','batch_id','41000000-0000-0000-0000-000000000197','created_at',1791997900000,'updated_at',1791997900000,'version',1,'deleted_at',null))
+      )
+    );
+    raise exception 'stale adjustment fingerprint was accepted';
+  exception when others then if sqlerrm not like '%ADJUSTMENT_BASELINE_CONFLICT%' then raise; end if; end;
+  reset role;
+  if exists(select 1 from timegenie.actual_time_adjustments where id='81000000-0000-0000-0000-000000000098')
+     or exists(select 1 from timegenie.processed_operations where operation_id='40000000-0000-0000-0000-000000000197') then
+    raise exception 'stale actual adjustment batch left partial remote data';
+  end if;
+  set role authenticated;
+
+  -- Ordinary time added after the snapshot is allowed because only the
+  -- adjustment-set fingerprint protects the fixed delta.
+  reset role;
+  insert into timegenie.time_entries(id,workspace_id,work_date,kind,source_type,state,label_snapshot,started_at,ended_at,duration_seconds,created_at,updated_at,version)
+  values('71000000-0000-0000-0000-000000000097','20000000-0000-0000-0000-000000000001','2026-10-16','work','manual','ended','普通计时增长',to_timestamp(1792080000),to_timestamp(1792083600),3600,to_timestamp(1792080000),to_timestamp(1792083600),1);
+  insert into timegenie.time_allocations(id,workspace_id,entry_id,task_id,minutes,created_at,updated_at,version)
+  values('72000000-0000-0000-0000-000000000097','20000000-0000-0000-0000-000000000001','71000000-0000-0000-0000-000000000097','61000000-0000-0000-0000-000000000095',65,to_timestamp(1792083600),to_timestamp(1792083600),1);
+  set role authenticated;
+  perform timegenie.actual_adjustment_batch_apply(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002','40000000-0000-0000-0000-000000000198',
+    jsonb_build_object('subjectId','51000000-0000-0000-0000-000000000095','workDate','2026-10-16','clientRequestId','40000000-0000-0000-0000-000000000198','batchId','41000000-0000-0000-0000-000000000198',
+      'items',jsonb_build_array(jsonb_build_object('taskId','61000000-0000-0000-0000-000000000095','expectedTaskVersion',1,'baselineMinutes',60,'targetMinutes',75,'deltaMinutes',15,'adjustmentFingerprint',empty_fingerprint)),
+      'newTasks','[]'::jsonb,'createdTasks','[]'::jsonb,
+      'adjustments',jsonb_build_array(jsonb_build_object('id','81000000-0000-0000-0000-000000000099','subject_id','51000000-0000-0000-0000-000000000095','task_id','61000000-0000-0000-0000-000000000095','work_date','2026-10-16','delta_minutes',15,'baseline_minutes',60,'target_minutes',75,'note',null,'source_type','quick_actual_adjustment','batch_id','41000000-0000-0000-0000-000000000198','created_at',1792083600000,'updated_at',1792083600000,'version',1,'deleted_at',null))
+    )
+  );
+  reset role;
+  if (select coalesce(sum(a.minutes),0) from timegenie.time_allocations a join timegenie.time_entries e on e.id=a.entry_id where a.task_id='61000000-0000-0000-0000-000000000095' and e.work_date='2026-10-16' and e.deleted_at is null)
+       +(select coalesce(sum(delta_minutes),0) from timegenie.actual_time_adjustments where task_id='61000000-0000-0000-0000-000000000095' and work_date='2026-10-16' and deleted_at is null)<>80 then
+    raise exception 'ordinary timing growth incorrectly conflicted with fixed actual adjustment delta';
+  end if;
+  update timegenie.actual_time_adjustments set deleted_at=to_timestamp(1792083600.123),updated_at=to_timestamp(1792083600.123),version=2
+  where id='81000000-0000-0000-0000-000000000099';
+  if timegenie.actual_adjustment_fingerprint('20000000-0000-0000-0000-000000000001','61000000-0000-0000-0000-000000000095','2026-10-16')
+     <> encode(extensions.digest('81000000-0000-0000-0000-000000000099:2:1792083600123','sha256'),'hex') then
+    raise exception 'PostgreSQL deleted-at fingerprint differs from Rust millisecond canonical format';
+  end if;
+  set role authenticated;
+end $$;
+reset role;
 
 select 'Supabase schema integration tests passed' as result;
 

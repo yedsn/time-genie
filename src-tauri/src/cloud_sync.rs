@@ -2762,6 +2762,34 @@ pub(crate) fn enqueue_payload_in_transaction(
     Ok(Some(generated_operation_id))
 }
 
+pub(crate) fn enqueue_actual_adjustment_batch_in_transaction(
+    transaction: &Transaction<'_>,
+    state: &crate::supabase::StorageModeSnapshot,
+    operation_id: &str,
+    payload: &Value,
+) -> Result<Option<String>, String> {
+    if state.mode != "cloud" {
+        return Ok(None);
+    }
+    Uuid::parse_str(operation_id)
+        .map_err(|_| "VALIDATION_ERROR: 云端实际调整批次请求标识必须是 UUID".to_string())?;
+    let batch_id = payload
+        .get("batchId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "VALIDATION_ERROR: 实际调整批次缺少批次 ID".to_string())?;
+    Uuid::parse_str(batch_id)
+        .map_err(|_| "VALIDATION_ERROR: 云端实际调整批次 ID 必须是 UUID".to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, payload_version, depends_on_operation_id, state, attempt_count, created_at)
+             VALUES (?1, ?2, ?3, 'actual_adjustment_batch_apply', 'actual_adjustment_batch', ?4, NULL, ?5, NULL, NULL, 'pending', 0, ?6)
+             ON CONFLICT(operation_id) DO NOTHING",
+            params![operation_id, state.workspace_id, state.device_id, batch_id, payload.to_string(), now_millis()],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(Some(operation_id.to_string()))
+}
+
 fn validate_planning_entity_payload(
     entity_type: &str,
     entity_id: &str,
@@ -3053,6 +3081,7 @@ fn ensure_supported_cloud_entity_type(entity_type: &str) -> Result<(), String> {
             | "task"
             | "time_entry"
             | "actual_time_adjustment"
+            | "actual_adjustment_batch"
             | "unassigned_session"
             | "report"
             | "report_template"
@@ -3211,6 +3240,18 @@ fn push_outbox_locked(
                         "p_session_id": operation.entity_id,
                         "p_expected_version": operation.base_version,
                         "p_resumed_at_millis": operation.payload.get("first_started_at")
+                    }),
+                    &session,
+                )
+            } else if operation.entity_type == "actual_adjustment_batch" {
+                api.rpc_for_database(
+                    database,
+                    "actual_adjustment_batch_apply",
+                    json!({
+                        "p_workspace_id": state.workspace_id,
+                        "p_device_id": state.device_id,
+                        "p_operation_id": operation.operation_id,
+                        "p_payload": operation.payload
                     }),
                     &session,
                 )
@@ -4529,10 +4570,19 @@ fn resolve_loaded_conflict(
 ) -> Result<(), String> {
     match strategy {
         "use_cloud" => {
+            if conflict.entity_type == "actual_adjustment_batch" {
+                rollback_actual_adjustment_batch_local_images(database, conflict)?;
+            }
             delete_outbox_entity_chain(database, &state.workspace_id, &conflict)?;
             mark_conflict_entity_for_cloud_reconciliation(database, state, conflict)?;
         }
         "keep_local" => {
+            if conflict.entity_type == "actual_adjustment_batch" {
+                return Err(
+                    "ADJUSTMENT_BASELINE_CONFLICT: 云端调整基线已经变化，不能直接覆盖；请使用云端并重新打开调整面板"
+                        .to_string(),
+                );
+            }
             let latest_local =
                 latest_outbox_entity_operation(database, &state.workspace_id, &conflict)?;
             let fetched_snapshot;
@@ -4610,6 +4660,65 @@ fn resolve_loaded_conflict(
         _ => return validate_conflict_strategy(strategy),
     }
     Ok(())
+}
+
+fn rollback_actual_adjustment_batch_local_images(
+    database: &Database,
+    conflict: &OutboxOperation,
+) -> Result<(), String> {
+    let created_task_ids = conflict
+        .payload
+        .get("createdTasks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|wrapper| wrapper.get("task"))
+        .filter_map(|task| task.get("id"))
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let adjustment_ids = conflict
+        .payload
+        .get("adjustments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|adjustment| adjustment.get("id"))
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let mut connection = database.open()?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    for adjustment_id in adjustment_ids {
+        transaction
+            .execute(
+                "DELETE FROM actual_time_adjustments WHERE id=?1",
+                [adjustment_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    for task_id in created_task_ids {
+        transaction
+            .execute("DELETE FROM tasks WHERE id=?1", [task_id])
+            .map_err(|error| {
+                format!(
+                    "SYNC_CONFLICT_REQUIRES_MANUAL_REPAIR: 云端拒绝的批次事项已被本地其他记录引用，无法自动撤销：{error}"
+                )
+            })?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM actual_adjustment_batches WHERE client_request_id=?1",
+            [conflict.operation_id.as_str()],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE app_metadata SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='global_revision'",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 fn incremental_entity_type_for_outbox(entity_type: &str) -> Option<&'static str> {
@@ -10522,6 +10631,104 @@ mod tests {
         assert_eq!(conflicts[0].entity_type, "task");
         assert_eq!(conflicts[0].base_version, Some(1));
         assert_eq!(conflicts[0].local_payload, json!({}));
+    }
+
+    #[test]
+    fn actual_adjustment_batch_use_cloud_rolls_back_only_its_optimistic_images() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("actual-adjustment-batch-use-cloud.sqlite3"),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let operation_id = Uuid::now_v7().to_string();
+        let batch_id = Uuid::now_v7().to_string();
+        let existing_task_id = Uuid::now_v7().to_string();
+        let created_task_id = Uuid::now_v7().to_string();
+        let existing_adjustment_id = Uuid::now_v7().to_string();
+        let created_adjustment_id = Uuid::now_v7().to_string();
+        connection.execute("INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version) VALUES(?1,?2,?3,'保留事项','open','manual',10,1,1,1)",params![existing_task_id,workspace_id,subject_id]).unwrap();
+        connection.execute("INSERT INTO tasks(id,workspace_id,subject_id,title,status,planned_date,source_type,source_ref,sort_order,created_at,updated_at,version) VALUES(?1,?2,?3,'撤销事项','open','2026-10-15','manual','actual_adjustment_quick_create',20,1,1,1)",params![created_task_id,workspace_id,subject_id]).unwrap();
+        for (id, task_id, delta, baseline, target) in [
+            (
+                &existing_adjustment_id,
+                &existing_task_id,
+                5_i64,
+                0_i64,
+                5_i64,
+            ),
+            (
+                &created_adjustment_id,
+                &created_task_id,
+                15_i64,
+                0_i64,
+                15_i64,
+            ),
+        ] {
+            connection.execute("INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,batch_id,created_at,updated_at,version) VALUES(?1,?2,?3,?4,'2026-10-15',?5,?6,?7,?8,1,1,1)",params![id,workspace_id,subject_id,task_id,delta,baseline,target,batch_id]).unwrap();
+        }
+        connection.execute("INSERT INTO actual_adjustment_batches(workspace_id,client_request_id,batch_id,request_hash,result_json,created_at) VALUES(?1,?2,?3,'hash','{}',1)",params![workspace_id,operation_id,batch_id]).unwrap();
+        let payload = json!({
+            "createdTasks": [{ "clientTaskId": "draft", "task": { "id": created_task_id } }],
+            "adjustments": [{ "id": existing_adjustment_id }, { "id": created_adjustment_id }]
+        });
+        connection.execute("INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,payload_json,state,attempt_count,created_at,error_json) VALUES(?1,?2,?3,'actual_adjustment_batch_apply','actual_adjustment_batch',?4,?5,'conflict',1,1,'{}')",params![operation_id,workspace_id,device_id,batch_id,payload.to_string()]).unwrap();
+        drop(connection);
+
+        let conflict = load_conflict(&database, &workspace_id, &operation_id).unwrap();
+        rollback_actual_adjustment_batch_local_images(&database, &conflict).unwrap();
+        let connection = database.open().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE id=?1",
+                    [created_task_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE id=?1",
+                    [existing_task_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM actual_time_adjustments WHERE batch_id=?1",
+                    [batch_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM actual_adjustment_batches WHERE client_request_id=?1",
+                    [operation_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

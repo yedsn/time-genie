@@ -12,6 +12,10 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
 use uuid::Uuid;
 
+use crate::actual_time_adjustments::{
+    self, ActualAdjustmentBatchItem, ActualAdjustmentBatchRequest, ActualAdjustmentDeleteRequest,
+    ActualAdjustmentNewTaskInput, ActualAdjustmentSnapshotRequest,
+};
 use crate::cloud_sync::{
     self, CloudConflictResolveRequest, CloudSyncPullRequest, CloudTimerStartRequest,
     CloudTimerVersionRequest, TrackingLeaseRequest,
@@ -3143,6 +3147,367 @@ fn real_supabase_two_device_flow() {
             .any(|task| task.id == queued_task.id),
         "设备 B 没有收到 outbox 提交的事项"
     );
+
+    // Actual adjustment batches upload new tasks and their initial adjustment
+    // as one remote transaction. A zero-minute draft creates only its task.
+    let adjustment_date = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let quick_create_parent = create_task(&device_a, &subject_id, "Supabase E2E 快速新增父事项");
+    cloud_sync::enqueue_entity(
+        &device_a,
+        "task_create",
+        "task",
+        Some(&quick_create_parent.id),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    pull_all(&device_b);
+    let quick_create_result = actual_time_adjustments::apply_batch(
+        &device_a,
+        ActualAdjustmentBatchRequest {
+            subject_id: subject_id.clone(),
+            work_date: adjustment_date.clone(),
+            client_request_id: Uuid::now_v7().to_string(),
+            batch_id: Uuid::now_v7().to_string(),
+            note: Some("Supabase E2E 快速新增".to_string()),
+            items: vec![],
+            new_tasks: vec![
+                ActualAdjustmentNewTaskInput {
+                    client_task_id: Uuid::now_v7().to_string(),
+                    title: "Supabase E2E 带实际事项".to_string(),
+                    parent_id: Some(quick_create_parent.id.clone()),
+                    expected_parent_version: Some(quick_create_parent.version),
+                    target_minutes: 30,
+                },
+                ActualAdjustmentNewTaskInput {
+                    client_task_id: Uuid::now_v7().to_string(),
+                    title: "Supabase E2E 零分钟事项".to_string(),
+                    parent_id: None,
+                    expected_parent_version: None,
+                    target_minutes: 0,
+                },
+            ],
+        },
+    )
+    .unwrap();
+    assert_eq!(quick_create_result.created_task_count, 2);
+    assert_eq!(quick_create_result.created_adjustment_count, 1);
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: None,
+        },
+    )
+    .unwrap();
+    let device_b_tasks = list_tasks(&device_b);
+    let timed_task = device_b_tasks
+        .iter()
+        .find(|task| task.title == "Supabase E2E 带实际事项")
+        .expect("设备 B 没有收到批次新增的带实际事项");
+    assert_eq!(
+        timed_task.parent_id.as_deref(),
+        Some(quick_create_parent.id.as_str()),
+        "设备 B 收到的新事项没有保留父子层级"
+    );
+    let zero_task = device_b_tasks
+        .iter()
+        .find(|task| task.title == "Supabase E2E 零分钟事项")
+        .expect("设备 B 没有收到批次新增的零分钟事项");
+    assert_eq!(
+        actual_time_adjustments::direct_actual_minutes(
+            &device_b.open().unwrap(),
+            &workspace.id,
+            &timed_task.id,
+            Some(&adjustment_date),
+        )
+        .unwrap(),
+        30
+    );
+    assert_eq!(
+        actual_time_adjustments::direct_actual_minutes(
+            &device_b.open().unwrap(),
+            &workspace.id,
+            &zero_task.id,
+            Some(&adjustment_date),
+        )
+        .unwrap(),
+        0
+    );
+
+    // A complete task+adjustment batch survives an interrupted upload. The
+    // same outbox operation is retried after connectivity returns, and the
+    // other device observes exactly one task and one initial adjustment.
+    let interrupted_request_id = Uuid::now_v7().to_string();
+    let interrupted_title = format!("Supabase E2E 中断续传 {}", Uuid::now_v7());
+    let original_project_url = device_a
+        .open()
+        .unwrap()
+        .query_row(
+            "SELECT value_json FROM device_settings WHERE key='supabase_project_url'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    actual_time_adjustments::apply_batch(
+        &device_a,
+        ActualAdjustmentBatchRequest {
+            subject_id: subject_id.clone(),
+            work_date: adjustment_date.clone(),
+            client_request_id: interrupted_request_id.clone(),
+            batch_id: Uuid::now_v7().to_string(),
+            note: Some("Supabase E2E 中断续传".to_string()),
+            items: vec![],
+            new_tasks: vec![ActualAdjustmentNewTaskInput {
+                client_task_id: Uuid::now_v7().to_string(),
+                title: interrupted_title.clone(),
+                parent_id: None,
+                expected_parent_version: None,
+                target_minutes: 35,
+            }],
+        },
+    )
+    .unwrap();
+    device_a
+        .open()
+        .unwrap()
+        .execute(
+            "UPDATE device_settings SET value_json=?1 WHERE key='supabase_project_url'",
+            [json!("http://127.0.0.1:9").to_string()],
+        )
+        .unwrap();
+    assert!(cloud_sync::push_outbox(&device_a).is_err());
+    assert_eq!(
+        cloud_sync::sync_status(&device_a)
+            .unwrap()
+            .pending_operations,
+        1,
+        "中断后的原子实际调整批次没有保留待重试"
+    );
+    device_a
+        .open()
+        .unwrap()
+        .execute(
+            "UPDATE device_settings SET value_json=?1 WHERE key='supabase_project_url'",
+            [original_project_url],
+        )
+        .unwrap();
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    pull_all(&device_b);
+    let interrupted_tasks = list_tasks(&device_b)
+        .into_iter()
+        .filter(|task| task.title == interrupted_title)
+        .collect::<Vec<_>>();
+    assert_eq!(interrupted_tasks.len(), 1, "中断续传重复创建了事项");
+    let interrupted_task = &interrupted_tasks[0];
+    assert_eq!(
+        actual_time_adjustments::direct_actual_minutes(
+            &device_b.open().unwrap(),
+            &workspace.id,
+            &interrupted_task.id,
+            Some(&adjustment_date),
+        )
+        .unwrap(),
+        35
+    );
+    assert_eq!(
+        device_b
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM actual_time_adjustments WHERE task_id=?1 AND deleted_at IS NULL",
+                [&interrupted_task.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1,
+        "中断续传重复创建了初始调整"
+    );
+
+    // Two devices can submit from the same old adjustment fingerprint. The
+    // first batch wins; using cloud on the losing device removes its optimistic
+    // local record before the authoritative batch is pulled.
+    let concurrent_task = create_task(&device_a, &subject_id, "Supabase E2E 并发调整事项");
+    cloud_sync::enqueue_entity(
+        &device_a,
+        "task_create",
+        "task",
+        Some(&concurrent_task.id),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: None,
+        },
+    )
+    .unwrap();
+    let snapshot_a = actual_time_adjustments::snapshot(
+        &device_a,
+        ActualAdjustmentSnapshotRequest {
+            subject_id: subject_id.clone(),
+            work_date: adjustment_date.clone(),
+        },
+    )
+    .unwrap();
+    let snapshot_b = actual_time_adjustments::snapshot(
+        &device_b,
+        ActualAdjustmentSnapshotRequest {
+            subject_id: subject_id.clone(),
+            work_date: adjustment_date.clone(),
+        },
+    )
+    .unwrap();
+    let task_a = snapshot_a
+        .tasks
+        .iter()
+        .find(|task| task.id == concurrent_task.id)
+        .unwrap();
+    let task_b = snapshot_b
+        .tasks
+        .iter()
+        .find(|task| task.id == concurrent_task.id)
+        .unwrap();
+    for (database, task, target_minutes) in
+        [(&device_a, task_a, 10_i64), (&device_b, task_b, 20_i64)]
+    {
+        actual_time_adjustments::apply_batch(
+            database,
+            ActualAdjustmentBatchRequest {
+                subject_id: subject_id.clone(),
+                work_date: adjustment_date.clone(),
+                client_request_id: Uuid::now_v7().to_string(),
+                batch_id: Uuid::now_v7().to_string(),
+                note: Some("Supabase E2E 并发基线".to_string()),
+                items: vec![ActualAdjustmentBatchItem {
+                    task_id: concurrent_task.id.clone(),
+                    expected_task_version: task.version,
+                    baseline_minutes: task.direct_minutes,
+                    target_minutes,
+                    delta_minutes: target_minutes - task.direct_minutes,
+                    adjustment_fingerprint: task.adjustment_fingerprint.clone(),
+                }],
+                new_tasks: vec![],
+            },
+        )
+        .unwrap();
+    }
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    assert_eq!(push_all(&device_b).conflicts, 1);
+    let conflicts = cloud_sync::list_conflicts(&device_b).unwrap();
+    let adjustment_conflict = conflicts
+        .iter()
+        .find(|conflict| conflict.entity_type == "actual_adjustment_batch")
+        .expect("同一旧基线的第二个批次没有形成云端冲突");
+    cloud_sync::resolve_conflict(
+        &device_b,
+        CloudConflictResolveRequest {
+            operation_id: adjustment_conflict.operation_id.clone(),
+            strategy: "use_cloud".to_string(),
+        },
+    )
+    .unwrap();
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        actual_time_adjustments::direct_actual_minutes(
+            &device_b.open().unwrap(),
+            &workspace.id,
+            &concurrent_task.id,
+            Some(&adjustment_date),
+        )
+        .unwrap(),
+        10
+    );
+
+    // Both devices delete the same adjustment from the same version while
+    // offline. The idempotent tombstone converges without restoring minutes.
+    let delete_adjustment = device_a
+        .open()
+        .unwrap()
+        .query_row(
+            "SELECT id,version FROM actual_time_adjustments WHERE task_id=?1 AND deleted_at IS NULL ORDER BY created_at,id LIMIT 1",
+            [&concurrent_task.id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .unwrap();
+    let delete_adjustment_b = device_b
+        .open()
+        .unwrap()
+        .query_row(
+            "SELECT id,version FROM actual_time_adjustments WHERE task_id=?1 AND deleted_at IS NULL ORDER BY created_at,id LIMIT 1",
+            [&concurrent_task.id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(delete_adjustment_b, delete_adjustment);
+    for database in [&device_a, &device_b] {
+        actual_time_adjustments::delete_adjustment(
+            database,
+            ActualAdjustmentDeleteRequest {
+                adjustment_id: delete_adjustment.0.clone(),
+                expected_version: delete_adjustment.1,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+    }
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    let delete_push_b = push_all(&device_b);
+    assert_eq!(delete_push_b.conflicts, 1, "并发删除没有形成预期的版本冲突");
+    let delete_conflict = cloud_sync::list_conflicts(&device_b)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.entity_type == "actual_time_adjustment")
+        .expect("并发删除冲突没有进入调整记录冲突列表");
+    cloud_sync::resolve_conflict(
+        &device_b,
+        CloudConflictResolveRequest {
+            operation_id: delete_conflict.operation_id,
+            strategy: "use_cloud".to_string(),
+        },
+    )
+    .unwrap();
+    pull_all(&device_a);
+    pull_all(&device_b);
+    for database in [&device_a, &device_b] {
+        let deleted = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT deleted_at,version FROM actual_time_adjustments WHERE id=?1",
+                [&delete_adjustment.0],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        assert!(deleted.0.is_some(), "并发删除后调整记录没有收敛为软删除");
+        assert_eq!(
+            actual_time_adjustments::direct_actual_minutes(
+                &database.open().unwrap(),
+                &workspace.id,
+                &concurrent_task.id,
+                Some(&adjustment_date),
+            )
+            .unwrap(),
+            0,
+            "并发删除后最终实际分钟没有收敛"
+        );
+    }
 
     // Planning parity: daily estimates and recurrence rules use the same
     // local-first outbox, propagate across devices, and conflict by their

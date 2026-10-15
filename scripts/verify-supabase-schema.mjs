@@ -23,6 +23,7 @@ const unassignedSegmentBoundaryPatchFile = path.join(repoRoot, "supabase", "2026
 const simplifiedUnassignedAnchorPatchFile = path.join(repoRoot, "supabase", "20261008_timegenie_simplified_unassigned_anchor.sql");
 const unassignedLeaseContinuityPatchFile = path.join(repoRoot, "supabase", "20261013_timegenie_unassigned_lease_continuity_fix.sql");
 const timerSyncAuthorityPatchFile = path.join(repoRoot, "supabase", "20261014_timegenie_timer_sync_authority.sql");
+const actualAdjustmentBatchPatchFile = path.join(repoRoot, "supabase", "20261015_timegenie_actual_adjustment_batch.sql");
 
 const binaryNames = process.platform === "win32"
   ? {
@@ -93,6 +94,7 @@ function verifyStaticSchemaInvariants() {
   const simplifiedUnassignedAnchorPatch = fs.readFileSync(simplifiedUnassignedAnchorPatchFile, "utf8");
   const unassignedLeaseContinuityPatch = fs.readFileSync(unassignedLeaseContinuityPatchFile, "utf8");
   const timerSyncAuthorityPatch = fs.readFileSync(timerSyncAuthorityPatchFile, "utf8");
+  const actualAdjustmentBatchPatch = fs.readFileSync(actualAdjustmentBatchPatchFile, "utf8");
   const schemaIntegrationTest = fs.readFileSync(schemaTestFile, "utf8");
   const importStart = schema.indexOf("create or replace function timegenie.migration_import_snapshot");
   const applyPatchStart = schema.indexOf("create or replace function timegenie.cloud_apply_patch");
@@ -191,6 +193,28 @@ function verifyStaticSchemaInvariants() {
   }
   if ((schemaIntegrationTest.match(/\\ir 20261014_timegenie_timer_sync_authority\.sql/g) ?? []).length < 2) {
     throw new Error("The schema integration test must prove the timer sync authority patch is idempotent.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261015_timegenie_actual_adjustment_batch\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the actual adjustment batch patch is idempotent.");
+  }
+  for (const expected of [
+    "create or replace function timegenie.actual_adjustment_fingerprint",
+    "create or replace function timegenie.actual_adjustment_batch_apply",
+    "ADJUSTMENT_BASELINE_CONFLICT",
+    "final actual minutes cannot be negative",
+    "existing task adjustment image does not match request",
+    "new task adjustment image does not match draft",
+    "grant execute on function timegenie.actual_adjustment_batch_apply(uuid,uuid,uuid,jsonb) to authenticated",
+  ]) {
+    const compactExpected = expected.replaceAll(" ", "").toLowerCase();
+    if (!schema.replaceAll(" ", "").toLowerCase().includes(compactExpected)
+        || !actualAdjustmentBatchPatch.replaceAll(" ", "").toLowerCase().includes(compactExpected)) {
+      throw new Error(`The schema and actual adjustment batch patch must include: ${expected}`);
+    }
+  }
+  if (!schemaIntegrationTest.includes("failed actual adjustment batch left partial remote data")
+      || !schemaIntegrationTest.includes("stale actual adjustment batch left partial remote data")) {
+    throw new Error("The schema integration test must prove failed actual adjustment batches leave no partial remote data.");
   }
   const authorityTickStart = timerSyncAuthorityPatch.indexOf("create or replace function timegenie.unassigned_tick");
   const authorityTickEnd = timerSyncAuthorityPatch.indexOf("end $$;", authorityTickStart);

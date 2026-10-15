@@ -238,12 +238,13 @@ fn adjustment_fingerprint(
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
+    let canonical = rows
+        .into_iter()
+        .map(|(id, version, deleted_at)| format!("{id}:{version}:{deleted_at}"))
+        .collect::<Vec<_>>()
+        .join("|");
     let mut hasher = Sha256::new();
-    for (id, version, deleted_at) in rows {
-        hasher.update(id.as_bytes());
-        hasher.update(version.to_le_bytes());
-        hasher.update(deleted_at.to_le_bytes());
-    }
+    hasher.update(canonical.as_bytes());
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -461,6 +462,8 @@ pub fn apply_batch(
         .as_ref()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let mut cloud_batch_payload =
+        serde_json::to_value(&request).map_err(|error| error.to_string())?;
     let mut adjustments = Vec::new();
     for item in &request.items {
         if !(0..=1440).contains(&item.target_minutes)
@@ -497,15 +500,6 @@ pub fn apply_batch(
         let id = Uuid::now_v7().to_string();
         let now = now_millis();
         transaction.execute("INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,note,batch_id,created_at,updated_at,version,created_by_device_id,updated_by_device_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11,1,?12,?12)",params![id,workspace_id,request.subject_id,item.task_id,request.work_date,item.delta_minutes,item.baseline_minutes,item.target_minutes,note,request.batch_id,now,state.device_id]).map_err(|error|error.to_string())?;
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            &state,
-            "actual_adjustment_create",
-            "actual_time_adjustment",
-            Some(&id),
-            None,
-            None,
-        )?;
         adjustments.push(load_adjustment(&transaction, &id)?);
     }
     let mut created_tasks = Vec::new();
@@ -538,15 +532,6 @@ pub fn apply_batch(
             draft.parent_id.as_deref(),
         )?;
         transaction.execute("INSERT INTO tasks(id,workspace_id,subject_id,parent_id,title,status,planned_date,source_type,source_ref,sort_order,created_at,updated_at,version,created_by_device_id,updated_by_device_id) VALUES(?1,?2,?3,?4,?5,'open',?6,'manual','actual_adjustment_quick_create',?7,?8,?8,1,?9,?9)",params![id,workspace_id,request.subject_id,draft.parent_id,draft.title.trim(),request.work_date,sort_order,now,state.device_id]).map_err(|error|error.to_string())?;
-        let task_operation = crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            &state,
-            "task_create_actual_adjustment",
-            "task",
-            Some(&id),
-            None,
-            None,
-        )?;
         created_tasks.push(ActualAdjustmentCreatedTaskDto {
             client_task_id: draft.client_task_id.clone(),
             task_id: id.clone(),
@@ -554,18 +539,42 @@ pub fn apply_batch(
         if draft.target_minutes > 0 {
             let adjustment_id = Uuid::now_v7().to_string();
             transaction.execute("INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,note,batch_id,created_at,updated_at,version,created_by_device_id,updated_by_device_id) VALUES(?1,?2,?3,?4,?5,?6,0,?6,?7,?8,?9,?9,1,?10,?10)",params![adjustment_id,workspace_id,request.subject_id,id,request.work_date,draft.target_minutes,note,request.batch_id,now,state.device_id]).map_err(|error|error.to_string())?;
-            crate::cloud_sync::enqueue_entity_in_transaction_with_dependency(
-                &transaction,
-                &state,
-                "actual_adjustment_create",
-                "actual_time_adjustment",
-                Some(&adjustment_id),
-                None,
-                None,
-                task_operation.as_deref(),
-            )?;
             adjustments.push(load_adjustment(&transaction, &adjustment_id)?);
         }
+    }
+    if state.mode == "cloud" {
+        let created_task_payloads = created_tasks
+            .iter()
+            .map(|created| {
+                let task = crate::cloud_sync::entity_payload_from_connection(
+                    &transaction,
+                    "task",
+                    Some(&created.task_id),
+                )?;
+                Ok::<serde_json::Value, String>(serde_json::json!({
+                    "clientTaskId": created.client_task_id,
+                    "task": task,
+                }))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let adjustment_payloads = adjustments
+            .iter()
+            .map(|adjustment| {
+                crate::cloud_sync::entity_payload_from_connection(
+                    &transaction,
+                    "actual_time_adjustment",
+                    Some(&adjustment.id),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        cloud_batch_payload["createdTasks"] = serde_json::Value::Array(created_task_payloads);
+        cloud_batch_payload["adjustments"] = serde_json::Value::Array(adjustment_payloads);
+        crate::cloud_sync::enqueue_actual_adjustment_batch_in_transaction(
+            &transaction,
+            &state,
+            &request.client_request_id,
+            &cloud_batch_payload,
+        )?;
     }
     bump_revision(&transaction)?;
     let result = ActualAdjustmentBatchResult {
@@ -803,6 +812,22 @@ mod tests {
     }
 
     #[test]
+    fn adjustment_fingerprint_uses_the_cross_database_canonical_format() {
+        let (database, workspace, subject) = fixture();
+        let task = insert_task(&database, &workspace, &subject, "指纹事项", None);
+        let connection = database.open().unwrap();
+        let first_id = "81000000-0000-0000-0000-000000000001";
+        let second_id = "81000000-0000-0000-0000-000000000002";
+        connection.execute("INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,batch_id,created_at,updated_at,version,deleted_at) VALUES(?1,?2,?3,?4,'2026-10-15',5,0,5,?5,1,1,2,NULL)",params![first_id,workspace,subject,task,Uuid::now_v7().to_string()]).unwrap();
+        connection.execute("INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,batch_id,created_at,updated_at,version,deleted_at) VALUES(?1,?2,?3,?4,'2026-10-15',-2,5,3,?5,1,1,4,1791997200123)",params![second_id,workspace,subject,task,Uuid::now_v7().to_string()]).unwrap();
+        let canonical = format!("{first_id}:2:0|{second_id}:4:1791997200123");
+        assert_eq!(
+            adjustment_fingerprint(&connection, &workspace, &task, "2026-10-15").unwrap(),
+            format!("{:x}", Sha256::digest(canonical.as_bytes()))
+        );
+    }
+
+    #[test]
     fn mixed_batch_rolls_back_everything_when_a_later_draft_is_invalid() {
         let (database, workspace, subject) = fixture();
         let leaf = insert_task(&database, &workspace, &subject, "现有事项", None);
@@ -914,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_outbox_orders_new_task_before_its_initial_adjustment() {
+    fn cloud_outbox_contains_one_atomic_batch_with_task_mapping_before_adjustments() {
         use crate::settings::{self, SettingsScope, SettingsUpdate};
         let (database, _workspace, subject) = fixture();
         settings::update_setting(
@@ -940,8 +965,8 @@ mod tests {
             ActualAdjustmentBatchRequest {
                 subject_id: subject,
                 work_date: "2026-10-15".into(),
-                client_request_id: "cloud-order".into(),
-                batch_id: "cloud-order-batch".into(),
+                client_request_id: "40000000-0000-0000-0000-000000000001".into(),
+                batch_id: "41000000-0000-0000-0000-000000000001".into(),
                 note: None,
                 items: vec![],
                 new_tasks: vec![ActualAdjustmentNewTaskInput {
@@ -955,13 +980,23 @@ mod tests {
         )
         .unwrap();
         let connection = database.open().unwrap();
-        let rows = connection.prepare("SELECT operation_id,entity_type,depends_on_operation_id FROM sync_outbox ORDER BY created_at,rowid").unwrap()
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))).unwrap()
-            .collect::<Result<Vec<_>, _>>().unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].1, "task");
-        assert_eq!(rows[1].1, "actual_time_adjustment");
-        assert_eq!(rows[1].2.as_deref(), Some(rows[0].0.as_str()));
+        let (operation_id, entity_type, payload_json): (String, String, String) = connection
+            .query_row(
+                "SELECT operation_id,entity_type,payload_json FROM sync_outbox",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(operation_id, "40000000-0000-0000-0000-000000000001");
+        assert_eq!(entity_type, "actual_adjustment_batch");
+        let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
+        let created = payload["createdTasks"].as_array().unwrap();
+        let adjustments = payload["adjustments"].as_array().unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(adjustments.len(), 1);
+        assert_eq!(created[0]["clientTaskId"], "draft");
+        assert_eq!(created[0]["task"]["title"], "离线事项");
+        assert_eq!(adjustments[0]["task_id"], created[0]["task"]["id"]);
     }
 
     #[test]
