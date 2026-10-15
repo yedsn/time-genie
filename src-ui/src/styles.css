@@ -1562,6 +1562,25 @@ pre {
 .plan-head-actions { margin-left: auto; display: flex; align-items: center; gap: 4px; }
 .plan-head-actions .plan-import-button { margin-left: 0; }
 .quick-estimate-entry { min-height: 30px; padding: 0 10px; display: inline-flex; align-items: center; gap: 5px; font-size: 12px; }
+.quick-plan-dialog { height: min(88vh, 760px); max-height: 88vh; display: flex; flex-direction: column; margin: 0 auto !important; }
+.quick-plan-dialog .el-dialog__body { min-height: 0; flex: 1; display: flex; overflow: hidden; }
+.quick-plan-dialog .el-dialog__footer { flex: 0 0 auto; }
+.quick-plan-workspace, .quick-plan-summary { min-height: 0; width: 100%; display: flex; flex-direction: column; gap: 12px; }
+.quick-plan-help { display: grid; gap: 3px; }
+.quick-plan-help span { color: var(--muted); font-size: 12px; }
+.quick-plan-editor { min-height: 240px; flex: 1; resize: none; overflow: auto; padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px; color: var(--text); background: var(--panel-2); font: inherit; line-height: 1.8; outline: none; tab-size: 2; white-space: pre; }
+.quick-plan-editor:focus { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 16%, transparent); }
+.quick-plan-errors { display: grid; gap: 4px; padding: 10px 12px; border: 1px solid rgba(224, 119, 72, .4); border-radius: 8px; color: #d66d3a; background: rgba(224, 119, 72, .08); font-size: 12px; }
+.quick-plan-summary { overflow: auto; }
+.quick-plan-summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.quick-plan-summary section { display: grid; align-content: start; gap: 5px; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-2); }
+.quick-plan-summary section span { overflow: hidden; color: var(--text-soft); font-size: 12px; text-overflow: ellipsis; white-space: pre; }
+.quick-plan-delete-summary { border-color: rgba(215, 71, 71, .4) !important; background: rgba(215, 71, 71, .08) !important; }
+.quick-plan-delete-summary strong { color: var(--danger); }
+.quick-plan-delete-summary span.child { padding-left: 22px; }
+.quick-plan-delete-summary small { margin-top: 5px; color: var(--muted); }
+.quick-plan-dialog .primary-button.danger { border-color: var(--danger); background: var(--danger); }
+@media (max-width: 760px) { .quick-plan-summary-grid { grid-template-columns: 1fr; } }
 
 .seatable-sync-preview { display: grid; gap: 14px; }
 .seatable-sync-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
@@ -1995,6 +2014,7 @@ pre {
 .recurrence-dialog .el-dialog__headerbtn:hover .el-dialog__close { color: var(--text); }
 .recurrence-dialog .el-dialog__body { padding: 16px 18px 18px; color: var(--text-soft); background: var(--panel); }
 .recurrence-dialog .el-dialog__footer { display: flex; justify-content: flex-end; gap: 8px; padding: 0 18px 16px; background: var(--panel); }
+.quick-estimate-overlay .el-overlay-dialog { display: flex; align-items: center; justify-content: center; padding: 5vh 0; }
 .quick-estimate-dialog { height: min(90vh, 760px); max-height: 90vh; display: flex; flex-direction: column; margin: 0 auto !important; }
 .quick-estimate-dialog .el-dialog__body { min-height: 0; flex: 1; display: flex; flex-direction: column; overflow: hidden; padding-top: 14px; }
 .quick-estimate-dialog .el-dialog__footer { flex: 0 0 auto; }
@@ -2018,7 +2038,7 @@ pre {
 .quick-estimate-suggestion { grid-column: 2; color: var(--accent); }
 .quick-estimate-suggestion:hover { border-color: var(--accent); color: var(--accent); }
 .quick-estimate-clear { grid-column: 4; color: var(--muted); }
-.quick-estimate-input-wrap { grid-column: 3; min-width: 0; display: grid; grid-template-rows: 32px 15px; gap: 3px; }
+.quick-estimate-input-wrap { grid-column: 3; min-width: 0; display: grid; gap: 3px; }
 .quick-estimate-editor { display: grid; grid-template-columns: 30px 82px 30px minmax(72px, 1fr); align-items: center; gap: 6px; }
 .quick-estimate-editor > button { width: 30px; height: 32px; display: inline-flex; align-items: center; justify-content: center; padding: 0; border: 1px solid var(--line); border-radius: 7px; color: var(--text-soft); background: var(--panel-2); cursor: pointer; }
 .quick-estimate-editor > button:hover { border-color: var(--accent); color: var(--accent); }
@@ -2027,8 +2047,7 @@ pre {
 .quick-estimate-editor input { width: 100%; min-width: 0; height: 30px; padding: 0 4px 0 8px; border: 0; color: var(--text); background: transparent; outline: none; }
 .quick-estimate-editor label > span { padding-right: 7px; font-size: 11px; }
 .quick-estimate-hours { overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.quick-estimate-input-wrap .error { min-height: 15px; overflow: hidden; color: transparent; font-size: 11px; line-height: 15px; text-overflow: ellipsis; white-space: nowrap; }
-.quick-estimate-input-wrap .error.visible { color: #d66d3a; }
+.quick-estimate-input-wrap .error { overflow: hidden; color: #d66d3a; font-size: 11px; line-height: 15px; text-overflow: ellipsis; white-space: nowrap; }
 .quick-estimate-empty { padding: 32px 12px; text-align: center; color: var(--muted); }
 .quick-estimate-dialog .primary-button.attention { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 24%, transparent); }
 @media (max-width: 760px) {

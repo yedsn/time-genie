@@ -748,6 +748,27 @@ export async function setTaskDailyEstimateBatch(
   return result;
 }
 
+export type TaskPlanBatchRequest = {
+  subjectId: string;
+  baselineTasks: Array<{ taskId: string; expectedVersion: number }>;
+  finalItems: Array<{ lineKey: string; taskId?: string; title: string; parentLineKey?: string }>;
+  confirmedDeleteTaskIds: string[];
+};
+
+export type TaskPlanBatchResult = {
+  createdCount: number;
+  updatedCount: number;
+  deletedCount: number;
+};
+
+export async function applyTaskPlanBatch(request: TaskPlanBatchRequest): Promise<TaskPlanBatchResult> {
+  const result = await invoke<TaskPlanBatchResult>("task_plan_batch_apply", { request });
+  if (result.createdCount || result.updatedCount || result.deletedCount) {
+    await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-plan-batch-apply");
+  }
+  return result;
+}
+
 export async function setRecurringTaskEstimate(taskId: string, expectedVersion: number, workDate: string, estimateMinutes: number): Promise<TaskRecord> {
   const result = await invoke<TaskRecord>("task_recurring_estimate_set", { request: { taskId, expectedVersion, workDate, estimateMinutes } });
   await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-recurring-estimate");

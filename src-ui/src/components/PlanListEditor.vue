@@ -2,12 +2,13 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import Sortable, { MultiDrag } from "sortablejs";
-import { CalendarDays, CheckCircle2, Circle, Clock3, Copy, CornerDownRight, DatabaseZap, FileInput, GripVertical, IndentDecrease, IndentIncrease, MessageSquareText, Minus, Play, Plus, Radio, Repeat2, TimerReset, Trash2 } from "lucide-vue-next";
+import { CalendarDays, CheckCircle2, Circle, Clock3, Copy, CornerDownRight, DatabaseZap, FileInput, FilePenLine, GripVertical, IndentDecrease, IndentIncrease, MessageSquareText, Minus, Play, Plus, Radio, Repeat2, TimerReset, Trash2 } from "lucide-vue-next";
 import type { Task } from "../store";
 import { isActivePlanTask } from "../services/completedTaskHistoryCore";
 import { contextMenuPosition, planTaskMoveIntent, todayEstimateDraft } from "../services/planTaskInteractionCore";
 import { getSubjectWorkSchedule, type SubjectWorkScheduleDay } from "../services/tauri";
 import { adjustQuickEstimateMinutes, allocatedMinutes, capacitySummary, changedEstimateDrafts, formatQuickEstimateHours, parseQuickDuration, parseQuickEstimateMinutes, quickEstimateRows, scheduleCapacity, weekdayIndexForDate, type QuickEstimateDraft } from "../services/quickPlanEstimateCore";
+import { analyzeQuickPlanDraft, buildQuickPlanBatchRequest, createQuickPlanBaseline, createQuickPlanDraft, reconcileQuickPlanText, serializeQuickPlanLines, type QuickPlanBaselineTask, type QuickPlanBatchRequest, type QuickPlanDraftLine } from "../services/quickPlanTextCore";
 
 const props = defineProps<{
   tasks: Task[];
@@ -19,6 +20,7 @@ const props = defineProps<{
   todayDate: string;
   timezone: string;
   saveEstimateBatch: (items: Array<{ taskId: string; expectedTaskVersion: number; expectedDailyEstimateVersion?: number; estimateMinutes?: number }>) => Promise<void>;
+  savePlanBatch: (request: QuickPlanBatchRequest) => Promise<{ createdCount: number; updatedCount: number; deletedCount: number }>;
 }>();
 
 const emit = defineEmits<{
@@ -72,6 +74,16 @@ const quickEstimateCapacityText = ref("");
 const quickEstimateCapacityMinutes = ref(0);
 const quickEstimateDoneFocus = ref(false);
 const quickEstimateConfirmingClose = ref(false);
+const quickPlanOpen = ref(false);
+const quickPlanSaving = ref(false);
+const quickPlanMode = ref<"edit" | "summary">("edit");
+const quickPlanBaseline = ref<QuickPlanBaselineTask[]>([]);
+const quickPlanSourceLines = ref<QuickPlanDraftLine[]>([]);
+const quickPlanLines = ref<QuickPlanDraftLine[]>([]);
+const quickPlanText = ref("");
+const quickPlanConfirmingClose = ref(false);
+const quickPlanPasteErrors = ref<Array<{ lineIndex: number; message: string }>>([]);
+let quickPlanTextVersion = 0;
 let sortable: Sortable | undefined;
 let levelChangedTimer: number | undefined;
 
@@ -91,6 +103,10 @@ const quickAllocatableRows = computed(() => quickRows.value.filter((row) => row.
 const quickAllocatedMinutes = computed(() => allocatedMinutes(quickEstimateDrafts.value));
 const quickCapacitySummary = computed(() => capacitySummary(quickAllocatedMinutes.value, quickEstimateCapacityMinutes.value));
 const quickEstimateDirty = computed(() => changedEstimateDrafts(quickEstimateDrafts.value).length > 0);
+const quickPlanSummary = computed(() => {
+  const summary = analyzeQuickPlanDraft(quickPlanBaseline.value, quickPlanLines.value);
+  return { ...summary, errors: [...quickPlanPasteErrors.value, ...summary.errors] };
+});
 
 function getDepth(task: Task) {
   let depth = 0;
@@ -358,6 +374,86 @@ function normalizeEstimate(value: number | undefined) {
 
 function formatQuickDraft(minutes?: number) {
   return String(minutes ?? 0);
+}
+
+function openQuickPlan() {
+  const activeTasks = pendingRows.value.map((row) => row.task);
+  quickPlanBaseline.value = createQuickPlanBaseline(activeTasks);
+  quickPlanSourceLines.value = createQuickPlanDraft(activeTasks);
+  quickPlanLines.value = quickPlanSourceLines.value.map((line) => ({ ...line }));
+  quickPlanText.value = serializeQuickPlanLines(quickPlanLines.value);
+  quickPlanPasteErrors.value = [];
+  quickPlanMode.value = "edit";
+  quickPlanOpen.value = true;
+}
+
+function updateQuickPlanText(text: string) {
+  quickPlanText.value = text;
+  const result = reconcileQuickPlanText(quickPlanSourceLines.value, text, `edit:${++quickPlanTextVersion}`);
+  quickPlanPasteErrors.value = result.errors;
+  if (!result.errors.length) quickPlanLines.value = result.lines;
+}
+
+function handleQuickPlanTextareaKey(event: KeyboardEvent) {
+  if (event.key !== "Tab") return;
+  event.preventDefault();
+  const textarea = event.currentTarget as HTMLTextAreaElement;
+  const start = textarea.selectionStart;
+  const end = textarea.selectionEnd;
+  const lineStart = quickPlanText.value.lastIndexOf("\n", start - 1) + 1;
+  let nextText = quickPlanText.value;
+  let nextCursor = start;
+  if (event.shiftKey) {
+    const prefix = nextText.slice(lineStart, start);
+    const removeLength = prefix.startsWith("\t") ? 1 : prefix.startsWith("  ") ? 2 : 0;
+    if (removeLength) {
+      nextText = nextText.slice(0, lineStart) + nextText.slice(lineStart + removeLength);
+      nextCursor = Math.max(lineStart, start - removeLength);
+    }
+  } else {
+    nextText = nextText.slice(0, lineStart) + "  " + nextText.slice(lineStart);
+    nextCursor = start + 2;
+  }
+  updateQuickPlanText(nextText);
+  void nextTick(() => { textarea.setSelectionRange(nextCursor, Math.max(nextCursor, end + (nextCursor - start))); });
+}
+
+function openQuickPlanSummary() {
+  if (quickPlanSummary.value.errors.length) return;
+  if (!quickPlanSummary.value.dirty) {
+    quickPlanOpen.value = false;
+    return;
+  }
+  quickPlanMode.value = "summary";
+}
+
+function closeQuickPlanSummary() {
+  quickPlanMode.value = "edit";
+}
+
+async function requestCloseQuickPlan(done: () => void) {
+  if (!quickPlanSummary.value.dirty || quickPlanConfirmingClose.value) { done(); return; }
+  quickPlanConfirmingClose.value = true;
+  try {
+    await ElMessageBox.confirm("快速编辑计划还有未保存修改，确定放弃吗？", "放弃修改", { confirmButtonText: "放弃", cancelButtonText: "继续编辑", type: "warning" });
+    done();
+  } catch {} finally {
+    quickPlanConfirmingClose.value = false;
+  }
+}
+
+async function saveQuickPlan() {
+  if (quickPlanSaving.value || quickPlanSummary.value.errors.length) return;
+  quickPlanSaving.value = true;
+  try {
+    await props.savePlanBatch(buildQuickPlanBatchRequest(props.subjectId, quickPlanBaseline.value, quickPlanSummary.value));
+    quickPlanOpen.value = false;
+    ElMessage.success("计划已保存");
+  } catch (error) {
+    ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "计划保存失败，请重新加载后重试");
+  } finally {
+    quickPlanSaving.value = false;
+  }
 }
 
 async function openQuickEstimate() {
@@ -693,6 +789,7 @@ onBeforeUnmount(() => {
       </div>
       <div class="plan-head-actions">
         <button class="secondary-button quick-estimate-entry" type="button" title="连续分配今日预计" @click="openQuickEstimate"><Clock3 :size="14" />分配今日预计</button>
+        <button class="secondary-button quick-estimate-entry" type="button" title="在一个编辑区调整整个计划" @click="openQuickPlan"><FilePenLine :size="14" />快速编辑计划</button>
         <button class="icon-button subtle" type="button" title="同步到 SeaTable" aria-label="同步到 SeaTable" @click="emit('syncSeaTable')"><DatabaseZap :size="15" /></button>
         <button class="icon-button subtle plan-import-button" type="button" title="从昨日 Obsidian 日报导入计划" aria-label="导入计划" @click="emit('importPlan')"><FileInput :size="15" /></button>
       </div>
@@ -852,12 +949,63 @@ onBeforeUnmount(() => {
     </el-dialog>
 
     <el-dialog
+      v-model="quickPlanOpen"
+      class="recurrence-dialog quick-plan-dialog"
+      title="快速编辑计划"
+      width="min(760px, 95vw)"
+      append-to-body
+      align-center
+      :close-on-click-modal="false"
+      :before-close="requestCloseQuickPlan"
+    >
+      <div v-if="quickPlanMode === 'edit'" class="quick-plan-workspace">
+        <div class="quick-plan-help"><strong>{{ subjectName }}</strong><span>每行一个事项；Tab / Shift+Tab 调整一、二级。粘贴多行时支持 Tab、两个空格或四个空格缩进。</span></div>
+        <textarea
+          class="quick-plan-editor"
+          :value="quickPlanText"
+          aria-label="计划文本编辑器"
+          placeholder="每行输入一个事项；在行首缩进表示子事项"
+          spellcheck="false"
+          @input="updateQuickPlanText(($event.target as HTMLTextAreaElement).value)"
+          @keydown="handleQuickPlanTextareaKey"
+        ></textarea>
+        <div v-if="quickPlanSummary.errors.length" class="quick-plan-errors">
+          <strong>请先修正以下问题</strong>
+          <span v-for="error in quickPlanSummary.errors" :key="`${error.lineIndex}:${error.message}`">第 {{ error.lineIndex + 1 }} 行：{{ error.message }}</span>
+        </div>
+      </div>
+      <div v-else class="quick-plan-summary">
+        <div class="quick-plan-summary-grid">
+          <section><strong>新增 {{ quickPlanSummary.added.length }} 项</strong><span v-for="item in quickPlanSummary.added" :key="item.lineKey">{{ item.depth ? '  ' : '' }}{{ item.title }}</span></section>
+          <section><strong>修改标题 {{ quickPlanSummary.renamed.length }} 项</strong><span v-for="item in quickPlanSummary.renamed" :key="item.lineKey">{{ item.title }}</span></section>
+          <section><strong>调整顺序或层级 {{ quickPlanSummary.moved.length }} 项</strong><span v-for="item in quickPlanSummary.moved" :key="item.lineKey">{{ item.depth ? '  ' : '' }}{{ item.title }}</span></section>
+        </div>
+        <section v-if="quickPlanSummary.deleted.length" class="quick-plan-delete-summary">
+          <strong>将删除 {{ quickPlanSummary.deleted.length }} 项</strong>
+          <span v-for="item in quickPlanSummary.deleted" :key="item.lineKey" :class="{ child: item.depth }">{{ item.title }}</span>
+          <small>父事项及其仍在删除范围内的子事项已全部列出，请确认后再保存。</small>
+        </section>
+      </div>
+      <template #footer>
+        <template v-if="quickPlanMode === 'edit'">
+          <button class="secondary-button" type="button" @click="requestCloseQuickPlan(() => { quickPlanOpen = false; })">取消</button>
+          <button class="primary-button" type="button" :disabled="Boolean(quickPlanSummary.errors.length)" @click="openQuickPlanSummary">预览变化</button>
+        </template>
+        <template v-else>
+          <button class="secondary-button" type="button" :disabled="quickPlanSaving" @click="closeQuickPlanSummary">返回编辑</button>
+          <button class="primary-button" :class="{ danger: quickPlanSummary.deleted.length }" type="button" :disabled="quickPlanSaving" @click="saveQuickPlan">{{ quickPlanSaving ? '保存中...' : quickPlanSummary.deleted.length ? '确认删除并保存' : '确认保存' }}</button>
+        </template>
+      </template>
+    </el-dialog>
+
+    <el-dialog
       v-model="quickEstimateOpen"
       class="recurrence-dialog quick-estimate-dialog"
       title="分配今日预计"
       width="min(820px, 95vw)"
       append-to-body
       align-center
+      modal-class="quick-estimate-overlay"
       :close-on-click-modal="false"
       :before-close="requestCloseQuickEstimate"
     >
@@ -903,7 +1051,7 @@ onBeforeUnmount(() => {
                 <button type="button" title="增加 15 分钟" aria-label="增加 15 分钟" @click="adjustQuickMinutes(row.task.id, 15)"><Plus :size="14" /></button>
                 <span class="quick-estimate-hours">{{ quickDraftHours(row.task.id) }}</span>
               </div>
-              <small class="error" :class="{ visible: quickEstimateErrors[row.task.id] }">{{ quickEstimateErrors[row.task.id] || '&nbsp;' }}</small>
+              <small v-if="quickEstimateErrors[row.task.id]" class="error">{{ quickEstimateErrors[row.task.id] }}</small>
             </div>
             <button class="quick-estimate-clear" type="button" @click="setQuickMinutes(row.task.id)">清空</button>
           </template>

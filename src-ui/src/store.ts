@@ -52,6 +52,7 @@ import {
   closeTaskRecurrence,
   setTaskDailyEstimate,
   setTaskDailyEstimateBatch,
+  applyTaskPlanBatch,
   setRecurringTaskEstimate,
   startTimerRecord,
   stopTimerRecord,
@@ -72,6 +73,7 @@ import { TRANSIENT_MISSING_STATE_REFRESH_LIMIT, transientMissingStateResult } fr
 import { canSubmitUnassignedResolution } from "./services/unassignedResolutionGuard";
 import { clampHistoryPage, collectTodayEntryTaskIds, findEntryInHistory, isTodayTimeEntry, timerStopHistoryTarget } from "./services/timeEntryHistoryCore";
 import { completedTaskHistoryFallbackPage, isCurrentCompletedTaskHistoryRequest } from "./services/completedTaskHistoryCore";
+import type { QuickPlanBatchRequest } from "./services/quickPlanTextCore";
 
 export type TaskStatus = "open" | "done";
 
@@ -1434,6 +1436,12 @@ export const useWorkdayStore = defineStore("workday", () => {
     await Promise.all([loadWorkspaceData(), loadTodayOverview()]);
   }
 
+  async function saveTaskPlanBatch(request: QuickPlanBatchRequest) {
+    const result = await applyTaskPlanBatch(request);
+    await Promise.all([loadWorkspaceData(), loadTodayOverview()]);
+    return result;
+  }
+
   async function openTimerStopConfirmation(entryId: string) {
     timerStopConfirmation.value = undefined;
     timerStopConfirmationEntryId.value = entryId;
@@ -1772,7 +1780,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     now, todayMinutes, allocatedMinutes, pendingMinutes, doneCount, todayCompletionDoneCount, todayCompletionTotalCount, todayCompletionPercent, unassignedSeconds, unassignedStartedAt,
     unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen, unassignedWorkDate, unassignedSessionId,
     unassignedCurrentSession,
-    workspaceLoaded, workspaceLoading, loadWorkspaceData, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addChildTask, addTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, duplicateTask, deleteTask, moveTask, reorderTask, movePlanTask,
+    workspaceLoaded, workspaceLoading, loadWorkspaceData, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addChildTask, addTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTaskPlanBatch, duplicateTask, deleteTask, moveTask, reorderTask, movePlanTask,
     indentTask, outdentTask, startTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, adjustTimerStopAllocation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, loadReportTemplates, createReportTemplate, updateReportTemplate, duplicateReportTemplate, setDefaultReportTemplate, deleteReportTemplate, reorderReportTemplates, getReportTemplatePlaceholders, publicReportText, previewObsidianReport, writeObsidianReport,
     beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, dismissUnassignedResolution, resolveUnassignedTime
   };

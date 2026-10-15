@@ -1443,6 +1443,7 @@ async function handleCompletedTaskDelete(task: Task) {
           :today-date="store.workspaceToday"
           :timezone="store.workspaceTimezone"
           :save-estimate-batch="store.saveTaskEstimateBatch"
+          :save-plan-batch="store.saveTaskPlanBatch"
           @select="store.selectedTaskId = $event"
           @add="store.addTask('', store.selectedSubjectId)"
           @add-child="store.addChildTask"
