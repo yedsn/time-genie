@@ -88,11 +88,11 @@ export function createQuickPlanDraft(tasks: readonly QuickPlanTask[]): QuickPlan
 
 function indentation(raw: string): { depth: 0 | 1; title: string } | { error: string } {
   const prefix = raw.match(/^[\t ]*/)?.[0] ?? "";
-  if (!prefix) return { depth: 0 as const, title: raw.trim() };
-  if (prefix === "\t" || prefix === "  " || prefix === "    ") {
-    return { depth: 1 as const, title: raw.slice(prefix.length).trim() };
-  }
-  return { error: "缩进只能为空、一个 Tab、两个空格或四个空格" };
+  const depth = !prefix ? 0 as const : prefix === "\t" || prefix === "  " || prefix === "    " ? 1 as const : undefined;
+  if (depth === undefined) return { error: "缩进只能为空、一个 Tab、两个空格或四个空格" };
+  const content = raw.slice(prefix.length);
+  if (!content.startsWith("- ")) return { error: "每一行事项必须以 '- ' 开头" };
+  return { depth, title: content.slice(2).trim() };
 }
 
 export function parseQuickPlanText(text: string, keyPrefix = "new"): { lines: QuickPlanDraftLine[]; errors: QuickPlanLineError[] } {
@@ -100,7 +100,7 @@ export function parseQuickPlanText(text: string, keyPrefix = "new"): { lines: Qu
   const errors: QuickPlanLineError[] = [];
   let rootSeen = false;
   text.replace(/\r\n?/g, "\n").split("\n").forEach((raw, lineIndex) => {
-    if (!raw.trim()) return;
+    if (!raw.trim() || raw.trim() === "-") return;
     const parsed = indentation(raw);
     if ("error" in parsed) {
       errors.push({ lineIndex, message: parsed.error });
@@ -116,7 +116,7 @@ export function parseQuickPlanText(text: string, keyPrefix = "new"): { lines: Qu
 }
 
 export function serializeQuickPlanLines(lines: readonly QuickPlanDraftLine[]) {
-  return lines.map((line) => `${line.depth ? "  " : ""}${line.text}`).join("\n");
+  return lines.map((line) => `${line.depth ? "  " : ""}- ${line.text}`).join("\n");
 }
 
 export function reconcileQuickPlanText(

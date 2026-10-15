@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
+import { MdEditor } from "md-editor-v3";
+import "md-editor-v3/lib/style.css";
 import Sortable, { MultiDrag } from "sortablejs";
 import { CalendarDays, CheckCircle2, Circle, Clock3, Copy, CornerDownRight, DatabaseZap, FileInput, FilePenLine, GripVertical, IndentDecrease, IndentIncrease, MessageSquareText, Minus, Play, Plus, Radio, Repeat2, TimerReset, Trash2 } from "lucide-vue-next";
 import type { Task } from "../store";
@@ -83,9 +85,25 @@ const quickPlanLines = ref<QuickPlanDraftLine[]>([]);
 const quickPlanText = ref("");
 const quickPlanConfirmingClose = ref(false);
 const quickPlanPasteErrors = ref<Array<{ lineIndex: number; message: string }>>([]);
+const quickPlanEditorRef = ref<{ getEditorView?: () => { state: { selection: { main: { from: number; to: number } } }; dispatch: (transaction: unknown) => void } } | undefined>(undefined);
 let quickPlanTextVersion = 0;
 let sortable: Sortable | undefined;
 let levelChangedTimer: number | undefined;
+
+const quickPlanMarkdownToolbars = [
+  "revoke",
+  "next",
+  "-",
+  "bold",
+  "underline",
+  "italic",
+  "strikeThrough",
+  "unorderedList",
+  "codeRow",
+  "link",
+  "=",
+  "preview",
+] as const;
 
 const sortableWithPlugins = Sortable as typeof Sortable & { treeMultiDragMounted?: boolean };
 if (!sortableWithPlugins.treeMultiDragMounted) {
@@ -397,25 +415,39 @@ function updateQuickPlanText(text: string) {
 function handleQuickPlanTextareaKey(event: KeyboardEvent) {
   if (event.key !== "Tab") return;
   event.preventDefault();
-  const textarea = event.currentTarget as HTMLTextAreaElement;
-  const start = textarea.selectionStart;
-  const end = textarea.selectionEnd;
+  event.stopPropagation();
+  const view = quickPlanEditorRef.value?.getEditorView?.();
+  if (!view) return;
+  const start = view.state.selection.main.from;
+  const end = view.state.selection.main.to;
   const lineStart = quickPlanText.value.lastIndexOf("\n", start - 1) + 1;
   let nextText = quickPlanText.value;
   let nextCursor = start;
+  let changeTo = lineStart;
+  let inserted = "";
   if (event.shiftKey) {
     const prefix = nextText.slice(lineStart, start);
     const removeLength = prefix.startsWith("\t") ? 1 : prefix.startsWith("  ") ? 2 : 0;
     if (removeLength) {
+      changeTo = lineStart + removeLength;
       nextText = nextText.slice(0, lineStart) + nextText.slice(lineStart + removeLength);
       nextCursor = Math.max(lineStart, start - removeLength);
     }
   } else {
-    nextText = nextText.slice(0, lineStart) + "  " + nextText.slice(lineStart);
+    inserted = "  ";
+    nextText = nextText.slice(0, lineStart) + inserted + nextText.slice(lineStart);
     nextCursor = start + 2;
   }
-  updateQuickPlanText(nextText);
-  void nextTick(() => { textarea.setSelectionRange(nextCursor, Math.max(nextCursor, end + (nextCursor - start))); });
+  if (nextText === quickPlanText.value) return;
+  const delta = inserted.length - (changeTo - lineStart);
+  view.dispatch({
+    changes: { from: lineStart, to: changeTo, insert: inserted },
+    selection: { anchor: nextCursor, head: Math.max(nextCursor, end + delta) },
+  });
+}
+
+function formatQuickPlanItem(depth: 0 | 1, title: string) {
+  return `${depth ? "  " : ""}- ${title}`;
 }
 
 function openQuickPlanSummary() {
@@ -959,16 +991,24 @@ onBeforeUnmount(() => {
       :before-close="requestCloseQuickPlan"
     >
       <div v-if="quickPlanMode === 'edit'" class="quick-plan-workspace">
-        <div class="quick-plan-help"><strong>{{ subjectName }}</strong><span>每行一个事项；Tab / Shift+Tab 调整一、二级。粘贴多行时支持 Tab、两个空格或四个空格缩进。</span></div>
-        <textarea
+        <div class="quick-plan-help"><strong>{{ subjectName }}</strong><span>每项必须以“- ”开头；一级写作“- 事项”，二级写作“&nbsp;&nbsp;- 子事项”。Tab / Shift+Tab 调整层级。</span></div>
+        <MdEditor
+          ref="quickPlanEditorRef"
           class="quick-plan-editor"
-          :value="quickPlanText"
-          aria-label="计划文本编辑器"
-          placeholder="每行输入一个事项；在行首缩进表示子事项"
-          spellcheck="false"
-          @input="updateQuickPlanText(($event.target as HTMLTextAreaElement).value)"
-          @keydown="handleQuickPlanTextareaKey"
-        ></textarea>
+          editor-id="quick-plan-markdown-editor"
+          :model-value="quickPlanText"
+          :toolbars="[...quickPlanMarkdownToolbars]"
+          :footers="['markdownTotal']"
+          :preview="false"
+          language="zh-CN"
+          theme="dark"
+          preview-theme="github"
+          code-theme="github"
+          placeholder="- 一级事项&#10;  - 二级事项"
+          aria-label="计划 Markdown 编辑器"
+          @update:model-value="updateQuickPlanText"
+          @keydown.capture="handleQuickPlanTextareaKey"
+        />
         <div v-if="quickPlanSummary.errors.length" class="quick-plan-errors">
           <strong>请先修正以下问题</strong>
           <span v-for="error in quickPlanSummary.errors" :key="`${error.lineIndex}:${error.message}`">第 {{ error.lineIndex + 1 }} 行：{{ error.message }}</span>
@@ -976,13 +1016,13 @@ onBeforeUnmount(() => {
       </div>
       <div v-else class="quick-plan-summary">
         <div class="quick-plan-summary-grid">
-          <section><strong>新增 {{ quickPlanSummary.added.length }} 项</strong><span v-for="item in quickPlanSummary.added" :key="item.lineKey">{{ item.depth ? '  ' : '' }}{{ item.title }}</span></section>
-          <section><strong>修改标题 {{ quickPlanSummary.renamed.length }} 项</strong><span v-for="item in quickPlanSummary.renamed" :key="item.lineKey">{{ item.title }}</span></section>
-          <section><strong>调整顺序或层级 {{ quickPlanSummary.moved.length }} 项</strong><span v-for="item in quickPlanSummary.moved" :key="item.lineKey">{{ item.depth ? '  ' : '' }}{{ item.title }}</span></section>
+          <section><strong>新增 {{ quickPlanSummary.added.length }} 项</strong><span v-for="item in quickPlanSummary.added" :key="item.lineKey">{{ formatQuickPlanItem(item.depth, item.title) }}</span></section>
+          <section><strong>修改标题 {{ quickPlanSummary.renamed.length }} 项</strong><span v-for="item in quickPlanSummary.renamed" :key="item.lineKey">{{ formatQuickPlanItem(item.depth, item.title) }}</span></section>
+          <section><strong>调整顺序或层级 {{ quickPlanSummary.moved.length }} 项</strong><span v-for="item in quickPlanSummary.moved" :key="item.lineKey">{{ formatQuickPlanItem(item.depth, item.title) }}</span></section>
         </div>
         <section v-if="quickPlanSummary.deleted.length" class="quick-plan-delete-summary">
           <strong>将删除 {{ quickPlanSummary.deleted.length }} 项</strong>
-          <span v-for="item in quickPlanSummary.deleted" :key="item.lineKey" :class="{ child: item.depth }">{{ item.title }}</span>
+          <span v-for="item in quickPlanSummary.deleted" :key="item.lineKey" :class="{ child: item.depth }">{{ formatQuickPlanItem(item.depth, item.title) }}</span>
           <small>父事项及其仍在删除范围内的子事项已全部列出，请确认后再保存。</small>
         </section>
       </div>
