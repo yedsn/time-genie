@@ -61,7 +61,7 @@ function resolveBinary(name) {
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: repoRoot,
-    env: { ...process.env, ...options.env },
+    env: { ...process.env, PGCLIENTENCODING: "UTF8", ...options.env },
     encoding: "utf8",
     stdio: options.capture ? "pipe" : "inherit",
   });
@@ -505,7 +505,7 @@ async function main() {
 
   let started = false;
   try {
-    run(initdb, ["-D", dataDir, "-U", "postgres", "-A", "trust", "--no-locale"]);
+    run(initdb, ["-D", dataDir, "-U", "postgres", "-A", "trust", "--no-locale", "--encoding=UTF8"]);
     run(pgCtl, ["-D", dataDir, "-o", `-p ${port}`, "-l", logFile, "start"]);
     started = true;
     await waitForPostgres(psql, port);

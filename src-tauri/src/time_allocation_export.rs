@@ -337,6 +337,43 @@ fn build_export(
             });
         }
     }
+    let mut adjustment_statement = connection
+        .prepare(
+            "SELECT a.work_date,a.task_id,a.delta_minutes,a.note
+             FROM actual_time_adjustments a
+             WHERE a.workspace_id=?1 AND a.work_date BETWEEN ?2 AND ?3 AND a.deleted_at IS NULL
+             ORDER BY a.work_date,a.created_at,a.id",
+        )
+        .map_err(|error| error.to_string())?;
+    for row in adjustment_statement
+        .query_map(
+            params![workspace_id, request.start_date, request.end_date],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .map_err(|error| error.to_string())?
+    {
+        let (work_date, task_id, minutes, note) = row.map_err(|error| error.to_string())?;
+        let note = note
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        rows.push(TimeAllocationExportRow {
+            work_date,
+            subject: task_subject(&task_id, &tasks),
+            task: task_path(&task_id, &tasks),
+            minutes,
+            time_range: String::new(),
+            note: note
+                .map(|value| format!("实际调整：{value}"))
+                .unwrap_or_else(|| "实际调整".to_string()),
+        });
+    }
     let total_minutes = rows.iter().map(|row| row.minutes).sum();
     Ok(BuiltExport {
         rows,

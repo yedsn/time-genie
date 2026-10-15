@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
-import { ElMessage } from "element-plus";
-import { Check, ChevronDown, ChevronRight, CircleDot, Clock3, Coffee, Download, Eraser, Pause, Play, Plus, RotateCcw, Split, Square, Trash2 } from "lucide-vue-next";
+import { ElMessage, ElMessageBox } from "element-plus";
+import { Check, ChevronDown, ChevronRight, CircleDot, Clock3, Coffee, Download, Eraser, Pause, Play, Plus, RotateCcw, Split, Square, TimerReset, Trash2 } from "lucide-vue-next";
 import { save } from "@tauri-apps/plugin-dialog";
 import { useWorkdayStore, type TimeEntry, type TimeEntryHistoryDay } from "../store";
 import TaskSelectControl from "./TaskSelectControl.vue";
@@ -229,7 +229,16 @@ function formatHistoryDate(workDate: string) {
 }
 
 function formatHistorySummary(group: TimeEntryHistoryDay) {
-  return `${group.entryCount} 段 · 工作 ${group.rawMinutes} 分钟 · 休息 ${group.breakMinutes} 分钟 · 待确认 ${group.pendingMinutes} 分钟`;
+  return group.entryCount + " 段 · 原始工作 " + group.allocatedMinutes + " 分钟 · 实际调整 " + (group.adjustmentMinutes >= 0 ? "+" : "") + group.adjustmentMinutes + " 分钟 · 最终实际 " + group.finalActualMinutes + " 分钟 · 待确认 " + group.pendingMinutes + " 分钟";
+}
+
+async function removeActualAdjustment(adjustment: TimeEntryHistoryDay["adjustments"][number]) {
+  const message = "确定删除“" + adjustment.taskTitle + "”的 " + (adjustment.deltaMinutes >= 0 ? "+" : "") + adjustment.deltaMinutes + " 分钟实际调整吗？";
+  try {
+    await ElMessageBox.confirm(message, "删除实际调整", { confirmButtonText: "删除", cancelButtonText: "取消", type: "warning" });
+    await store.removeActualAdjustment(adjustment.id, adjustment.version);
+    ElMessage.success("实际调整已撤销");
+  } catch (error) { if (error !== "cancel" && error !== "close") ElMessage.error(errorText(error, "撤销实际调整失败")); }
 }
 
 async function openExportDialog() {
@@ -609,6 +618,16 @@ defineExpose({ focusTaskSelector });
           <span>{{ formatHistorySummary(group) }}</span>
         </header>
         <div class="time-entry-list">
+          <article v-for="adjustment in group.adjustments" :key="adjustment.id" class="time-entry actual-adjustment-history-item">
+            <div class="time-entry-summary">
+              <span class="time-entry-icon ended"><TimerReset :size="15" /></span>
+              <span class="time-entry-range">{{ formatTime(adjustment.createdAt) }}</span>
+              <span class="time-entry-title"><strong>{{ adjustment.taskTitle }}</strong><small>{{ adjustment.note || '无备注' }}</small></span>
+              <span class="time-entry-duration actual-adjustment-history-delta">{{ adjustment.deltaMinutes >= 0 ? '+' : '' }}{{ adjustment.deltaMinutes }} 分钟</span>
+              <span class="time-entry-status ended">实际调整</span>
+              <button class="icon-button subtle" type="button" title="删除并撤销此调整" @click="removeActualAdjustment(adjustment)"><Trash2 :size="14" /></button>
+            </div>
+          </article>
           <article
             v-for="entry in group.entries"
             :key="entry.id"

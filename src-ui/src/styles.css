@@ -2059,6 +2059,28 @@ pre {
 .quick-estimate-hours { overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .quick-estimate-input-wrap .error { overflow: hidden; color: #d66d3a; font-size: 11px; line-height: 15px; text-overflow: ellipsis; white-space: nowrap; }
 .quick-estimate-empty { padding: 32px 12px; text-align: center; color: var(--muted); }
+.actual-adjustment-dialog { font-family: inherit; color: var(--text); }
+.actual-adjustment-toolbar .secondary-button { display: inline-flex; align-items: center; gap: 6px; }
+.actual-adjustment-list { min-height: 0; flex: 1; overflow: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.actual-adjustment-row { display: grid; grid-template-columns: minmax(240px, 1fr) 130px 54px; align-items: center; gap: 10px; min-height: 64px; padding: 10px 12px; border-bottom: 1px solid var(--line); color: var(--text); }
+.actual-adjustment-row:last-child { border-bottom: 0; }
+.actual-adjustment-row.group { grid-template-columns: 1fr; background: var(--panel-2); }
+.actual-adjustment-row.child > div:first-child { padding-left: 18px; }
+.actual-adjustment-row > div:first-child { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 5px; }
+.actual-adjustment-row strong { overflow: hidden; font-size: 14px; font-weight: 650; color: var(--text); text-overflow: ellipsis; white-space: nowrap; }
+.actual-adjustment-row small { flex-basis: 100%; color: var(--text-soft); font-size: 12px; }
+.actual-adjustment-row > label { height: 36px; display: grid; grid-template-columns: 1fr auto; align-items: center; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); }
+.actual-adjustment-row > label:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 16%, transparent); }
+.actual-adjustment-row > label input { min-width: 0; width: 100%; height: 34px; padding: 0 8px; border: 0; outline: 0; color: var(--text); background: transparent; font: inherit; }
+.actual-adjustment-row > label span { padding-right: 8px; color: var(--text-soft); font-size: 12px; }
+.actual-adjustment-delta { color: var(--accent); font-size: 13px; font-weight: 650; text-align: right; }
+.actual-adjustment-row .error { grid-column: 2 / -1; color: #d66d3a; }
+.actual-new-task-fields { display: grid !important; grid-template-columns: minmax(150px, 1fr) minmax(130px, .55fr); gap: 8px !important; padding-left: 0 !important; }
+.actual-new-task-fields input, .actual-new-task-fields select, .actual-adjustment-note input { min-width: 0; height: 36px; padding: 0 9px; border: 1px solid var(--line); border-radius: 8px; outline: 0; color: var(--text); background: var(--panel-2); font: inherit; }
+.actual-adjustment-note { display: grid; gap: 6px; margin-top: 12px; color: var(--text-soft); font-size: 12px; }
+.actual-adjustment-confirm-list { max-height: 320px; margin: 12px 0 0; padding-left: 22px; overflow: auto; color: var(--text); font: inherit; }
+.actual-adjustment-confirm-list li { margin: 7px 0; line-height: 1.45; }
+@media (max-width: 760px) { .actual-adjustment-row { grid-template-columns: minmax(0, 1fr) 46px; } .actual-adjustment-row > div:first-child, .actual-adjustment-row > label { grid-column: 1 / -1; } .actual-adjustment-delta { grid-column: 2; } .actual-new-task-fields { grid-template-columns: 1fr; } }
 .quick-estimate-dialog .primary-button.attention { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 24%, transparent); }
 @media (max-width: 760px) {
   .quick-estimate-toolbar { flex-direction: column; }

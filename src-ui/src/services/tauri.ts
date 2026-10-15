@@ -233,6 +233,33 @@ export type TaskListResult = {
   revision: number;
 };
 
+export type ActualTimeAdjustmentRecord = {
+  id: string; subjectId: string; taskId: string; taskTitle: string; workDate: string;
+  deltaMinutes: number; baselineMinutes: number; targetMinutes: number; note?: string;
+  batchId: string; createdAt: number; version: number; deletedAt?: number;
+};
+
+export type ActualAdjustmentSnapshotTaskRecord = {
+  id: string; parentId?: string; title: string; status: "open" | "done"; completedAt?: number;
+  version: number; isLeaf: boolean; directMinutes: number; totalMinutes: number;
+  adjustmentFingerprint: string; timerState?: "running" | "paused"; canAcceptChildren: boolean;
+};
+
+export type ActualAdjustmentSnapshotRecord = {
+  subjectId: string; workDate: string; tasks: ActualAdjustmentSnapshotTaskRecord[]; adjustments: ActualTimeAdjustmentRecord[];
+};
+
+export type ActualAdjustmentBatchRequest = {
+  subjectId: string; workDate: string; clientRequestId: string; batchId: string; note?: string;
+  items: Array<{ taskId: string; expectedTaskVersion: number; baselineMinutes: number; targetMinutes: number; deltaMinutes: number; adjustmentFingerprint: string }>;
+  newTasks: Array<{ clientTaskId: string; title: string; parentId?: string; expectedParentVersion?: number; targetMinutes: number }>;
+};
+
+export type ActualAdjustmentBatchResult = {
+  batchId: string; createdAdjustmentCount: number; createdTaskCount: number;
+  createdTasks: Array<{ clientTaskId: string; taskId: string }>; adjustments: ActualTimeAdjustmentRecord[];
+};
+
 export type CompletedTaskPageResult = {
   tasks: TaskRecord[];
   page: number;
@@ -318,6 +345,9 @@ export type TimeEntryHistoryDayRecord = {
   pendingMinutes: number;
   breakMinutes: number;
   entries: TimeEntryRecord[];
+  adjustmentMinutes: number;
+  finalActualMinutes: number;
+  adjustments: ActualTimeAdjustmentRecord[];
 };
 
 export type TimeEntryHistoryResult = {
@@ -477,8 +507,16 @@ export type ReportTemplatePlaceholder = {
 
 export type ReportTaskSuggestion = {
   taskId: string;
+  parentId?: string;
+  title: string;
+  status: "open" | "done";
+  estimateMinutes?: number;
   actualMinutes: number;
   dailyEstimateMinutes?: number;
+  sortOrder: number;
+  periodStatus: "completed" | "active" | "planned" | "context";
+  defaultSelected: boolean;
+  candidateRole: "selectable" | "context";
 };
 
 export type ObsidianReportWritePreview = {
@@ -724,6 +762,22 @@ export async function confirmObsidianPlan(
 ): Promise<{ batchId: string; tasks: TaskRecord[]; alreadyConfirmed: boolean }> {
   const result = await invoke<{ batchId: string; tasks: TaskRecord[]; alreadyConfirmed: boolean }>("obsidian_plan_import_confirm", { request: { batchId, items, expectedVersion } });
   if (!result.alreadyConfirmed) await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-plan-import");
+  return result;
+}
+
+export async function getActualAdjustmentSnapshot(subjectId: string, workDate: string): Promise<ActualAdjustmentSnapshotRecord> {
+  return await invoke("actual_adjustment_snapshot", { request: { subjectId, workDate } });
+}
+
+export async function applyActualAdjustmentBatch(request: ActualAdjustmentBatchRequest): Promise<ActualAdjustmentBatchResult> {
+  const result = await invoke<ActualAdjustmentBatchResult>("actual_adjustment_batch_apply", { request });
+  await notifyWorkDataChanged(workDataChangeDomainsForMutation("time"), "actual-adjustment-apply");
+  return result;
+}
+
+export async function deleteActualAdjustment(adjustmentId: string, expectedVersion: number, clientRequestId = crypto.randomUUID()): Promise<ActualTimeAdjustmentRecord> {
+  const result = await invoke<ActualTimeAdjustmentRecord>("actual_adjustment_delete", { request: { adjustmentId, expectedVersion, clientRequestId } });
+  await notifyWorkDataChanged(workDataChangeDomainsForMutation("time"), "actual-adjustment-delete");
   return result;
 }
 

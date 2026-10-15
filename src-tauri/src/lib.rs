@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 mod database;
 use database::Database;
+mod actual_time_adjustments;
 mod automation_hooks;
 #[cfg(test)]
 mod cloud_e2e;
@@ -484,6 +485,9 @@ pub fn run() {
             tasks::task_move,
             tasks::task_change_parent,
             tasks::task_duplicate_subtree,
+            actual_time_adjustments::actual_adjustment_snapshot,
+            actual_time_adjustments::actual_adjustment_batch_apply,
+            actual_time_adjustments::actual_adjustment_delete,
             today_overview::today_work_overview_get,
             recurring::task_recurrence_save,
             recurring::task_recurrence_close,

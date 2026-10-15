@@ -71,6 +71,9 @@ pub struct TimeEntryHistoryDayDto {
     pub pending_minutes: i64,
     pub break_minutes: i64,
     pub entries: Vec<TimeEntryDto>,
+    pub adjustment_minutes: i64,
+    pub final_actual_minutes: i64,
+    pub adjustments: Vec<crate::actual_time_adjustments::ActualTimeAdjustmentDto>,
 }
 
 #[derive(Debug, Serialize)]
@@ -789,9 +792,10 @@ pub fn list_time_entry_history(
     let workspace_id = workspace_id(&connection)?;
     let total_days: i64 = connection
         .query_row(
-            "SELECT COUNT(DISTINCT work_date) FROM time_entries
-             WHERE workspace_id=?1 AND deleted_at IS NULL
-               AND (?2=1 OR kind!='break')",
+            "SELECT COUNT(*) FROM (
+               SELECT work_date FROM time_entries WHERE workspace_id=?1 AND deleted_at IS NULL AND (?2=1 OR kind!='break')
+               UNION SELECT work_date FROM actual_time_adjustments WHERE workspace_id=?1 AND deleted_at IS NULL
+             )",
             params![workspace_id, request.include_breaks],
             |row| row.get(0),
         )
@@ -810,9 +814,10 @@ pub fn list_time_entry_history(
     let work_dates = {
         let mut statement = connection
             .prepare(
-                "SELECT DISTINCT work_date FROM time_entries
-                 WHERE workspace_id=?1 AND deleted_at IS NULL
-                   AND (?2=1 OR kind!='break')
+                "SELECT work_date FROM (
+                   SELECT work_date FROM time_entries WHERE workspace_id=?1 AND deleted_at IS NULL AND (?2=1 OR kind!='break')
+                   UNION SELECT work_date FROM actual_time_adjustments WHERE workspace_id=?1 AND deleted_at IS NULL
+                 )
                  ORDER BY work_date DESC
                  LIMIT ?3 OFFSET ?4",
             )
@@ -873,6 +878,25 @@ pub fn list_time_entry_history(
             .filter(|entry| entry.kind == "break")
             .map(|entry| entry.settlement_minutes)
             .sum();
+        let adjustment_ids = {
+            let mut statement = connection.prepare("SELECT id FROM actual_time_adjustments WHERE workspace_id=?1 AND work_date=?2 AND deleted_at IS NULL ORDER BY created_at DESC,id DESC").map_err(|error|error.to_string())?;
+            let result = statement
+                .query_map(params![workspace_id, work_date], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            result
+        };
+        let adjustments = adjustment_ids
+            .iter()
+            .map(|id| crate::actual_time_adjustments::load_adjustment_for_history(&connection, id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let adjustment_minutes = adjustments
+            .iter()
+            .map(|item| item.delta_minutes)
+            .sum::<i64>();
         groups.push(TimeEntryHistoryDayDto {
             work_date,
             entry_count: entries.len() as i64,
@@ -881,6 +905,9 @@ pub fn list_time_entry_history(
             pending_minutes: (raw_minutes - allocated_minutes).max(0),
             break_minutes,
             entries,
+            adjustment_minutes,
+            final_actual_minutes: (allocated_minutes + adjustment_minutes).max(0),
+            adjustments,
         });
     }
     Ok(TimeEntryHistoryResult {

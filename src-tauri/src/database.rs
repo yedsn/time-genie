@@ -95,6 +95,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "timer_sync_recovery",
         sql: include_str!("../migrations/0016_timer_sync_recovery.sql"),
     },
+    Migration {
+        version: 17,
+        name: "actual_time_adjustments",
+        sql: include_str!("../migrations/0017_actual_time_adjustments.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -540,7 +545,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let database = Database::initialize_at(directory.path().join("test.sqlite3")).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 16);
+        assert_eq!(status.schema_version, 17);
         for table in REQUIRED_TABLES {
             assert!(
                 status.tables.iter().any(|value| value == table),
@@ -580,7 +585,7 @@ mod tests {
         let workspace_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migration_count, 16);
+        assert_eq!(migration_count, 17);
         assert_eq!(workspace_count, 1);
     }
 
@@ -651,7 +656,7 @@ mod tests {
         drop(connection);
 
         let database = Database::initialize_at(path).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 16);
+        assert_eq!(database.status().unwrap().schema_version, 17);
         let connection = database.open().unwrap();
         let queue: (String,String,i64,String,String,i64,Option<String>,String,Option<String>) = connection.query_row(
             "SELECT operation_id,state,attempt_count,payload_json,error_json,coalesced_count,depends_on_operation_id,recovery_kind,recovery_context_json FROM sync_outbox WHERE operation_id='legacy-timer-op'",
@@ -878,7 +883,7 @@ mod tests {
         assert_eq!(task_title, "升级前事项");
         assert_eq!(queued, 1);
         assert_eq!(deferred_table, 6);
-        assert_eq!(database.status().unwrap().schema_version, 16);
+        assert_eq!(database.status().unwrap().schema_version, 17);
     }
 
     #[test]
@@ -1318,7 +1323,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outbox_operations, vec!["keep-op", "sending-op"]);
-        assert_eq!(database.status().unwrap().schema_version, 16);
+        assert_eq!(database.status().unwrap().schema_version, 17);
 
         // Deployment rollback keeps the migrated database in place. Rehearse
         // the previous client's read path against that database and verify
@@ -1405,7 +1410,7 @@ mod tests {
         drop(connection);
 
         let database = Database::initialize_at(path).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 16);
+        assert_eq!(database.status().unwrap().schema_version, 17);
         let connection = database.open().unwrap();
 
         let stale_index_count: i64 = connection
@@ -1751,7 +1756,7 @@ mod tests {
 
         let database = Database::initialize_at(path).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 16);
+        assert_eq!(status.schema_version, 17);
         assert!(status.tables.iter().any(|table| table == "device_hooks"));
         assert!(status
             .tables

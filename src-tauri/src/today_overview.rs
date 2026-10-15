@@ -369,14 +369,22 @@ fn load_task_day_stats(
 ) -> Result<HashMap<(String, String), TaskDayStats>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT a.task_id, e.work_date, COALESCE(SUM(a.minutes), 0), MAX(e.started_at)
-             FROM time_allocations a
-             JOIN time_entries e ON e.id = a.entry_id
-             JOIN tasks t ON t.id = a.task_id
-             WHERE a.workspace_id = ?1 AND e.deleted_at IS NULL AND t.deleted_at IS NULL
-               AND e.work_date BETWEEN ?2 AND ?3
-               AND (?4 IS NULL OR t.subject_id = ?4)
-             GROUP BY a.task_id, e.work_date",
+            "SELECT actual.task_id, actual.work_date, COALESCE(SUM(actual.minutes), 0), MAX(actual.started_at)
+             FROM (
+               SELECT a.task_id, e.work_date, a.minutes, e.started_at
+               FROM time_allocations a
+               JOIN time_entries e ON e.id = a.entry_id
+               WHERE a.workspace_id = ?1 AND e.deleted_at IS NULL
+                 AND e.work_date BETWEEN ?2 AND ?3
+               UNION ALL
+               SELECT aa.task_id, aa.work_date, aa.delta_minutes, NULL
+               FROM actual_time_adjustments aa
+               WHERE aa.workspace_id = ?1 AND aa.deleted_at IS NULL
+                 AND aa.work_date BETWEEN ?2 AND ?3
+             ) actual
+             JOIN tasks t ON t.id = actual.task_id
+             WHERE t.deleted_at IS NULL AND (?4 IS NULL OR t.subject_id = ?4)
+             GROUP BY actual.task_id, actual.work_date",
         )
         .map_err(|error| error.to_string())?;
     let mut result = HashMap::new();
@@ -875,6 +883,40 @@ mod tests {
         assert_eq!(scoped.summary.estimated_minutes, 60);
         assert_eq!(scoped.tasks.len(), 1);
         assert_eq!(scoped.tasks[0].task_id, first.id);
+    }
+
+    #[test]
+    fn overview_includes_adjustment_only_actual_minutes() {
+        let (database, workspace_id, subject_id) = setup();
+        let task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                parent_id: None,
+                title: "仅调整事项".into(),
+                planned_date: Some("2026-09-29".into()),
+                estimate_minutes: Some(30),
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        database.open().unwrap().execute(
+            "INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,batch_id,created_at,updated_at,version) VALUES(?1,?2,?3,?4,'2026-09-29',18,0,18,?5,1,1,1)",
+            params![Uuid::now_v7().to_string(), workspace_id, subject_id, task.id, Uuid::now_v7().to_string()],
+        ).unwrap();
+        let overview = get_today_work_overview(&database, request(Some(subject_id))).unwrap();
+        assert_eq!(overview.summary.actual_minutes, 18);
+        assert_eq!(
+            overview
+                .tasks
+                .iter()
+                .find(|item| item.task_id == task.id)
+                .unwrap()
+                .actual_minutes,
+            18
+        );
     }
 
     #[test]

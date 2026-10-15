@@ -56,8 +56,16 @@ pub struct ReportTaskSuggestionRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ReportTaskSuggestionDto {
     pub task_id: String,
+    pub parent_id: Option<String>,
+    pub title: String,
+    pub status: String,
+    pub estimate_minutes: Option<i64>,
     pub actual_minutes: i64,
     pub daily_estimate_minutes: Option<i64>,
+    pub sort_order: i64,
+    pub period_status: String,
+    pub default_selected: bool,
+    pub candidate_role: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -291,17 +299,124 @@ pub fn suggest_report_tasks(
         daily_estimate_date,
     )?;
     let actuals = task_actual_minutes(&connection, &workspace_id, &period_start, &period_end)?;
+    let completed = completed_task_ids_for_period(
+        &connection,
+        &workspace_id,
+        &request.subject_id,
+        &period_start,
+        &period_end,
+    )?;
+    let task_map: HashMap<_, _> = tasks.iter().map(|task| (task.id.clone(), task)).collect();
+    let selectable: HashSet<String> = tasks
+        .iter()
+        .filter(|task| {
+            task.status == "open"
+                || completed.contains(&task.id)
+                || actuals.get(&task.id).copied().unwrap_or(0) > 0
+        })
+        .map(|task| task.id.clone())
+        .collect();
+    let mut included = selectable.clone();
+    for task_id in &selectable {
+        let mut parent_id = task_map
+            .get(task_id)
+            .and_then(|task| task.parent_id.clone());
+        let mut visited = HashSet::new();
+        let mut guard = 0;
+        while let Some(id) = parent_id {
+            guard += 1;
+            if guard > 64 || !visited.insert(id.clone()) {
+                break;
+            }
+            included.insert(id.clone());
+            parent_id = task_map.get(&id).and_then(|task| task.parent_id.clone());
+        }
+    }
     Ok(tasks
         .into_iter()
-        .filter_map(|task| {
+        .filter(|task| included.contains(&task.id))
+        .map(|task| {
             let actual_minutes = actuals.get(&task.id).copied().unwrap_or(0);
-            (actual_minutes > 0).then_some(ReportTaskSuggestionDto {
+            let period_completed = completed.contains(&task.id);
+            let is_selectable = selectable.contains(&task.id);
+            let period_status = if !is_selectable {
+                "context"
+            } else if period_completed {
+                "completed"
+            } else if actual_minutes > 0 {
+                "active"
+            } else {
+                "planned"
+            };
+            ReportTaskSuggestionDto {
                 task_id: task.id,
+                parent_id: task.parent_id,
+                title: task.title,
+                status: task.status,
+                estimate_minutes: task.estimate_minutes,
                 actual_minutes,
                 daily_estimate_minutes: task.daily_estimate_minutes,
-            })
+                sort_order: task.sort_order,
+                period_status: period_status.to_string(),
+                default_selected: is_selectable && (period_completed || actual_minutes > 0),
+                candidate_role: if is_selectable {
+                    "selectable"
+                } else {
+                    "context"
+                }
+                .to_string(),
+            }
         })
         .collect())
+}
+
+fn completed_task_ids_for_period(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    period_start: &str,
+    period_end: &str,
+) -> Result<HashSet<String>, String> {
+    let timezone = crate::work_calendar::workspace_timezone(connection, workspace_id)?;
+    let start_at = crate::work_calendar::day_bounds(timezone, period_start)?.start_at;
+    let end_at = crate::work_calendar::day_bounds(timezone, period_end)?.end_at;
+    let mut completed = HashSet::new();
+    let mut ordinary = connection
+        .prepare(
+            "SELECT id FROM tasks
+             WHERE workspace_id = ?1 AND subject_id = ?2 AND status = 'done'
+               AND completed_at >= ?3 AND completed_at < ?4 AND deleted_at IS NULL",
+        )
+        .map_err(|error| error.to_string())?;
+    for task_id in ordinary
+        .query_map(params![workspace_id, subject_id, start_at, end_at], |row| {
+            row.get(0)
+        })
+        .map_err(|error| error.to_string())?
+    {
+        completed.insert(task_id.map_err(|error| error.to_string())?);
+    }
+    let mut recurring = connection
+        .prepare(
+            "SELECT DISTINCT occurrence.task_id
+             FROM task_occurrences occurrence
+             JOIN tasks task ON task.id = occurrence.task_id AND task.workspace_id = occurrence.workspace_id
+             WHERE occurrence.workspace_id = ?1 AND task.subject_id = ?2
+               AND occurrence.status = 'done'
+               AND occurrence.occurrence_date BETWEEN ?3 AND ?4
+               AND task.deleted_at IS NULL",
+        )
+        .map_err(|error| error.to_string())?;
+    for task_id in recurring
+        .query_map(
+            params![workspace_id, subject_id, period_start, period_end],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?
+    {
+        completed.insert(task_id.map_err(|error| error.to_string())?);
+    }
+    Ok(completed)
 }
 
 pub fn preview_report_work_period(
@@ -1624,10 +1739,17 @@ fn render_daily_situation(
         let day = date.format("%Y-%m-%d").to_string();
         let minutes: i64 = connection
             .query_row(
-                "SELECT COALESCE(SUM(a.minutes), 0)
-                 FROM time_allocations a JOIN time_entries e ON e.id = a.entry_id
-                 JOIN tasks t ON t.id = a.task_id
-                 WHERE a.workspace_id = ?1 AND t.subject_id = ?2 AND e.work_date = ?3 AND e.deleted_at IS NULL",
+                "SELECT COALESCE(SUM(actual.minutes), 0)
+                 FROM (
+                   SELECT a.task_id, e.work_date, a.minutes
+                   FROM time_allocations a JOIN time_entries e ON e.id = a.entry_id
+                   WHERE a.workspace_id = ?1 AND e.work_date = ?3 AND e.deleted_at IS NULL
+                   UNION ALL
+                   SELECT aa.task_id, aa.work_date, aa.delta_minutes
+                   FROM actual_time_adjustments aa
+                   WHERE aa.workspace_id = ?1 AND aa.work_date = ?3 AND aa.deleted_at IS NULL
+                 ) actual JOIN tasks t ON t.id = actual.task_id
+                 WHERE t.subject_id = ?2 AND t.deleted_at IS NULL",
                 params![workspace_id, subject_id, day],
                 |row| row.get(0),
             )
@@ -1647,10 +1769,16 @@ fn render_daily_situation(
             let mut statement = connection
                 .prepare(
                     "SELECT DISTINCT t.title
-                     FROM time_allocations a JOIN time_entries e ON e.id = a.entry_id
-                     JOIN tasks t ON t.id = a.task_id
-                     WHERE a.workspace_id = ?1 AND t.subject_id = ?2 AND e.work_date = ?3
-                       AND e.deleted_at IS NULL AND a.minutes > 0
+                     FROM (
+                       SELECT a.task_id, e.work_date, a.minutes
+                       FROM time_allocations a JOIN time_entries e ON e.id = a.entry_id
+                       WHERE a.workspace_id = ?1 AND e.work_date = ?3 AND e.deleted_at IS NULL
+                       UNION ALL
+                       SELECT aa.task_id, aa.work_date, aa.delta_minutes
+                       FROM actual_time_adjustments aa
+                       WHERE aa.workspace_id = ?1 AND aa.work_date = ?3 AND aa.deleted_at IS NULL
+                     ) actual JOIN tasks t ON t.id = actual.task_id
+                     WHERE t.subject_id = ?2 AND t.deleted_at IS NULL AND actual.minutes > 0
                      ORDER BY t.sort_order, t.created_at LIMIT 5",
                 )
                 .map_err(|error| error.to_string())?;
@@ -1745,10 +1873,14 @@ fn task_actual_minutes(
 ) -> Result<HashMap<String, i64>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT a.task_id, COALESCE(SUM(a.minutes), 0)
-             FROM time_allocations a JOIN time_entries e ON e.id = a.entry_id
-             WHERE a.workspace_id = ?1 AND e.work_date BETWEEN ?2 AND ?3 AND e.deleted_at IS NULL
-             GROUP BY a.task_id",
+            "SELECT task_id, SUM(minutes) FROM (
+               SELECT a.task_id AS task_id,a.minutes AS minutes
+               FROM time_allocations a JOIN time_entries e ON e.id=a.entry_id
+               WHERE a.workspace_id=?1 AND e.work_date BETWEEN ?2 AND ?3 AND e.deleted_at IS NULL
+               UNION ALL
+               SELECT task_id,delta_minutes FROM actual_time_adjustments
+               WHERE workspace_id=?1 AND work_date BETWEEN ?2 AND ?3 AND deleted_at IS NULL
+             ) GROUP BY task_id",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
@@ -1927,10 +2059,6 @@ fn period_label(start: &str, end: &str) -> String {
     }
 }
 
-fn format_decimal_hours(minutes: i64) -> String {
-    format!("{:.1}h", minutes as f64 / 60.0)
-}
-
 fn normalize_duration_format(value: &str) -> &str {
     if value == "hours" {
         "hours"
@@ -1940,10 +2068,16 @@ fn normalize_duration_format(value: &str) -> &str {
 }
 
 fn format_report_duration(minutes: i64, format: &str) -> String {
-    if normalize_duration_format(format) == "minutes" {
-        format!("{minutes}min")
+    let _ = normalize_duration_format(format);
+    if minutes < 60 {
+        return format!("{minutes}min");
+    }
+    let hours = minutes / 60;
+    let remainder = minutes % 60;
+    if remainder == 0 {
+        format!("{hours}h")
     } else {
-        format_decimal_hours(minutes)
+        format!("{hours}h{remainder}min")
     }
 }
 
@@ -2937,10 +3071,25 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(suggestions.len(), 1);
-        assert_eq!(suggestions[0].task_id, timed_task_id);
-        assert_eq!(suggestions[0].actual_minutes, 30);
-        assert_eq!(suggestions[0].daily_estimate_minutes, Some(20));
+        let timed = suggestions
+            .iter()
+            .find(|suggestion| suggestion.task_id == timed_task_id)
+            .unwrap();
+        assert_eq!(timed.actual_minutes, 30);
+        assert_eq!(timed.daily_estimate_minutes, Some(20));
+        assert_eq!(timed.period_status, "completed");
+        assert!(timed.default_selected);
+        let planned = suggestions
+            .iter()
+            .find(|suggestion| suggestion.task_id == open_task.id)
+            .unwrap();
+        assert_eq!(planned.period_status, "planned");
+        assert!(!planned.default_selected);
+        assert!(suggestions
+            .iter()
+            .filter(|suggestion| suggestion.default_selected)
+            .all(|suggestion| suggestion.period_status == "completed"
+                || suggestion.actual_minutes > 0));
 
         let report = create_report(
             &database,
@@ -2956,6 +3105,200 @@ mod tests {
         .unwrap();
         assert!(report.markdown.contains(&open_task.title));
         assert!(report.markdown.contains("## 明日计划"));
+    }
+
+    #[test]
+    fn report_candidates_include_period_completion_context_and_use_workspace_timezone() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("report-candidates.sqlite3")).unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE workspaces SET timezone='America/New_York' WHERE id=?1",
+                [&workspace_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let parent = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                parent_id: None,
+                title: "候选父事项".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let completed = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                parent_id: Some(parent.id.clone()),
+                title: "无计时完成事项".to_string(),
+                planned_date: None,
+                estimate_minutes: Some(25),
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let historical = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                parent_id: None,
+                title: "周期外历史完成".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let timezone: chrono_tz::Tz = "America/New_York".parse().unwrap();
+        let in_period = timezone
+            .with_ymd_and_hms(2026, 10, 15, 0, 30, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let outside_period = timezone
+            .with_ymd_and_hms(2026, 10, 14, 23, 30, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        connection
+            .execute(
+                "UPDATE tasks SET status='done',completed_at=?1 WHERE id=?2",
+                params![in_period, completed.id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE tasks SET status='done',completed_at=?1 WHERE id=?2",
+                params![outside_period, parent.id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE tasks SET status='done',completed_at=?1 WHERE id=?2",
+                params![outside_period, historical.id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let candidates = suggest_report_tasks(
+            &database,
+            ReportTaskSuggestionRequest {
+                report_type: "daily".to_string(),
+                reference_date: "2026-10-15".to_string(),
+                subject_id,
+            },
+        )
+        .unwrap();
+        assert!(!candidates.iter().any(|item| item.task_id == historical.id));
+        let parent_candidate = candidates
+            .iter()
+            .find(|item| item.task_id == parent.id)
+            .unwrap();
+        assert_eq!(parent_candidate.candidate_role, "context");
+        assert_eq!(parent_candidate.period_status, "context");
+        assert!(!parent_candidate.default_selected);
+        let completed_candidate = candidates
+            .iter()
+            .find(|item| item.task_id == completed.id)
+            .unwrap();
+        assert_eq!(
+            completed_candidate.parent_id.as_deref(),
+            Some(parent.id.as_str())
+        );
+        assert_eq!(completed_candidate.period_status, "completed");
+        assert!(completed_candidate.default_selected);
+        assert_eq!(completed_candidate.actual_minutes, 0);
+    }
+
+    #[test]
+    fn report_candidates_deduplicate_recurring_completions_across_week() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("recurring-candidates.sqlite3")).unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                parent_id: None,
+                title: "每周多次完成".to_string(),
+                planned_date: None,
+                estimate_minutes: Some(15),
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let today = chrono::Local::now().date_naive();
+        let monday = today - Duration::days(today.weekday().num_days_from_monday() as i64);
+        let first_date = (monday + Duration::days(1)).format("%Y-%m-%d").to_string();
+        let second_date = (monday + Duration::days(3)).format("%Y-%m-%d").to_string();
+        let reference_date = second_date.clone();
+        save_rule(
+            &database,
+            RecurrenceSaveRequest {
+                task_id: task.id.clone(),
+                task_expected_version: task.version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: today.format("%Y-%m-%d").to_string(),
+                rule_expected_version: None,
+            },
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        for (index, date) in [first_date, second_date].into_iter().enumerate() {
+            connection.execute(
+                "INSERT INTO task_occurrences(workspace_id,task_id,occurrence_date,origin,status,completed_at,created_at,updated_at,version) VALUES (?1,?2,?3,'scheduled','done',?4,?4,?4,1)",
+                params![workspace_id, task.id, date, 1000 + index as i64],
+            ).unwrap();
+        }
+        drop(connection);
+        let candidates = suggest_report_tasks(
+            &database,
+            ReportTaskSuggestionRequest {
+                report_type: "weekly".to_string(),
+                reference_date,
+                subject_id,
+            },
+        )
+        .unwrap();
+        let recurring_candidates = candidates
+            .iter()
+            .filter(|candidate| candidate.task_id == task.id)
+            .collect::<Vec<_>>();
+        assert_eq!(recurring_candidates.len(), 1);
+        assert_eq!(recurring_candidates[0].period_status, "completed");
+        assert!(recurring_candidates[0].default_selected);
     }
 
     #[test]
@@ -3011,8 +3354,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(report.markdown.contains("预计：120min 实际：30min"));
-        assert!(!report.markdown.contains("实际：90min"));
+        assert!(report.markdown.contains("预计：2h 实际：30min"));
+        assert!(!report.markdown.contains("实际：1h30min"));
     }
 
     #[test]
@@ -3078,6 +3421,53 @@ mod tests {
         .unwrap();
         assert_eq!(overview.summary.actual_minutes, 37);
         assert!(report.markdown.contains("实际：37min"));
+    }
+
+    #[test]
+    fn daily_report_includes_adjustment_only_actual_minutes() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("adjustment-only-report.sqlite3"))
+                .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                parent_id: None,
+                title: "日报调整事项".into(),
+                planned_date: Some("2026-09-29".into()),
+                estimate_minutes: Some(30),
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        database.open().unwrap().execute(
+            "INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,batch_id,created_at,updated_at,version) VALUES(?1,?2,?3,?4,'2026-09-29',22,0,22,?5,1,1,1)",
+            params![Uuid::now_v7().to_string(), workspace_id, subject_id.clone(), task.id.clone(), Uuid::now_v7().to_string()],
+        ).unwrap();
+        let report = create_report(
+            &database,
+            ReportCreateRequest {
+                report_type: "daily".into(),
+                reference_date: "2026-09-29".into(),
+                subject_id,
+                task_ids: vec![task.id],
+                template_id: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        assert!(report.markdown.contains("实际：22min"));
     }
 
     #[test]
@@ -3577,13 +3967,14 @@ mod tests {
         assert!(validate_template("daily", "{{日期范围}}").is_err());
         assert!(validate_template("daily", "{{日期").is_err());
         assert!(validate_template("daily", "   ").is_err());
-        assert_eq!(format_decimal_hours(12), "0.2h");
-        assert_eq!(format_decimal_hours(90), "1.5h");
         assert_eq!(normalize_duration_format("minutes"), "minutes");
         assert_eq!(normalize_duration_format("hours"), "hours");
         assert_eq!(normalize_duration_format("unknown"), "minutes");
-        assert_eq!(format_report_duration(90, "minutes"), "90min");
-        assert_eq!(format_report_duration(90, "hours"), "1.5h");
+        assert_eq!(format_report_duration(12, "minutes"), "12min");
+        assert_eq!(format_report_duration(60, "minutes"), "1h");
+        assert_eq!(format_report_duration(80, "minutes"), "1h20min");
+        assert_eq!(format_report_duration(90, "hours"), "1h30min");
+        assert_eq!(format_report_duration(90, "minutes"), "1h30min");
     }
 
     #[test]
@@ -3836,8 +4227,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(report.markdown.contains("预计：0.3h 实际：0.5h"));
-        assert!(!report.markdown.contains("预计：0.5h"));
+        assert!(report.markdown.contains("预计：20min 实际：30min"));
+        assert!(!report.markdown.contains("0.5h"));
     }
 
     #[test]

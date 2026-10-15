@@ -240,6 +240,38 @@ create table if not exists timegenie.time_allocations (
   unique(entry_id, task_id)
 );
 
+create table if not exists timegenie.actual_time_adjustments (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references timegenie.workspaces(id) on delete cascade,
+  subject_id uuid not null references timegenie.subjects(id),
+  task_id uuid not null references timegenie.tasks(id),
+  work_date date not null,
+  delta_minutes integer not null check (delta_minutes <> 0),
+  baseline_minutes integer not null check (baseline_minutes >= 0),
+  target_minutes integer not null check (target_minutes between 0 and 1440),
+  note text,
+  source_type text not null default 'quick_actual_adjustment' check (source_type = 'quick_actual_adjustment'),
+  batch_id uuid not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  version bigint not null default 1,
+  created_by_device_id uuid references timegenie.devices(id),
+  updated_by_device_id uuid references timegenie.devices(id),
+  deleted_at timestamptz
+);
+create index if not exists idx_actual_adjustments_task_date on timegenie.actual_time_adjustments(workspace_id,task_id,work_date,deleted_at);
+
+create table if not exists timegenie.actual_adjustment_batches (
+  workspace_id uuid not null references timegenie.workspaces(id) on delete cascade,
+  client_request_id uuid not null,
+  batch_id uuid not null,
+  request_hash text not null,
+  result_json jsonb not null,
+  created_at timestamptz not null default now(),
+  primary key(workspace_id,client_request_id),
+  unique(workspace_id,batch_id)
+);
+
 create table if not exists timegenie.unassigned_sessions (
   id uuid primary key default gen_random_uuid(),
   workspace_id uuid not null references timegenie.workspaces(id) on delete cascade,
@@ -388,6 +420,8 @@ alter table timegenie.task_occurrences enable row level security;
 alter table timegenie.time_entries enable row level security;
 alter table timegenie.time_segments enable row level security;
 alter table timegenie.time_allocations enable row level security;
+alter table timegenie.actual_time_adjustments enable row level security;
+alter table timegenie.actual_adjustment_batches enable row level security;
 alter table timegenie.unassigned_sessions enable row level security;
 alter table timegenie.unassigned_segments enable row level security;
 alter table timegenie.report_templates enable row level security;
@@ -402,7 +436,7 @@ create policy workspaces_owner on timegenie.workspaces for all using(owner_user_
 do $$
 declare table_name text;
 begin
-  foreach table_name in array array['devices','tracking_leases','workspace_changes','processed_operations','subjects','work_days','app_settings','tasks','task_status_events','task_daily_estimates','task_recurrence_rules','task_occurrences','time_entries','time_segments','time_allocations','unassigned_sessions','unassigned_segments','report_templates','reports','report_tasks','integration_configs','external_bindings'] loop
+  foreach table_name in array array['devices','tracking_leases','workspace_changes','processed_operations','subjects','work_days','app_settings','tasks','task_status_events','task_daily_estimates','task_recurrence_rules','task_occurrences','time_entries','time_segments','time_allocations','actual_time_adjustments','actual_adjustment_batches','unassigned_sessions','unassigned_segments','report_templates','reports','report_tasks','integration_configs','external_bindings'] loop
     execute format('drop policy if exists workspace_owner on timegenie.%I', table_name);
     execute format(
       'create policy workspace_owner on timegenie.%I for all using(
@@ -649,7 +683,7 @@ end $$;
 do $$
 declare table_name text;
 begin
-  foreach table_name in array array['subjects','work_days','app_settings','tasks','task_status_events','task_daily_estimates','task_recurrence_rules','task_occurrences','time_entries','time_segments','time_allocations','unassigned_sessions','report_templates','reports','report_tasks','integration_configs','external_bindings'] loop
+  foreach table_name in array array['subjects','work_days','app_settings','tasks','task_status_events','task_daily_estimates','task_recurrence_rules','task_occurrences','time_entries','time_segments','time_allocations','actual_time_adjustments','unassigned_sessions','report_templates','reports','report_tasks','integration_configs','external_bindings'] loop
     execute format('drop trigger if exists workspace_change_trigger on timegenie.%I', table_name);
     execute format('create trigger workspace_change_trigger after insert or update or delete on timegenie.%I for each row execute function timegenie.touch_workspace_change()', table_name);
   end loop;
@@ -1130,6 +1164,7 @@ begin
     'time_entries', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.time_entries where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
     'time_segments', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.time_segments where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
     'time_allocations', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.time_allocations where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
+    'actual_time_adjustments', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.actual_time_adjustments where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
     'unassigned_sessions', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.unassigned_sessions where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
     'unassigned_segments', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.unassigned_segments where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
     'report_templates', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.report_templates where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
@@ -1316,6 +1351,7 @@ begin
       'segments', coalesce((select jsonb_agg(to_jsonb(segment_value) order by sequence_no, id) from timegenie.time_segments segment_value where workspace_id = p_workspace_id and entry_id = row_value.id), '[]'::jsonb),
       'allocations', coalesce((select jsonb_agg(to_jsonb(allocation_value) order by created_at, id) from timegenie.time_allocations allocation_value where workspace_id = p_workspace_id and entry_id = row_value.id), '[]'::jsonb)
     ) from timegenie.time_entries row_value where workspace_id = p_workspace_id and id::text = p_entity_id)
+    when 'actual_time_adjustments' then (select to_jsonb(row_value) from timegenie.actual_time_adjustments row_value where workspace_id=p_workspace_id and id::text=p_entity_id)
     when 'report_templates' then (select to_jsonb(row_value) from timegenie.report_templates row_value where workspace_id = p_workspace_id and id::text = p_entity_id)
     when 'reports' then (select to_jsonb(row_value) || jsonb_build_object(
       'report_tasks', coalesce((select jsonb_agg(to_jsonb(task_value) order by sort_order, task_id) from timegenie.report_tasks task_value where workspace_id = p_workspace_id and report_id = row_value.id), '[]'::jsonb)
@@ -1404,7 +1440,7 @@ begin
 
   row_data := coalesce(p_payload, '{}'::jsonb);
 
-  if p_entity_type in ('subject','task','time_entry','unassigned_session','report','report_template') then
+  if p_entity_type in ('subject','task','time_entry','actual_time_adjustment','unassigned_session','report','report_template') then
     if p_entity_id is null or row_data->>'id' is distinct from p_entity_id then
       raise exception 'VALIDATION_ERROR: entity id does not match payload id';
     end if;
@@ -1447,11 +1483,12 @@ begin
     end if;
   end if;
 
-  if p_entity_type in ('subject','task','time_entry','report','report_template','app_setting','integration_config','task_occurrence','task_daily_estimate') then
+  if p_entity_type in ('subject','task','time_entry','actual_time_adjustment','report','report_template','app_setting','integration_config','task_occurrence','task_daily_estimate') then
     case p_entity_type
       when 'subject' then select version into current_version from timegenie.subjects where workspace_id = p_workspace_id and id = p_entity_id::uuid;
       when 'task' then select version into current_version from timegenie.tasks where workspace_id = p_workspace_id and id = p_entity_id::uuid;
       when 'time_entry' then select version into current_version from timegenie.time_entries where workspace_id = p_workspace_id and id = p_entity_id::uuid;
+      when 'actual_time_adjustment' then select version into current_version from timegenie.actual_time_adjustments where workspace_id = p_workspace_id and id = p_entity_id::uuid;
       when 'report' then select version into current_version from timegenie.reports where workspace_id = p_workspace_id and id = p_entity_id::uuid;
       when 'report_template' then select version into current_version from timegenie.report_templates where workspace_id = p_workspace_id and id = p_entity_id::uuid;
       when 'app_setting' then select version into current_version from timegenie.app_settings where workspace_id = p_workspace_id and key = row_data->>'key';
@@ -1619,6 +1656,37 @@ begin
         and state in ('resolved','discarded');
     end if;
     result_value := jsonb_build_object('entityType','time_entry','entityId',p_entity_id,'version',(select version from timegenie.time_entries where id = p_entity_id::uuid));
+  elsif p_entity_type = 'actual_time_adjustment' then
+    if coalesce((row_data->>'deleted_at') is null, true) and not exists(
+      select 1 from timegenie.tasks task
+      where task.id=(row_data->>'task_id')::uuid
+        and task.workspace_id=p_workspace_id
+        and task.subject_id=(row_data->>'subject_id')::uuid
+        and task.deleted_at is null
+        and not exists(select 1 from timegenie.tasks child where child.parent_id=task.id and child.deleted_at is null)
+    ) then
+      raise exception 'VALIDATION_ERROR: actual adjustment task must be an active leaf in the same workspace and subject';
+    end if;
+    if coalesce((row_data->>'deleted_at') is null, true) and (
+       (row_data->>'delta_minutes')::integer = 0
+       or (row_data->>'baseline_minutes')::integer < 0
+       or (row_data->>'target_minutes')::integer not between 0 and 1440
+       or (row_data->>'target_minutes')::integer - (row_data->>'baseline_minutes')::integer <> (row_data->>'delta_minutes')::integer) then
+      raise exception 'VALIDATION_ERROR: actual adjustment minutes are inconsistent';
+    end if;
+    if coalesce((row_data->>'deleted_at') is null, true) and (
+      coalesce((select sum(a.minutes) from timegenie.time_allocations a join timegenie.time_entries e on e.id=a.entry_id
+                where a.workspace_id=p_workspace_id and a.task_id=(row_data->>'task_id')::uuid and e.work_date=(row_data->>'work_date')::date and e.deleted_at is null),0)
+      + coalesce((select sum(existing.delta_minutes) from timegenie.actual_time_adjustments existing
+                  where existing.workspace_id=p_workspace_id and existing.task_id=(row_data->>'task_id')::uuid and existing.work_date=(row_data->>'work_date')::date and existing.deleted_at is null and existing.id <> (row_data->>'id')::uuid),0)
+      + (row_data->>'delta_minutes')::integer
+    ) < 0 then
+      raise exception 'VALIDATION_ERROR: final actual minutes cannot be negative';
+    end if;
+    insert into timegenie.actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,note,source_type,batch_id,created_at,updated_at,version,created_by_device_id,updated_by_device_id,deleted_at)
+    values((row_data->>'id')::uuid,p_workspace_id,(row_data->>'subject_id')::uuid,(row_data->>'task_id')::uuid,(row_data->>'work_date')::date,(row_data->>'delta_minutes')::integer,(row_data->>'baseline_minutes')::integer,(row_data->>'target_minutes')::integer,nullif(row_data->>'note',''),'quick_actual_adjustment',(row_data->>'batch_id')::uuid,to_timestamp((row_data->>'created_at')::double precision/1000),to_timestamp((row_data->>'updated_at')::double precision/1000),coalesce((row_data->>'version')::bigint,1),p_device_id,p_device_id,case when row_data->>'deleted_at' is null then null else to_timestamp((row_data->>'deleted_at')::double precision/1000) end)
+    on conflict(id) do update set subject_id=excluded.subject_id,task_id=excluded.task_id,work_date=excluded.work_date,delta_minutes=excluded.delta_minutes,baseline_minutes=excluded.baseline_minutes,target_minutes=excluded.target_minutes,note=excluded.note,batch_id=excluded.batch_id,updated_at=excluded.updated_at,version=excluded.version,updated_by_device_id=p_device_id,deleted_at=excluded.deleted_at;
+    result_value := jsonb_build_object('entityType','actual_time_adjustment','entityId',p_entity_id,'version',(select version from timegenie.actual_time_adjustments where id=p_entity_id::uuid));
   elsif p_entity_type = 'unassigned_session' then
     insert into timegenie.unassigned_sessions(id, workspace_id, work_date, state, threshold_seconds, duration_seconds, first_started_at, last_ended_at, prompted_at, resolution_type, generated_entry_id, resolved_at, created_at, updated_at, version)
     values((row_data->>'id')::uuid, p_workspace_id, (row_data->>'work_date')::date, row_data->>'state', coalesce((row_data->>'threshold_seconds')::integer,300), coalesce((row_data->>'duration_seconds')::bigint,0), to_timestamp((row_data->>'first_started_at')::double precision / 1000), case when row_data->>'last_ended_at' is null then null else to_timestamp((row_data->>'last_ended_at')::double precision / 1000) end, case when row_data->>'prompted_at' is null then null else to_timestamp((row_data->>'prompted_at')::double precision / 1000) end, row_data->>'resolution_type', nullif(row_data->>'generated_entry_id','')::uuid, case when row_data->>'resolved_at' is null then null else to_timestamp((row_data->>'resolved_at')::double precision / 1000) end, to_timestamp(coalesce((row_data->>'created_at')::double precision, extract(epoch from now()) * 1000) / 1000), to_timestamp(coalesce((row_data->>'updated_at')::double precision, extract(epoch from now()) * 1000) / 1000), coalesce((row_data->>'version')::bigint,1))
@@ -2476,6 +2544,11 @@ create or replace function timegenie.migration_import_snapshot(p_workspace_id uu
 returns jsonb language plpgsql security definer set search_path = timegenie, extensions, pg_catalog
 as $$ declare result_value jsonb; row_data jsonb; begin
   result_value:=timegenie.migration_import_snapshot_pre_calendar(p_workspace_id,p_operation_id,p_device_id,p_snapshot);
+  for row_data in select value from jsonb_array_elements(coalesce(p_snapshot->'actual_time_adjustments','[]'::jsonb)) loop
+    insert into timegenie.actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,note,source_type,batch_id,created_at,updated_at,version,created_by_device_id,updated_by_device_id,deleted_at)
+    values((row_data->>'id')::uuid,p_workspace_id,(row_data->>'subject_id')::uuid,(row_data->>'task_id')::uuid,(row_data->>'work_date')::date,(row_data->>'delta_minutes')::integer,(row_data->>'baseline_minutes')::integer,(row_data->>'target_minutes')::integer,nullif(row_data->>'note',''),'quick_actual_adjustment',(row_data->>'batch_id')::uuid,to_timestamp((row_data->>'created_at')::double precision/1000),to_timestamp((row_data->>'updated_at')::double precision/1000),coalesce((row_data->>'version')::bigint,1),p_device_id,p_device_id,case when row_data->>'deleted_at' is null then null else to_timestamp((row_data->>'deleted_at')::double precision/1000) end)
+    on conflict(id) do update set subject_id=excluded.subject_id,task_id=excluded.task_id,work_date=excluded.work_date,delta_minutes=excluded.delta_minutes,baseline_minutes=excluded.baseline_minutes,target_minutes=excluded.target_minutes,note=excluded.note,batch_id=excluded.batch_id,updated_at=excluded.updated_at,version=excluded.version,deleted_at=excluded.deleted_at;
+  end loop;
   for row_data in select value from jsonb_array_elements(coalesce(p_snapshot->'time_entries','[]'::jsonb)) loop
     if row_data->>'source_type'='timer' then
       update timegenie.time_entries set timer_chain_id=coalesce(nullif(row_data->>'timer_chain_id','')::uuid,(row_data->>'id')::uuid),

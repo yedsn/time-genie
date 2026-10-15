@@ -5,8 +5,9 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { ArrowDown, ArrowUp, Braces, CalendarDays, CalendarRange, Check, ChevronRight, ClipboardCopy, Clock3, Copy, FilePenLine, FileText, Folder, HardDriveDownload, LayoutTemplate, MoreHorizontal, Pencil, Plus, ReceiptText, RefreshCcw, Search, Sparkles, Star, Trash2 } from "lucide-vue-next";
 import { MdEditor, MdPreview } from "md-editor-v3";
 import "md-editor-v3/lib/style.css";
-import { useWorkdayStore, type ReportRecord, type ReportType, type Task } from "../store";
+import { useWorkdayStore, type ReportRecord, type ReportType } from "../store";
 import { getReportTaskSuggestions, getReportWorkPeriodPreview, getSettings, querySeaTableReimbursements, type ObsidianReportWritePreview, type ReportTaskSuggestion, type ReportTemplateRecord } from "../services/tauri";
+import { defaultReportTaskIds, preserveReportTaskSelection, reportTaskDepth, selectableReportTaskIds } from "../services/reportTaskCandidateCore";
 import {
   insertTemplateToken,
   placeholdersForReportType,
@@ -73,22 +74,22 @@ const filteredReports = computed(() => {
     return `${report.period} ${report.subjectName} ${reportTypeLabel(report.type)}`.toLocaleLowerCase().includes(query);
   });
 });
-const draftTasks = computed(() => store.tasks.filter((task) => task.subjectId === draftSubjectId.value));
-const draftTaskMinutes = computed(() => new Map(draftTaskSuggestions.value.map((item) => [item.taskId, item.actualMinutes])));
-const draftTaskDailyEstimates = computed(() => new Map(draftTaskSuggestions.value.map((item) => [item.taskId, item.dailyEstimateMinutes])));
+const draftTasks = computed(() => draftTaskSuggestions.value);
+const selectableDraftTasks = computed(() => draftTasks.value.filter((task) => task.candidateRole === "selectable"));
 const visibleDraftTasks = computed(() => {
   const query = draftTaskQuery.value.trim().toLocaleLowerCase();
   if (!query) return draftTasks.value;
-  const matchingIds = new Set(draftTasks.value.filter((task) => task.title.toLocaleLowerCase().includes(query)).map((task) => task.id));
+  const matchingIds = new Set(draftTasks.value.filter((task) => task.title.toLocaleLowerCase().includes(query)).map((task) => task.taskId));
+  const byId = new Map(draftTasks.value.map((task) => [task.taskId, task]));
   for (const task of draftTasks.value) {
-    if (!matchingIds.has(task.id)) continue;
+    if (!matchingIds.has(task.taskId)) continue;
     let parentId = task.parentId;
     while (parentId) {
       matchingIds.add(parentId);
-      parentId = store.tasks.find((item) => item.id === parentId)?.parentId;
+      parentId = byId.get(parentId)?.parentId;
     }
   }
-  return draftTasks.value.filter((task) => matchingIds.has(task.id));
+  return draftTasks.value.filter((task) => matchingIds.has(task.taskId));
 });
 const hasUnsavedChanges = computed(() => Boolean(selectedReport.value && selectedReport.value.markdown !== editorDraft.value));
 const dialogTitle = computed(() => dialogMode.value === "create" ? "创建报告" : "调整报告范围");
@@ -107,11 +108,11 @@ const reportCounts = computed(() => ({
 }));
 const draftSummary = computed(() => {
   const selected = new Set(draftTaskIds.value);
-  const tasks = draftTasks.value.filter((task) => selected.has(task.id));
+  const tasks = selectableDraftTasks.value.filter((task) => selected.has(task.taskId));
   return {
     total: tasks.length,
-    completed: tasks.filter((task) => task.status === "done").length,
-    minutes: tasks.reduce((sum, task) => sum + draftMinutes(task.id), 0)
+    completed: tasks.filter((task) => task.periodStatus === "completed").length,
+    minutes: tasks.reduce((sum, task) => sum + task.actualMinutes, 0)
   };
 });
 const templatePreview = computed(() => {
@@ -161,8 +162,7 @@ watch(selectedReport, (report) => {
 watch([draftSubjectId, draftType, draftReferenceDate], () => {
   if (!reportDialogOpen.value) return;
   void loadDraftWorkPeriod();
-  if (dialogMode.value !== "create") return;
-  void loadSuggestedTasks(true);
+  void loadSuggestedTasks(dialogMode.value === "create");
 });
 watch(draftSubjectId, (subjectId) => {
   if (subjectId) {
@@ -245,27 +245,22 @@ function taskMinutes(taskId: string) {
 }
 
 function draftMinutes(taskId: string) {
-  return draftTaskMinutes.value.get(taskId) ?? 0;
+  return draftTasks.value.find((task) => task.taskId === taskId)?.actualMinutes ?? 0;
 }
 
 function draftDailyEstimate(taskId: string) {
-  return draftTaskDailyEstimates.value.get(taskId);
+  return draftTasks.value.find((task) => task.taskId === taskId)?.dailyEstimateMinutes;
 }
 
 function formatHours(minutes: number) {
-  return reportDurationFormat.value === "minutes" ? `${minutes}min` : `${(minutes / 60).toFixed(1)}h`;
+  if (minutes < 60) return `${minutes}min`;
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  return remainder ? `${hours}h${remainder}min` : `${hours}h`;
 }
 
-function taskDepth(task: Task) {
-  let depth = 0;
-  let parentId = task.parentId;
-  while (parentId && depth < 8) {
-    const parent = store.tasks.find((item) => item.id === parentId);
-    if (!parent) break;
-    depth += 1;
-    parentId = parent.parentId;
-  }
-  return depth;
+function taskDepth(task: ReportTaskSuggestion) {
+  return reportTaskDepth(task, draftTasks.value);
 }
 
 function reportTaskLines(taskIds: string[]) {
@@ -307,8 +302,7 @@ function generateMarkdown(type: ReportType, subjectName: string, period: string,
 }
 
 function selectSuggestedTasks() {
-  const suggested = new Set(draftTaskSuggestions.value.map((item) => item.taskId));
-  draftTaskIds.value = draftTasks.value.filter((task) => suggested.has(task.id)).map((task) => task.id);
+  draftTaskIds.value = defaultReportTaskIds(draftTasks.value);
 }
 
 async function loadSuggestedTasks(applySelection = false) {
@@ -328,6 +322,7 @@ async function loadSuggestedTasks(applySelection = false) {
     if (requestId !== draftSuggestionRequest) return;
     draftTaskSuggestions.value = suggestions;
     if (applySelection) selectSuggestedTasks();
+    else draftTaskIds.value = preserveReportTaskSelection(suggestions, draftTaskIds.value);
   } catch (error) {
     if (requestId !== draftSuggestionRequest) return;
     draftTaskSuggestions.value = [];
@@ -401,7 +396,8 @@ function confirmTemplatePicker() {
 }
 
 function toggleAllDraftTasks() {
-  draftTaskIds.value = draftTaskIds.value.length === draftTasks.value.length ? [] : draftTasks.value.map((task) => task.id);
+  const selectableIds = selectableReportTaskIds(draftTasks.value);
+  draftTaskIds.value = draftTaskIds.value.length === selectableIds.length ? [] : selectableIds;
 }
 
 function clearDraftTasks() {
@@ -965,15 +961,15 @@ function existingReportId(error: unknown) {
             <div class="report-import-tools">
               <label><Search :size="13" /><input v-model="draftTaskQuery" type="search" placeholder="筛选事项" /></label>
               <div>
-                <button class="secondary-button compact" type="button" :disabled="draftTasksLoading" @click="selectSuggestedTasks"><Sparkles :size="12" />{{ draftTasksLoading ? '加载中' : '按用时选择' }}</button>
-                <button class="secondary-button compact" type="button" @click="toggleAllDraftTasks">{{ draftTaskIds.length === draftTasks.length ? '取消全选' : '全选' }}</button>
+                <button class="secondary-button compact" type="button" :disabled="draftTasksLoading" @click="selectSuggestedTasks"><Sparkles :size="12" />{{ draftTasksLoading ? '加载中' : '按状态选择' }}</button>
+                <button class="secondary-button compact" type="button" @click="toggleAllDraftTasks">{{ draftTaskIds.length === selectableDraftTasks.length ? '取消全选' : '全选' }}</button>
                 <button class="icon-button subtle" type="button" title="清空选择" :disabled="!draftTaskIds.length" @click="clearDraftTasks"><Trash2 :size="13" /></button>
               </div>
             </div>
             <el-checkbox-group v-model="draftTaskIds" class="report-task-options">
-              <el-checkbox v-for="task in visibleDraftTasks" :key="task.id" :value="task.id" :style="{ paddingLeft: `${taskDepth(task) * 18 + 10}px` }">
-                <span class="report-task-option-title"><i :class="task.status === 'done' ? 'done' : draftMinutes(task.id) > 0 ? 'active' : 'planned'"></i>{{ task.title }}</span>
-                <span class="report-task-option-meta"><template v-if="draftType === 'daily' && draftDailyEstimate(task.id)">今日预计 {{ formatHours(draftDailyEstimate(task.id)!) }} · </template><template v-if="task.estimate">整体预计 {{ formatHours(task.estimate) }} · </template><template v-if="draftMinutes(task.id)">实际 {{ formatHours(draftMinutes(task.id)) }} · </template>{{ task.status === 'done' ? '已完成' : draftMinutes(task.id) > 0 ? '有计时' : '未执行' }}</span>
+              <el-checkbox v-for="task in visibleDraftTasks" :key="task.taskId" :value="task.taskId" :disabled="task.candidateRole === 'context'" :style="{ paddingLeft: `${taskDepth(task) * 18 + 10}px` }">
+                <span class="report-task-option-title"><i :class="task.periodStatus === 'completed' ? 'done' : task.periodStatus === 'active' ? 'active' : 'planned'"></i>{{ task.title }}</span>
+                <span class="report-task-option-meta"><template v-if="draftType === 'daily' && task.dailyEstimateMinutes">今日预计 {{ formatHours(task.dailyEstimateMinutes) }} · </template><template v-if="task.estimateMinutes">整体预计 {{ formatHours(task.estimateMinutes) }} · </template><template v-if="task.actualMinutes">实际 {{ formatHours(task.actualMinutes) }} · </template>{{ task.periodStatus === 'completed' ? '本期已完成' : task.periodStatus === 'active' ? '有执行记录' : task.periodStatus === 'context' ? '层级上下文' : '未执行' }}</span>
               </el-checkbox>
               <div v-if="!visibleDraftTasks.length" class="report-task-empty">没有匹配的事项</div>
             </el-checkbox-group>

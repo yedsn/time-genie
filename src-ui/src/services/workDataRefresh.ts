@@ -19,6 +19,6 @@ export function workDataRefreshPlan(domains: Iterable<string>, mainView: boolean
   };
 }
 
-export function workDataChangeDomainsForMutation(mutation: "subject" | "task"): string[] {
-  return mutation === "subject" ? ["subjects"] : ["tasks"];
+export function workDataChangeDomainsForMutation(mutation: "subject" | "task" | "time"): string[] {
+  return mutation === "subject" ? ["subjects"] : mutation === "time" ? ["time", "tasks"] : ["tasks"];
 }

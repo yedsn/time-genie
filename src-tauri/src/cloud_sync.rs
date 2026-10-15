@@ -1248,6 +1248,7 @@ fn incremental_outbox_identity(entity: &IncrementalEntity) -> (&str, &str) {
         "task_occurrences" => ("task_occurrence", entity.entity_id.as_str()),
         "unassigned_sessions" => ("unassigned_session", entity.entity_id.as_str()),
         "time_entries" => ("time_entry", entity.entity_id.as_str()),
+        "actual_time_adjustments" => ("actual_time_adjustment", entity.entity_id.as_str()),
         "report_templates" => ("report_template", entity.entity_id.as_str()),
         "reports" => ("report", entity.entity_id.as_str()),
         "app_settings" => ("app_setting", entity.entity_id.as_str()),
@@ -1272,6 +1273,7 @@ fn expected_incremental_entity_type(source_entity_type: &str) -> Option<&str> {
         | "task_occurrences"
         | "unassigned_sessions"
         | "time_entries"
+        | "actual_time_adjustments"
         | "report_templates"
         | "reports"
         | "integration_configs"
@@ -1289,7 +1291,7 @@ fn incremental_domain(entity_type: &str) -> Result<&'static str, String> {
         | "task_daily_estimates"
         | "task_recurrence_rules"
         | "task_occurrences" => Ok("tasks"),
-        "work_days" | "time_entries" => Ok("time"),
+        "work_days" | "time_entries" | "actual_time_adjustments" => Ok("time"),
         "unassigned_sessions" => Ok("unassigned"),
         "report_templates" | "reports" => Ok("reports"),
         "app_settings" | "integration_configs" | "external_bindings" => Ok("settings"),
@@ -1841,6 +1843,12 @@ fn apply_incremental_entity(
             apply_incremental_unassigned_session(transaction, workspace_id, data)
         }
         "time_entries" => apply_incremental_time_entry(transaction, workspace_id, data),
+        "actual_time_adjustments" => transaction.execute(
+            "INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,note,source_type,batch_id,created_at,updated_at,version,created_by_device_id,updated_by_device_id,deleted_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'quick_actual_adjustment',?10,?11,?12,?13,?14,?15,?16)
+             ON CONFLICT(id) DO UPDATE SET subject_id=excluded.subject_id,task_id=excluded.task_id,work_date=excluded.work_date,delta_minutes=excluded.delta_minutes,baseline_minutes=excluded.baseline_minutes,target_minutes=excluded.target_minutes,note=excluded.note,batch_id=excluded.batch_id,updated_at=excluded.updated_at,version=excluded.version,updated_by_device_id=excluded.updated_by_device_id,deleted_at=excluded.deleted_at",
+            params![text(data,"id"),workspace_id,text(data,"subject_id"),text(data,"task_id"),text(data,"work_date"),integer(data,"delta_minutes"),integer(data,"baseline_minutes"),integer(data,"target_minutes"),optional_text(data,"note"),text(data,"batch_id"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version"),optional_text(data,"created_by_device_id"),optional_text(data,"updated_by_device_id"),optional_millis(data,"deleted_at")],
+        ),
         "report_templates" => {
             if boolean(data, "is_default") && optional_millis(data, "deleted_at").is_none() {
                 transaction.execute(
@@ -1888,7 +1896,8 @@ fn validate_incremental_identity(entity: &IncrementalEntity) -> Result<(), Strin
         | "task_status_events"
         | "time_entries"
         | "report_templates"
-        | "reports" => {
+        | "reports"
+        | "actual_time_adjustments" => {
             data.and_then(|row| row.get("id")).and_then(Value::as_str)
                 == Some(entity.entity_id.as_str())
         }
@@ -1964,7 +1973,8 @@ fn validate_incremental_entity_key(entity_type: &str, entity_id: &str) -> Result
         | "unassigned_sessions"
         | "time_entries"
         | "report_templates"
-        | "reports" => parts.len() == 1 && Uuid::parse_str(entity_id).is_ok(),
+        | "reports"
+        | "actual_time_adjustments" => parts.len() == 1 && Uuid::parse_str(entity_id).is_ok(),
         _ => false,
     };
     if valid {
@@ -2507,6 +2517,10 @@ fn delete_incremental_entity(
             "DELETE FROM time_entries WHERE workspace_id=?1 AND id=?2",
             params![workspace_id, entity.entity_id],
         ),
+        "actual_time_adjustments" => transaction.execute(
+            "DELETE FROM actual_time_adjustments WHERE workspace_id=?1 AND id=?2",
+            params![workspace_id, entity.entity_id],
+        ),
         "report_templates" => transaction.execute(
             "DELETE FROM report_templates WHERE workspace_id=?1 AND id=?2",
             params![workspace_id, entity.entity_id],
@@ -3038,6 +3052,7 @@ fn ensure_supported_cloud_entity_type(entity_type: &str) -> Result<(), String> {
             | "subject_work_schedule"
             | "task"
             | "time_entry"
+            | "actual_time_adjustment"
             | "unassigned_session"
             | "report"
             | "report_template"
@@ -4605,6 +4620,7 @@ fn incremental_entity_type_for_outbox(entity_type: &str) -> Option<&'static str>
         "task_daily_estimate" => Some("task_daily_estimates"),
         "task_recurrence_rule" => Some("task_recurrence_rules"),
         "time_entry" => Some("time_entries"),
+        "actual_time_adjustment" => Some("actual_time_adjustments"),
         "report" => Some("reports"),
         "report_template" => Some("report_templates"),
         "app_setting" => Some("app_settings"),
@@ -5108,6 +5124,7 @@ fn cloud_entity_payload<'a>(
         "subject_work_schedule" => ("subject_work_schedules", "id", entity_id?),
         "task" => ("tasks", "id", entity_id?),
         "time_entry" => ("time_entries", "id", entity_id?),
+        "actual_time_adjustment" => ("actual_time_adjustments", "id", entity_id?),
         "unassigned_session" => ("unassigned_sessions", "id", entity_id?),
         "report" => ("reports", "id", entity_id?),
         "report_template" => ("report_templates", "id", entity_id?),
@@ -5428,6 +5445,10 @@ pub(crate) fn entity_payload_from_connection(
             value.as_object_mut().ok_or_else(|| "CACHE_ERROR: 时间记录缓存不是对象".to_string())?.insert("work_day".to_string(), work_day.unwrap_or(Value::Null));
             return Ok(value);
         }
+        "actual_time_adjustment" => (
+            "SELECT * FROM actual_time_adjustments WHERE workspace_id = ?1 AND id = ?2",
+            entity_id,
+        ),
         "unassigned_session" => {
             let id = entity_id.ok_or_else(|| "VALIDATION_ERROR: 未归属会话同步缺少实体 ID".to_string())?;
             let mut value = query_json_row(
@@ -6289,6 +6310,12 @@ fn apply_snapshot_with_policy(
     replace_snapshot_table(
         &transaction,
         snapshot,
+        "actual_time_adjustments",
+        &local_workspace_id,
+    )?;
+    replace_snapshot_table(
+        &transaction,
+        snapshot,
         "unassigned_sessions",
         &local_workspace_id,
     )?;
@@ -6901,6 +6928,11 @@ fn replace_snapshot_table(
                 tx.execute("INSERT INTO time_allocations(id,workspace_id,entry_id,task_id,minutes,note,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![text(row,"id"),ws,text(row,"entry_id"),text(row,"task_id"),integer(row,"minutes"),optional_text(row,"note"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version")])
             })?
         }
+        "actual_time_adjustments" => {
+            replace_simple_rows(transaction, table, workspace_id, rows, |tx, row, ws| {
+                tx.execute("INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,note,source_type,batch_id,created_at,updated_at,version,created_by_device_id,updated_by_device_id,deleted_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'quick_actual_adjustment',?10,?11,?12,?13,?14,?15,?16)", params![text(row,"id"),ws,text(row,"subject_id"),text(row,"task_id"),text(row,"work_date"),integer(row,"delta_minutes"),integer(row,"baseline_minutes"),integer(row,"target_minutes"),optional_text(row,"note"),text(row,"batch_id"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version"),optional_text(row,"created_by_device_id"),optional_text(row,"updated_by_device_id"),optional_millis(row,"deleted_at")])
+            })?
+        }
         "unassigned_sessions" => {
             replace_simple_rows(transaction, table, workspace_id, rows, |tx, row, ws| {
                 let last_continuous_at = optional_millis(row, "last_continuous_at")
@@ -7006,6 +7038,7 @@ fn clear_snapshot_cache(transaction: &Transaction<'_>, workspace_id: &str) -> Re
         "task_recurrence_rules",
         "task_daily_estimates",
         "time_allocations",
+        "actual_time_adjustments",
         "time_segments",
         "unassigned_segments",
         "time_entries",

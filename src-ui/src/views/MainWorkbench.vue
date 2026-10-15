@@ -1444,6 +1444,8 @@ async function handleCompletedTaskDelete(task: Task) {
           :timezone="store.workspaceTimezone"
           :save-estimate-batch="store.saveTaskEstimateBatch"
           :save-plan-batch="store.saveTaskPlanBatch"
+          :load-actual-snapshot="store.loadActualAdjustmentSnapshot"
+          :save-actual-batch="store.saveActualAdjustmentBatch"
           @select="store.selectedTaskId = $event"
           @add="store.addTask('', store.selectedSubjectId)"
           @add-child="store.addChildTask"
@@ -1538,11 +1540,10 @@ async function handleCompletedTaskDelete(task: Task) {
           </div>
           <div class="settings-choice-field">
             <span>报告时长格式</span>
-            <div class="settings-segmented" role="radiogroup" aria-label="报告时长格式">
-              <button type="button" role="radio" :aria-checked="settingsDraft.reportDurationFormat === 'minutes'" :class="{ active: settingsDraft.reportDurationFormat === 'minutes' }" :disabled="!settingsLoaded" @click="settingsDraft.reportDurationFormat = 'minutes'"><strong>分钟</strong><small>12min</small></button>
-              <button type="button" role="radio" :aria-checked="settingsDraft.reportDurationFormat === 'hours'" :class="{ active: settingsDraft.reportDurationFormat === 'hours' }" :disabled="!settingsLoaded" @click="settingsDraft.reportDurationFormat = 'hours'"><strong>小时</strong><small>0.2h</small></button>
+            <div class="settings-segmented" aria-label="报告时长格式">
+              <div class="settings-segmented-option active"><strong>混合时长</strong><small>1h20min</small></div>
             </div>
-            <small class="settings-hint">用于新生成或重新生成的报告，默认使用分钟。</small>
+            <small class="settings-hint">报告统一使用混合时长：不足 1 小时显示分钟，超过或达到 1 小时显示小时和剩余分钟。</small>
           </div>
         </div>
 

@@ -90,7 +90,10 @@ function taskMinutes(taskId: string) {
 }
 
 function formatHours(minutes: number) {
-  return `${(minutes / 60).toFixed(1)}h`;
+  if (minutes < 60) return `${minutes}min`;
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  return remainder ? `${hours}h${remainder}min` : `${hours}h`;
 }
 
 function getChildren(taskId: string) {

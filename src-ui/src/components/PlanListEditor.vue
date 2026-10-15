@@ -9,7 +9,9 @@ import type { Task } from "../store";
 import { isActivePlanTask } from "../services/completedTaskHistoryCore";
 import { contextMenuPosition, planTaskMoveIntent, todayEstimateDraft } from "../services/planTaskInteractionCore";
 import { getSubjectWorkSchedule, type SubjectWorkScheduleDay } from "../services/tauri";
+import type { ActualAdjustmentBatchRequest, ActualAdjustmentBatchResult, ActualAdjustmentSnapshotRecord } from "../services/tauri";
 import { adjustQuickEstimateMinutes, allocatedMinutes, capacitySummary, changedEstimateDrafts, formatQuickEstimateHours, parseQuickDuration, parseQuickEstimateMinutes, quickEstimateRows, scheduleCapacity, weekdayIndexForDate, type QuickEstimateDraft } from "../services/quickPlanEstimateCore";
+import { actualAdjustmentSummary, eligibleActualAdjustmentParents, parentTargetTotal, parseActualMinutes, type ActualAdjustmentDraft, type ActualAdjustmentNewTaskDraft } from "../services/quickActualAdjustmentCore";
 import { analyzeQuickPlanDraft, buildQuickPlanBatchRequest, createQuickPlanBaseline, createQuickPlanDraft, reconcileQuickPlanText, serializeQuickPlanLines, type QuickPlanBaselineTask, type QuickPlanBatchRequest, type QuickPlanDraftLine } from "../services/quickPlanTextCore";
 
 const props = defineProps<{
@@ -23,6 +25,8 @@ const props = defineProps<{
   timezone: string;
   saveEstimateBatch: (items: Array<{ taskId: string; expectedTaskVersion: number; expectedDailyEstimateVersion?: number; estimateMinutes?: number }>) => Promise<void>;
   savePlanBatch: (request: QuickPlanBatchRequest) => Promise<{ createdCount: number; updatedCount: number; deletedCount: number }>;
+  loadActualSnapshot: () => Promise<ActualAdjustmentSnapshotRecord>;
+  saveActualBatch: (request: ActualAdjustmentBatchRequest) => Promise<ActualAdjustmentBatchResult>;
 }>();
 
 const emit = defineEmits<{
@@ -76,6 +80,16 @@ const quickEstimateCapacityText = ref("");
 const quickEstimateCapacityMinutes = ref(0);
 const quickEstimateDoneFocus = ref(false);
 const quickEstimateConfirmingClose = ref(false);
+const actualAdjustmentOpen = ref(false);
+const actualAdjustmentSaving = ref(false);
+const actualAdjustmentSnapshot = ref<ActualAdjustmentSnapshotRecord>();
+const actualAdjustmentDrafts = ref<ActualAdjustmentDraft[]>([]);
+const actualAdjustmentNewTasks = ref<ActualAdjustmentNewTaskDraft[]>([]);
+const actualAdjustmentErrors = ref<Record<string, string>>({});
+const actualAdjustmentNote = ref("");
+const actualAdjustmentClientRequestId = ref("");
+const actualAdjustmentBatchId = ref("");
+const actualAdjustmentSubjectId = ref("");
 const quickPlanOpen = ref(false);
 const quickPlanSaving = ref(false);
 const quickPlanMode = ref<"edit" | "summary">("edit");
@@ -121,6 +135,9 @@ const quickAllocatableRows = computed(() => quickRows.value.filter((row) => row.
 const quickAllocatedMinutes = computed(() => allocatedMinutes(quickEstimateDrafts.value));
 const quickCapacitySummary = computed(() => capacitySummary(quickAllocatedMinutes.value, quickEstimateCapacityMinutes.value));
 const quickEstimateDirty = computed(() => changedEstimateDrafts(quickEstimateDrafts.value).length > 0);
+const actualAdjustmentSummaryValue = computed(() => actualAdjustmentSummary(actualAdjustmentDrafts.value, actualAdjustmentNewTasks.value));
+const actualAdjustmentDirty = computed(() => actualAdjustmentSummaryValue.value.changes.length > 0 || actualAdjustmentNewTasks.value.length > 0);
+const actualAdjustmentParents = computed(() => eligibleActualAdjustmentParents(actualAdjustmentSnapshot.value?.tasks ?? []));
 const quickPlanSummary = computed(() => {
   const summary = analyzeQuickPlanDraft(quickPlanBaseline.value, quickPlanLines.value);
   return { ...summary, errors: [...quickPlanPasteErrors.value, ...summary.errors] };
@@ -512,6 +529,78 @@ async function openQuickEstimate() {
   await focusQuickEstimate(0);
 }
 
+async function openActualAdjustment() {
+  try {
+    const snapshot = await props.loadActualSnapshot();
+    actualAdjustmentSnapshot.value = snapshot;
+    actualAdjustmentDrafts.value = snapshot.tasks.filter((task) => task.isLeaf).map((task) => ({ taskId: task.id, baselineMinutes: task.directMinutes, targetMinutes: task.directMinutes, text: String(task.directMinutes), expectedTaskVersion: task.version, adjustmentFingerprint: task.adjustmentFingerprint }));
+    actualAdjustmentNewTasks.value = [];
+    actualAdjustmentErrors.value = {};
+    actualAdjustmentNote.value = "";
+    actualAdjustmentClientRequestId.value = crypto.randomUUID();
+    actualAdjustmentBatchId.value = crypto.randomUUID();
+    actualAdjustmentSubjectId.value = props.subjectId;
+    actualAdjustmentOpen.value = true;
+  } catch (error) {
+    ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "实际时间加载失败");
+  }
+}
+
+function actualDraft(taskId: string) { return actualAdjustmentDrafts.value.find((item) => item.taskId === taskId); }
+function updateActualDraft(taskId: string, text: string) {
+  const draft = actualDraft(taskId); if (!draft) return;
+  draft.text = text; const parsed = parseActualMinutes(text);
+  if (!parsed.ok) { actualAdjustmentErrors.value = { ...actualAdjustmentErrors.value, [taskId]: parsed.message }; return; }
+  draft.targetMinutes = parsed.minutes; const errors = { ...actualAdjustmentErrors.value }; delete errors[taskId]; actualAdjustmentErrors.value = errors;
+}
+function addActualNewTask() { actualAdjustmentNewTasks.value.push({ clientTaskId: crypto.randomUUID(), title: "", targetMinutes: 0, text: "0" }); }
+function removeActualNewTask(clientTaskId: string) { actualAdjustmentNewTasks.value = actualAdjustmentNewTasks.value.filter((item) => item.clientTaskId !== clientTaskId); const errors = { ...actualAdjustmentErrors.value }; delete errors[clientTaskId]; actualAdjustmentErrors.value = errors; }
+function updateActualNewTaskMinutes(draft: ActualAdjustmentNewTaskDraft, text: string) { draft.text = text; const parsed = parseActualMinutes(text); if (!parsed.ok) { actualAdjustmentErrors.value = { ...actualAdjustmentErrors.value, [draft.clientTaskId]: parsed.message }; return; } draft.targetMinutes = parsed.minutes; const errors = { ...actualAdjustmentErrors.value }; delete errors[draft.clientTaskId]; actualAdjustmentErrors.value = errors; }
+function setActualNewTaskParent(draft: ActualAdjustmentNewTaskDraft, parentId: string) { draft.parentId = parentId || undefined; draft.expectedParentVersion = actualAdjustmentParents.value.find((task) => task.id === parentId)?.version; }
+function actualParentTarget(parentId: string) { return parentTargetTotal(parentId, actualAdjustmentSnapshot.value?.tasks ?? [], actualAdjustmentDrafts.value, actualAdjustmentNewTasks.value); }
+
+async function closeActualAdjustment() {
+  if (!actualAdjustmentDirty.value) { actualAdjustmentOpen.value = false; return; }
+  try { await ElMessageBox.confirm("调整今日实际还有未保存修改，确定放弃吗？", "放弃修改", { confirmButtonText: "放弃", cancelButtonText: "继续编辑", type: "warning" }); actualAdjustmentOpen.value = false; } catch {}
+}
+
+async function saveActualAdjustment() {
+  if (actualAdjustmentSaving.value || !actualAdjustmentSnapshot.value) return;
+  if (actualAdjustmentSubjectId.value !== props.subjectId) {
+    ElMessage.warning("计划主体已经切换，请关闭面板后重新打开");
+    return;
+  }
+  for (const draft of actualAdjustmentDrafts.value) updateActualDraft(draft.taskId, draft.text);
+  for (const draft of actualAdjustmentNewTasks.value) {
+    updateActualNewTaskMinutes(draft, draft.text);
+    if (!draft.title.trim()) actualAdjustmentErrors.value = { ...actualAdjustmentErrors.value, [draft.clientTaskId]: "事项名称不能为空" };
+  }
+  if (Object.keys(actualAdjustmentErrors.value).length) return;
+  const summary = actualAdjustmentSummaryValue.value;
+  if (!summary.changes.length && !actualAdjustmentNewTasks.value.length) { actualAdjustmentOpen.value = false; return; }
+  const escapeHtml = (value: string) => value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character] ?? character);
+  const taskById = new Map((actualAdjustmentSnapshot.value.tasks ?? []).map((task) => [task.id, task]));
+  const existingRows = summary.changes.map((item) => {
+    const task = taskById.get(item.taskId);
+    const delta = item.deltaMinutes >= 0 ? `+${item.deltaMinutes}` : String(item.deltaMinutes);
+    return `<li><strong>实际调整</strong> · ${escapeHtml(task?.title ?? "未知事项")}：${item.baselineMinutes} → ${item.targetMinutes} 分钟（${delta}）</li>`;
+  });
+  const newRows = actualAdjustmentNewTasks.value.map((draft) => {
+    const parent = draft.parentId ? taskById.get(draft.parentId) : undefined;
+    const position = parent ? `${escapeHtml(parent.title)} 下` : "顶层事项";
+    const adjustment = draft.targetMinutes > 0 ? `初始调整 +${draft.targetMinutes} 分钟` : "仅新增事项，无实际调整";
+    return `<li><strong>新增事项</strong> · ${escapeHtml(draft.title.trim())}（${position}）：目标 ${draft.targetMinutes} 分钟，${adjustment}</li>`;
+  });
+  const message = `<p>新增 ${summary.newTaskCount} 个事项，保存 ${summary.adjustmentCount} 条实际调整；增加 ${summary.addedMinutes} 分钟，减少 ${summary.reducedMinutes} 分钟，净变化 ${summary.netMinutes >= 0 ? "+" : ""}${summary.netMinutes} 分钟。</p><ul class="actual-adjustment-confirm-list">${[...newRows, ...existingRows].join("")}</ul>`;
+  try { await ElMessageBox.confirm(message, "确认今日实际变化", { confirmButtonText: "保存", cancelButtonText: "继续调整", type: "info", dangerouslyUseHTMLString: true }); } catch { return; }
+  actualAdjustmentSaving.value = true;
+  try {
+    await props.saveActualBatch({ subjectId: actualAdjustmentSubjectId.value, workDate: actualAdjustmentSnapshot.value.workDate, clientRequestId: actualAdjustmentClientRequestId.value, batchId: actualAdjustmentBatchId.value, note: actualAdjustmentNote.value.trim() || undefined, items: summary.changes, newTasks: actualAdjustmentNewTasks.value.map((draft) => ({ clientTaskId: draft.clientTaskId, title: draft.title.trim(), parentId: draft.parentId, expectedParentVersion: draft.expectedParentVersion, targetMinutes: draft.targetMinutes })) });
+    actualAdjustmentOpen.value = false; ElMessage.success("今日实际已调整");
+  } catch (error) { ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "今日实际保存失败，草稿已保留"); }
+  finally { actualAdjustmentSaving.value = false; }
+}
+
 function quickDraft(taskId: string) {
   return quickEstimateDrafts.value.find((draft) => draft.taskId === taskId);
 }
@@ -820,6 +909,7 @@ onBeforeUnmount(() => {
         <span>{{ pendingRows.length }} 项待办 · 点击文字直接编辑</span>
       </div>
       <div class="plan-head-actions">
+        <button class="secondary-button quick-estimate-entry" type="button" title="直接调整今天最终实际时间" @click="openActualAdjustment"><TimerReset :size="14" />调整今日实际</button>
         <button class="secondary-button quick-estimate-entry" type="button" title="连续分配今日预计" @click="openQuickEstimate"><Clock3 :size="14" />分配今日预计</button>
         <button class="secondary-button quick-estimate-entry" type="button" title="在一个编辑区调整整个计划" @click="openQuickPlan"><FilePenLine :size="14" />快速编辑计划</button>
         <button class="icon-button subtle" type="button" title="同步到 SeaTable" aria-label="同步到 SeaTable" @click="emit('syncSeaTable')"><DatabaseZap :size="15" /></button>
@@ -1036,6 +1126,46 @@ onBeforeUnmount(() => {
           <button class="primary-button" :class="{ danger: quickPlanSummary.deleted.length }" type="button" :disabled="quickPlanSaving" @click="saveQuickPlan">{{ quickPlanSaving ? '保存中...' : quickPlanSummary.deleted.length ? '确认删除并保存' : '确认保存' }}</button>
         </template>
       </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="actualAdjustmentOpen"
+      class="recurrence-dialog quick-estimate-dialog actual-adjustment-dialog"
+      modal-class="quick-estimate-overlay"
+      title="调整今日实际"
+      width="min(860px, 94vw)"
+      append-to-body
+      :close-on-click-modal="false"
+      :before-close="(_done: () => void) => closeActualAdjustment()"
+    >
+      <div class="quick-estimate-toolbar actual-adjustment-toolbar">
+        <div><strong>{{ subjectName }} · {{ actualAdjustmentSnapshot?.workDate }}</strong><span>输入今天最终应该是多少分钟；计时继续增长不会改变本次固定差额。</span></div>
+        <button class="secondary-button" type="button" @click="addActualNewTask"><Plus :size="14" />新增事项</button>
+      </div>
+      <div class="quick-estimate-summary">
+        <span>新增 <strong>{{ actualAdjustmentSummaryValue.newTaskCount }}</strong> 项</span><span>调整 <strong>{{ actualAdjustmentSummaryValue.adjustmentCount }}</strong> 项</span><span>增加 <strong>{{ actualAdjustmentSummaryValue.addedMinutes }}</strong> 分钟</span><span>减少 <strong>{{ actualAdjustmentSummaryValue.reducedMinutes }}</strong> 分钟</span><span>净变化 <strong>{{ actualAdjustmentSummaryValue.netMinutes >= 0 ? '+' : '' }}{{ actualAdjustmentSummaryValue.netMinutes }}</strong> 分钟</span>
+      </div>
+      <div class="actual-adjustment-list">
+        <template v-for="task in actualAdjustmentSnapshot?.tasks ?? []" :key="task.id">
+          <div v-if="!task.isLeaf" class="actual-adjustment-row group">
+            <div><strong>{{ task.title }}</strong><small>当前合计 {{ formatMinutes(task.totalMinutes) }} · 目标合计 {{ formatMinutes(actualParentTarget(task.id)) }}</small></div>
+          </div>
+          <div v-else class="actual-adjustment-row" :class="{ child: task.parentId }">
+            <div><CornerDownRight v-if="task.parentId" :size="14" /><strong>{{ task.title }}</strong><small>{{ task.timerState ? (task.timerState === 'running' ? '正在计时' : '计时已暂停') : task.status === 'done' ? '今天已完成' : '进行中' }} · 当前 {{ formatMinutes(task.directMinutes) }}</small></div>
+            <label><input :value="actualDraft(task.id)?.text" inputmode="numeric" @input="updateActualDraft(task.id, ($event.target as HTMLInputElement).value)" /><span>分钟</span></label>
+            <span class="actual-adjustment-delta">{{ (actualDraft(task.id)?.targetMinutes ?? task.directMinutes) - task.directMinutes >= 0 ? '+' : '' }}{{ (actualDraft(task.id)?.targetMinutes ?? task.directMinutes) - task.directMinutes }}</span>
+            <small v-if="actualAdjustmentErrors[task.id]" class="error">{{ actualAdjustmentErrors[task.id] }}</small>
+          </div>
+        </template>
+        <div v-for="draft in actualAdjustmentNewTasks" :key="draft.clientTaskId" class="actual-adjustment-row new-task">
+          <div class="actual-new-task-fields"><input v-model="draft.title" placeholder="新增事项名称" /><select :value="draft.parentId ?? ''" @change="setActualNewTaskParent(draft, ($event.target as HTMLSelectElement).value)"><option value="">顶层事项</option><option v-for="parent in actualAdjustmentParents" :key="parent.id" :value="parent.id">{{ parent.title }} 下</option></select></div>
+          <label><input :value="draft.text" inputmode="numeric" @input="updateActualNewTaskMinutes(draft, ($event.target as HTMLInputElement).value)" /><span>分钟</span></label>
+          <button class="icon-button subtle" type="button" title="移除草稿" @click="removeActualNewTask(draft.clientTaskId)"><Trash2 :size="14" /></button>
+          <small v-if="actualAdjustmentErrors[draft.clientTaskId]" class="error">{{ actualAdjustmentErrors[draft.clientTaskId] }}</small>
+        </div>
+      </div>
+      <label class="actual-adjustment-note"><span>统一备注（可选）</span><input v-model="actualAdjustmentNote" placeholder="例如：按日报核对后修正" /></label>
+      <template #footer><button class="secondary-button" type="button" :disabled="actualAdjustmentSaving" @click="closeActualAdjustment">取消</button><button class="primary-button" type="button" :disabled="actualAdjustmentSaving || !actualAdjustmentDirty" @click="saveActualAdjustment">{{ actualAdjustmentSaving ? '保存中...' : '查看摘要并保存' }}</button></template>
     </el-dialog>
 
     <el-dialog

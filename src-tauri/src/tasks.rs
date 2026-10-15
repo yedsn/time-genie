@@ -2457,27 +2457,11 @@ fn enrich_and_order_tasks(
     context_date: Option<&str>,
     tasks: &mut Vec<TaskDto>,
 ) -> Result<(), String> {
-    let mut direct_minutes = HashMap::<String, i64>::new();
-    let mut statement = connection
-        .prepare(
-            "SELECT a.task_id, COALESCE(SUM(a.minutes), 0)
-             FROM time_allocations a
-             JOIN tasks t ON t.id = a.task_id
-             JOIN time_entries e ON e.id = a.entry_id
-             WHERE a.workspace_id = ?1 AND t.deleted_at IS NULL
-               AND (?2 IS NULL OR e.work_date = ?2)
-             GROUP BY a.task_id",
-        )
-        .map_err(|error| error.to_string())?;
-    for row in statement
-        .query_map(params![workspace_id, context_date], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
-        .map_err(|error| error.to_string())?
-    {
-        let (task_id, minutes) = row.map_err(|error| error.to_string())?;
-        direct_minutes.insert(task_id, minutes);
-    }
+    let direct_minutes = crate::actual_time_adjustments::direct_actual_minutes_map(
+        connection,
+        workspace_id,
+        context_date,
+    )?;
 
     let active_states = connection
         .prepare(
@@ -2715,13 +2699,13 @@ fn ensure_parent(
 }
 
 fn ensure_no_direct_time(connection: &rusqlite::Connection, task_id: &str) -> Result<(), String> {
-    let direct_minutes: i64 = connection
-        .query_row(
-            "SELECT COALESCE(SUM(minutes), 0) FROM time_allocations WHERE task_id = ?1",
-            [task_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
+    let workspace_id = workspace_id(connection)?;
+    let direct_minutes = crate::actual_time_adjustments::direct_actual_minutes(
+        connection,
+        &workspace_id,
+        task_id,
+        None,
+    )?;
     if direct_minutes > 0 {
         Err("TASK_HAS_DIRECT_TIME: 有直接工时的事项不能成为父事项".to_string())
     } else {
@@ -2765,7 +2749,7 @@ fn is_descendant(
     Err("TASK_TREE_CYCLE: 事项层级过深或存在循环".to_string())
 }
 
-fn next_sort_order(
+pub(crate) fn next_sort_order(
     connection: &rusqlite::Connection,
     workspace_id: &str,
     subject_id: &str,
@@ -2799,12 +2783,37 @@ fn bump_revision(connection: &rusqlite::Connection) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-fn validate_title(title: &str) -> Result<(), String> {
+pub(crate) fn validate_title(title: &str) -> Result<(), String> {
     if title.trim().is_empty() {
         Err("VALIDATION_ERROR: 事项名称不能为空".to_string())
     } else {
         Ok(())
     }
+}
+
+pub(crate) fn validate_quick_child_parent(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    parent_id: &str,
+    expected_version: Option<i64>,
+) -> Result<(), String> {
+    ensure_parent(connection, workspace_id, parent_id, subject_id)?;
+    let (parent_parent, version): (Option<String>, i64) = connection
+        .query_row(
+            "SELECT parent_id,version FROM tasks WHERE id=?1 AND workspace_id=?2 AND deleted_at IS NULL",
+            params![parent_id, workspace_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    if parent_parent.is_some() {
+        return Err("TASK_DEPTH_LIMIT: 待办事项最多支持两级".to_string());
+    }
+    if expected_version != Some(version) {
+        return Err("VERSION_CONFLICT: 父事项已变化，请重新加载".to_string());
+    }
+    ensure_no_direct_time(connection, parent_id)?;
+    ensure_not_recurring(connection, workspace_id, parent_id)
 }
 
 fn validate_estimate(estimate: Option<i64>) -> Result<(), String> {
