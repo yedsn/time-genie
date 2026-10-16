@@ -13,8 +13,10 @@ assert.equal(inlineTimerParentUnavailableReason({ ...base, status: "done" }, "s1
 
 const selector = readFileSync("src-ui/src/components/TaskSelectControl.vue", "utf8");
 assert.match(selector, /新建为一级事项/);
-assert.match(selector, /新建到一级事项下/);
-assert.match(selector, /在此事项下新建/);
+assert.match(selector, /新建为二级事项/);
+assert.doesNotMatch(selector, /在此事项下新建/);
+assert.doesNotMatch(selector, /task-option-create-child/);
+assert.match(selector, /if \(props\.intentMode && choosingParent\.value\)/);
 assert.match(selector, /if \(props\.intentMode\) return/);
 assert.match(selector, /const title = item\.label\.trim\(\)/);
 assert.match(selector, /pendingTitle\.value = item\.label\.trim\(\)/);

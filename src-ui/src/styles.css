@@ -2643,9 +2643,6 @@ pre {
 .task-autocomplete-option.is-create .task-option-name { font-weight: 700; }
 .task-option-subject { flex: none; max-width: 88px; overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .task-option-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.task-option-create-child { flex: none; border: 0; border-radius: 6px; padding: 3px 7px; color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); font: inherit; font-size: 10px; cursor: pointer; }
-.task-option-create-child:hover { background: color-mix(in srgb, var(--accent) 18%, transparent); }
-.task-option-create-child:disabled { cursor: wait; opacity: 0.55; }
 .task-option-state {
   min-width: 52px;
   flex: none;

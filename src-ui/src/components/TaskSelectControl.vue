@@ -20,7 +20,6 @@ type TaskSuggestion = {
   kind?: "task" | "create-root" | "choose-parent" | "create-child" | "parent-unavailable";
   parentId?: string;
   parentVersion?: number;
-  canCreateChild?: boolean;
   unavailableReason?: string;
 };
 
@@ -174,7 +173,7 @@ function fetchSuggestions(query: string, callback: (items: TaskSuggestion[]) => 
         label: task.title,
         pathLabel: task.title,
         subjectLabel: taskSubjectLabel(task),
-        stateLabel: inlineTimerParentUnavailableReason(task, subjectId) ?? "在此事项下新建",
+        stateLabel: inlineTimerParentUnavailableReason(task, subjectId) ?? "可选",
         stateClass: "not-started",
         spentLabel: "",
         recurrenceLabel: "",
@@ -202,9 +201,6 @@ function fetchSuggestions(query: string, callback: (items: TaskSuggestion[]) => 
       const descendants = getDescendantTasks(task);
       const spentMinutes = taskSpentMinutes(task, descendants);
       const state = taskState(task, spentMinutes, descendants);
-      const parentUnavailableReason = props.intentMode && keyword && !task.parentId
-        ? inlineTimerParentUnavailableReason(task, targetSubjectId())
-        : undefined;
       return {
         value: label,
         label,
@@ -218,10 +214,6 @@ function fetchSuggestions(query: string, callback: (items: TaskSuggestion[]) => 
         isMatch: !keyword || label.toLocaleLowerCase().includes(keyword),
         taskId: task.id,
         kind: "task" as const,
-        canCreateChild: props.intentMode && !!keyword && !task.parentId && !parentUnavailableReason,
-        unavailableReason: parentUnavailableReason,
-        parentId: task.id,
-        parentVersion: task.version,
       };
     });
   if (props.intentMode && keyword) {
@@ -231,8 +223,8 @@ function fetchSuggestions(query: string, callback: (items: TaskSuggestion[]) => 
         stateLabel: "创建", stateClass: "not-started", spentLabel: "", recurrenceLabel: "", selectable: true, isMatch: true, kind: "create-root",
       },
       {
-        value: `新建到一级事项下“${query.trim()}”`, label: query.trim(), pathLabel: `新建到一级事项下：${query.trim()}`, subjectLabel: "",
-        stateLabel: "选择父级", stateClass: "not-started", spentLabel: "", recurrenceLabel: "", selectable: true, isMatch: true, kind: "choose-parent",
+        value: `新建为二级事项“${query.trim()}”`, label: query.trim(), pathLabel: `新建为二级事项：${query.trim()}`, subjectLabel: "",
+        stateLabel: "选择一级事项", stateClass: "not-started", spentLabel: "", recurrenceLabel: "", selectable: true, isMatch: true, kind: "choose-parent",
       },
     );
   }
@@ -374,20 +366,6 @@ function scheduleCommit() {
   }, 160);
 }
 
-function createChildUnder(item: TaskSuggestion) {
-  if (props.busy || !item.canCreateChild || !item.parentId) return;
-  const title = inputText.value.trim();
-  if (!title) return;
-  emit("submit", {
-    newTask: {
-      subjectId: targetSubjectId(),
-      parentId: item.parentId,
-      expectedParentVersion: item.parentVersion,
-      title,
-    },
-  });
-}
-
 function handleEscape() {
   if (!choosingParent.value) return;
   choosingParent.value = false;
@@ -439,16 +417,6 @@ defineExpose({ commit: commitText, closeSuggestions: closeTaskSuggestions, focus
         >
           <span v-if="selectedSubjectId === allSubjectsValue" class="task-option-subject">{{ item.subjectLabel }}</span>
           <span class="task-option-name">{{ item.pathLabel }}</span>
-          <button
-            v-if="item.canCreateChild"
-            type="button"
-            class="task-option-create-child"
-            :disabled="busy"
-            @mousedown.prevent.stop
-            @click.prevent.stop="createChildUnder(item)"
-          >
-            在此事项下新建
-          </button>
           <span v-if="item.recurrenceLabel" class="task-option-repeat">{{ item.recurrenceLabel }}</span>
           <span class="task-option-spent">{{ item.spentLabel }}</span>
           <span class="task-option-state" :class="`is-${item.stateClass}`">{{ item.stateLabel }}</span>
