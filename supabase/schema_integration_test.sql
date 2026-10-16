@@ -54,6 +54,8 @@ end $$;
 \ir 20261014_timegenie_timer_sync_authority.sql
 \ir 20261015_timegenie_actual_adjustment_batch.sql
 \ir 20261015_timegenie_actual_adjustment_batch.sql
+\ir 20261016_timegenie_named_template_bootstrap_fix.sql
+\ir 20261016_timegenie_named_template_bootstrap_fix.sql
 
 do $$
 begin
@@ -226,6 +228,19 @@ insert into timegenie.workspaces(id, owner_user_id, name) values
 
 select timegenie.workspace_initialize_defaults('20000000-0000-0000-0000-000000000001');
 select timegenie.workspace_initialize_defaults('20000000-0000-0000-0000-000000000001');
+
+do $$
+begin
+  if (select count(*) from timegenie.report_templates where workspace_id='20000000-0000-0000-0000-000000000001' and deleted_at is null)<>3
+     or exists(select 1 from timegenie.report_templates where workspace_id='20000000-0000-0000-0000-000000000001' and nullif(btrim(name),'') is null)
+     or (select count(*) from timegenie.report_templates where workspace_id='20000000-0000-0000-0000-000000000001' and is_default and deleted_at is null)<>3 then
+    raise exception 'workspace bootstrap did not create exactly three named default report templates';
+  end if;
+  if (select count(*) from timegenie.subject_work_schedules where workspace_id='20000000-0000-0000-0000-000000000001')<>7
+     or (select count(*) from timegenie.subject_work_schedule_segments where workspace_id='20000000-0000-0000-0000-000000000001')<>10 then
+    raise exception 'workspace bootstrap did not create an idempotent default work schedule';
+  end if;
+end $$;
 
 select timegenie.device_authorize('20000000-0000-0000-0000-000000000001', '30000000-0000-0000-0000-000000000001', '设备 A', 'windows', '0.2.1');
 reset role;

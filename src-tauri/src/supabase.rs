@@ -703,6 +703,7 @@ fn workspace_bootstrap_with_session(
     session: &CloudSession,
 ) -> Result<CloudWorkspace, String> {
     let mut workspace = read_workspace_with_session(database, client, session)?;
+    let workspace_already_existed = workspace.is_some();
     if workspace.is_none() {
         let response = client.request_for_database(
             database,
@@ -723,12 +724,23 @@ fn workspace_bootstrap_with_session(
     }
     let workspace =
         workspace.ok_or_else(|| "VERSION_CONFLICT: Supabase 未返回可用工作空间".to_string())?;
-    let _ = client.rpc_for_database(
+    let initialize_result = client.rpc_for_database(
         database,
         "workspace_initialize_defaults",
         json!({ "p_workspace_id": workspace.id.clone() }),
         session,
-    )?;
+    );
+    if let Err(error) = initialize_result {
+        // Older cloud projects can have the named report-template columns but
+        // still expose a pre-upgrade bootstrap function that inserts templates
+        // without `name`. Existing workspaces already have their business data,
+        // so allow them to continue to snapshot download until the cloud SQL
+        // patch is deployed. A newly-created workspace must still initialize
+        // successfully or it would be left incomplete.
+        if !(workspace_already_existed && is_legacy_report_template_bootstrap_error(&error)) {
+            return Err(error);
+        }
+    }
     settings::update_setting(
         database,
         SettingsUpdate {
@@ -744,6 +756,13 @@ fn workspace_bootstrap_with_session(
         timezone: workspace.timezone,
         latest_change_seq,
     })
+}
+
+fn is_legacy_report_template_bootstrap_error(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("null value in column \"name\"")
+        && normalized.contains("report_templates")
+        && normalized.contains("not-null constraint")
 }
 
 fn read_workspace_with_session(
@@ -3221,6 +3240,19 @@ mod tests {
         );
         assert!(!sensitive.contains("secret-value"));
         assert!(sensitive.contains("已脱敏"));
+    }
+
+    #[test]
+    fn recognizes_only_the_legacy_named_report_template_bootstrap_failure() {
+        assert!(is_legacy_report_template_bootstrap_error(
+            "CLOUD_REQUEST_FAILED: null value in column \"name\" of relation \"report_templates\" violates not-null constraint"
+        ));
+        assert!(!is_legacy_report_template_bootstrap_error(
+            "CLOUD_REQUEST_FAILED: null value in column \"content\" of relation \"report_templates\" violates not-null constraint"
+        ));
+        assert!(!is_legacy_report_template_bootstrap_error(
+            "CLOUD_REQUEST_FAILED: null value in column \"name\" of relation \"subjects\" violates not-null constraint"
+        ));
     }
 
     #[test]

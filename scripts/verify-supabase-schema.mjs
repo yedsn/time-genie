@@ -24,6 +24,7 @@ const simplifiedUnassignedAnchorPatchFile = path.join(repoRoot, "supabase", "202
 const unassignedLeaseContinuityPatchFile = path.join(repoRoot, "supabase", "20261013_timegenie_unassigned_lease_continuity_fix.sql");
 const timerSyncAuthorityPatchFile = path.join(repoRoot, "supabase", "20261014_timegenie_timer_sync_authority.sql");
 const actualAdjustmentBatchPatchFile = path.join(repoRoot, "supabase", "20261015_timegenie_actual_adjustment_batch.sql");
+const namedTemplateBootstrapFixFile = path.join(repoRoot, "supabase", "20261016_timegenie_named_template_bootstrap_fix.sql");
 
 const binaryNames = process.platform === "win32"
   ? {
@@ -95,6 +96,7 @@ function verifyStaticSchemaInvariants() {
   const unassignedLeaseContinuityPatch = fs.readFileSync(unassignedLeaseContinuityPatchFile, "utf8");
   const timerSyncAuthorityPatch = fs.readFileSync(timerSyncAuthorityPatchFile, "utf8");
   const actualAdjustmentBatchPatch = fs.readFileSync(actualAdjustmentBatchPatchFile, "utf8");
+  const namedTemplateBootstrapFix = fs.readFileSync(namedTemplateBootstrapFixFile, "utf8");
   const schemaIntegrationTest = fs.readFileSync(schemaTestFile, "utf8");
   const importStart = schema.indexOf("create or replace function timegenie.migration_import_snapshot");
   const applyPatchStart = schema.indexOf("create or replace function timegenie.cloud_apply_patch");
@@ -196,6 +198,23 @@ function verifyStaticSchemaInvariants() {
   }
   if ((schemaIntegrationTest.match(/\\ir 20261015_timegenie_actual_adjustment_batch\.sql/g) ?? []).length < 2) {
     throw new Error("The schema integration test must prove the actual adjustment batch patch is idempotent.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261016_timegenie_named_template_bootstrap_fix\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the named-template bootstrap fix is idempotent.");
+  }
+  for (const expected of [
+    "create or replace function timegenie.workspace_initialize_defaults",
+    "'标准日报'",
+    "'标准周报'",
+    "'标准月报'",
+    "subject_work_schedules",
+  ]) {
+    if (!namedTemplateBootstrapFix.includes(expected)) {
+      throw new Error(`The named-template bootstrap fix must include: ${expected}`);
+    }
+  }
+  if (!schema.includes("\\ir 20261016_timegenie_named_template_bootstrap_fix.sql")) {
+    throw new Error("The source schema must finish with the named-template bootstrap fix.");
   }
   for (const expected of [
     "create or replace function timegenie.actual_adjustment_fingerprint",

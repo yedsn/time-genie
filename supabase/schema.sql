@@ -3550,3 +3550,6 @@ notify pgrst, 'reload schema';
 -- Ordinary timer sync authority. Keep this final override after every wrapper
 -- above so lease traffic cannot re-enable server-side timer coordination.
 \ir 20261014_timegenie_timer_sync_authority.sql
+
+-- Keep workspace bootstrap independent from pre-named-template wrappers.
+\ir 20261016_timegenie_named_template_bootstrap_fix.sql
