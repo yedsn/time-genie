@@ -36,7 +36,10 @@ use crate::tasks::{
     self, TaskCreateRequest, TaskDailyEstimateBatchItem, TaskDailyEstimateBatchSetRequest,
     TaskDailyEstimateSetRequest, TaskListRequest, TaskUpdateRequest,
 };
-use crate::time_tracking::{self, ManualEntryRequest, TimeEntryListRequest};
+use crate::time_tracking::{
+    self, ManualEntryRequest, TimeEntryListRequest, TimerTransitionNewTaskRequest,
+    TimerTransitionRequest,
+};
 use crate::unassigned::{
     self, ResolveSessionRequest, ResolveWorkRequest, UnassignedAllocationInput,
 };
@@ -929,6 +932,97 @@ fn handle_planning_cloud_request(
             state.tracking_lease_expired = false;
         }
         return write_http_json(&mut stream, 200, json!(released));
+    }
+    if request_line.contains("/rest/v1/rpc/timer_transition_apply") {
+        let workspace_id = body["p_workspace_id"].as_str().unwrap();
+        let operation_id = body["p_operation_id"].as_str().unwrap();
+        let payload = &body["p_payload"];
+        let previous = payload
+            .get("previous_entry")
+            .filter(|value| !value.is_null());
+        let task = payload.get("task").filter(|value| !value.is_null());
+        let active = payload
+            .get("active_entry")
+            .filter(|value| !value.is_null())
+            .unwrap();
+        let remote_active = state
+            .time_entries
+            .values()
+            .find(|entry| {
+                matches!(entry["state"].as_str(), Some("running" | "paused"))
+                    && entry["deleted_at"].is_null()
+            })
+            .cloned();
+        match (previous, remote_active.as_ref()) {
+            (None, Some(_)) => {
+                return write_http_json(
+                    &mut stream,
+                    409,
+                    json!({ "message": "VERSION_CONFLICT: remote timer is active" }),
+                )
+            }
+            (Some(previous), Some(remote))
+                if remote["id"].as_str() != previous["id"].as_str()
+                    || remote["version"].as_i64() != payload["previous_base_version"].as_i64() =>
+            {
+                return write_http_json(
+                    &mut stream,
+                    409,
+                    json!({ "message": "VERSION_CONFLICT: remote timer changed" }),
+                );
+            }
+            (Some(_), None) => {
+                return write_http_json(
+                    &mut stream,
+                    409,
+                    json!({ "message": "VERSION_CONFLICT: remote timer changed" }),
+                )
+            }
+            _ => {}
+        }
+        if let Some(previous) = previous {
+            state.time_entries.insert(
+                previous["id"].as_str().unwrap().to_string(),
+                previous.clone(),
+            );
+            record_change(
+                &mut state,
+                workspace_id,
+                "time_entries",
+                previous["id"].as_str().unwrap(),
+                "update",
+                previous["version"].as_i64().unwrap_or(1),
+            );
+        }
+        if let Some(task) = task {
+            state
+                .tasks
+                .insert(task["id"].as_str().unwrap().to_string(), task.clone());
+            record_change(
+                &mut state,
+                workspace_id,
+                "tasks",
+                task["id"].as_str().unwrap(),
+                "insert",
+                task["version"].as_i64().unwrap_or(1),
+            );
+        }
+        state
+            .time_entries
+            .insert(active["id"].as_str().unwrap().to_string(), active.clone());
+        record_change(
+            &mut state,
+            workspace_id,
+            "time_entries",
+            active["id"].as_str().unwrap(),
+            "insert",
+            active["version"].as_i64().unwrap_or(1),
+        );
+        return write_http_json(
+            &mut stream,
+            200,
+            json!({ "accepted": true, "operationId": operation_id }),
+        );
     }
     if !request_line.contains("/rest/v1/rpc/cloud_apply_patch") {
         return write_http_json(
@@ -1925,6 +2019,104 @@ fn isolated_supabase_planning_two_device_flow() {
     )
     .unwrap();
     assert_eq!(cloud.request_counts().1, snapshots_before_reset + 1);
+}
+
+#[test]
+fn isolated_timer_transition_offline_retry_converges_two_devices() {
+    let directory = tempfile::tempdir().unwrap();
+    let device_a = Database::initialize_at(directory.path().join("transition-a.sqlite3")).unwrap();
+    let device_b = Database::initialize_at(directory.path().join("transition-b.sqlite3")).unwrap();
+    let cloud = PlanningCloudServer::start();
+    let workspace_id = Uuid::now_v7().to_string();
+    let state_a = configure_isolated_planning_device(
+        &device_a,
+        &cloud.base_url,
+        &workspace_id,
+        "transition-user-a",
+    );
+    configure_isolated_planning_device(
+        &device_b,
+        &cloud.base_url,
+        &workspace_id,
+        "transition-user-b",
+    );
+    let subject = subjects::list_subjects(&device_a).unwrap().remove(0);
+    let initial_task = create_task(&device_a, &subject.id, "原计时事项");
+    cloud.seed(&device_a, &subject, &initial_task);
+    cloud_sync::pull_snapshot(&device_b).unwrap();
+
+    let operation_id = Uuid::now_v7().to_string();
+    let local_result = time_tracking::transition_timer_for_cloud_test(
+        &device_a,
+        TimerTransitionRequest {
+            client_request_id: operation_id.clone(),
+            current_entry_id: None,
+            current_entry_expected_version: None,
+            task_id: None,
+            new_task: Some(TimerTransitionNewTaskRequest {
+                subject_id: subject.id.clone(),
+                parent_id: None,
+                expected_parent_version: None,
+                title: "离线新事项".to_string(),
+            }),
+            note: None,
+        },
+        &state_a,
+    )
+    .unwrap();
+    let created_task_id = local_result.created_task.as_ref().unwrap().id.clone();
+    assert_eq!(
+        cloud_sync::sync_status(&device_a)
+            .unwrap()
+            .pending_operations,
+        1
+    );
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: None,
+        },
+    )
+    .unwrap();
+    assert!(list_tasks(&device_b)
+        .iter()
+        .any(|task| task.id == created_task_id));
+    assert!(today_entries(&device_b)
+        .entries
+        .iter()
+        .any(|entry| entry.id == local_result.active_entry.id && entry.state == "running"));
+
+    let stale_operation_id = Uuid::now_v7().to_string();
+    let stale = time_tracking::transition_timer_for_cloud_test(
+        &device_a,
+        TimerTransitionRequest {
+            client_request_id: stale_operation_id.clone(),
+            current_entry_id: Some(local_result.active_entry.id.clone()),
+            current_entry_expected_version: Some(local_result.active_entry.version),
+            task_id: Some(initial_task.id),
+            new_task: None,
+            note: None,
+        },
+        &state_a,
+    )
+    .unwrap();
+    cloud
+        .state
+        .lock()
+        .unwrap()
+        .time_entries
+        .get_mut(&local_result.active_entry.id)
+        .unwrap()["version"] = json!(99);
+    let pushed = push_all(&device_a);
+    assert_eq!(pushed.conflicts, 1);
+    let remote = cloud.state.lock().unwrap();
+    assert!(!remote.time_entries.contains_key(&stale.active_entry.id));
+    assert_eq!(
+        remote.time_entries[&local_result.active_entry.id]["state"].as_str(),
+        Some("running")
+    );
 }
 
 #[test]

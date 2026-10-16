@@ -58,6 +58,7 @@ import {
   applyActualAdjustmentBatch,
   setRecurringTaskEstimate,
   startTimerRecord,
+  transitionTimerRecord,
   stopTimerRecord,
   notifyTimerStopConfirmation,
   updateTask as updateTaskRecord,
@@ -66,6 +67,8 @@ import {
   type TimeEntryRecord,
   type TimeEntryHistoryDayRecord,
   type TimerStopResultRecord,
+  type TimerTransitionNewTaskRequest,
+  type TimerTransitionResultRecord,
   type TaskRecord,
   type TodayWorkOverviewRecord,
   type ReportRecordDto,
@@ -1532,6 +1535,33 @@ export const useWorkdayStore = defineStore("workday", () => {
     return true;
   }
 
+  async function transitionTimer(target: { taskId: string } | { newTask: TimerTransitionNewTaskRequest }, note = ""): Promise<TimerTransitionResultRecord> {
+    const current = runningEntry.value;
+    markTimeDataChanged();
+    const result = await transitionTimerRecord({
+      currentEntryId: current?.id,
+      currentEntryExpectedVersion: current?.version,
+      taskId: "taskId" in target ? target.taskId : undefined,
+      newTask: "newTask" in target ? target.newTask : undefined,
+      note: note.trim() || undefined,
+    });
+    resetUnassignedTracking();
+    unassignedCurrentSession.value = undefined;
+    if (result.previousStopResult) {
+      for (const slice of result.previousStopResult.slices) replaceTimeEntry(slice);
+    }
+    replaceTimeEntry(result.activeEntry);
+    selectedTaskId.value = result.activeEntry.defaultTaskId ?? result.createdTask?.id ?? "";
+    selectedEntryId.value = result.activeEntry.id;
+    await Promise.all([
+      loadWorkspaceData(),
+      loadUnassignedState(),
+      loadTodayOverview(),
+      loadTimeHistory(timeHistoryPage.value),
+    ]);
+    return result;
+  }
+
   async function allocate(entryId: string, allocations: TimeAllocation[]): Promise<BatchCompletionResult | undefined> {
     const entry = findTimeEntry(entryId);
     if (!entry) return;
@@ -1801,7 +1831,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen, unassignedWorkDate, unassignedSessionId,
     unassignedCurrentSession,
     workspaceLoaded, workspaceLoading, loadWorkspaceData, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addChildTask, addTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTaskPlanBatch, loadActualAdjustmentSnapshot, saveActualAdjustmentBatch, removeActualAdjustment, duplicateTask, deleteTask, moveTask, reorderTask, movePlanTask,
-    indentTask, outdentTask, startTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, adjustTimerStopAllocation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, loadReportTemplates, createReportTemplate, updateReportTemplate, duplicateReportTemplate, setDefaultReportTemplate, deleteReportTemplate, reorderReportTemplates, getReportTemplatePlaceholders, publicReportText, previewObsidianReport, writeObsidianReport,
+    indentTask, outdentTask, startTimer, transitionTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, adjustTimerStopAllocation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, loadReportTemplates, createReportTemplate, updateReportTemplate, duplicateReportTemplate, setDefaultReportTemplate, deleteReportTemplate, reorderReportTemplates, getReportTemplatePlaceholders, publicReportText, previewObsidianReport, writeObsidianReport,
     beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, dismissUnassignedResolution, resolveUnassignedTime
   };
 });

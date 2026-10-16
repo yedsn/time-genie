@@ -1224,8 +1224,7 @@ async function startTimerForTask(taskId: string) {
     return;
   }
   try {
-    if (store.runningEntry) await store.stopTimer();
-    await store.startTimer(taskId);
+    await store.transitionTimer({ taskId });
   } catch (error) {
     ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "开始计时失败");
   }

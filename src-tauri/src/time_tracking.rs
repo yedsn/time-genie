@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::database::Database;
@@ -87,7 +88,7 @@ pub struct TimeEntryHistoryResult {
     pub revision: i64,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TimerStopResultDto {
     pub current_entry: TimeEntryDto,
@@ -127,6 +128,36 @@ pub struct TimerStopRequest {
     pub entry_id: String,
     pub expected_version: i64,
     pub create_default_allocation: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TimerTransitionNewTaskRequest {
+    pub subject_id: String,
+    pub parent_id: Option<String>,
+    pub expected_parent_version: Option<i64>,
+    pub title: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TimerTransitionRequest {
+    pub client_request_id: String,
+    pub current_entry_id: Option<String>,
+    pub current_entry_expected_version: Option<i64>,
+    pub task_id: Option<String>,
+    pub new_task: Option<TimerTransitionNewTaskRequest>,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TimerTransitionResultDto {
+    pub created_task: Option<crate::tasks::TaskDto>,
+    pub previous_stop_result: Option<TimerStopResultDto>,
+    pub active_entry: TimeEntryDto,
+    pub transition_at: i64,
+    pub no_op: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,6 +312,13 @@ fn timer_chain_result(
     current_entry: TimeEntryDto,
 ) -> Result<TimerStopResultDto, String> {
     let connection = database.open()?;
+    timer_chain_result_from_connection(&connection, current_entry)
+}
+
+fn timer_chain_result_from_connection(
+    connection: &rusqlite::Connection,
+    current_entry: TimeEntryDto,
+) -> Result<TimerStopResultDto, String> {
     let chain_id = current_entry
         .timer_chain_id
         .clone()
@@ -315,6 +353,266 @@ fn timer_chain_result(
             .unwrap_or(current_entry),
         slices,
     })
+}
+
+fn transition_timer_with_cloud_operation(
+    database: &Database,
+    request: TimerTransitionRequest,
+    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+) -> Result<TimerTransitionResultDto, String> {
+    validate_operation_id(&request.client_request_id)?;
+    if request.task_id.is_some() == request.new_task.is_some() {
+        return Err("VALIDATION_ERROR: 必须且只能选择一个目标事项".to_string());
+    }
+    if request.current_entry_id.is_some() != request.current_entry_expected_version.is_some() {
+        return Err("VALIDATION_ERROR: 当前计时 ID 和版本必须同时提供".to_string());
+    }
+
+    let mut connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    if let Some(result) = processed_result::<TimerTransitionResultDto>(
+        &connection,
+        &workspace_id,
+        &request.client_request_id,
+    )? {
+        return Ok(result);
+    }
+    let device_id = device_id(&connection, &workspace_id)?;
+    let now = now_millis();
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+
+    let active = if let (Some(entry_id), Some(expected_version)) = (
+        request.current_entry_id.as_deref(),
+        request.current_entry_expected_version,
+    ) {
+        let (resolved_id, resolved_version) = resolve_active_timer_request(
+            &transaction,
+            &workspace_id,
+            entry_id,
+            expected_version,
+            now,
+        )?;
+        Some((resolved_id, resolved_version))
+    } else {
+        coordinate_active_timer_in_transaction(&transaction, &workspace_id, now)?;
+        let active: Option<(String, i64)> = transaction
+            .query_row(
+                "SELECT id,version FROM time_entries
+                 WHERE workspace_id=?1 AND state IN ('running','paused') AND deleted_at IS NULL
+                 LIMIT 1",
+                [&workspace_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if active.is_some() {
+            return Err("VERSION_CONFLICT: 当前计时状态已变化，请重新加载".to_string());
+        }
+        None
+    };
+
+    let work_date = crate::work_calendar::current_work_date(&transaction, now)?;
+    let mut created_task = None;
+    let target_task_id = if let Some(task_id) = request.task_id.as_deref() {
+        ensure_selectable_task(&transaction, &workspace_id, task_id)?;
+        task_id.to_string()
+    } else {
+        let draft = request.new_task.as_ref().expect("validated new task");
+        let task_request = crate::tasks::TaskCreateRequest {
+            subject_id: draft.subject_id.clone(),
+            parent_id: draft.parent_id.clone(),
+            title: draft.title.clone(),
+            planned_date: Some(work_date.clone()),
+            estimate_minutes: None,
+            note: None,
+            project_name: None,
+            solution_name: None,
+        };
+        let (task, _) = crate::tasks::create_task_in_transaction(
+            &transaction,
+            &workspace_id,
+            &task_request,
+            "timer_quick_create",
+            draft.expected_parent_version,
+            now,
+            None,
+            None,
+            None,
+        )?;
+        let id = task.id.clone();
+        created_task = Some(task);
+        id
+    };
+
+    if let Some((active_id, _)) = active.as_ref() {
+        let current_task_id: Option<String> = transaction
+            .query_row(
+                "SELECT default_task_id FROM time_entries WHERE id=?1",
+                [active_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if created_task.is_none() && current_task_id.as_deref() == Some(target_task_id.as_str()) {
+            let result = TimerTransitionResultDto {
+                created_task: None,
+                previous_stop_result: None,
+                active_entry: load_entry(&transaction, active_id, now)?,
+                transition_at: now,
+                no_op: true,
+            };
+            save_processed_result(
+                &transaction,
+                &workspace_id,
+                &device_id,
+                &request.client_request_id,
+                "timer_transition",
+                &result,
+            )?;
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(result);
+        }
+    }
+
+    let mut previous_base_version = None;
+    let mut previous_entry_id = None;
+    let previous_stop_result = if let Some((active_id, active_version)) = active {
+        let state = entry_state(&transaction, &workspace_id, &active_id, active_version)?;
+        if state == "running" {
+            close_open_segment(&transaction, &active_id, now)?;
+        } else if state != "paused" {
+            return Err("VERSION_CONFLICT: 当前计时状态已变化".to_string());
+        }
+        let duration = segment_duration_sum(&transaction, &active_id)?;
+        update_entry_state(
+            &transaction,
+            &active_id,
+            active_version,
+            "ended",
+            Some(now),
+            duration,
+            now,
+        )?;
+        let stopped = load_entry(&transaction, &active_id, now)?;
+        previous_base_version = Some(active_version);
+        previous_entry_id = Some(active_id);
+        Some(timer_chain_result_from_connection(&transaction, stopped)?)
+    } else {
+        None
+    };
+
+    crate::recurring::ensure_occurrence_if_recurring(
+        &transaction,
+        &workspace_id,
+        &target_task_id,
+        &work_date,
+        now,
+    )?;
+    crate::unassigned::clear_for_timer(&transaction, &workspace_id, now, cloud_state.is_some())?;
+    let label = selectable_task_title(&transaction, &workspace_id, &target_task_id)?;
+    let entry_id = Uuid::now_v7().to_string();
+    transaction
+        .execute(
+            "INSERT INTO time_entries(
+           id,workspace_id,work_date,kind,source_type,state,default_task_id,label_snapshot,
+           started_at,duration_seconds,note,created_at,updated_at,version,created_by_device_id,
+           updated_by_device_id,timer_chain_id,last_continuous_at
+         ) VALUES(?1,?2,?3,'work','timer','running',?4,?5,?6,0,?7,?6,?6,1,?8,?8,?1,?6)",
+            params![
+                entry_id,
+                workspace_id,
+                work_date,
+                target_task_id,
+                label,
+                now,
+                request
+                    .note
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty()),
+                device_id
+            ],
+        )
+        .map_err(map_active_timer_error)?;
+    transaction.execute(
+        "INSERT INTO time_segments(id,workspace_id,entry_id,sequence_no,started_at,duration_seconds)
+         VALUES(?1,?2,?3,1,?4,0)",
+        params![Uuid::now_v7().to_string(),workspace_id,entry_id,now],
+    ).map_err(|error|error.to_string())?;
+    record_runtime_heartbeat(&transaction, &workspace_id, now)?;
+    bump_revision(&transaction)?;
+    let active_entry = load_entry(&transaction, &entry_id, now)?;
+    if let Some(state) = cloud_state {
+        let previous_entry = previous_entry_id
+            .as_deref()
+            .map(|id| {
+                crate::cloud_sync::entity_payload_from_connection(
+                    &transaction,
+                    "time_entry",
+                    Some(id),
+                )
+            })
+            .transpose()?;
+        let task = created_task
+            .as_ref()
+            .map(|task| {
+                crate::cloud_sync::entity_payload_from_connection(
+                    &transaction,
+                    "task",
+                    Some(&task.id),
+                )
+            })
+            .transpose()?;
+        let next_entry = crate::cloud_sync::entity_payload_from_connection(
+            &transaction,
+            "time_entry",
+            Some(&entry_id),
+        )?;
+        crate::cloud_sync::enqueue_payload_in_transaction(
+            &transaction,
+            state,
+            "timer_transition_apply",
+            "timer_transition",
+            &request.client_request_id,
+            None,
+            &json!({
+                "previous_entry": previous_entry,
+                "previous_base_version": previous_base_version,
+                "task": task,
+                "expected_parent_version": request.new_task.as_ref().and_then(|draft| draft.expected_parent_version),
+                "active_entry": next_entry,
+            }),
+            Some(&request.client_request_id),
+            None,
+        )?;
+    }
+    let result = TimerTransitionResultDto {
+        created_task,
+        previous_stop_result,
+        active_entry,
+        transition_at: now,
+        no_op: false,
+    };
+    save_processed_result(
+        &transaction,
+        &workspace_id,
+        &device_id,
+        &request.client_request_id,
+        "timer_transition",
+        &result,
+    )?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(result)
+}
+
+#[cfg(test)]
+pub(crate) fn transition_timer_for_cloud_test(
+    database: &Database,
+    request: TimerTransitionRequest,
+    state: &crate::supabase::StorageModeSnapshot,
+) -> Result<TimerTransitionResultDto, String> {
+    transition_timer_with_cloud_operation(database, request, Some(state))
 }
 
 pub(crate) fn publish_timer_hook(
@@ -2490,6 +2788,20 @@ pub fn timer_start(
 }
 
 #[tauri::command]
+pub fn timer_transition(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, Database>,
+    request: TimerTransitionRequest,
+) -> Result<TimerTransitionResultDto, String> {
+    crate::supabase::ensure_repository_write_mode(&database)?;
+    let state = crate::supabase::storage_mode(&database)?;
+    let result = transition_timer_with_cloud_operation(&database, request, Some(&state))?;
+    crate::cloud_sync::flush_if_online(&database)?;
+    let _ = crate::refresh_tray_presentation(&app, &database);
+    Ok(result)
+}
+
+#[tauri::command]
 pub fn timer_pause(
     app: tauri::AppHandle,
     database: tauri::State<'_, Database>,
@@ -2673,6 +2985,575 @@ mod tests {
         )
         .unwrap();
         (database, workspace_id, task.id)
+    }
+
+    fn subject_id(database: &Database) -> String {
+        database
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn transition(
+        database: &Database,
+        request: TimerTransitionRequest,
+    ) -> Result<TimerTransitionResultDto, String> {
+        transition_timer_with_cloud_operation(database, request, None)
+    }
+
+    fn cloud_state(database: &Database) -> crate::supabase::StorageModeSnapshot {
+        let connection = database.open().unwrap();
+        let local_workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        crate::supabase::StorageModeSnapshot {
+            mode: "cloud".to_string(),
+            workspace_id: local_workspace_id,
+            device_id,
+            online: false,
+            sync_state: "idle".to_string(),
+            pending_operations: 0,
+            conflict_count: 0,
+            last_change_seq: 0,
+            last_synced_at: None,
+            last_error: None,
+            auth_blocked: false,
+            auth_blocked_reason: None,
+        }
+    }
+
+    #[test]
+    fn transition_creates_root_task_and_starts_timer_atomically() {
+        let (database, _, _) = setup();
+        let operation_id = Uuid::now_v7().to_string();
+        let result = transition(
+            &database,
+            TimerTransitionRequest {
+                client_request_id: operation_id.clone(),
+                current_entry_id: None,
+                current_entry_expected_version: None,
+                task_id: None,
+                new_task: Some(TimerTransitionNewTaskRequest {
+                    subject_id: subject_id(&database),
+                    parent_id: None,
+                    expected_parent_version: None,
+                    title: "临时一级事项".to_string(),
+                }),
+                note: None,
+            },
+        )
+        .unwrap();
+        let created = result.created_task.as_ref().unwrap();
+        assert_eq!(created.title, "临时一级事项");
+        assert_eq!(
+            created.planned_date.as_deref(),
+            Some(test_work_date().as_str())
+        );
+        assert_eq!(
+            result.active_entry.default_task_id.as_deref(),
+            Some(created.id.as_str())
+        );
+        assert_eq!(result.active_entry.state, "running");
+
+        let repeated = transition(
+            &database,
+            TimerTransitionRequest {
+                client_request_id: operation_id,
+                current_entry_id: None,
+                current_entry_expected_version: None,
+                task_id: None,
+                new_task: Some(TimerTransitionNewTaskRequest {
+                    subject_id: subject_id(&database),
+                    parent_id: None,
+                    expected_parent_version: None,
+                    title: "临时一级事项".to_string(),
+                }),
+                note: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(repeated.active_entry.id, result.active_entry.id);
+        assert_eq!(repeated.created_task.unwrap().id, created.id);
+    }
+
+    #[test]
+    fn transition_creates_child_and_switches_at_one_boundary() {
+        let (database, _, initial_task_id) = setup();
+        let parent = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id(&database),
+                parent_id: None,
+                title: "父事项".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let active = start_timer(
+            &database,
+            TimerStartRequest {
+                task_id: Some(initial_task_id),
+                note: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        let result = transition(
+            &database,
+            TimerTransitionRequest {
+                client_request_id: Uuid::now_v7().to_string(),
+                current_entry_id: Some(active.id),
+                current_entry_expected_version: Some(active.version),
+                task_id: None,
+                new_task: Some(TimerTransitionNewTaskRequest {
+                    subject_id: parent.subject_id.clone(),
+                    parent_id: Some(parent.id.clone()),
+                    expected_parent_version: Some(parent.version),
+                    title: "临时二级事项".to_string(),
+                }),
+                note: None,
+            },
+        )
+        .unwrap();
+        let child = result.created_task.unwrap();
+        assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(result.active_entry.started_at, result.transition_at);
+        assert_eq!(
+            result
+                .previous_stop_result
+                .as_ref()
+                .unwrap()
+                .current_entry
+                .ended_at,
+            Some(result.transition_at)
+        );
+        let active_count: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM time_entries WHERE state IN ('running','paused') AND deleted_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_count, 1);
+    }
+
+    #[test]
+    fn transition_from_paused_timer_ends_it_and_starts_target() {
+        let (database, _, initial_task_id) = setup();
+        let target = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id(&database),
+                parent_id: None,
+                title: "暂停后切换目标".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let active = start_timer(
+            &database,
+            TimerStartRequest {
+                task_id: Some(initial_task_id),
+                note: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        let paused = pause_timer_with_cloud_operation(
+            &database,
+            TimerVersionRequest {
+                entry_id: active.id,
+                expected_version: active.version,
+            },
+            None,
+        )
+        .unwrap();
+
+        let result = transition(
+            &database,
+            TimerTransitionRequest {
+                client_request_id: Uuid::now_v7().to_string(),
+                current_entry_id: Some(paused.id.clone()),
+                current_entry_expected_version: Some(paused.version),
+                task_id: Some(target.id.clone()),
+                new_task: None,
+                note: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.active_entry.default_task_id.as_deref(),
+            Some(target.id.as_str())
+        );
+        assert_eq!(result.active_entry.state, "running");
+        assert_eq!(
+            result
+                .previous_stop_result
+                .as_ref()
+                .unwrap()
+                .current_entry
+                .state,
+            "ended"
+        );
+        assert_eq!(
+            result
+                .previous_stop_result
+                .as_ref()
+                .unwrap()
+                .current_entry
+                .ended_at,
+            Some(result.active_entry.started_at)
+        );
+        let active_count: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM time_entries WHERE state IN ('running','paused') AND deleted_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_count, 1);
+    }
+
+    #[test]
+    fn transition_to_current_task_is_no_op() {
+        let (database, _, task_id) = setup();
+        let active = start_timer(
+            &database,
+            TimerStartRequest {
+                task_id: Some(task_id.clone()),
+                note: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        let result = transition(
+            &database,
+            TimerTransitionRequest {
+                client_request_id: Uuid::now_v7().to_string(),
+                current_entry_id: Some(active.id.clone()),
+                current_entry_expected_version: Some(active.version),
+                task_id: Some(task_id),
+                new_task: None,
+                note: None,
+            },
+        )
+        .unwrap();
+        assert!(result.no_op);
+        assert_eq!(result.active_entry.id, active.id);
+        assert!(result.previous_stop_result.is_none());
+    }
+
+    #[test]
+    fn transition_rolls_back_new_task_when_parent_version_is_stale() {
+        let (database, _, _) = setup();
+        let parent = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id(&database),
+                parent_id: None,
+                title: "并发父事项".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let error = transition(
+            &database,
+            TimerTransitionRequest {
+                client_request_id: Uuid::now_v7().to_string(),
+                current_entry_id: None,
+                current_entry_expected_version: None,
+                task_id: None,
+                new_task: Some(TimerTransitionNewTaskRequest {
+                    subject_id: parent.subject_id.clone(),
+                    parent_id: Some(parent.id),
+                    expected_parent_version: Some(parent.version + 1),
+                    title: "不应创建".to_string(),
+                }),
+                note: None,
+            },
+        )
+        .unwrap_err();
+        assert!(error.starts_with("VERSION_CONFLICT:"));
+        let count: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE title='不应创建'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn transition_rejects_completed_parent_without_creating_or_starting() {
+        let (database, _, _) = setup();
+        let parent = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id(&database),
+                parent_id: None,
+                title: "已完成父事项".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status='done',completed_at=?1,version=version+1 WHERE id=?2",
+                params![now_millis(), parent.id],
+            )
+            .unwrap();
+
+        let error = transition(
+            &database,
+            TimerTransitionRequest {
+                client_request_id: Uuid::now_v7().to_string(),
+                current_entry_id: None,
+                current_entry_expected_version: None,
+                task_id: None,
+                new_task: Some(TimerTransitionNewTaskRequest {
+                    subject_id: parent.subject_id,
+                    parent_id: Some(parent.id),
+                    expected_parent_version: Some(parent.version + 1),
+                    title: "不应创建在已完成父项下".to_string(),
+                }),
+                note: None,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("已完成"));
+        let connection = database.open().unwrap();
+        let task_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE title='不应创建在已完成父项下'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let active_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM time_entries WHERE state IN ('running','paused') AND deleted_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((task_count, active_count), (0, 0));
+    }
+
+    #[test]
+    fn transition_uses_workspace_work_date_across_natural_date_boundary() {
+        let (database, _, _) = setup();
+        database
+            .open()
+            .unwrap()
+            .execute("UPDATE workspaces SET timezone='Pacific/Honolulu'", [])
+            .unwrap();
+        let expected_work_date =
+            crate::work_calendar::current_work_date(&database.open().unwrap(), now_millis())
+                .unwrap();
+        assert_ne!(
+            expected_work_date,
+            chrono::Local::now().format("%Y-%m-%d").to_string()
+        );
+
+        let result = transition(
+            &database,
+            TimerTransitionRequest {
+                client_request_id: Uuid::now_v7().to_string(),
+                current_entry_id: None,
+                current_entry_expected_version: None,
+                task_id: None,
+                new_task: Some(TimerTransitionNewTaskRequest {
+                    subject_id: subject_id(&database),
+                    parent_id: None,
+                    expected_parent_version: None,
+                    title: "跨自然日事项".to_string(),
+                }),
+                note: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .created_task
+                .as_ref()
+                .unwrap()
+                .planned_date
+                .as_deref(),
+            Some(expected_work_date.as_str())
+        );
+        assert_eq!(result.active_entry.work_date, expected_work_date);
+    }
+
+    #[test]
+    fn transition_coordinates_cross_day_chain_before_switching() {
+        let (database, workspace_id, initial_task_id) = setup();
+        let target = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id(&database),
+                parent_id: None,
+                title: "跨日切换目标".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let timezone =
+            crate::work_calendar::current_workspace_timezone(&database.open().unwrap()).unwrap();
+        let current_date = crate::work_calendar::work_date_at(timezone, now_millis()).unwrap();
+        let current_start = crate::work_calendar::day_bounds(timezone, &current_date)
+            .unwrap()
+            .start_at;
+        let active_id = seed_active_timer_at(
+            &database,
+            &workspace_id,
+            &initial_task_id,
+            "running",
+            current_start - 30_000,
+            now_millis(),
+        );
+
+        let result = transition(
+            &database,
+            TimerTransitionRequest {
+                client_request_id: Uuid::now_v7().to_string(),
+                current_entry_id: Some(active_id),
+                current_entry_expected_version: Some(1),
+                task_id: Some(target.id),
+                new_task: None,
+                note: None,
+            },
+        )
+        .unwrap();
+        let stopped = result.previous_stop_result.unwrap();
+        assert!(stopped.slices.len() >= 2);
+        assert_eq!(stopped.current_entry.ended_at, Some(result.transition_at));
+        assert_eq!(result.active_entry.started_at, result.transition_at);
+    }
+
+    #[test]
+    fn transition_creates_current_occurrence_for_recurring_target() {
+        let (database, workspace_id, _) = setup();
+        let target = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id(&database),
+                parent_id: None,
+                title: "重复计时目标".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        save_rule(
+            &database,
+            RecurrenceSaveRequest {
+                task_id: target.id.clone(),
+                task_expected_version: target.version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: test_work_date(),
+                rule_expected_version: None,
+            },
+        )
+        .unwrap();
+
+        transition(
+            &database,
+            TimerTransitionRequest {
+                client_request_id: Uuid::now_v7().to_string(),
+                current_entry_id: None,
+                current_entry_expected_version: None,
+                task_id: Some(target.id.clone()),
+                new_task: None,
+                note: None,
+            },
+        )
+        .unwrap();
+        let occurrence_count: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM task_occurrences WHERE workspace_id=?1 AND task_id=?2 AND occurrence_date=?3",
+                params![workspace_id, target.id, test_work_date()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(occurrence_count, 1);
+    }
+
+    #[test]
+    fn transition_queues_one_atomic_cloud_operation_and_reuses_it_on_retry() {
+        let (database, _, task_id) = setup();
+        let state = cloud_state(&database);
+        let operation_id = Uuid::now_v7().to_string();
+        let request = TimerTransitionRequest {
+            client_request_id: operation_id.clone(),
+            current_entry_id: None,
+            current_entry_expected_version: None,
+            task_id: Some(task_id),
+            new_task: None,
+            note: None,
+        };
+        let first = transition_timer_with_cloud_operation(&database, request.clone(), Some(&state))
+            .unwrap();
+        let repeated =
+            transition_timer_with_cloud_operation(&database, request, Some(&state)).unwrap();
+        assert_eq!(repeated.active_entry.id, first.active_entry.id);
+        let connection = database.open().unwrap();
+        let rows: Vec<(String, String, String)> = connection
+            .prepare(
+                "SELECT operation_id,operation_type,entity_type FROM sync_outbox ORDER BY rowid",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                operation_id,
+                "timer_transition_apply".to_string(),
+                "timer_transition".to_string()
+            )]
+        );
     }
 
     fn seed_history_entry(

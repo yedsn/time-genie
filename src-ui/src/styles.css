@@ -858,6 +858,8 @@ pre {
 .topbar-quick-timer .task-select-composite .el-select__selected-item { font-size: 11px; }
 .quick-timer-start { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 6px; color: var(--accent-ink); background: var(--accent); }
 .quick-timer-start:hover { background: color-mix(in srgb, var(--accent) 86%, var(--text)); }
+.timer-switch-cancel { color: var(--text-soft); background: var(--surface-hover); }
+.timer-switch-cancel:hover { color: var(--text); background: var(--surface-strong); }
 
 .unassigned-time-dialog.el-dialog {
   --unassigned-dialog-width: 60vw;
@@ -2635,10 +2637,15 @@ pre {
 .task-autocomplete-option.is-match { color: var(--text); }
 .task-autocomplete-option.is-match .task-option-name { font-weight: 700; }
 .task-autocomplete-option.is-match .task-option-subject { color: var(--text-soft); font-weight: 650; }
-.task-autocomplete-option.is-parent { pointer-events: none; opacity: 0.74; }
+.task-autocomplete-option.is-parent { opacity: 0.74; }
 .task-autocomplete-option.is-parent .task-option-name { color: var(--text-soft); font-weight: 650; }
+.task-autocomplete-option.is-create { color: var(--accent); }
+.task-autocomplete-option.is-create .task-option-name { font-weight: 700; }
 .task-option-subject { flex: none; max-width: 88px; overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .task-option-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-option-create-child { flex: none; border: 0; border-radius: 6px; padding: 3px 7px; color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); font: inherit; font-size: 10px; cursor: pointer; }
+.task-option-create-child:hover { background: color-mix(in srgb, var(--accent) 18%, transparent); }
+.task-option-create-child:disabled { cursor: wait; opacity: 0.55; }
 .task-option-state {
   min-width: 52px;
   flex: none;

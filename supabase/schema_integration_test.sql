@@ -56,6 +56,8 @@ end $$;
 \ir 20261015_timegenie_actual_adjustment_batch.sql
 \ir 20261016_timegenie_named_template_bootstrap_fix.sql
 \ir 20261016_timegenie_named_template_bootstrap_fix.sql
+\ir 20261016b_timegenie_timer_transition.sql
+\ir 20261016b_timegenie_timer_transition.sql
 
 do $$
 begin
@@ -2437,6 +2439,100 @@ begin
      or active_anchor->>'session_id' is null then
     raise exception 'timer stop did not create one idempotent authoritative anchor: %',active_anchor;
   end if;
+end $$;
+
+-- Timer transitions create/switch the target and timer images in one remote
+-- transaction. Retries reuse the exact result and conflicts leave no partial
+-- task or timer behind.
+do $$
+declare start_millis bigint; switch_millis bigint; start_payload jsonb; switch_payload jsonb; stale_payload jsonb; first_result jsonb; retry_result jsonb;
+begin
+  start_millis:=floor(extract(epoch from clock_timestamp())*1000)::bigint;
+  switch_millis:=start_millis+60000;
+  start_payload:=jsonb_build_object(
+    'previous_entry',null,'previous_base_version',null,'task',jsonb_build_object(
+      'id','62100000-0000-0000-0000-000000000001','subject_id','52000000-0000-0000-0000-000000000001','parent_id',null,
+      'title','原子转换一级事项','status','open','planned_date',timegenie.workspace_work_date('20000000-0000-0000-0000-000000000002',to_timestamp(start_millis::double precision/1000)),
+      'planned_time',null,'estimate_minutes',null,'note',null,'project_name',null,'solution_name',null,'source_type','timer_quick_create',
+      'source_ref',null,'sort_order',10,'completed_at',null,'created_at',start_millis,'updated_at',start_millis,'version',1,'deleted_at',null
+    ),'expected_parent_version',null,'active_entry',jsonb_build_object(
+      'id','74100000-0000-0000-0000-000000000011','work_date',timegenie.workspace_work_date('20000000-0000-0000-0000-000000000002',to_timestamp(start_millis::double precision/1000)),
+      'kind','work','source_type','timer','state','running','default_task_id','62100000-0000-0000-0000-000000000001','label_snapshot','原子转换一级事项',
+      'started_at',start_millis,'ended_at',null,'duration_seconds',0,'note',null,'created_at',start_millis,'updated_at',start_millis,'version',1,
+      'segments',jsonb_build_array(jsonb_build_object('id','74200000-0000-0000-0000-000000000011','sequence_no',1,'started_at',start_millis,'ended_at',null,'duration_seconds',0)),
+      'allocations','[]'::jsonb
+    )
+  );
+  first_result:=timegenie.timer_transition_apply(
+    '20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000003','42000000-0000-0000-0000-000000000011',start_payload
+  );
+  retry_result:=timegenie.timer_transition_apply(
+    '20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000003','42000000-0000-0000-0000-000000000011',start_payload
+  );
+  reset role;
+  if first_result is distinct from retry_result
+     or (select count(*) from timegenie.tasks where id='62100000-0000-0000-0000-000000000001')<>1
+     or (select count(*) from timegenie.time_entries where id='74100000-0000-0000-0000-000000000011' and state='running')<>1 then
+    raise exception 'timer transition create/start retry was not idempotent';
+  end if;
+  set role authenticated;
+
+  switch_payload:=jsonb_build_object(
+    'previous_entry',(start_payload->'active_entry')||jsonb_build_object(
+      'state','ended','ended_at',switch_millis,'duration_seconds',60,'updated_at',switch_millis,'version',2,
+      'segments',jsonb_build_array(jsonb_build_object('id','74200000-0000-0000-0000-000000000011','sequence_no',1,'started_at',start_millis,'ended_at',switch_millis,'duration_seconds',60))
+    ),'previous_base_version',1,'task',jsonb_build_object(
+      'id','62100000-0000-0000-0000-000000000002','subject_id','52000000-0000-0000-0000-000000000001','parent_id','62100000-0000-0000-0000-000000000001',
+      'title','原子转换二级事项','status','open','planned_date',timegenie.workspace_work_date('20000000-0000-0000-0000-000000000002',to_timestamp(switch_millis::double precision/1000)),
+      'planned_time',null,'estimate_minutes',null,'note',null,'project_name',null,'solution_name',null,'source_type','timer_quick_create',
+      'source_ref',null,'sort_order',10,'completed_at',null,'created_at',switch_millis,'updated_at',switch_millis,'version',1,'deleted_at',null
+    ),'expected_parent_version',1,'active_entry',jsonb_build_object(
+      'id','74100000-0000-0000-0000-000000000012','work_date',timegenie.workspace_work_date('20000000-0000-0000-0000-000000000002',to_timestamp(switch_millis::double precision/1000)),
+      'kind','work','source_type','timer','state','running','default_task_id','62100000-0000-0000-0000-000000000002','label_snapshot','原子转换二级事项',
+      'started_at',switch_millis,'ended_at',null,'duration_seconds',0,'note',null,'created_at',switch_millis,'updated_at',switch_millis,'version',1,
+      'segments',jsonb_build_array(jsonb_build_object('id','74200000-0000-0000-0000-000000000012','sequence_no',1,'started_at',switch_millis,'ended_at',null,'duration_seconds',0)),
+      'allocations','[]'::jsonb
+    )
+  );
+  perform timegenie.timer_transition_apply(
+    '20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000003','42000000-0000-0000-0000-000000000012',switch_payload
+  );
+  reset role;
+  if not exists(select 1 from timegenie.time_entries where id='74100000-0000-0000-0000-000000000011' and state='ended' and ended_at=to_timestamp(switch_millis::double precision/1000))
+     or not exists(select 1 from timegenie.time_entries where id='74100000-0000-0000-0000-000000000012' and state='running' and started_at=to_timestamp(switch_millis::double precision/1000))
+     or (select count(*) from timegenie.time_entries where workspace_id='20000000-0000-0000-0000-000000000002' and state in ('running','paused') and deleted_at is null)<>1 then
+    raise exception 'timer transition switch did not preserve one boundary and one active timer';
+  end if;
+  set role authenticated;
+
+  stale_payload:=jsonb_build_object(
+    'previous_entry',(switch_payload->'active_entry')||jsonb_build_object('state','ended','ended_at',switch_millis+60000,'updated_at',switch_millis+60000,'version',2,
+      'segments',jsonb_build_array(jsonb_build_object('id','74200000-0000-0000-0000-000000000012','sequence_no',1,'started_at',switch_millis,'ended_at',switch_millis+60000,'duration_seconds',60))),
+    'previous_base_version',999,'task',jsonb_build_object(
+      'id','62100000-0000-0000-0000-000000000003','subject_id','52000000-0000-0000-0000-000000000001','parent_id',null,'title','冲突时不应创建',
+      'status','open','planned_date','2026-10-16','planned_time',null,'estimate_minutes',null,'note',null,'project_name',null,'solution_name',null,
+      'source_type','timer_quick_create','source_ref',null,'sort_order',20,'completed_at',null,'created_at',switch_millis+60000,'updated_at',switch_millis+60000,'version',1,'deleted_at',null
+    ),'expected_parent_version',null,'active_entry',jsonb_build_object(
+      'id','74100000-0000-0000-0000-000000000013','work_date','2026-10-16','kind','work','source_type','timer','state','running',
+      'default_task_id','62100000-0000-0000-0000-000000000003','label_snapshot','冲突时不应创建','started_at',switch_millis+60000,'ended_at',null,
+      'duration_seconds',0,'note',null,'created_at',switch_millis+60000,'updated_at',switch_millis+60000,'version',1,
+      'segments',jsonb_build_array(jsonb_build_object('id','74200000-0000-0000-0000-000000000013','sequence_no',1,'started_at',switch_millis+60000,'ended_at',null,'duration_seconds',0)),
+      'allocations','[]'::jsonb
+    )
+  );
+  begin
+    perform timegenie.timer_transition_apply(
+      '20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000003','42000000-0000-0000-0000-000000000013',stale_payload
+    );
+    raise exception 'stale timer transition was accepted';
+  exception when others then if sqlerrm not like '%VERSION_CONFLICT%' then raise; end if; end;
+  reset role;
+  if exists(select 1 from timegenie.tasks where id='62100000-0000-0000-0000-000000000003')
+     or exists(select 1 from timegenie.time_entries where id='74100000-0000-0000-0000-000000000013')
+     or exists(select 1 from timegenie.processed_operations where operation_id='42000000-0000-0000-0000-000000000013') then
+    raise exception 'failed timer transition left partial remote data';
+  end if;
+  set role authenticated;
 end $$;
 
 -- Owner isolation and registered-device checks also apply to the shared RPCs.

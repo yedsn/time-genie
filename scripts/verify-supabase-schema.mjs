@@ -25,6 +25,7 @@ const unassignedLeaseContinuityPatchFile = path.join(repoRoot, "supabase", "2026
 const timerSyncAuthorityPatchFile = path.join(repoRoot, "supabase", "20261014_timegenie_timer_sync_authority.sql");
 const actualAdjustmentBatchPatchFile = path.join(repoRoot, "supabase", "20261015_timegenie_actual_adjustment_batch.sql");
 const namedTemplateBootstrapFixFile = path.join(repoRoot, "supabase", "20261016_timegenie_named_template_bootstrap_fix.sql");
+const timerTransitionPatchFile = path.join(repoRoot, "supabase", "20261016b_timegenie_timer_transition.sql");
 
 const binaryNames = process.platform === "win32"
   ? {
@@ -97,7 +98,22 @@ function verifyStaticSchemaInvariants() {
   const timerSyncAuthorityPatch = fs.readFileSync(timerSyncAuthorityPatchFile, "utf8");
   const actualAdjustmentBatchPatch = fs.readFileSync(actualAdjustmentBatchPatchFile, "utf8");
   const namedTemplateBootstrapFix = fs.readFileSync(namedTemplateBootstrapFixFile, "utf8");
+  const timerTransitionPatch = fs.readFileSync(timerTransitionPatchFile, "utf8");
   const schemaIntegrationTest = fs.readFileSync(schemaTestFile, "utf8");
+  for (const expected of [
+    "create or replace function timegenie.timer_transition_apply",
+    "expected_parent_version",
+    "VERSION_CONFLICT: remote timer version changed",
+    "grant execute on function timegenie.timer_transition_apply(uuid,uuid,uuid,jsonb) to authenticated",
+  ]) {
+    if (!schema.replaceAll(" ", "").toLowerCase().includes(expected.replaceAll(" ", "").toLowerCase())
+        || !timerTransitionPatch.replaceAll(" ", "").toLowerCase().includes(expected.replaceAll(" ", "").toLowerCase())) {
+      throw new Error(`The schema and timer transition patch must include: ${expected}`);
+    }
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261016b_timegenie_timer_transition\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the timer transition patch is idempotent.");
+  }
   const importStart = schema.indexOf("create or replace function timegenie.migration_import_snapshot");
   const applyPatchStart = schema.indexOf("create or replace function timegenie.cloud_apply_patch");
   if (importStart < 0 || applyPatchStart < 0 || applyPatchStart <= importStart) {

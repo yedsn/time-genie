@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::database::Database;
 use crate::recurring::{RecurrenceRuleDto, TaskOccurrenceDto};
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskDto {
     pub id: String,
@@ -914,30 +914,69 @@ fn create_task_with_source(
     validate_estimate(request.estimate_minutes)?;
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
-    ensure_subject(&connection, &workspace_id, &request.subject_id)?;
-    if let Some(parent_id) = &request.parent_id {
-        ensure_parent(&connection, &workspace_id, parent_id, &request.subject_id)?;
-        ensure_no_direct_time(&connection, parent_id)?;
-        ensure_not_recurring(&connection, &workspace_id, parent_id)?;
-    }
     let now = now_millis();
-    let id = Uuid::now_v7().to_string();
-    let sort_order = next_sort_order(
-        &connection,
-        &workspace_id,
-        &request.subject_id,
-        request.parent_id.as_deref(),
-    )?;
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
+    let (result, _) = create_task_in_transaction(
+        &transaction,
+        &workspace_id,
+        &request,
+        source_type,
+        None,
+        now,
+        cloud_operation.map(|value| value.0),
+        cloud_operation.map(|value| value.1),
+        None,
+    )?;
+    bump_revision(&transaction)?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_task_in_transaction(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    request: &TaskCreateRequest,
+    source_type: &str,
+    expected_parent_version: Option<i64>,
+    now: i64,
+    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+    operation_type: Option<&str>,
+    dependency_operation_id: Option<&str>,
+) -> Result<(TaskDto, Option<String>), String> {
+    validate_title(&request.title)?;
+    validate_estimate(request.estimate_minutes)?;
+    ensure_subject(transaction, workspace_id, &request.subject_id)?;
+    if let Some(parent_id) = request.parent_id.as_deref() {
+        if expected_parent_version.is_some() {
+            validate_quick_child_parent(
+                transaction,
+                workspace_id,
+                &request.subject_id,
+                parent_id,
+                expected_parent_version,
+            )?;
+        } else {
+            ensure_parent(transaction, workspace_id, parent_id, &request.subject_id)?;
+            ensure_no_direct_time(transaction, parent_id)?;
+            ensure_not_recurring(transaction, workspace_id, parent_id)?;
+        }
+    }
+    let id = Uuid::now_v7().to_string();
+    let sort_order = next_sort_order(
+        transaction,
+        workspace_id,
+        &request.subject_id,
+        request.parent_id.as_deref(),
+    )?;
     transaction
         .execute(
             "INSERT INTO tasks(
-                id, workspace_id, subject_id, parent_id, title, status, planned_date,
-                estimate_minutes, note, project_name, solution_name, source_type, sort_order,
-                created_at, updated_at, version
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, 1)",
+                id,workspace_id,subject_id,parent_id,title,status,planned_date,estimate_minutes,note,
+                project_name,solution_name,source_type,sort_order,created_at,updated_at,version
+             ) VALUES(?1,?2,?3,?4,?5,'open',?6,?7,?8,?9,?10,?11,?12,?13,?13,1)",
             params![
                 id,
                 workspace_id,
@@ -955,21 +994,20 @@ fn create_task_with_source(
             ],
         )
         .map_err(|error| error.to_string())?;
-    bump_revision(&transaction)?;
-    if let Some((state, operation_type)) = cloud_operation {
+    let operation_id = if let (Some(state), Some(operation_type)) = (cloud_state, operation_type) {
         crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
+            transaction,
             state,
             operation_type,
             "task",
             Some(&id),
             None,
-            None,
-        )?;
-    }
-    let result = load_task(&transaction, &id)?;
-    transaction.commit().map_err(|error| error.to_string())?;
-    Ok(result)
+            dependency_operation_id,
+        )?
+    } else {
+        None
+    };
+    Ok((load_task(transaction, &id)?, operation_id))
 }
 
 fn create_positioned_task_with_cloud_operation(
@@ -2799,15 +2837,18 @@ pub(crate) fn validate_quick_child_parent(
     expected_version: Option<i64>,
 ) -> Result<(), String> {
     ensure_parent(connection, workspace_id, parent_id, subject_id)?;
-    let (parent_parent, version): (Option<String>, i64) = connection
+    let (parent_parent, status, version): (Option<String>, String, i64) = connection
         .query_row(
-            "SELECT parent_id,version FROM tasks WHERE id=?1 AND workspace_id=?2 AND deleted_at IS NULL",
+            "SELECT parent_id,status,version FROM tasks WHERE id=?1 AND workspace_id=?2 AND deleted_at IS NULL",
             params![parent_id, workspace_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|error| error.to_string())?;
     if parent_parent.is_some() {
         return Err("TASK_DEPTH_LIMIT: 待办事项最多支持两级".to_string());
+    }
+    if status != "open" {
+        return Err("VALIDATION_ERROR: 已完成事项不能新增子事项".to_string());
     }
     if expected_version != Some(version) {
         return Err("VERSION_CONFLICT: 父事项已变化，请重新加载".to_string());
@@ -5329,7 +5370,14 @@ mod tests {
     fn recurring_estimate_updates_template_daily_override_and_dependency() {
         let database = database();
         let task = create_leaf_task(&database, "重复预计");
-        let first_date = "2026-10-15".to_string();
+        let first_day = chrono::Local::now().date_naive();
+        let first_date = first_day.format("%Y-%m-%d").to_string();
+        let second_date = first_day.succ_opt().unwrap().format("%Y-%m-%d").to_string();
+        let third_date = first_day
+            .checked_add_days(chrono::Days::new(2))
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string();
         crate::recurring::save_rule(
             &database,
             crate::recurring::RecurrenceSaveRequest {
@@ -5362,9 +5410,9 @@ mod tests {
                 subject_id: Some(task.subject_id.clone()),
                 include_completed: Some(false),
                 planned_date: None,
-                today_date: Some("2026-10-16".to_string()),
+                today_date: Some(second_date.clone()),
                 today_only: Some(false),
-                daily_estimate_date: Some("2026-10-16".to_string()),
+                daily_estimate_date: Some(second_date.clone()),
                 query: None,
             },
         )
@@ -5383,7 +5431,7 @@ mod tests {
             RecurringTaskEstimateSetRequest {
                 task_id: task.id.clone(),
                 expected_version: current.version,
-                work_date: "2026-10-16".to_string(),
+                work_date: second_date.clone(),
                 estimate_minutes: 20,
             },
             None,
@@ -5391,8 +5439,8 @@ mod tests {
         .unwrap_err()
         .contains("VERSION_CONFLICT"));
         let row: (Option<i64>, i64) = database.open().unwrap().query_row(
-            "SELECT estimate_minutes,(SELECT COUNT(*) FROM task_daily_estimates WHERE task_id=?1 AND work_date='2026-10-16') FROM tasks WHERE id=?1",
-            [&task.id], |row| Ok((row.get(0)?, row.get(1)?)),
+            "SELECT estimate_minutes,(SELECT COUNT(*) FROM task_daily_estimates WHERE task_id=?1 AND work_date=?2) FROM tasks WHERE id=?1",
+            params![task.id, second_date], |row| Ok((row.get(0)?, row.get(1)?)),
         ).unwrap();
         assert_eq!(row, (Some(10), 0));
         let updated = set_recurring_task_estimate_with_cloud_operation(
@@ -5400,7 +5448,7 @@ mod tests {
             RecurringTaskEstimateSetRequest {
                 task_id: task.id.clone(),
                 expected_version: saved.version,
-                work_date: "2026-10-16".to_string(),
+                work_date: second_date,
                 estimate_minutes: 20,
             },
             Some(&state),
@@ -5413,9 +5461,9 @@ mod tests {
                 subject_id: Some(task.subject_id.clone()),
                 include_completed: Some(false),
                 planned_date: None,
-                today_date: Some("2026-10-17".to_string()),
+                today_date: Some(third_date.clone()),
                 today_only: Some(false),
-                daily_estimate_date: Some("2026-10-17".to_string()),
+                daily_estimate_date: Some(third_date),
                 query: None,
             },
         )

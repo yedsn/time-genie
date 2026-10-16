@@ -4,7 +4,7 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { Check, ChevronDown, ChevronRight, CircleDot, Clock3, Coffee, Download, Eraser, Pause, Play, Plus, RotateCcw, Split, Square, TimerReset, Trash2 } from "lucide-vue-next";
 import { save } from "@tauri-apps/plugin-dialog";
 import { useWorkdayStore, type TimeEntry, type TimeEntryHistoryDay } from "../store";
-import TaskSelectControl from "./TaskSelectControl.vue";
+import TaskSelectControl, { type TaskSelectIntent } from "./TaskSelectControl.vue";
 import { playCompletionFeedback } from "../services/completionFeedback";
 import { clampPartialAllocationMinutes } from "../services/allocationMath";
 import { historyDateLabel, historyPaginationState } from "../services/timeEntryHistoryCore";
@@ -441,14 +441,14 @@ async function markEntryDisposition(entry: TimeEntry, disposition: "break" | "di
   }
 }
 
-async function startSelectedTimer() {
-  const taskId = timerTaskControl.value?.commit() ?? store.selectedTaskId;
+async function submitTimerIntent(intent: TaskSelectIntent) {
   timerBusy.value = true;
   try {
-    await store.startTimer(taskId, timerNote.value);
+    const result = await store.transitionTimer(intent, timerNote.value);
     timerNote.value = "";
+    if (result.previousStopResult && !result.noOp) ElMessage.success("已切换事项，上一段计时可稍后确认归属");
   } catch (error) {
-    ElMessage.error(errorText(error, "开始计时失败"));
+    ElMessage.error(errorText(error, store.runningEntry ? "切换计时失败" : "开始计时失败"));
   } finally {
     timerBusy.value = false;
   }
@@ -558,25 +558,23 @@ defineExpose({ focusTaskSelector });
       </div>
 
       <div class="time-focus-controls">
-        <div v-if="!store.runningEntry" class="time-focus-selector">
-          <span>计时事项</span>
+        <div class="time-focus-selector">
+          <span>{{ store.runningEntry ? '切换事项' : '计时事项' }}</span>
           <TaskSelectControl
             ref="timerTaskControl"
             v-model="store.selectedTaskId"
             variant="focus"
-            placeholder="选择或输入临时事项"
-            aria-label="选择计时事项"
+            intent-mode
+            :busy="timerBusy"
+            :placeholder="store.runningEntry ? '选择或输入新事项并切换' : '选择或输入新事项'"
+            :aria-label="store.runningEntry ? '切换计时事项' : '选择计时事项'"
+            @submit="submitTimerIntent"
           />
           <input v-model="timerNote" class="time-focus-note" placeholder="备注（可选）" aria-label="计时备注" />
         </div>
-        <div v-else class="time-focus-running-label">
-          <span :class="store.runningEntry.state"></span>
-          {{ store.runningEntry.state === 'paused' ? '已暂停' : '进行中' }}
-        </div>
         <div class="time-focus-actions">
-          <button v-if="!store.runningEntry" class="primary-button time-start-button" :disabled="timerBusy" @click="startSelectedTimer"><Play :size="16" fill="currentColor" />开始计时</button>
-          <button v-else-if="store.runningEntry.state === 'running'" class="secondary-button" :disabled="timerBusy" @click="runTimerAction(store.pauseTimer, '暂停计时失败')"><Pause :size="15" fill="currentColor" />暂停</button>
-          <button v-else class="primary-button" :disabled="timerBusy" @click="runTimerAction(store.resumeTimer, '继续计时失败')"><Play :size="15" fill="currentColor" />继续计时</button>
+          <button v-if="store.runningEntry?.state === 'running'" class="secondary-button" :disabled="timerBusy" @click="runTimerAction(store.pauseTimer, '暂停计时失败')"><Pause :size="15" fill="currentColor" />暂停</button>
+          <button v-else-if="store.runningEntry?.state === 'paused'" class="primary-button" :disabled="timerBusy" @click="runTimerAction(store.resumeTimer, '继续计时失败')"><Play :size="15" fill="currentColor" />继续计时</button>
           <button v-if="store.runningEntry" class="danger-button" :disabled="timerBusy" @click="runTimerAction(store.stopTimer, '结束计时失败')"><Square :size="13" fill="currentColor" />结束计时</button>
         </div>
       </div>

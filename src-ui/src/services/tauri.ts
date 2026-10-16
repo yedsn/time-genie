@@ -328,6 +328,30 @@ export type TimerStopResultRecord = {
   totalSettlementMinutes: number;
 };
 
+export type TimerTransitionNewTaskRequest = {
+  subjectId: string;
+  parentId?: string;
+  expectedParentVersion?: number;
+  title: string;
+};
+
+export type TimerTransitionRequest = {
+  clientRequestId?: string;
+  currentEntryId?: string;
+  currentEntryExpectedVersion?: number;
+  taskId?: string;
+  newTask?: TimerTransitionNewTaskRequest;
+  note?: string;
+};
+
+export type TimerTransitionResultRecord = {
+  createdTask?: TaskRecord;
+  previousStopResult?: TimerStopResultRecord;
+  activeEntry: TimeEntryRecord;
+  transitionAt: number;
+  noOp: boolean;
+};
+
 export type TimeEntryListResult = {
   entries: TimeEntryRecord[];
   rawMinutes: number;
@@ -866,6 +890,12 @@ export async function startTimerRecord(taskId?: string, note?: string): Promise<
   const clientRequestId = crypto.randomUUID();
   return await invoke<TimeEntryRecord>("timer_start", {
     request: { taskId, note, clientRequestId },
+  });
+}
+
+export async function transitionTimerRecord(request: TimerTransitionRequest): Promise<TimerTransitionResultRecord> {
+  return await invoke<TimerTransitionResultRecord>("timer_transition", {
+    request: { ...request, clientRequestId: request.clientRequestId ?? crypto.randomUUID() },
   });
 }
 

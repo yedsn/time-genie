@@ -3080,6 +3080,7 @@ fn ensure_supported_cloud_entity_type(entity_type: &str) -> Result<(), String> {
             | "subject_work_schedule"
             | "task"
             | "time_entry"
+            | "timer_transition"
             | "actual_time_adjustment"
             | "actual_adjustment_batch"
             | "unassigned_session"
@@ -3247,6 +3248,18 @@ fn push_outbox_locked(
                 api.rpc_for_database(
                     database,
                     "actual_adjustment_batch_apply",
+                    json!({
+                        "p_workspace_id": state.workspace_id,
+                        "p_device_id": state.device_id,
+                        "p_operation_id": operation.operation_id,
+                        "p_payload": operation.payload
+                    }),
+                    &session,
+                )
+            } else if operation.entity_type == "timer_transition" {
+                api.rpc_for_database(
+                    database,
+                    "timer_transition_apply",
                     json!({
                         "p_workspace_id": state.workspace_id,
                         "p_device_id": state.device_id,

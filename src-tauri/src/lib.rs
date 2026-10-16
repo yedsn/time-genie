@@ -498,6 +498,7 @@ pub fn run() {
             obsidian::obsidian_report_write_execute,
             time_tracking::timer_get_state,
             time_tracking::timer_start,
+            time_tracking::timer_transition,
             time_tracking::timer_pause,
             time_tracking::timer_resume,
             time_tracking::timer_stop,

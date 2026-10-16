@@ -3,6 +3,7 @@ import { computed, onUnmounted, ref, watch } from "vue";
 import { ElMessage } from "element-plus";
 import { X } from "lucide-vue-next";
 import { useWorkdayStore, type Task } from "../store";
+import { canAcceptInlineTimerChild, inlineTimerParentUnavailableReason } from "../services/inlineTimerTaskCreationCore";
 
 type TaskSuggestion = {
   value: string;
@@ -16,7 +17,16 @@ type TaskSuggestion = {
   selectable: boolean;
   isMatch: boolean;
   taskId?: string;
+  kind?: "task" | "create-root" | "choose-parent" | "create-child" | "parent-unavailable";
+  parentId?: string;
+  parentVersion?: number;
+  canCreateChild?: boolean;
+  unavailableReason?: string;
 };
+
+export type TaskSelectIntent =
+  | { taskId: string }
+  | { newTask: { subjectId: string; parentId?: string; expectedParentVersion?: number; title: string } };
 
 type AutocompleteInstance = {
   getData: (query: string) => Promise<void>;
@@ -24,6 +34,7 @@ type AutocompleteInstance = {
   close: () => void;
   blur: () => void;
   focus: () => void;
+  activated: boolean | { value: boolean };
 };
 
 const props = withDefaults(defineProps<{
@@ -31,14 +42,19 @@ const props = withDefaults(defineProps<{
   placeholder?: string;
   ariaLabel?: string;
   variant?: "default" | "focus" | "compact";
+  intentMode?: boolean;
+  busy?: boolean;
 }>(), {
   placeholder: "选择或输入临时事项",
   ariaLabel: "选择事项",
-  variant: "default"
+  variant: "default",
+  intentMode: false,
+  busy: false,
 });
 
 const emit = defineEmits<{
   "update:modelValue": [value: string];
+  submit: [intent: TaskSelectIntent];
 }>();
 const store = useWorkdayStore();
 const allSubjectsValue = "__all_subjects__";
@@ -48,6 +64,8 @@ const selectedSubjectId = ref(allSubjectsValue);
 const autocompleteRef = ref<AutocompleteInstance>();
 let lastQuery = "";
 let blurTimer: number | undefined;
+const choosingParent = ref(false);
+const pendingTitle = ref("");
 
 const selectedTask = computed(() => store.tasks.find((task) => task.id === props.modelValue));
 const selectedTaskPath = computed(() => selectedTask.value ? store.taskPathLabel(selectedTask.value) : "");
@@ -71,6 +89,8 @@ watch([() => props.modelValue, selectedTaskPath], () => {
 }, { immediate: true });
 
 watch(selectedSubjectId, () => {
+  choosingParent.value = false;
+  pendingTitle.value = "";
   if (selectedSubjectId.value === allSubjectsValue || selectedTask.value?.subjectId === selectedSubjectId.value) return;
   inputText.value = "";
   dirty.value = false;
@@ -145,12 +165,46 @@ function taskState(task: Task, spentMinutes: number, descendants: Task[]) {
 function fetchSuggestions(query: string, callback: (items: TaskSuggestion[]) => void) {
   lastQuery = query;
   const keyword = query.trim().toLocaleLowerCase();
-  const suggestions = allSubjectTasks.value
+  if (props.intentMode && choosingParent.value) {
+    const subjectId = targetSubjectId();
+    const parents = store.tasks
+      .filter((task) => task.subjectId === subjectId && !task.parentId)
+      .map((task) => ({
+        value: `在“${task.title}”下新建`,
+        label: task.title,
+        pathLabel: task.title,
+        subjectLabel: taskSubjectLabel(task),
+        stateLabel: inlineTimerParentUnavailableReason(task, subjectId) ?? "在此事项下新建",
+        stateClass: "not-started",
+        spentLabel: "",
+        recurrenceLabel: "",
+        selectable: canAcceptInlineTimerChild(task, subjectId),
+        isMatch: true,
+        kind: canAcceptInlineTimerChild(task, subjectId) ? "create-child" as const : "parent-unavailable" as const,
+        parentId: task.id,
+        parentVersion: task.version,
+        unavailableReason: inlineTimerParentUnavailableReason(task, subjectId),
+      }));
+    if (!parents.length) {
+      callback([{
+        value: "暂无一级事项", label: "暂无一级事项", pathLabel: "当前主体还没有可作为父级的一级事项", subjectLabel: "",
+        stateLabel: "请先新建一级事项", stateClass: "not-started", spentLabel: "", recurrenceLabel: "",
+        selectable: false, isMatch: true, kind: "parent-unavailable", unavailableReason: "当前主体还没有一级事项",
+      }]);
+      return;
+    }
+    callback(parents);
+    return;
+  }
+  const suggestions: TaskSuggestion[] = allSubjectTasks.value
     .map((task) => {
       const label = taskLabel(task);
       const descendants = getDescendantTasks(task);
       const spentMinutes = taskSpentMinutes(task, descendants);
       const state = taskState(task, spentMinutes, descendants);
+      const parentUnavailableReason = props.intentMode && keyword && !task.parentId
+        ? inlineTimerParentUnavailableReason(task, targetSubjectId())
+        : undefined;
       return {
         value: label,
         label,
@@ -162,13 +216,35 @@ function fetchSuggestions(query: string, callback: (items: TaskSuggestion[]) => 
         recurrenceLabel: task.recurrence?.summary ?? "",
         selectable: task.selectable !== false && descendants.length === 0,
         isMatch: !keyword || label.toLocaleLowerCase().includes(keyword),
-        taskId: task.id
+        taskId: task.id,
+        kind: "task" as const,
+        canCreateChild: props.intentMode && !!keyword && !task.parentId && !parentUnavailableReason,
+        unavailableReason: parentUnavailableReason,
+        parentId: task.id,
+        parentVersion: task.version,
       };
     });
+  if (props.intentMode && keyword) {
+    suggestions.push(
+      {
+        value: `新建一级事项“${query.trim()}”`, label: query.trim(), pathLabel: `新建为一级事项：${query.trim()}`, subjectLabel: "",
+        stateLabel: "创建", stateClass: "not-started", spentLabel: "", recurrenceLabel: "", selectable: true, isMatch: true, kind: "create-root",
+      },
+      {
+        value: `新建到一级事项下“${query.trim()}”`, label: query.trim(), pathLabel: `新建到一级事项下：${query.trim()}`, subjectLabel: "",
+        stateLabel: "选择父级", stateClass: "not-started", spentLabel: "", recurrenceLabel: "", selectable: true, isMatch: true, kind: "choose-parent",
+      },
+    );
+  }
   callback(suggestions);
 }
 
+function targetSubjectId() {
+  return selectedSubjectId.value === allSubjectsValue ? store.selectedSubjectId : selectedSubjectId.value;
+}
+
 function handleInput(value: string | number) {
+  if (choosingParent.value) choosingParent.value = false;
   inputText.value = String(value);
   const selectedLabel = selectedTask.value ? taskPathLabel(selectedTask.value) : "";
   dirty.value = inputText.value.trim() !== selectedLabel.trim();
@@ -188,6 +264,11 @@ function openTaskSuggestions(event: MouseEvent) {
 }
 
 function showTaskSuggestions() {
+  if (autocompleteRef.value) {
+    const activated = autocompleteRef.value.activated;
+    if (typeof activated === "object" && activated) activated.value = true;
+    else autocompleteRef.value.activated = true;
+  }
   void autocompleteRef.value?.getData(inputText.value);
 }
 
@@ -203,6 +284,35 @@ function focusTaskInput() {
 
 function selectSuggestion(item: TaskSuggestion) {
   if (blurTimer) window.clearTimeout(blurTimer);
+  if (props.busy) return;
+  if (item.kind === "create-root") {
+    const title = item.label.trim();
+    if (title) {
+      inputText.value = title;
+      dirty.value = true;
+      emit("submit", { newTask: { subjectId: targetSubjectId(), title } });
+    }
+    return;
+  }
+  if (item.kind === "choose-parent") {
+    pendingTitle.value = item.label.trim();
+    choosingParent.value = true;
+    dirty.value = true;
+    window.setTimeout(() => {
+      inputText.value = pendingTitle.value;
+      focusTaskInput();
+      showTaskSuggestions();
+    }, 80);
+    return;
+  }
+  if (item.kind === "create-child" && item.parentId) {
+    const title = pendingTitle.value;
+    choosingParent.value = false;
+    inputText.value = title;
+    dirty.value = true;
+    emit("submit", { newTask: { subjectId: targetSubjectId(), parentId: item.parentId, expectedParentVersion: item.parentVersion, title } });
+    return;
+  }
   dirty.value = false;
   if (!item.selectable) {
     inputText.value = lastQuery.trim();
@@ -213,6 +323,7 @@ function selectSuggestion(item: TaskSuggestion) {
   if (item.taskId) {
     // Selecting another concrete item replaces the previous association immediately.
     emit("update:modelValue", item.taskId);
+    if (props.intentMode) emit("submit", { taskId: item.taskId });
     return;
   }
   commitText();
@@ -245,6 +356,8 @@ function commitText() {
     emit("update:modelValue", existing.id);
     dirty.value = false;
     return existing.id;
+  } else if (props.intentMode) {
+    return "";
   } else {
     const taskId = store.addQuickTask(title, targetSubjectId);
     emit("update:modelValue", taskId);
@@ -255,9 +368,31 @@ function commitText() {
 }
 
 function scheduleCommit() {
+  if (props.intentMode) return;
   blurTimer = window.setTimeout(() => {
     if (dirty.value) commitText();
   }, 160);
+}
+
+function createChildUnder(item: TaskSuggestion) {
+  if (props.busy || !item.canCreateChild || !item.parentId) return;
+  const title = inputText.value.trim();
+  if (!title) return;
+  emit("submit", {
+    newTask: {
+      subjectId: targetSubjectId(),
+      parentId: item.parentId,
+      expectedParentVersion: item.parentVersion,
+      title,
+    },
+  });
+}
+
+function handleEscape() {
+  if (!choosingParent.value) return;
+  choosingParent.value = false;
+  inputText.value = pendingTitle.value;
+  window.setTimeout(showTaskSuggestions);
 }
 
 onUnmounted(() => {
@@ -284,7 +419,7 @@ defineExpose({ commit: commitText, closeSuggestions: closeTaskSuggestions, focus
       placement="bottom-start"
       fit-input-width
       highlight-first-item
-      select-when-unmatched
+      :select-when-unmatched="!intentMode"
       clearable
       :clear-icon="X"
       @input="handleInput"
@@ -293,16 +428,27 @@ defineExpose({ commit: commitText, closeSuggestions: closeTaskSuggestions, focus
       @select="selectSuggestion"
       @blur="scheduleCommit"
       @keydown.enter.stop
+      @keydown.esc.stop="handleEscape"
     >
       <template #default="{ item }">
         <span
           class="task-autocomplete-option"
-          :class="{ 'is-parent': !item.selectable, 'is-match': item.isMatch }"
-          :title="item.selectable ? item.label : '父事项仅汇总子事项用时，请选择具体子事项'"
+          :class="{ 'is-parent': !item.selectable, 'is-match': item.isMatch, 'is-create': item.kind && item.kind !== 'task' }"
+          :title="item.unavailableReason ?? (item.selectable ? item.label : '父事项仅汇总子事项用时，请选择具体子事项')"
           :aria-disabled="!item.selectable"
         >
           <span v-if="selectedSubjectId === allSubjectsValue" class="task-option-subject">{{ item.subjectLabel }}</span>
           <span class="task-option-name">{{ item.pathLabel }}</span>
+          <button
+            v-if="item.canCreateChild"
+            type="button"
+            class="task-option-create-child"
+            :disabled="busy"
+            @mousedown.prevent.stop
+            @click.prevent.stop="createChildUnder(item)"
+          >
+            在此事项下新建
+          </button>
           <span v-if="item.recurrenceLabel" class="task-option-repeat">{{ item.recurrenceLabel }}</span>
           <span class="task-option-spent">{{ item.spentLabel }}</span>
           <span class="task-option-state" :class="`is-${item.stateClass}`">{{ item.stateLabel }}</span>
