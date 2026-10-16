@@ -1,21 +1,22 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import { ElMessage } from "element-plus";
 import { X } from "lucide-vue-next";
 import { useWorkdayStore, type Task } from "../store";
 import { canAcceptInlineTimerChild, inlineTimerParentUnavailableReason } from "../services/inlineTimerTaskCreationCore";
+import { resolveTaskSelectionSubject, taskSelectionRows } from "../services/taskSelectionCore";
 
 type TaskSuggestion = {
   value: string;
   label: string;
   pathLabel: string;
-  subjectLabel: string;
   stateLabel: string;
   stateClass: string;
   spentLabel: string;
   recurrenceLabel: string;
   selectable: boolean;
   isMatch: boolean;
+  depth: number;
   taskId?: string;
   kind?: "task" | "create-root" | "choose-parent" | "create-child" | "parent-unavailable";
   parentId?: string;
@@ -44,7 +45,7 @@ const props = withDefaults(defineProps<{
   intentMode?: boolean;
   busy?: boolean;
 }>(), {
-  placeholder: "选择或输入临时事项",
+  placeholder: "选择或输入事项",
   ariaLabel: "选择事项",
   variant: "default",
   intentMode: false,
@@ -56,54 +57,36 @@ const emit = defineEmits<{
   submit: [intent: TaskSelectIntent];
 }>();
 const store = useWorkdayStore();
-const allSubjectsValue = "__all_subjects__";
 const inputText = ref("");
 const dirty = ref(false);
-const selectedSubjectId = ref(allSubjectsValue);
+const activeSubjectId = ref("");
 const autocompleteRef = ref<AutocompleteInstance>();
-let lastQuery = "";
-let blurTimer: number | undefined;
 const choosingParent = ref(false);
 const pendingTitle = ref("");
+let lastQuery = "";
 
 const selectedTask = computed(() => store.tasks.find((task) => task.id === props.modelValue));
 const selectedTaskPath = computed(() => selectedTask.value ? store.taskPathLabel(selectedTask.value) : "");
-const allSubjectTasks = computed(() => {
-  const ordered = selectedSubjectId.value === allSubjectsValue
-    ? store.visibleTasks
-    : store.visibleTasks.filter((task) => task.subjectId === selectedSubjectId.value);
-  return [
-    ...ordered.filter((task) => task.status !== "done"),
-    ...ordered.filter((task) => task.status === "done")
-  ];
-});
+const activeRows = computed(() => taskSelectionRows(store.visibleTasks, activeSubjectId.value));
 const inputClass = computed(() => [
   "task-autocomplete",
   props.variant === "focus" && "task-autocomplete--focus",
-  props.variant === "compact" && "task-autocomplete--compact"
+  props.variant === "compact" && "task-autocomplete--compact",
 ]);
 
+function defaultSubjectId(task = selectedTask.value) {
+  return resolveTaskSelectionSubject(store.subjects, task, store.selectedSubjectId);
+}
+
 watch([() => props.modelValue, selectedTaskPath], () => {
+  if (selectedTask.value) activeSubjectId.value = defaultSubjectId(selectedTask.value);
+  else if (!dirty.value) activeSubjectId.value = defaultSubjectId();
   if (!dirty.value) inputText.value = selectedTaskPath.value;
 }, { immediate: true });
 
-watch(selectedSubjectId, () => {
-  choosingParent.value = false;
-  pendingTitle.value = "";
-  if (selectedSubjectId.value === allSubjectsValue || selectedTask.value?.subjectId === selectedSubjectId.value) return;
-  inputText.value = "";
-  dirty.value = false;
-  emit("update:modelValue", "");
-});
-
-function taskLabel(task: Task) {
-  const subject = store.subjects.find((item) => item.id === task.subjectId);
-  return [subject?.name ?? "默认", store.taskPathLabel(task)].join(" / ");
-}
-
-function taskSubjectLabel(task: Task) {
-  return store.subjects.find((item) => item.id === task.subjectId)?.name ?? "默认";
-}
+watch(() => store.subjects.map((subject) => subject.id).join("|"), () => {
+  if (!store.subjects.some((subject) => subject.id === activeSubjectId.value)) activeSubjectId.value = defaultSubjectId();
+}, { immediate: true });
 
 function taskPathLabel(task: Task) {
   return store.taskPathLabel(task);
@@ -118,9 +101,7 @@ function directTaskSpentMinutes(taskId: string) {
   let total = 0;
   for (const entry of store.entries) {
     if (entry.allocations?.length) {
-      total += entry.allocations
-        .filter((allocation) => allocation.taskId === taskId)
-        .reduce((sum, allocation) => sum + Math.max(0, allocation.minutes), 0);
+      total += entry.allocations.filter((allocation) => allocation.taskId === taskId).reduce((sum, allocation) => sum + Math.max(0, allocation.minutes), 0);
       continue;
     }
     if (entry.defaultTask !== taskId) continue;
@@ -130,17 +111,15 @@ function directTaskSpentMinutes(taskId: string) {
 }
 
 function taskSpentMinutes(task: Task, descendants: Task[]) {
-  if (descendants.length) {
-    return descendants.reduce((sum, child) => sum + directTaskSpentMinutes(child.id), 0);
-  }
+  if (descendants.length) return descendants.reduce((sum, child) => sum + directTaskSpentMinutes(child.id), 0);
   return directTaskSpentMinutes(task.id);
 }
 
 function formatSpentMinutes(minutes: number) {
-  if (minutes < 60) return `${minutes} 分钟`;
+  if (minutes < 60) return String(minutes) + " 分钟";
   const hours = Math.floor(minutes / 60);
   const rest = minutes % 60;
-  return rest ? `${hours}小时${rest}分` : `${hours}小时`;
+  return rest ? String(hours) + "小时" + String(rest) + "分" : String(hours) + "小时";
 }
 
 function taskState(task: Task, spentMinutes: number, descendants: Task[]) {
@@ -161,78 +140,74 @@ function taskState(task: Task, spentMinutes: number, descendants: Task[]) {
   return { label: "未开始", className: "not-started" };
 }
 
+function targetSubjectId() {
+  return activeSubjectId.value || defaultSubjectId();
+}
+
 function fetchSuggestions(query: string, callback: (items: TaskSuggestion[]) => void) {
   lastQuery = query;
-  const keyword = query.trim().toLocaleLowerCase();
-  if (props.intentMode && choosingParent.value) {
+  if (choosingParent.value) {
     const subjectId = targetSubjectId();
-    const parents = store.tasks
-      .filter((task) => task.subjectId === subjectId && !task.parentId)
-      .map((task) => ({
-        value: `在“${task.title}”下新建`,
+    const parents = activeRows.value.filter((row) => row.depth === 0).map(({ task }) => {
+      const unavailableReason = inlineTimerParentUnavailableReason(task, subjectId);
+      return {
+        value: "在“" + task.title + "”下新建",
         label: task.title,
         pathLabel: task.title,
-        subjectLabel: taskSubjectLabel(task),
-        stateLabel: inlineTimerParentUnavailableReason(task, subjectId) ?? "可选",
+        stateLabel: unavailableReason ?? "可选",
         stateClass: "not-started",
         spentLabel: "",
         recurrenceLabel: "",
         selectable: canAcceptInlineTimerChild(task, subjectId),
         isMatch: true,
-        kind: canAcceptInlineTimerChild(task, subjectId) ? "create-child" as const : "parent-unavailable" as const,
+        depth: 0,
+        kind: unavailableReason ? "parent-unavailable" as const : "create-child" as const,
         parentId: task.id,
         parentVersion: task.version,
-        unavailableReason: inlineTimerParentUnavailableReason(task, subjectId),
-      }));
-    if (!parents.length) {
-      callback([{
-        value: "暂无一级事项", label: "暂无一级事项", pathLabel: "当前主体还没有可作为父级的一级事项", subjectLabel: "",
-        stateLabel: "请先新建一级事项", stateClass: "not-started", spentLabel: "", recurrenceLabel: "",
-        selectable: false, isMatch: true, kind: "parent-unavailable", unavailableReason: "当前主体还没有一级事项",
-      }]);
-      return;
-    }
-    callback(parents);
+        unavailableReason,
+      };
+    });
+    callback(parents.length ? parents : [{
+      value: "暂无一级事项", label: "暂无一级事项", pathLabel: "当前主体还没有可作为父级的一级事项",
+      stateLabel: "请先新建一级事项", stateClass: "not-started", spentLabel: "", recurrenceLabel: "",
+      selectable: false, isMatch: true, depth: 0, kind: "parent-unavailable", unavailableReason: "当前主体还没有一级事项",
+    }]);
     return;
   }
-  const suggestions: TaskSuggestion[] = allSubjectTasks.value
-    .map((task) => {
-      const label = taskLabel(task);
+
+  const keyword = dirty.value ? query.trim().toLocaleLowerCase() : "";
+  const suggestions: TaskSuggestion[] = activeRows.value
+    .filter(({ task }) => !keyword || (task.title + " " + taskPathLabel(task)).toLocaleLowerCase().includes(keyword))
+    .map(({ task, depth }) => {
       const descendants = getDescendantTasks(task);
       const spentMinutes = taskSpentMinutes(task, descendants);
       const state = taskState(task, spentMinutes, descendants);
       return {
-        value: label,
-        label,
-        pathLabel: taskPathLabel(task),
-        subjectLabel: taskSubjectLabel(task),
-        stateLabel: state.label,
-        stateClass: state.className,
-        spentLabel: `已用 ${formatSpentMinutes(spentMinutes)}`,
-        recurrenceLabel: task.recurrence?.summary ?? "",
-        selectable: task.selectable !== false && descendants.length === 0,
-        isMatch: !keyword || label.toLocaleLowerCase().includes(keyword),
-        taskId: task.id,
-        kind: "task" as const,
+        value: taskPathLabel(task), label: taskPathLabel(task), pathLabel: task.title,
+        stateLabel: state.label, stateClass: state.className, spentLabel: "已用 " + formatSpentMinutes(spentMinutes),
+        recurrenceLabel: task.recurrence?.summary ?? "", selectable: task.selectable !== false && descendants.length === 0,
+        isMatch: Boolean(keyword), depth, taskId: task.id, kind: "task" as const,
       };
     });
-  if (props.intentMode && keyword) {
+  const title = query.trim();
+  const exactSelectable = title && activeRows.value.some(({ task }) => {
+    if (getDescendantTasks(task).length || task.selectable === false) return false;
+    return task.title.trim() === title || taskPathLabel(task).trim() === title;
+  });
+  if (title && dirty.value && !exactSelectable) {
     suggestions.push(
-      {
-        value: `新建一级事项“${query.trim()}”`, label: query.trim(), pathLabel: `新建为一级事项：${query.trim()}`, subjectLabel: "",
-        stateLabel: "创建", stateClass: "not-started", spentLabel: "", recurrenceLabel: "", selectable: true, isMatch: true, kind: "create-root",
-      },
-      {
-        value: `新建为二级事项“${query.trim()}”`, label: query.trim(), pathLabel: `新建为二级事项：${query.trim()}`, subjectLabel: "",
-        stateLabel: "选择一级事项", stateClass: "not-started", spentLabel: "", recurrenceLabel: "", selectable: true, isMatch: true, kind: "choose-parent",
-      },
+      { value: "新建一级事项“" + title + "”", label: title, pathLabel: "新建为一级事项：" + title, stateLabel: "创建", stateClass: "not-started", spentLabel: "", recurrenceLabel: "", selectable: true, isMatch: true, depth: 0, kind: "create-root" },
+      { value: "新建为二级事项“" + title + "”", label: title, pathLabel: "新建为二级事项：" + title, stateLabel: "选择一级事项", stateClass: "not-started", spentLabel: "", recurrenceLabel: "", selectable: true, isMatch: true, depth: 0, kind: "choose-parent" },
     );
   }
+  if (!suggestions.length && !title) {
+    suggestions.push({
+      value: "当前主体暂无事项", label: "当前主体暂无事项", pathLabel: "当前主体暂无可选事项",
+      stateLabel: "输入名称可新建", stateClass: "not-started", spentLabel: "", recurrenceLabel: "",
+      selectable: false, isMatch: true, depth: 0, kind: "parent-unavailable", unavailableReason: "当前主体暂无可选事项",
+    });
+  }
   callback(suggestions);
-}
-
-function targetSubjectId() {
-  return selectedSubjectId.value === allSubjectsValue ? store.selectedSubjectId : selectedSubjectId.value;
 }
 
 function handleInput(value: string | number) {
@@ -243,9 +218,11 @@ function handleInput(value: string | number) {
 }
 
 function clearSelectedTask() {
-  if (blurTimer) window.clearTimeout(blurTimer);
   inputText.value = "";
   dirty.value = false;
+  choosingParent.value = false;
+  pendingTitle.value = "";
+  activeSubjectId.value = resolveTaskSelectionSubject(store.subjects, undefined, store.selectedSubjectId);
   emit("update:modelValue", "");
 }
 
@@ -265,7 +242,6 @@ function showTaskSuggestions() {
 }
 
 function closeTaskSuggestions() {
-  if (blurTimer) window.clearTimeout(blurTimer);
   autocompleteRef.value?.close();
   autocompleteRef.value?.blur();
 }
@@ -274,16 +250,41 @@ function focusTaskInput() {
   autocompleteRef.value?.focus();
 }
 
+function switchSubject(subjectId: string) {
+  if (props.busy || subjectId === activeSubjectId.value) return;
+  activeSubjectId.value = subjectId;
+  if (choosingParent.value) {
+    choosingParent.value = false;
+    inputText.value = pendingTitle.value;
+  }
+  window.setTimeout(async () => {
+    focusTaskInput();
+    showTaskSuggestions();
+    await Promise.resolve();
+    autocompleteRef.value?.highlight(0);
+  });
+}
+
+function createDraft(title: string, parentId?: string) {
+  try {
+    const taskId = store.addTaskSelectionDraft(title, targetSubjectId(), parentId);
+    if (!taskId) return;
+    emit("update:modelValue", taskId);
+    inputText.value = parentId ? (store.tasks.find((task) => task.id === parentId)?.title ?? "") + " / " + title : title;
+    dirty.value = false;
+    ElMessage.success("已新建事项“" + title + "”");
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  }
+}
+
 function selectSuggestion(item: TaskSuggestion) {
-  if (blurTimer) window.clearTimeout(blurTimer);
   if (props.busy) return;
   if (item.kind === "create-root") {
     const title = item.label.trim();
-    if (title) {
-      inputText.value = title;
-      dirty.value = true;
-      emit("submit", { newTask: { subjectId: targetSubjectId(), title } });
-    }
+    if (!title) return;
+    if (props.intentMode) emit("submit", { newTask: { subjectId: targetSubjectId(), title } });
+    else createDraft(title);
     return;
   }
   if (item.kind === "choose-parent") {
@@ -301,28 +302,22 @@ function selectSuggestion(item: TaskSuggestion) {
     const title = pendingTitle.value;
     choosingParent.value = false;
     inputText.value = title;
-    dirty.value = true;
-    emit("submit", { newTask: { subjectId: targetSubjectId(), parentId: item.parentId, expectedParentVersion: item.parentVersion, title } });
+    if (props.intentMode) emit("submit", { newTask: { subjectId: targetSubjectId(), parentId: item.parentId, expectedParentVersion: item.parentVersion, title } });
+    else createDraft(title, item.parentId);
+    return;
+  }
+  if (!item.selectable) {
+    inputText.value = lastQuery.trim();
     return;
   }
   dirty.value = false;
-  if (!item.selectable) {
-    inputText.value = lastQuery.trim();
-    dirty.value = inputText.value.trim() !== (selectedTask.value ? taskPathLabel(selectedTask.value) : "").trim();
-    return;
-  }
-  inputText.value = item.pathLabel.trim();
-  if (item.taskId) {
-    // Selecting another concrete item replaces the previous association immediately.
-    emit("update:modelValue", item.taskId);
-    if (props.intentMode) emit("submit", { taskId: item.taskId });
-    return;
-  }
-  commitText();
+  inputText.value = item.label.trim();
+  if (!item.taskId) return;
+  emit("update:modelValue", item.taskId);
+  if (props.intentMode) emit("submit", { taskId: item.taskId });
 }
 
 function commitText() {
-  if (blurTimer) window.clearTimeout(blurTimer);
   const title = inputText.value.trim();
   if (!title) {
     dirty.value = false;
@@ -333,37 +328,19 @@ function commitText() {
     dirty.value = false;
     return selectedTask.value.id;
   }
-  const targetSubjectId = selectedSubjectId.value === allSubjectsValue ? store.selectedSubjectId : selectedSubjectId.value;
-  const subjectMatches = selectedSubjectId.value === allSubjectsValue
-    ? store.tasks
-    : store.tasks.filter((task) => task.subjectId === selectedSubjectId.value);
-  const existing = subjectMatches.find((task) => taskPathLabel(task).trim() === title)
-    ?? subjectMatches.find((task) => task.title.trim() === title);
-  if (existing && getDescendantTasks(existing).length) {
-    inputText.value = selectedTask.value ? taskPathLabel(selectedTask.value) : "";
-    dirty.value = false;
-    return "";
-  }
+  const existing = activeRows.value.map(({ task }) => task).find((task) => !getDescendantTasks(task).length && task.selectable !== false && (taskPathLabel(task).trim() === title || task.title.trim() === title));
   if (existing) {
     emit("update:modelValue", existing.id);
     dirty.value = false;
     return existing.id;
-  } else if (props.intentMode) {
-    return "";
-  } else {
-    const taskId = store.addQuickTask(title, targetSubjectId);
-    emit("update:modelValue", taskId);
-    ElMessage.success(`已创建临时事项“${title}”`);
-    dirty.value = false;
-    return taskId;
   }
-}
-
-function scheduleCommit() {
-  if (props.intentMode) return;
-  blurTimer = window.setTimeout(() => {
-    if (dirty.value) commitText();
-  }, 160);
+  ElMessage.warning("请从列表选择事项，或明确选择新建为一级/二级事项");
+  if (selectedTask.value) {
+    inputText.value = taskPathLabel(selectedTask.value);
+    dirty.value = false;
+    return selectedTask.value.id;
+  }
+  return "";
 }
 
 function handleEscape() {
@@ -373,53 +350,24 @@ function handleEscape() {
   window.setTimeout(showTaskSuggestions);
 }
 
-onUnmounted(() => {
-  if (blurTimer) window.clearTimeout(blurTimer);
-});
-
 defineExpose({ commit: commitText, closeSuggestions: closeTaskSuggestions, focus: focusTaskInput });
 </script>
 
 <template>
   <div class="task-select-composite" :class="inputClass">
-    <el-select v-model="selectedSubjectId" class="task-subject-select" aria-label="选择主体" popper-class="task-subject-popper">
-      <el-option label="全部主体" :value="allSubjectsValue" />
-      <el-option v-for="subject in store.subjects" :key="subject.id" :label="subject.name" :value="subject.id" />
-    </el-select>
-    <el-autocomplete
-      ref="autocompleteRef"
-      v-model="inputText"
-      class="task-autocomplete-input"
-      :fetch-suggestions="fetchSuggestions"
-      :placeholder="placeholder"
-      :aria-label="ariaLabel"
-      popper-class="task-autocomplete-popper"
-      placement="bottom-start"
-      fit-input-width
-      highlight-first-item
-      :select-when-unmatched="!intentMode"
-      clearable
-      :clear-icon="X"
-      @input="handleInput"
-      @click="openTaskSuggestions"
-      @clear="clearSelectedTask"
-      @select="selectSuggestion"
-      @blur="scheduleCommit"
-      @keydown.enter.stop
-      @keydown.esc.stop="handleEscape"
-    >
+    <el-autocomplete ref="autocompleteRef" v-model="inputText" class="task-autocomplete-input" :fetch-suggestions="fetchSuggestions" :placeholder="placeholder" :aria-label="ariaLabel" popper-class="task-autocomplete-popper" placement="bottom-start" fit-input-width highlight-first-item :select-when-unmatched="false" clearable :clear-icon="X" @input="handleInput" @click="openTaskSuggestions" @clear="clearSelectedTask" @select="selectSuggestion" @keydown.enter.stop @keydown.esc.stop="handleEscape">
+      <template #header>
+        <div class="task-subject-tabs" role="tablist" aria-label="筛选事项主体">
+          <button v-for="subject in store.subjects" :key="subject.id" type="button" role="tab" :aria-selected="activeSubjectId === subject.id" :class="{ active: activeSubjectId === subject.id }" @mousedown.prevent @click.stop="switchSubject(subject.id)">{{ subject.name }}</button>
+        </div>
+      </template>
       <template #default="{ item }">
-        <span
-          class="task-autocomplete-option"
-          :class="{ 'is-parent': !item.selectable, 'is-match': item.isMatch, 'is-create': item.kind && item.kind !== 'task' }"
-          :title="item.unavailableReason ?? (item.selectable ? item.label : '父事项仅汇总子事项用时，请选择具体子事项')"
-          :aria-disabled="!item.selectable"
-        >
-          <span v-if="selectedSubjectId === allSubjectsValue" class="task-option-subject">{{ item.subjectLabel }}</span>
+        <span class="task-autocomplete-option" :class="{ 'is-parent': !item.selectable, 'is-match': item.isMatch, 'is-create': item.kind && item.kind !== 'task' }" :title="item.unavailableReason ?? item.label" :aria-disabled="!item.selectable">
+          <span v-if="item.kind === 'task'" class="task-option-indent" :style="{ width: String(item.depth * 18) + 'px' }" aria-hidden="true"></span>
           <span class="task-option-name">{{ item.pathLabel }}</span>
           <span v-if="item.recurrenceLabel" class="task-option-repeat">{{ item.recurrenceLabel }}</span>
           <span class="task-option-spent">{{ item.spentLabel }}</span>
-          <span class="task-option-state" :class="`is-${item.stateClass}`">{{ item.stateLabel }}</span>
+          <span class="task-option-state" :class="'is-' + item.stateClass">{{ item.stateLabel }}</span>
         </span>
       </template>
     </el-autocomplete>

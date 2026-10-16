@@ -16,11 +16,13 @@ assert.match(selector, /新建为一级事项/);
 assert.match(selector, /新建为二级事项/);
 assert.doesNotMatch(selector, /在此事项下新建/);
 assert.doesNotMatch(selector, /task-option-create-child/);
-assert.match(selector, /if \(props\.intentMode && choosingParent\.value\)/);
-assert.match(selector, /if \(props\.intentMode\) return/);
+assert.match(selector, /if \(choosingParent\.value\)/);
+assert.match(selector, /if \(props\.intentMode\) emit\("submit"/);
 assert.match(selector, /const title = item\.label\.trim\(\)/);
 assert.match(selector, /pendingTitle\.value = item\.label\.trim\(\)/);
 assert.match(selector, /inputText\.value = title/);
+assert.match(selector, /store\.addTaskSelectionDraft/);
+assert.doesNotMatch(selector, /@blur=/);
 assert.match(selector, /@keydown.esc.stop="handleEscape"/);
 
 const timerBar = readFileSync("src-ui/src/components/GlobalTimerBar.vue", "utf8");

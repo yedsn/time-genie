@@ -80,6 +80,7 @@ import { TRANSIENT_MISSING_STATE_REFRESH_LIMIT, transientMissingStateResult } fr
 import { canSubmitUnassignedResolution } from "./services/unassignedResolutionGuard";
 import { clampHistoryPage, collectTodayEntryTaskIds, findEntryInHistory, isTodayTimeEntry, timerStopHistoryTarget } from "./services/timeEntryHistoryCore";
 import { completedTaskHistoryFallbackPage, isCurrentCompletedTaskHistoryRequest } from "./services/completedTaskHistoryCore";
+import { canAcceptInlineTimerChild, inlineTimerParentUnavailableReason } from "./services/inlineTimerTaskCreationCore";
 import type { QuickPlanBatchRequest } from "./services/quickPlanTextCore";
 
 export type TaskStatus = "open" | "done";
@@ -1158,6 +1159,22 @@ export const useWorkdayStore = defineStore("workday", () => {
     return taskId;
   }
 
+  function addTaskSelectionDraft(title: string, subjectId: string, parentId?: string) {
+    const normalizedTitle = title.trim();
+    if (!normalizedTitle) throw new Error("事项名称不能为空");
+    if (!subjects.some((subject) => subject.id === subjectId)) throw new Error("所选主体不存在");
+    if (!parentId) return addQuickTask(normalizedTitle, subjectId);
+
+    const parent = tasks.find((task) => task.id === parentId);
+    if (!parent) throw new Error("所选一级事项不存在");
+    const unavailableReason = inlineTimerParentUnavailableReason(parent, subjectId);
+    if (!canAcceptInlineTimerChild(parent, subjectId)) throw new Error(unavailableReason ?? "所选一级事项不能新建子项");
+    const taskId = addChildTask(parent.id, normalizedTitle);
+    const task = tasks.find((item) => item.id === taskId);
+    if (task) task.quickCreate = true;
+    return taskId;
+  }
+
   async function duplicateTask(taskId: string) {
     const ordered = buildVisibleTaskList(tasks);
     const source = ordered.find((task) => task.id === taskId);
@@ -1830,7 +1847,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     now, todayMinutes, allocatedMinutes, pendingMinutes, doneCount, todayCompletionDoneCount, todayCompletionTotalCount, todayCompletionPercent, unassignedSeconds, unassignedStartedAt,
     unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen, unassignedWorkDate, unassignedSessionId,
     unassignedCurrentSession,
-    workspaceLoaded, workspaceLoading, loadWorkspaceData, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addChildTask, addTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTaskPlanBatch, loadActualAdjustmentSnapshot, saveActualAdjustmentBatch, removeActualAdjustment, duplicateTask, deleteTask, moveTask, reorderTask, movePlanTask,
+    workspaceLoaded, workspaceLoading, loadWorkspaceData, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addTaskSelectionDraft, addChildTask, addTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTaskPlanBatch, loadActualAdjustmentSnapshot, saveActualAdjustmentBatch, removeActualAdjustment, duplicateTask, deleteTask, moveTask, reorderTask, movePlanTask,
     indentTask, outdentTask, startTimer, transitionTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, adjustTimerStopAllocation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, loadReportTemplates, createReportTemplate, updateReportTemplate, duplicateReportTemplate, setDefaultReportTemplate, deleteReportTemplate, reorderReportTemplates, getReportTemplatePlaceholders, publicReportText, previewObsidianReport, writeObsidianReport,
     beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, dismissUnassignedResolution, resolveUnassignedTime
   };

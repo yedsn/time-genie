@@ -2574,23 +2574,18 @@ pre {
   --el-fill-color-blank: var(--surface-soft);
   --el-fill-color-light: var(--surface-hover);
 }
-.task-select-composite { width: 100%; min-width: 0; display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 6px; }
-.task-select-composite .task-subject-select,
+.task-select-composite { width: 100%; min-width: 0; }
 .task-select-composite .task-autocomplete-input { min-width: 0; width: 100%; }
-.task-select-composite .el-input__wrapper,
-.task-select-composite .el-select__wrapper {
+.task-select-composite .el-input__wrapper {
   min-height: 38px;
   border-radius: 6px;
   background: var(--surface-soft);
   box-shadow: 0 0 0 1px var(--line) inset;
   padding: 6px 10px;
 }
-.task-select-composite .el-input__wrapper:hover,
-.task-select-composite .el-select__wrapper:hover { box-shadow: 0 0 0 1px rgba(201,239,143,0.28) inset; }
-.task-select-composite .el-input__wrapper.is-focus,
-.task-select-composite .el-select__wrapper.is-focused { box-shadow: 0 0 0 1px rgba(121,217,169,0.72) inset; }
-.task-select-composite .el-input__inner,
-.task-select-composite .el-select__selected-item {
+.task-select-composite .el-input__wrapper:hover { box-shadow: 0 0 0 1px rgba(201,239,143,0.28) inset; }
+.task-select-composite .el-input__wrapper.is-focus { box-shadow: 0 0 0 1px rgba(121,217,169,0.72) inset; }
+.task-select-composite .el-input__inner {
   width: 100%;
   height: auto;
   color: var(--text) !important;
@@ -2608,15 +2603,10 @@ pre {
   transition: color 0.16s ease, transform 0.16s ease;
 }
 .task-select-composite .el-input__clear:hover { color: var(--text); transform: scale(1.04); }
-.task-autocomplete--focus .el-input__wrapper,
-.task-autocomplete--focus .el-select__wrapper { min-height: 42px; }
-.task-autocomplete--compact .el-input__wrapper,
-.task-autocomplete--compact .el-select__wrapper { min-height: 36px; }
-.unassigned-allocation-row .task-select-composite .el-input__wrapper,
-.unassigned-allocation-row .task-select-composite .el-select__wrapper { min-height: 40px; padding: 6px 10px; }
-.unassigned-allocation-row .task-select-composite .el-input__inner,
-.unassigned-allocation-row .task-select-composite .el-select__selected-item { font-size: 13px; }
-.task-subject-popper.el-popper { --el-bg-color-overlay: var(--popover-bg); --el-text-color-regular: var(--text-soft); --el-fill-color-light: var(--surface-hover); border: 1px solid var(--line); background: var(--popover-bg); }
+.task-autocomplete--focus .el-input__wrapper { min-height: 42px; }
+.task-autocomplete--compact .el-input__wrapper { min-height: 36px; }
+.unassigned-allocation-row .task-select-composite .el-input__wrapper { min-height: 40px; padding: 6px 10px; }
+.unassigned-allocation-row .task-select-composite .el-input__inner { font-size: 13px; }
 .task-autocomplete-popper.el-popper {
   --el-bg-color-overlay: var(--popover-bg);
   --el-text-color-regular: var(--text-soft);
@@ -2629,6 +2619,11 @@ pre {
 }
 .task-autocomplete-popper.el-popper .el-popper__arrow::before { border-color: var(--line); background: var(--popover-bg); }
 .task-autocomplete-popper .el-autocomplete-suggestion { background: var(--popover-bg); }
+.task-autocomplete-popper .el-autocomplete-suggestion__header { position: sticky; z-index: 2; top: 0; border-bottom: 1px solid var(--line-soft); padding: 7px 8px; background: color-mix(in srgb, var(--popover-bg) 96%, transparent); backdrop-filter: blur(12px); }
+.task-subject-tabs { min-width: 0; display: flex; gap: 5px; overflow-x: auto; scrollbar-width: thin; overscroll-behavior-x: contain; }
+.task-subject-tabs button { min-width: max-content; height: 28px; flex: none; border: 1px solid transparent; border-radius: 6px; padding: 0 10px; color: var(--muted); background: transparent; font-size: 11px; font-weight: 650; white-space: nowrap; }
+.task-subject-tabs button:hover { color: var(--text-soft); background: var(--surface-hover); }
+.task-subject-tabs button.active { border-color: color-mix(in srgb, var(--accent) 38%, var(--line)); color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--popover-bg)); }
 .task-autocomplete-popper .el-autocomplete-suggestion__wrap { padding: 6px 0; }
 .task-autocomplete-popper .el-autocomplete-suggestion li { min-height: 46px; color: var(--text-soft); line-height: 20px; padding: 6px 12px; }
 .task-autocomplete-popper .el-autocomplete-suggestion li:hover,
@@ -2641,7 +2636,7 @@ pre {
 .task-autocomplete-option.is-parent .task-option-name { color: var(--text-soft); font-weight: 650; }
 .task-autocomplete-option.is-create { color: var(--accent); }
 .task-autocomplete-option.is-create .task-option-name { font-weight: 700; }
-.task-option-subject { flex: none; max-width: 88px; overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.task-option-indent { height: 1px; flex: none; }
 .task-option-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .task-option-state {
   min-width: 52px;
