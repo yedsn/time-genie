@@ -224,7 +224,7 @@ function errorText(error: unknown, fallback: string) {
           placeholder="选择或输入临时事项"
           aria-label="未归属时间对应事项"
         />
-        <label><input :value="allocation.minutes" min="0" type="number" @input="updateAllocationMinutes(allocationIndex, $event)" /><span>分钟</span></label>
+        <label class="unassigned-allocation-minutes"><input :value="allocation.minutes" min="0" type="number" @input="updateAllocationMinutes(allocationIndex, $event)" /><span>分钟</span></label>
         <label class="allocation-complete-toggle" title="保存工时时同时完成这个事项">
           <input v-model="allocation.completeTask" type="checkbox" />
           <span>同时完成</span>

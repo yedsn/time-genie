@@ -26,7 +26,15 @@ assert.match(selector, /resolveTaskSelectionSubject/);
 assert.match(selector, /taskSelectionRows/);
 assert.match(selector, /#header/);
 assert.match(selector, /task-subject-tabs/);
-assert.match(selector, /@mousedown\.prevent/);
+assert.match(selector, /'is-root-task': item\.kind === 'task' && item\.depth === 0/);
+assert.match(selector, /'is-child-task': item\.kind === 'task' && item\.depth > 0/);
+assert.match(selector, /@pointerdown\.stop="switchSubject\(subject\.id\)"/);
+assert.doesNotMatch(selector, /@pointerdown\.prevent[^>]*switchSubject/);
+assert.doesNotMatch(selector, /@mousedown[^>]*switchSubject/);
+assert.match(selector, /async function switchSubject/);
+assert.match(selector, /await autocompleteRef\.value\?\.getData\(inputText\.value\)/);
+assert.match(selector.match(/async function switchSubject[\s\S]*?\n}\n\nfunction createDraft/)?.[0] ?? "", /activated\.value = true/);
+assert.doesNotMatch(selector.match(/async function switchSubject[\s\S]*?\n}\n\nfunction createDraft/)?.[0] ?? "", /setTimeout|focusTaskInput|showTaskSuggestions/);
 assert.doesNotMatch(selector, /__all_subjects__/);
 assert.doesNotMatch(selector, /task-subject-select/);
 assert.doesNotMatch(selector, /store\.selectSubject/);
@@ -47,5 +55,17 @@ for (const file of [
 ]) {
   assert.match(readFileSync(file, "utf8"), /TaskSelectControl/);
 }
+
+const unassignedDialog = readFileSync("src-ui/src/components/UnassignedTimeDialog.vue", "utf8");
+const styles = readFileSync("src-ui/src/styles.css", "utf8");
+assert.match(unassignedDialog, /class="unassigned-allocation-minutes"/);
+assert.match(styles, /--unassigned-dialog-width:\s*clamp\(720px, 64vw, 980px\)/);
+assert.match(styles, /\.unassigned-allocation-row\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 92px max-content 30px/);
+assert.match(styles, /\.task-autocomplete-option\.is-root-task \.task-option-name/);
+assert.match(styles, /\.task-autocomplete-option\.is-root-task \.task-option-name\s*\{[^}]*font-weight:\s*520/);
+assert.doesNotMatch(styles, /\.task-autocomplete-option\.is-root-task \.task-option-name\s*\{[^}]*font-weight:\s*(?:6[0-9]{2}|7[0-9]{2}|bold)/);
+assert.match(styles, /\.task-autocomplete-option\.is-parent\s*\{\s*opacity:\s*1/);
+assert.match(styles, /\.task-autocomplete-option\.is-child-task \.task-option-name\s*\{[^}]*var\(--text\) 86%/);
+assert.match(styles, /\.task-autocomplete-option\.is-child-task \.task-option-indent::after/);
 
 console.log("Task selection verification passed.");

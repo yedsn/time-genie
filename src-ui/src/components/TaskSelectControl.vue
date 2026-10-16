@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { ElMessage } from "element-plus";
 import { X } from "lucide-vue-next";
 import { useWorkdayStore, type Task } from "../store";
@@ -250,19 +250,22 @@ function focusTaskInput() {
   autocompleteRef.value?.focus();
 }
 
-function switchSubject(subjectId: string) {
+async function switchSubject(subjectId: string) {
   if (props.busy || subjectId === activeSubjectId.value) return;
+  const activated = autocompleteRef.value?.activated;
+  if (typeof activated === "object" && activated) activated.value = true;
+  else if (autocompleteRef.value) autocompleteRef.value.activated = true;
   activeSubjectId.value = subjectId;
   if (choosingParent.value) {
     choosingParent.value = false;
     inputText.value = pendingTitle.value;
   }
-  window.setTimeout(async () => {
-    focusTaskInput();
-    showTaskSuggestions();
-    await Promise.resolve();
-    autocompleteRef.value?.highlight(0);
-  });
+  await autocompleteRef.value?.getData(inputText.value);
+  await nextTick();
+  const refreshedActivated = autocompleteRef.value?.activated;
+  if (typeof refreshedActivated === "object" && refreshedActivated) refreshedActivated.value = true;
+  else if (autocompleteRef.value) autocompleteRef.value.activated = true;
+  autocompleteRef.value?.highlight(0);
 }
 
 function createDraft(title: string, parentId?: string) {
@@ -358,11 +361,11 @@ defineExpose({ commit: commitText, closeSuggestions: closeTaskSuggestions, focus
     <el-autocomplete ref="autocompleteRef" v-model="inputText" class="task-autocomplete-input" :fetch-suggestions="fetchSuggestions" :placeholder="placeholder" :aria-label="ariaLabel" popper-class="task-autocomplete-popper" placement="bottom-start" fit-input-width highlight-first-item :select-when-unmatched="false" clearable :clear-icon="X" @input="handleInput" @click="openTaskSuggestions" @clear="clearSelectedTask" @select="selectSuggestion" @keydown.enter.stop @keydown.esc.stop="handleEscape">
       <template #header>
         <div class="task-subject-tabs" role="tablist" aria-label="筛选事项主体">
-          <button v-for="subject in store.subjects" :key="subject.id" type="button" role="tab" :aria-selected="activeSubjectId === subject.id" :class="{ active: activeSubjectId === subject.id }" @mousedown.prevent @click.stop="switchSubject(subject.id)">{{ subject.name }}</button>
+          <button v-for="subject in store.subjects" :key="subject.id" type="button" role="tab" :aria-selected="activeSubjectId === subject.id" :class="{ active: activeSubjectId === subject.id }" @pointerdown.stop="switchSubject(subject.id)">{{ subject.name }}</button>
         </div>
       </template>
       <template #default="{ item }">
-        <span class="task-autocomplete-option" :class="{ 'is-parent': !item.selectable, 'is-match': item.isMatch, 'is-create': item.kind && item.kind !== 'task' }" :title="item.unavailableReason ?? item.label" :aria-disabled="!item.selectable">
+        <span class="task-autocomplete-option" :class="{ 'is-parent': !item.selectable, 'is-match': item.isMatch, 'is-create': item.kind && item.kind !== 'task', 'is-root-task': item.kind === 'task' && item.depth === 0, 'is-child-task': item.kind === 'task' && item.depth > 0 }" :title="item.unavailableReason ?? item.label" :aria-disabled="!item.selectable">
           <span v-if="item.kind === 'task'" class="task-option-indent" :style="{ width: String(item.depth * 18) + 'px' }" aria-hidden="true"></span>
           <span class="task-option-name">{{ item.pathLabel }}</span>
           <span v-if="item.recurrenceLabel" class="task-option-repeat">{{ item.recurrenceLabel }}</span>

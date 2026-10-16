@@ -862,7 +862,7 @@ pre {
 .timer-switch-cancel:hover { color: var(--text); background: var(--surface-strong); }
 
 .unassigned-time-dialog.el-dialog {
-  --unassigned-dialog-width: 60vw;
+  --unassigned-dialog-width: clamp(720px, 64vw, 980px);
   --el-dialog-bg-color: var(--panel);
   --el-text-color-primary: var(--text);
   --el-text-color-regular: var(--text-soft);
@@ -871,6 +871,7 @@ pre {
   border-radius: 8px;
   background: var(--panel);
   box-shadow: 0 26px 80px rgba(0,0,0,0.52);
+  max-width: calc(100vw - 24px);
 }
 .unassigned-time-dialog .el-dialog__header { display: none; }
 .unassigned-time-dialog .el-dialog__body { padding: 20px; }
@@ -889,10 +890,12 @@ pre {
 .unassigned-allocation-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 10px; }
 .unassigned-allocation-head strong { color: #9dcdb5; font-weight: 600; }
 .unassigned-allocation-head strong.invalid { color: #f0a19a; }
-.unassigned-allocation-row { display: grid; grid-template-columns: minmax(0, 1fr) 108px 112px 30px; align-items: center; gap: 8px; }
+.unassigned-allocation-row { display: grid; grid-template-columns: minmax(0, 1fr) 92px max-content 30px; align-items: center; gap: 8px; }
 .unassigned-allocation-row label { height: 40px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 5px; border: 1px solid var(--line); border-radius: 6px; padding: 0 8px; color: var(--muted); background: var(--surface-soft); font-size: 10px; }
 .unassigned-allocation-row label:focus-within { border-color: rgba(201,239,143,0.32); }
 .unassigned-allocation-row input { width: 100%; height: 30px; border: 0; padding: 0; background: transparent; text-align: left; }
+.unassigned-allocation-row .unassigned-allocation-minutes { padding-right: 7px; padding-left: 7px; }
+.unassigned-allocation-row .allocation-complete-toggle { padding-right: 9px; padding-left: 9px; }
 .unassigned-allocation-row .task-select-composite { min-width: 0; }
 .unassigned-add-allocation { width: max-content; min-height: 28px; display: inline-flex; align-items: center; gap: 5px; padding: 4px 7px; border-radius: 5px; color: #a8b5ae; background: transparent; font-size: 11px; }
 .unassigned-add-allocation:hover { color: var(--text); background: var(--surface-soft); }
@@ -935,7 +938,7 @@ pre {
 
 @media (max-width: 800px) {
   .unassigned-time-dialog.el-dialog { --unassigned-dialog-width: calc(100vw - 24px); }
-  .unassigned-allocation-row { grid-template-columns: 108px minmax(84px, auto) 30px; }
+  .unassigned-allocation-row { grid-template-columns: 92px max-content 30px; }
   .unassigned-allocation-row .task-select-composite { grid-column: 1 / -1; }
   .timer-stop-default-allocation { grid-template-columns: minmax(0, 1fr); }
   .timer-stop-confirm-actions { align-items: stretch; flex-direction: column; }
@@ -2632,11 +2635,15 @@ pre {
 .task-autocomplete-option.is-match { color: var(--text); }
 .task-autocomplete-option.is-match .task-option-name { font-weight: 700; }
 .task-autocomplete-option.is-match .task-option-subject { color: var(--text-soft); font-weight: 650; }
-.task-autocomplete-option.is-parent { opacity: 0.74; }
+.task-autocomplete-option.is-parent { opacity: 1; }
 .task-autocomplete-option.is-parent .task-option-name { color: var(--text-soft); font-weight: 650; }
 .task-autocomplete-option.is-create { color: var(--accent); }
 .task-autocomplete-option.is-create .task-option-name { font-weight: 700; }
-.task-option-indent { height: 1px; flex: none; }
+.task-option-indent { position: relative; height: 28px; flex: none; }
+.task-autocomplete-option.is-root-task .task-option-name { color: var(--text); font-weight: 520; }
+.task-autocomplete-option.is-child-task .task-option-name { color: color-mix(in srgb, var(--text) 86%, var(--text-soft)); font-weight: 520; }
+.task-autocomplete-option.is-child-task .task-option-indent::before { position: absolute; top: -10px; right: 8px; bottom: 50%; width: 1px; background: color-mix(in srgb, var(--text) 46%, transparent); content: ""; }
+.task-autocomplete-option.is-child-task .task-option-indent::after { position: absolute; top: 50%; right: 0; width: 9px; height: 1px; background: color-mix(in srgb, var(--text) 56%, transparent); content: ""; }
 .task-option-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .task-option-state {
   min-width: 52px;
