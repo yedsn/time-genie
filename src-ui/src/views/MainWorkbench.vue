@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
-import { AlertTriangle, CalendarDays, CheckCircle2, Clock3, Copy, Database, FileText, Home, LoaderCircle, Minus, Pencil, Plus, RefreshCw, Save, Settings, Square, UserRound, X } from "lucide-vue-next";
+import { AlertTriangle, CalendarDays, CheckCircle2, Clock3, Copy, Database, FileText, Folder, Home, LoaderCircle, Minus, Pencil, Plus, RefreshCw, Save, Settings, Square, UserRound, X } from "lucide-vue-next";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useWorkdayStore, type Task } from "../store";
 import { checkAppUpdate, closeMainWindow, confirmObsidianPlan, configureCloud, downloadAndInstallUpdate, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listCloudSyncConflicts, listCloudSyncQueue, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onOpenTimerTaskSelection, onTrayCheckUpdate, previewObsidianPlan, previewSeaTableTaskSync, previewStorageMigration, registerCloudDevice, resetLocalCacheFromCloud, resolveAllCloudSyncConflicts, restartApp, resumeCloudSyncAfterReauth, retryFailedSeaTableSync, revokeCloudDevice, saveCloudSync, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudSessionSnapshot, type CloudSyncConflict, type CloudSyncQueueItem, type PlanImportPreviewResult, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
@@ -8,7 +8,6 @@ import PlanListEditor from "../components/PlanListEditor.vue";
 import CompletedTaskHistory from "../components/CompletedTaskHistory.vue";
 import GlobalTimerBar from "../components/GlobalTimerBar.vue";
 import UnassignedTimeIndicator from "../components/UnassignedTimeIndicator.vue";
-import UnassignedTimeDialog from "../components/UnassignedTimeDialog.vue";
 import TimeTrackingWorkspace from "../components/TimeTrackingWorkspace.vue";
 import TodayOverviewWorkspace from "../components/TodayOverviewWorkspace.vue";
 import ReportWorkspace from "../components/ReportWorkspace.vue";
@@ -23,6 +22,7 @@ import { timerSyncRecoveryDetail, timerSyncRecoveryLabel } from "../services/tim
 import { isCompletionFeedbackEnabled, playCompletionFeedback, setCompletionFeedbackEnabled, setCompletionFeedbackSoundEnabled } from "../services/completionFeedback";
 import { remainingOpenTaskCount } from "../services/completionFeedbackCore";
 import { APP_THEMES, applyAppTheme, isAppTheme, type AppTheme } from "../services/theme";
+import type { ExecutionPanelMode } from "../services/executionTaskPanelCore";
 import { cloneWorkSchedule, createDefaultWorkSchedule, loadSubjectWorkSchedule, saveSubjectWorkSchedule, type WorkScheduleDay } from "../services/subjectWorkScheduleMock";
 
 const store = useWorkdayStore();
@@ -163,9 +163,11 @@ let cloudSaveSettledTimer: number | undefined;
 let cloudSavePendingSince = 0;
 const completingTaskIds = new Set<string>();
 const recentCompletedTaskId = ref("");
-const timerTaskDialogOpen = ref(false);
-const timerTaskDialogSubjectId = ref("");
-const timerTaskDialogNote = ref("");
+const executionPanelOpen = ref(false);
+const executionPanelMode = ref<ExecutionPanelMode>("execute");
+const executionPanelSubjectId = ref("");
+const executionPanelEntryId = ref("");
+const executionPanelTimerNote = ref("");
 const timeTrackingWorkspaceRef = ref<{ clearTimerNote: () => void }>();
 let recentCompletedTimer: number | undefined;
 
@@ -253,6 +255,10 @@ function updateVisibleCloudSaveState(state: StorageModeSnapshot | undefined) {
 }
 
 watch(storageState, updateVisibleCloudSaveState, { immediate: true });
+watch(() => store.unassignedDialogOpen, (open) => {
+  if (!open) return;
+  openExecutionPanel({ mode: "unassigned-allocation", subjectId: store.selectedSubjectId });
+});
 const cloudBusinessEntities = new Set([
   "tasks",
   "task_daily_estimates",
@@ -1218,10 +1224,32 @@ async function retrySeaTableFailures() {
   }
 }
 
+function openExecutionPanel(options: {
+  mode?: ExecutionPanelMode;
+  subjectId?: string;
+  entryId?: string;
+  timerNote?: string;
+} = {}) {
+  executionPanelMode.value = options.mode ?? "execute";
+  executionPanelSubjectId.value = options.subjectId ?? "";
+  executionPanelEntryId.value = options.entryId ?? "";
+  executionPanelTimerNote.value = options.timerNote ?? "";
+  executionPanelOpen.value = true;
+}
+
 function openTimerTaskDialog(subjectId = "", note = "") {
-  timerTaskDialogSubjectId.value = subjectId;
-  timerTaskDialogNote.value = note;
-  timerTaskDialogOpen.value = true;
+  openExecutionPanel({ mode: "execute", subjectId, timerNote: note });
+}
+
+function openEntryAllocation(entryId: string, subjectId = "") {
+  openExecutionPanel({ mode: "entry-allocation", entryId, subjectId });
+}
+
+function updateExecutionPanelOpen(open: boolean) {
+  executionPanelOpen.value = open;
+  if (!open && executionPanelMode.value === "unassigned-allocation" && store.unassignedDialogOpen) {
+    store.dismissUnassignedResolution();
+  }
 }
 
 function openTimerDialogForTask(taskId: string) {
@@ -1235,7 +1263,7 @@ async function goToPlanFromTimerDialog(subjectId: string) {
 }
 
 function handleTimerTaskStarted() {
-  timerTaskDialogNote.value = "";
+  executionPanelTimerNote.value = "";
   timeTrackingWorkspaceRef.value?.clearTimerNote();
 }
 
@@ -1489,7 +1517,12 @@ async function handleCompletedTaskDelete(task: Task) {
         />
       </section>
 
-      <TimeTrackingWorkspace v-else-if="store.activePage === 'timer'" ref="timeTrackingWorkspaceRef" @open-timer-task-dialog="(note) => openTimerTaskDialog('', note)" />
+      <TimeTrackingWorkspace
+        v-else-if="store.activePage === 'timer'"
+        ref="timeTrackingWorkspaceRef"
+        @open-timer-task-dialog="(note) => openTimerTaskDialog('', note)"
+        @open-entry-allocation="openEntryAllocation"
+      />
 
       <ReportWorkspace v-else-if="store.activePage === 'reports'" />
 
@@ -1693,8 +1726,16 @@ async function handleCompletedTaskDelete(task: Task) {
       </footer>
     </section>
 
-    <TimerTaskDialog v-model="timerTaskDialogOpen" :context-subject-id="timerTaskDialogSubjectId" :timer-note="timerTaskDialogNote" @go-plan="goToPlanFromTimerDialog" @timer-started="handleTimerTaskStarted" />
-    <UnassignedTimeDialog />
+    <TimerTaskDialog
+      :model-value="executionPanelOpen"
+      :mode="executionPanelMode"
+      :context-subject-id="executionPanelSubjectId"
+      :entry-id="executionPanelEntryId"
+      :timer-note="executionPanelTimerNote"
+      @update:model-value="updateExecutionPanelOpen"
+      @go-plan="goToPlanFromTimerDialog"
+      @timer-started="handleTimerTaskStarted"
+    />
     <TimerStopConfirmationDialog />
     <el-dialog v-model="cloudQueueDialogOpen" class="cloud-sync-queue-dialog" title="同步队列" width="min(620px, 94vw)" append-to-body :close-on-click-modal="false">
       <div class="cloud-sync-queue-summary">

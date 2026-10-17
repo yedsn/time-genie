@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 
 const component = fs.readFileSync(new URL("../src-ui/src/components/PlanListEditor.vue", import.meta.url), "utf8");
+const executionPanel = fs.readFileSync(new URL("../src-ui/src/components/TimerTaskDialog.vue", import.meta.url), "utf8");
 const styles = fs.readFileSync(new URL("../src-ui/src/styles.css", import.meta.url), "utf8");
 
-const actualButton = component.indexOf(">调整今日实际</button>");
-const estimateButton = component.indexOf(">分配今日预计</button>");
-assert(actualButton >= 0 && estimateButton > actualButton, "调整按钮应位于分配今日预计左侧");
+assert(!component.includes(">调整今日实际</button>"), "待办页不应保留独立调整今日实际入口");
+assert(executionPanel.includes("今日实际") && executionPanel.includes("openActualAdjustment"), "执行事项面板缺少今日实际调整入口");
 assert(component.includes("actualAdjustmentBatchId.value = crypto.randomUUID()"));
 assert(component.includes("batchId: actualAdjustmentBatchId.value"), "重试必须复用同一批次 ID");
 assert(component.includes("actualAdjustmentSubjectId.value !== props.subjectId"), "主体切换后不能把旧草稿保存到新主体");

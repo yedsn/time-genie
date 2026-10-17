@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { contextMenuPosition, effectiveTodayEstimate, planTaskMoveIntent, todayEstimateDraft } from "../.tmp-plan-task-interactions-test/planTaskInteractionCore.js";
+import { contextMenuPosition, effectiveTodayEstimate, planTaskMoveIntent, taskDragTargetDepth, taskDragTargetInvalid, taskSubtreeIds, todayEstimateDraft } from "../.tmp-plan-task-interactions-test/planTaskInteractionCore.js";
 
 const rows = [
   { id: "a" },
@@ -15,6 +15,12 @@ assert.deepEqual(planTaskMoveIntent([rows[0], rows[1], rows[2], rows[3], rows[4]
 assert.deepEqual(planTaskMoveIntent([rows[0], rows[1], rows[3], rows[2], rows[4]], "a2", new Set(["a2"]), 0, false), { parentId: undefined, previousSiblingId: "b", nextSiblingId: undefined });
 assert.deepEqual(planTaskMoveIntent([rows[0], rows[1], rows[2], rows[3], rows[4]], "b", new Set(["b"]), 1, false), { parentId: "a", previousSiblingId: "a2", nextSiblingId: undefined });
 assert.equal(planTaskMoveIntent(rows, "a", new Set(["a", "a1", "a2"]), 1, true), undefined);
+assert.deepEqual([...taskSubtreeIds(rows, "a")], ["a", "a1", "a2"]);
+assert.equal(taskDragTargetDepth(0, 80, 0), 0);
+assert.equal(taskDragTargetDepth(0, 100, 0), 1);
+assert.equal(taskDragTargetDepth(1, 20, 0), 1);
+assert.equal(taskDragTargetInvalid(1, new Set(["a", "a1"])), true);
+assert.equal(taskDragTargetInvalid(1, new Set(["a1"])), false);
 assert.equal(todayEstimateDraft(undefined), 60);
 assert.equal(todayEstimateDraft(undefined, "a"), 30);
 assert.equal(todayEstimateDraft(15, "a"), 15);

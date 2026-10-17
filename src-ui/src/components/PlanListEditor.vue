@@ -3,11 +3,11 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { MdEditor } from "md-editor-v3";
 import "md-editor-v3/lib/style.css";
-import Sortable, { MultiDrag } from "sortablejs";
 import { CalendarDays, CheckCircle2, Circle, Clock3, Copy, CornerDownRight, DatabaseZap, FileInput, FilePenLine, GripVertical, IndentDecrease, IndentIncrease, MessageSquareText, Minus, Play, Plus, Radio, Repeat2, TimerReset, Trash2 } from "lucide-vue-next";
 import type { Task } from "../store";
 import { isActivePlanTask } from "../services/completedTaskHistoryCore";
-import { contextMenuPosition, planTaskMoveIntent, todayEstimateDraft } from "../services/planTaskInteractionCore";
+import { contextMenuPosition, taskSubtreeIds, todayEstimateDraft } from "../services/planTaskInteractionCore";
+import { createTaskTreeSortable } from "../services/taskTreeSortable";
 import { getSubjectWorkSchedule, type SubjectWorkScheduleDay } from "../services/tauri";
 import type { ActualAdjustmentBatchRequest, ActualAdjustmentBatchResult, ActualAdjustmentSnapshotRecord } from "../services/tauri";
 import { adjustQuickEstimateMinutes, allocatedMinutes, capacitySummary, changedEstimateDrafts, formatQuickEstimateHours, parseQuickDuration, parseQuickEstimateMinutes, quickEstimateRows, scheduleCapacity, weekdayIndexForDate, type QuickEstimateDraft } from "../services/quickPlanEstimateCore";
@@ -70,8 +70,6 @@ const contextMenuOpen = ref(false);
 const contextTaskId = ref("");
 const contextMenuLeft = ref(0);
 const contextMenuTop = ref(0);
-const dragTargetDepth = ref<0 | 1>(0);
-const dragTargetInvalid = ref(false);
 const quickEstimateOpen = ref(false);
 const quickEstimateSaving = ref(false);
 const quickEstimateDrafts = ref<QuickEstimateDraft[]>([]);
@@ -101,7 +99,6 @@ const quickPlanConfirmingClose = ref(false);
 const quickPlanPasteErrors = ref<Array<{ lineIndex: number; message: string }>>([]);
 const quickPlanEditorRef = ref<{ getEditorView?: () => { state: { selection: { main: { from: number; to: number } } }; dispatch: (transaction: unknown) => void } } | undefined>(undefined);
 let quickPlanTextVersion = 0;
-let sortable: Sortable | undefined;
 let levelChangedTimer: number | undefined;
 
 const quickPlanMarkdownToolbars = [
@@ -119,11 +116,6 @@ const quickPlanMarkdownToolbars = [
   "preview",
 ] as const;
 
-const sortableWithPlugins = Sortable as typeof Sortable & { treeMultiDragMounted?: boolean };
-if (!sortableWithPlugins.treeMultiDragMounted) {
-  Sortable.mount(new MultiDrag());
-  sortableWithPlugins.treeMultiDragMounted = true;
-}
 
 const flatRows = computed(() => props.tasks.map((task) => ({ task, depth: getDepth(task) })));
 const pendingRows = computed(() => flatRows.value.filter((row) => isActivePlanTask({
@@ -179,32 +171,11 @@ function childPlaceholderParent(rowIndex: number) {
 }
 
 function getSubtreeIds(taskId: string) {
-  const ids = new Set([taskId]);
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const task of props.tasks) {
-      if (task.parentId && ids.has(task.parentId) && !ids.has(task.id)) {
-        ids.add(task.id);
-        changed = true;
-      }
-    }
-  }
-  return ids;
+  return taskSubtreeIds(props.tasks, taskId);
 }
 
 function prepareSubtreeDrag(taskId: string) {
-  if (!rowsRef.value) return;
-  const movingIds = getSubtreeIds(taskId);
-  const rows = Array.from(rowsRef.value.querySelectorAll<HTMLElement>(".pending-reminder-row"));
-  for (const row of rows) Sortable.utils.deselect(row);
-  for (const row of rows) {
-    if (movingIds.has(row.dataset.taskId ?? "")) Sortable.utils.select(row);
-  }
-}
-
-function clearSubtreeDrag(rows: HTMLElement[]) {
-  for (const row of rows) Sortable.utils.deselect(row);
+  treeSortable.prepareSubtree(taskId);
 }
 
 function canIndent(task: Task) {
@@ -830,64 +801,30 @@ async function confirmDelete(task: Task) {
   } catch {}
 }
 
+const treeSortable = createTaskTreeSortable({
+  container: () => rowsRef.value,
+  rowSelector: ".pending-reminder-row",
+  handleSelector: ".drag-handle",
+  taskIdAttribute: "data-task-id",
+  subtreeIds: getSubtreeIds,
+  parentId: (taskId) => props.tasks.find((task) => task.id === taskId)?.parentId,
+  onStart() {
+    closeContextMenu();
+    isSorting.value = true;
+  },
+  onIntent(taskId, intent) {
+    emit("move", taskId, intent.parentId, intent.previousSiblingId, intent.nextSiblingId);
+  },
+  onInvalid() { ElMessage.warning("该落点会产生三级事项，请选择一级或同级位置"); },
+  onSettled: rebuildSortableList,
+});
+
 function mountSortable() {
-  if (!rowsRef.value) return;
-  sortable?.destroy();
-  sortable = new Sortable(rowsRef.value, {
-    animation: 140,
-    draggable: ".pending-reminder-row",
-    handle: ".drag-handle",
-    forceFallback: true,
-    fallbackOnBody: true,
-    multiDrag: true,
-    selectedClass: "sortable-tree-selected",
-    avoidImplicitDeselect: true,
-    ghostClass: "sortable-ghost",
-    chosenClass: "sortable-chosen",
-    dragClass: "sortable-drag",
-    onStart() {
-      closeContextMenu();
-      isSorting.value = true;
-    },
-    onMove(event, originalEvent) {
-      const related = event.related as HTMLElement;
-      const relatedDepth = Number(related?.dataset.depth ?? 0);
-      const pointerX = originalEvent instanceof MouseEvent ? originalEvent.clientX : 0;
-      const listLeft = rowsRef.value?.getBoundingClientRect().left ?? 0;
-      dragTargetDepth.value = relatedDepth > 0 || pointerX > listLeft + 92 ? 1 : 0;
-      const taskId = (event.dragged as HTMLElement).dataset.taskId ?? "";
-      dragTargetInvalid.value = dragTargetDepth.value === 1 && getSubtreeIds(taskId).size > 1;
-      rowsRef.value?.setAttribute("data-drop-depth", String(dragTargetDepth.value));
-      rowsRef.value?.classList.toggle("drop-invalid", dragTargetInvalid.value);
-      return !dragTargetInvalid.value;
-    },
-    async onEnd(event) {
-      const taskId = (event.item as HTMLElement).dataset.taskId;
-      const rows = Array.from(rowsRef.value?.querySelectorAll<HTMLElement>(".pending-reminder-row") ?? []);
-      if (!taskId || event.oldIndex === undefined || event.newIndex === undefined) {
-        clearSubtreeDrag(rows);
-        await rebuildSortableList();
-        return;
-      }
-      const movingIds = getSubtreeIds(taskId);
-      const orderedRows = rows.map((row) => {
-        const id = row.dataset.taskId ?? "";
-        return { id, parentId: props.tasks.find((task) => task.id === id)?.parentId };
-      });
-      const intent = planTaskMoveIntent(orderedRows, taskId, movingIds, dragTargetDepth.value, movingIds.size > 1);
-      if (intent) emit("move", taskId, intent.parentId, intent.previousSiblingId, intent.nextSiblingId);
-      else ElMessage.warning("该落点会产生三级事项，请选择一级或同级位置");
-      clearSubtreeDrag(rows);
-      rowsRef.value?.removeAttribute("data-drop-depth");
-      rowsRef.value?.classList.remove("drop-invalid");
-      await rebuildSortableList();
-    }
-  });
+  treeSortable.mount();
 }
 
 async function rebuildSortableList() {
-  sortable?.destroy();
-  sortable = undefined;
+  treeSortable.destroy();
   listRenderVersion.value += 1;
   await nextTick();
   isSorting.value = false;
@@ -903,8 +840,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
-  sortable?.destroy();
-  sortable = undefined;
+  treeSortable.destroy();
   document.removeEventListener("pointerdown", closeContextMenuForPointer);
   document.removeEventListener("keydown", closeContextMenuForKey);
   window.removeEventListener("scroll", closeContextMenu, true);
@@ -920,7 +856,6 @@ onBeforeUnmount(() => {
         <span>{{ pendingRows.length }} 项待办 · 点击文字直接编辑</span>
       </div>
       <div class="plan-head-actions">
-        <button class="secondary-button quick-estimate-entry" type="button" title="直接调整今天最终实际时间" @click="openActualAdjustment"><TimerReset :size="14" />调整今日实际</button>
         <button class="secondary-button quick-estimate-entry" type="button" title="连续分配今日预计" @click="openQuickEstimate"><Clock3 :size="14" />分配今日预计</button>
         <button class="secondary-button quick-estimate-entry" type="button" title="在一个编辑区调整整个计划" @click="openQuickPlan"><FilePenLine :size="14" />快速编辑计划</button>
         <button class="icon-button subtle" type="button" title="同步到 SeaTable" aria-label="同步到 SeaTable" @click="emit('syncSeaTable')"><DatabaseZap :size="15" /></button>

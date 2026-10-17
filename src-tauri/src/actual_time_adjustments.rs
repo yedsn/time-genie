@@ -30,12 +30,21 @@ pub struct ActualTimeAdjustmentDto {
 #[serde(rename_all = "camelCase")]
 pub struct ActualAdjustmentSnapshotTaskDto {
     pub id: String,
+    pub subject_id: String,
     pub parent_id: Option<String>,
     pub title: String,
+    pub note: Option<String>,
     pub status: String,
     pub completed_at: Option<i64>,
+    pub completed_today: bool,
+    pub planned_date: Option<String>,
+    pub estimate_minutes: Option<i64>,
+    pub today_estimate_minutes: Option<i64>,
+    pub daily_estimate_version: Option<i64>,
+    pub sort_order: i64,
     pub version: i64,
     pub is_leaf: bool,
+    pub selectable: bool,
     pub direct_minutes: i64,
     pub total_minutes: i64,
     pub adjustment_fingerprint: String,
@@ -300,31 +309,55 @@ pub fn snapshot(
         return Err("NOT_FOUND: 主体不存在".to_string());
     }
     let direct = direct_actual_minutes_map(&connection, &workspace_id, Some(&request.work_date))?;
+    let timezone = crate::work_calendar::workspace_timezone(&connection, &workspace_id)?;
+    let workday = crate::work_calendar::day_bounds(timezone, &request.work_date)?;
     let mut statement = connection.prepare(
-        "SELECT t.id,t.parent_id,t.title,t.status,t.completed_at,t.version,
+        "SELECT t.id,t.subject_id,t.parent_id,t.title,t.note,t.status,t.completed_at,
+                t.planned_date,t.estimate_minutes,de.estimate_minutes,de.version,t.sort_order,t.version,
                 NOT EXISTS(SELECT 1 FROM tasks c WHERE c.parent_id=t.id AND c.deleted_at IS NULL),
                 (SELECT state FROM time_entries e WHERE e.default_task_id=t.id AND e.deleted_at IS NULL AND e.state IN ('running','paused') LIMIT 1),
                 t.parent_id IS NULL AND t.status='open' AND NOT EXISTS(SELECT 1 FROM task_recurrence_rules r WHERE r.task_id=t.id AND r.effective_end IS NULL)
-         FROM tasks t WHERE t.workspace_id=?1 AND t.subject_id=?2 AND t.deleted_at IS NULL
-           AND (t.status='open' OR date(t.completed_at/1000,'unixepoch','localtime')=?3
+         FROM tasks t
+         LEFT JOIN task_daily_estimates de ON de.workspace_id=t.workspace_id AND de.task_id=t.id AND de.work_date=?3
+         WHERE t.workspace_id=?1 AND t.subject_id=?2 AND t.deleted_at IS NULL
+           AND (t.status='open' OR (t.completed_at>=?4 AND t.completed_at<?5)
                 OR EXISTS(SELECT 1 FROM time_allocations a JOIN time_entries e ON e.id=a.entry_id WHERE a.task_id=t.id AND e.work_date=?3 AND e.deleted_at IS NULL)
-                OR EXISTS(SELECT 1 FROM actual_time_adjustments aa WHERE aa.task_id=t.id AND aa.work_date=?3 AND aa.deleted_at IS NULL))
-         ORDER BY t.sort_order,t.id"
+                OR EXISTS(SELECT 1 FROM actual_time_adjustments aa WHERE aa.task_id=t.id AND aa.work_date=?3 AND aa.deleted_at IS NULL)
+                OR EXISTS(
+                    SELECT 1 FROM tasks c WHERE c.parent_id=t.id AND c.deleted_at IS NULL
+                      AND (c.status='open' OR (c.completed_at>=?4 AND c.completed_at<?5)
+                           OR EXISTS(SELECT 1 FROM time_allocations ca JOIN time_entries ce ON ce.id=ca.entry_id WHERE ca.task_id=c.id AND ce.work_date=?3 AND ce.deleted_at IS NULL)
+                           OR EXISTS(SELECT 1 FROM actual_time_adjustments cad WHERE cad.task_id=c.id AND cad.work_date=?3 AND cad.deleted_at IS NULL))
+                ))
+         ORDER BY t.sort_order,t.created_at,t.id"
     ).map_err(|error| error.to_string())?;
     let raw = statement
         .query_map(
-            params![workspace_id, request.subject_id, request.work_date],
+            params![
+                workspace_id,
+                request.subject_id,
+                request.work_date,
+                workday.start_at,
+                workday.end_at
+            ],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, bool>(6)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
                     row.get::<_, Option<String>>(7)?,
-                    row.get::<_, bool>(8)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, bool>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, bool>(15)?,
                 ))
             },
         )
@@ -334,7 +367,7 @@ pub fn snapshot(
     let visible_ids = raw.iter().map(|row| row.0.clone()).collect::<HashSet<_>>();
     let mut children = HashMap::<String, Vec<String>>::new();
     for row in &raw {
-        if let Some(parent) = &row.1 {
+        if let Some(parent) = &row.2 {
             if visible_ids.contains(parent) {
                 children
                     .entry(parent.clone())
@@ -357,10 +390,17 @@ pub fn snapshot(
     let mut tasks = Vec::new();
     for (
         id,
+        subject_id,
         parent_id,
         title,
+        note,
         status,
         completed_at,
+        planned_date,
+        estimate_minutes,
+        today_estimate_minutes,
+        daily_estimate_version,
+        sort_order,
         version,
         is_leaf,
         timer_state,
@@ -370,14 +410,25 @@ pub fn snapshot(
         let direct_minutes = *direct.get(&id).unwrap_or(&0);
         let can_accept_children =
             parent_candidate && direct_actual_minutes(&connection, &workspace_id, &id, None)? == 0;
+        let completed_today =
+            completed_at.is_some_and(|value| value >= workday.start_at && value < workday.end_at);
         tasks.push(ActualAdjustmentSnapshotTaskDto {
             id: id.clone(),
+            subject_id,
             parent_id,
             title,
+            note,
             status,
             completed_at,
+            completed_today,
+            planned_date,
+            estimate_minutes,
+            today_estimate_minutes,
+            daily_estimate_version,
+            sort_order,
             version,
             is_leaf,
+            selectable: is_leaf,
             direct_minutes,
             total_minutes: total(&id, &children, &direct),
             adjustment_fingerprint: adjustment_fingerprint(
@@ -453,6 +504,7 @@ pub fn apply_batch(
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
+    crate::work_calendar::ensure_current_work_date(&transaction, &request.work_date, now_millis())?;
     let subject_exists:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM subjects WHERE id=?1 AND workspace_id=?2 AND deleted_at IS NULL)",params![request.subject_id,workspace_id],|row|row.get(0)).map_err(|error|error.to_string())?;
     if !subject_exists {
         return Err("NOT_FOUND: 主体不存在".to_string());
@@ -603,13 +655,14 @@ pub fn delete_adjustment(
         .transaction()
         .map_err(|error| error.to_string())?;
     let current = load_adjustment(&transaction, &request.adjustment_id)?;
+    let now = now_millis();
+    crate::work_calendar::ensure_current_work_date(&transaction, &current.work_date, now)?;
     if current.deleted_at.is_some() {
         return Ok(current);
     }
     if current.version != request.expected_version {
         return Err("VERSION_CONFLICT: 实际调整记录已变化".to_string());
     }
-    let now = now_millis();
     transaction.execute("UPDATE actual_time_adjustments SET deleted_at=?1,updated_at=?1,version=version+1,updated_by_device_id=?2 WHERE id=?3 AND workspace_id=?4",params![now,state.device_id,request.adjustment_id,workspace_id]).map_err(|error|error.to_string())?;
     crate::cloud_sync::enqueue_entity_in_transaction(
         &transaction,
@@ -677,12 +730,17 @@ mod tests {
         (database, workspace, subject)
     }
 
+    fn current_work_date(database: &Database) -> String {
+        crate::work_calendar::current_work_date(&database.open().unwrap(), now_millis()).unwrap()
+    }
+
     #[test]
     fn creates_new_task_and_adjustment_atomically_and_is_idempotent() {
         let (database, _workspace, subject) = fixture();
+        let work_date = current_work_date(&database);
         let request = ActualAdjustmentBatchRequest {
             subject_id: subject.clone(),
-            work_date: "2026-10-15".into(),
+            work_date,
             client_request_id: "request-1".into(),
             batch_id: "batch-1".into(),
             note: Some("核对".into()),
@@ -716,11 +774,12 @@ mod tests {
     #[test]
     fn zero_target_creates_task_without_adjustment_and_invalid_draft_rolls_back() {
         let (database, _workspace, subject) = fixture();
+        let work_date = current_work_date(&database);
         let zero = apply_batch(
             &database,
             ActualAdjustmentBatchRequest {
                 subject_id: subject.clone(),
-                work_date: "2026-10-15".into(),
+                work_date: work_date.clone(),
                 client_request_id: "zero".into(),
                 batch_id: "zero-batch".into(),
                 note: None,
@@ -741,7 +800,7 @@ mod tests {
             &database,
             ActualAdjustmentBatchRequest {
                 subject_id: subject,
-                work_date: "2026-10-15".into(),
+                work_date,
                 client_request_id: "bad".into(),
                 batch_id: "bad-batch".into(),
                 note: None,
@@ -828,12 +887,100 @@ mod tests {
     }
 
     #[test]
+    fn execution_snapshot_keeps_original_tree_order_and_workspace_today_context() {
+        let (database, workspace, subject) = fixture();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE workspaces SET timezone='Asia/Shanghai' WHERE id=?1",
+                [&workspace],
+            )
+            .unwrap();
+        let timezone: chrono_tz::Tz = "Asia/Shanghai".parse().unwrap();
+        let work_date = "2026-10-15";
+        let bounds = crate::work_calendar::day_bounds(timezone, work_date).unwrap();
+        let parent = insert_task(&database, &workspace, &subject, "已完成父项", None);
+        let open_child = insert_task(&database, &workspace, &subject, "进行中子项", Some(&parent));
+        let today_child = insert_task(&database, &workspace, &subject, "今天完成", Some(&parent));
+        let old_done = insert_task(&database, &workspace, &subject, "历史完成", None);
+        let connection = database.open().unwrap();
+        connection.execute(
+            "UPDATE tasks SET status='done',completed_at=?1,sort_order=10,note='父备注' WHERE id=?2",
+            params![bounds.start_at + 1000, parent],
+        ).unwrap();
+        connection
+            .execute("UPDATE tasks SET sort_order=20 WHERE id=?1", [&open_child])
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE tasks SET status='done',completed_at=?1,sort_order=30 WHERE id=?2",
+                params![bounds.end_at - 1000, today_child],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE tasks SET status='done',completed_at=?1,sort_order=40 WHERE id=?2",
+                params![bounds.start_at - 1000, old_done],
+            )
+            .unwrap();
+        connection.execute(
+            "INSERT INTO task_daily_estimates(workspace_id,task_id,work_date,estimate_minutes,created_at,updated_at,version) VALUES(?1,?2,?3,45,1,1,2)",
+            params![workspace, open_child, work_date],
+        ).unwrap();
+        let entry = Uuid::now_v7().to_string();
+        connection.execute(
+            "INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,default_task_id,label_snapshot,started_at,duration_seconds,created_at,updated_at,version) VALUES(?1,?2,?3,'work','timer','running',?4,'进行中子项',?5,0,?5,?5,1)",
+            params![entry, workspace, work_date, open_child, bounds.start_at + 2000],
+        ).unwrap();
+        drop(connection);
+
+        let result = snapshot(
+            &database,
+            ActualAdjustmentSnapshotRequest {
+                subject_id: subject,
+                work_date: work_date.into(),
+            },
+        )
+        .unwrap();
+        let visible_ids = result
+            .tasks
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>();
+        let parent_index = visible_ids.iter().position(|id| **id == parent).unwrap();
+        let open_index = visible_ids
+            .iter()
+            .position(|id| **id == open_child)
+            .unwrap();
+        let today_index = visible_ids
+            .iter()
+            .position(|id| **id == today_child)
+            .unwrap();
+        assert!(parent_index < open_index && open_index < today_index);
+        let parent_row = result.tasks.iter().find(|task| task.id == parent).unwrap();
+        assert!(parent_row.completed_today);
+        assert!(!parent_row.is_leaf);
+        assert_eq!(parent_row.note.as_deref(), Some("父备注"));
+        let open_row = result
+            .tasks
+            .iter()
+            .find(|task| task.id == open_child)
+            .unwrap();
+        assert_eq!(open_row.today_estimate_minutes, Some(45));
+        assert_eq!(open_row.daily_estimate_version, Some(2));
+        assert_eq!(open_row.timer_state.as_deref(), Some("running"));
+        assert!(!result.tasks.iter().any(|task| task.id == old_done));
+    }
+
+    #[test]
     fn mixed_batch_rolls_back_everything_when_a_later_draft_is_invalid() {
         let (database, workspace, subject) = fixture();
         let leaf = insert_task(&database, &workspace, &subject, "现有事项", None);
+        let work_date = current_work_date(&database);
         let request = ActualAdjustmentBatchRequest {
             subject_id: subject,
-            work_date: "2026-10-15".into(),
+            work_date: work_date.clone(),
             client_request_id: "mixed-rollback".into(),
             batch_id: "mixed-rollback-batch".into(),
             note: None,
@@ -847,7 +994,7 @@ mod tests {
                     &database.open().unwrap(),
                     &workspace,
                     &leaf,
-                    "2026-10-15",
+                    &work_date,
                 )
                 .unwrap(),
             }],
@@ -904,9 +1051,10 @@ mod tests {
     fn parent_eligibility_and_version_are_revalidated_at_commit_time() {
         let (database, workspace, subject) = fixture();
         let parent = insert_task(&database, &workspace, &subject, "父事项", None);
+        let work_date = current_work_date(&database);
         let make_request = |request_id: &str, version: i64| ActualAdjustmentBatchRequest {
             subject_id: subject.clone(),
-            work_date: "2026-10-15".into(),
+            work_date: work_date.clone(),
             client_request_id: request_id.into(),
             batch_id: format!("{request_id}-batch"),
             note: None,
@@ -930,7 +1078,7 @@ mod tests {
 
         let entry = Uuid::now_v7().to_string();
         let connection = database.open().unwrap();
-        connection.execute("INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,label_snapshot,started_at,ended_at,duration_seconds,created_at,updated_at,version) VALUES(?1,?2,'2026-10-15','work','manual','ended','父事项计时',1,61,60,1,1,1)", params![entry, workspace]).unwrap();
+        connection.execute("INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,label_snapshot,started_at,ended_at,duration_seconds,created_at,updated_at,version) VALUES(?1,?2,?3,'work','manual','ended','父事项计时',1,61,60,1,1,1)", params![entry, workspace, work_date]).unwrap();
         connection.execute("INSERT INTO time_allocations(id,workspace_id,entry_id,task_id,minutes,created_at,updated_at,version) VALUES(?1,?2,?3,?4,1,1,1,1)", params![Uuid::now_v7().to_string(), workspace, entry, parent]).unwrap();
         drop(connection);
         assert!(apply_batch(&database, make_request("timed-parent", 2))
@@ -960,11 +1108,12 @@ mod tests {
             },
         )
         .unwrap();
+        let work_date = current_work_date(&database);
         apply_batch(
             &database,
             ActualAdjustmentBatchRequest {
                 subject_id: subject,
-                work_date: "2026-10-15".into(),
+                work_date,
                 client_request_id: "40000000-0000-0000-0000-000000000001".into(),
                 batch_id: "41000000-0000-0000-0000-000000000001".into(),
                 note: None,
@@ -1003,11 +1152,12 @@ mod tests {
     fn deleting_adjustment_is_idempotent_and_removes_it_from_effective_actual() {
         let (database, workspace, subject) = fixture();
         let task = insert_task(&database, &workspace, &subject, "可撤销事项", None);
+        let work_date = current_work_date(&database);
         let created = apply_batch(
             &database,
             ActualAdjustmentBatchRequest {
                 subject_id: subject,
-                work_date: "2026-10-15".into(),
+                work_date: work_date.clone(),
                 client_request_id: "delete-adjustment".into(),
                 batch_id: "delete-adjustment-batch".into(),
                 note: None,
@@ -1021,7 +1171,7 @@ mod tests {
                         &database.open().unwrap(),
                         &workspace,
                         &task,
-                        "2026-10-15",
+                        &work_date,
                     )
                     .unwrap(),
                 }],
@@ -1045,7 +1195,7 @@ mod tests {
                 &database.open().unwrap(),
                 &workspace,
                 &task,
-                Some("2026-10-15")
+                Some(&work_date)
             )
             .unwrap(),
             0
@@ -1060,5 +1210,99 @@ mod tests {
         )
         .unwrap();
         assert!(repeated.deleted_at.is_some());
+    }
+
+    #[test]
+    fn historical_adjustment_delete_is_rejected_without_mutation() {
+        let (database, workspace, subject) = fixture();
+        let task = insert_task(&database, &workspace, &subject, "历史调整", None);
+        let work_date = "2000-01-01";
+        let adjustment_id = Uuid::now_v7().to_string();
+        let batch_id = Uuid::now_v7().to_string();
+        database.open().unwrap().execute(
+            "INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,batch_id,created_at,updated_at,version,deleted_at) VALUES(?1,?2,?3,?4,?5,10,0,10,?6,1,1,1,NULL)",
+            params![adjustment_id, workspace, subject, task, work_date, batch_id],
+        ).unwrap();
+        let error = delete_adjustment(
+            &database,
+            ActualAdjustmentDeleteRequest {
+                adjustment_id: adjustment_id.clone(),
+                expected_version: 1,
+                client_request_id: "historical-delete".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.starts_with("HISTORICAL_RECORD_READ_ONLY:"));
+        let stored = load_adjustment(&database.open().unwrap(), &adjustment_id).unwrap();
+        assert!(stored.deleted_at.is_none());
+        assert_eq!(stored.version, 1);
+    }
+
+    #[test]
+    fn historical_adjustment_batch_is_rejected_without_mutation() {
+        let (database, workspace, subject) = fixture();
+        let task = insert_task(&database, &workspace, &subject, "历史创建保护", None);
+        let error = apply_batch(
+            &database,
+            ActualAdjustmentBatchRequest {
+                subject_id: subject,
+                work_date: "2000-01-01".into(),
+                client_request_id: "historical-create".into(),
+                batch_id: "historical-create-batch".into(),
+                note: None,
+                items: vec![ActualAdjustmentBatchItem {
+                    task_id: task.clone(),
+                    expected_task_version: 1,
+                    baseline_minutes: 0,
+                    target_minutes: 10,
+                    delta_minutes: 10,
+                    adjustment_fingerprint: adjustment_fingerprint(
+                        &database.open().unwrap(),
+                        &workspace,
+                        &task,
+                        "2000-01-01",
+                    )
+                    .unwrap(),
+                }],
+                new_tasks: vec![ActualAdjustmentNewTaskInput {
+                    client_task_id: "historical-draft".into(),
+                    title: "不应创建".into(),
+                    parent_id: None,
+                    expected_parent_version: None,
+                    target_minutes: 5,
+                }],
+            },
+        )
+        .unwrap_err();
+        assert!(error.starts_with("HISTORICAL_RECORD_READ_ONLY:"));
+        let connection = database.open().unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM actual_time_adjustments", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM actual_adjustment_batches",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE title='不应创建'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
     }
 }

@@ -13,6 +13,7 @@ pub struct TimeAllocationDto {
     pub id: String,
     pub task_id: String,
     pub task_title: String,
+    pub subject_id: Option<String>,
     pub minutes: i64,
     pub note: Option<String>,
     pub version: i64,
@@ -146,6 +147,8 @@ pub struct TimerTransitionRequest {
     pub current_entry_id: Option<String>,
     pub current_entry_expected_version: Option<i64>,
     pub task_id: Option<String>,
+    #[serde(default)]
+    pub reopen_completed_task_version: Option<i64>,
     pub new_task: Option<TimerTransitionNewTaskRequest>,
     pub note: Option<String>,
 }
@@ -417,6 +420,48 @@ fn transition_timer_with_cloud_operation(
     let mut created_task = None;
     let target_task_id = if let Some(task_id) = request.task_id.as_deref() {
         ensure_selectable_task(&transaction, &workspace_id, task_id)?;
+        if let Some(expected_version) = request.reopen_completed_task_version {
+            let task: (String, Option<i64>, i64, bool) = transaction.query_row(
+                "SELECT status,completed_at,version,EXISTS(SELECT 1 FROM task_recurrence_rules r WHERE r.task_id=tasks.id AND r.effective_end IS NULL) FROM tasks WHERE id=?1 AND workspace_id=?2 AND deleted_at IS NULL",
+                params![task_id, workspace_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).map_err(|error| error.to_string())?;
+            if task.0 != "done" || task.2 != expected_version {
+                return Err("VERSION_CONFLICT: 已完成事项状态已变化，请重新加载".to_string());
+            }
+            if task.3 {
+                return Err(
+                    "VALIDATION_ERROR: 重复事项不能通过普通事项继续动作重新打开".to_string()
+                );
+            }
+            let completed_at = task
+                .1
+                .ok_or_else(|| "VALIDATION_ERROR: 已完成事项缺少完成时间".to_string())?;
+            let timezone = crate::work_calendar::workspace_timezone(&transaction, &workspace_id)?;
+            if crate::work_calendar::work_date_at(timezone, completed_at)? != work_date {
+                return Err("VALIDATION_ERROR: 只能继续今天完成的事项".to_string());
+            }
+            let changed = transaction.execute(
+                "UPDATE tasks SET status='open',completed_at=NULL,updated_at=?1,version=version+1 WHERE id=?2 AND workspace_id=?3 AND status='done' AND version=?4 AND deleted_at IS NULL",
+                params![now, task_id, workspace_id, expected_version],
+            ).map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("VERSION_CONFLICT: 已完成事项状态已变化，请重新加载".to_string());
+            }
+            transaction.execute(
+                "INSERT INTO task_status_events(id,workspace_id,task_id,status,occurred_at,source_type,created_at) VALUES(?1,?2,?3,'open',?4,'user',?4)",
+                params![Uuid::now_v7().to_string(), workspace_id, task_id, now],
+            ).map_err(|error| error.to_string())?;
+        } else {
+            let status: String = transaction
+                .query_row("SELECT status FROM tasks WHERE id=?1", [task_id], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| error.to_string())?;
+            if status != "open" {
+                return Err("TASK_NOT_SELECTABLE: 已完成事项需使用继续动作".to_string());
+            }
+        }
         task_id.to_string()
     } else {
         let draft = request.new_task.as_ref().expect("validated new task");
@@ -554,16 +599,21 @@ fn transition_timer_with_cloud_operation(
                 )
             })
             .transpose()?;
-        let task = created_task
-            .as_ref()
-            .map(|task| {
-                crate::cloud_sync::entity_payload_from_connection(
-                    &transaction,
-                    "task",
-                    Some(&task.id),
-                )
-            })
-            .transpose()?;
+        let task = if let Some(task) = created_task.as_ref() {
+            Some(crate::cloud_sync::entity_payload_from_connection(
+                &transaction,
+                "task",
+                Some(&task.id),
+            )?)
+        } else if request.reopen_completed_task_version.is_some() {
+            Some(crate::cloud_sync::entity_payload_from_connection(
+                &transaction,
+                "task",
+                Some(&target_task_id),
+            )?)
+        } else {
+            None
+        };
         let next_entry = crate::cloud_sync::entity_payload_from_connection(
             &transaction,
             "time_entry",
@@ -580,6 +630,7 @@ fn transition_timer_with_cloud_operation(
                 "previous_entry": previous_entry,
                 "previous_base_version": previous_base_version,
                 "task": task,
+                "reopen_task_base_version": request.reopen_completed_task_version,
                 "expected_parent_version": request.new_task.as_ref().and_then(|draft| draft.expected_parent_version),
                 "active_entry": next_entry,
             }),
@@ -1389,16 +1440,15 @@ fn update_time_entry_with_cloud_operation(
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
-    let state = entry_state(
-        &transaction,
-        &workspace_id,
-        &request.entry_id,
-        request.expected_version,
-    )?;
-    if state != "ended" {
+    let now = now_millis();
+    let current = load_entry(&transaction, &request.entry_id, now)?;
+    if current.version != request.expected_version {
+        return Err("VERSION_CONFLICT: 时间记录已被更新".to_string());
+    }
+    if current.state != "ended" {
         return Err("VALIDATION_ERROR: 只能修正已结束的时间记录".to_string());
     }
-    let now = now_millis();
+    crate::work_calendar::ensure_current_work_date(&transaction, &current.work_date, now)?;
     transaction
         .execute(
             "UPDATE time_entries SET started_at = ?1, ended_at = ?2, duration_seconds = ?3,
@@ -1461,7 +1511,11 @@ fn update_time_entry_disposition_with_cloud_operation(
 ) -> Result<TimeEntryDto, String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
-    let current = load_entry(&connection, &request.entry_id, now_millis())?;
+    let now = now_millis();
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let current = load_entry(&transaction, &request.entry_id, now)?;
     if current.version != request.expected_version {
         return Err("VERSION_CONFLICT: 时间记录已被更新".to_string());
     }
@@ -1471,11 +1525,7 @@ fn update_time_entry_disposition_with_cloud_operation(
     if request.disposition != "break" && request.disposition != "discard" {
         return Err("VALIDATION_ERROR: 处理方式必须是休息或无效".to_string());
     }
-
-    let now = now_millis();
-    let transaction = connection
-        .transaction()
-        .map_err(|error| error.to_string())?;
+    crate::work_calendar::ensure_current_work_date(&transaction, &current.work_date, now)?;
     transaction
         .execute(
             "DELETE FROM time_allocations WHERE entry_id = ?1",
@@ -1546,7 +1596,11 @@ fn replace_allocations_with_cloud_operation(
 ) -> Result<TimeEntryDto, String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
-    let current = load_entry(&connection, &request.entry_id, now_millis())?;
+    let now = now_millis();
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let current = load_entry(&transaction, &request.entry_id, now)?;
     if current.version != request.expected_version {
         return Err("VERSION_CONFLICT: 时间记录已被更新".to_string());
     }
@@ -1556,6 +1610,7 @@ fn replace_allocations_with_cloud_operation(
     if current.kind != "work" && !(current.kind == "break" && current.source_type == "unassigned") {
         return Err("VALIDATION_ERROR: 只能分配工作记录或未归属处理记录".to_string());
     }
+    crate::work_calendar::ensure_current_work_date(&transaction, &current.work_date, now)?;
     let mut merged = HashMap::<String, (i64, Option<String>, bool, Option<i64>)>::new();
     for allocation in request.allocations {
         if allocation.minutes < 0 {
@@ -1564,7 +1619,7 @@ fn replace_allocations_with_cloud_operation(
         if allocation.minutes == 0 {
             continue;
         }
-        ensure_selectable_task(&connection, &workspace_id, &allocation.task_id)?;
+        ensure_selectable_task(&transaction, &workspace_id, &allocation.task_id)?;
         let item = merged.entry(allocation.task_id).or_insert((
             0,
             allocation.note.clone(),
@@ -1594,11 +1649,7 @@ fn replace_allocations_with_cloud_operation(
                 .map(|version| (task_id.clone(), version))
         })
         .collect::<Vec<_>>();
-    let now = now_millis();
     let mut completed_occurrence_outbox = Vec::<(String, Option<i64>)>::new();
-    let transaction = connection
-        .transaction()
-        .map_err(|error| error.to_string())?;
     for (task_id, (_, _, complete_task, expected_version)) in &merged {
         if *complete_task {
             validate_task_completion(
@@ -1782,7 +1833,7 @@ fn load_entry(
     }
     let mut statement = connection
         .prepare(
-            "SELECT a.id, a.task_id, COALESCE(t.title, '已删除事项'), a.minutes, a.note, a.version
+            "SELECT a.id, a.task_id, COALESCE(t.title, '已删除事项'), t.subject_id, a.minutes, a.note, a.version
              FROM time_allocations a LEFT JOIN tasks t ON t.id = a.task_id
              WHERE a.entry_id = ?1 ORDER BY a.created_at, a.id",
         )
@@ -1793,9 +1844,10 @@ fn load_entry(
                 id: row.get(0)?,
                 task_id: row.get(1)?,
                 task_title: row.get(2)?,
-                minutes: row.get(3)?,
-                note: row.get(4)?,
-                version: row.get(5)?,
+                subject_id: row.get(3)?,
+                minutes: row.get(4)?,
+                note: row.get(5)?,
+                version: row.get(6)?,
             })
         })
         .map_err(|error| error.to_string())?
@@ -3037,6 +3089,7 @@ mod tests {
                 current_entry_id: None,
                 current_entry_expected_version: None,
                 task_id: None,
+                reopen_completed_task_version: None,
                 new_task: Some(TimerTransitionNewTaskRequest {
                     subject_id: subject_id(&database),
                     parent_id: None,
@@ -3066,6 +3119,7 @@ mod tests {
                 current_entry_id: None,
                 current_entry_expected_version: None,
                 task_id: None,
+                reopen_completed_task_version: None,
                 new_task: Some(TimerTransitionNewTaskRequest {
                     subject_id: subject_id(&database),
                     parent_id: None,
@@ -3113,6 +3167,7 @@ mod tests {
                 current_entry_id: Some(active.id),
                 current_entry_expected_version: Some(active.version),
                 task_id: None,
+                reopen_completed_task_version: None,
                 new_task: Some(TimerTransitionNewTaskRequest {
                     subject_id: parent.subject_id.clone(),
                     parent_id: Some(parent.id.clone()),
@@ -3190,6 +3245,7 @@ mod tests {
                 current_entry_id: Some(paused.id.clone()),
                 current_entry_expected_version: Some(paused.version),
                 task_id: Some(target.id.clone()),
+                reopen_completed_task_version: None,
                 new_task: None,
                 note: None,
             },
@@ -3250,6 +3306,7 @@ mod tests {
                 current_entry_id: Some(active.id.clone()),
                 current_entry_expected_version: Some(active.version),
                 task_id: Some(task_id),
+                reopen_completed_task_version: None,
                 new_task: None,
                 note: None,
             },
@@ -3258,6 +3315,116 @@ mod tests {
         assert!(result.no_op);
         assert_eq!(result.active_entry.id, active.id);
         assert!(result.previous_stop_result.is_none());
+    }
+
+    #[test]
+    fn transition_reopens_today_completed_task_and_starts_atomically() {
+        let (database, _, task_id) = setup();
+        let now = now_millis();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status='done',completed_at=?1,version=2 WHERE id=?2",
+                params![now, task_id],
+            )
+            .unwrap();
+        let result = transition(
+            &database,
+            TimerTransitionRequest {
+                client_request_id: Uuid::now_v7().to_string(),
+                current_entry_id: None,
+                current_entry_expected_version: None,
+                task_id: Some(task_id.clone()),
+                reopen_completed_task_version: Some(2),
+                new_task: None,
+                note: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result.active_entry.default_task_id.as_deref(),
+            Some(task_id.as_str())
+        );
+        let (status, completed_at, version): (String, Option<i64>, i64) = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT status,completed_at,version FROM tasks WHERE id=?1",
+                [&task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), completed_at, version), ("open", None, 3));
+    }
+
+    #[test]
+    fn transition_continue_failure_rolls_back_task_and_active_timer() {
+        let (database, _, initial_task_id) = setup();
+        let completed = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id(&database),
+                parent_id: None,
+                title: "待继续".into(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status='done',completed_at=?1,version=2 WHERE id=?2",
+                params![now_millis(), completed.id],
+            )
+            .unwrap();
+        let active = start_timer(
+            &database,
+            TimerStartRequest {
+                task_id: Some(initial_task_id.clone()),
+                note: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        let error = transition(
+            &database,
+            TimerTransitionRequest {
+                client_request_id: Uuid::now_v7().to_string(),
+                current_entry_id: Some(active.id.clone()),
+                current_entry_expected_version: Some(active.version),
+                task_id: Some(completed.id.clone()),
+                reopen_completed_task_version: Some(999),
+                new_task: None,
+                note: None,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("VERSION_CONFLICT"));
+        let connection = database.open().unwrap();
+        let status: String = connection
+            .query_row(
+                "SELECT status FROM tasks WHERE id=?1",
+                [&completed.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let active_state: String = connection
+            .query_row(
+                "SELECT state FROM time_entries WHERE id=?1",
+                [&active.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            (status.as_str(), active_state.as_str()),
+            ("done", "running")
+        );
     }
 
     #[test]
@@ -3284,6 +3451,7 @@ mod tests {
                 current_entry_id: None,
                 current_entry_expected_version: None,
                 task_id: None,
+                reopen_completed_task_version: None,
                 new_task: Some(TimerTransitionNewTaskRequest {
                     subject_id: parent.subject_id.clone(),
                     parent_id: Some(parent.id),
@@ -3340,6 +3508,7 @@ mod tests {
                 current_entry_id: None,
                 current_entry_expected_version: None,
                 task_id: None,
+                reopen_completed_task_version: None,
                 new_task: Some(TimerTransitionNewTaskRequest {
                     subject_id: parent.subject_id,
                     parent_id: Some(parent.id),
@@ -3392,6 +3561,7 @@ mod tests {
                 current_entry_id: None,
                 current_entry_expected_version: None,
                 task_id: None,
+                reopen_completed_task_version: None,
                 new_task: Some(TimerTransitionNewTaskRequest {
                     subject_id: subject_id(&database),
                     parent_id: None,
@@ -3453,6 +3623,7 @@ mod tests {
                 current_entry_id: Some(active_id),
                 current_entry_expected_version: Some(1),
                 task_id: Some(target.id),
+                reopen_completed_task_version: None,
                 new_task: None,
                 note: None,
             },
@@ -3501,6 +3672,7 @@ mod tests {
                 current_entry_id: None,
                 current_entry_expected_version: None,
                 task_id: Some(target.id.clone()),
+                reopen_completed_task_version: None,
                 new_task: None,
                 note: None,
             },
@@ -3528,6 +3700,7 @@ mod tests {
             current_entry_id: None,
             current_entry_expected_version: None,
             task_id: Some(task_id),
+            reopen_completed_task_version: None,
             new_task: None,
             note: None,
         };
@@ -3708,7 +3881,7 @@ mod tests {
     }
 
     #[test]
-    fn history_edit_delete_last_entry_clamps_page_and_does_not_disturb_active_timer() {
+    fn historical_entry_writes_are_rejected_without_disturbing_active_timer() {
         let (database, workspace_id, task_id) = setup();
         let base = shanghai_millis("2026-09-01 09:00:00");
         for day in 1..=7 {
@@ -3743,7 +3916,8 @@ mod tests {
         )
         .unwrap();
         let target = &oldest.groups[0].entries[0];
-        let corrected = update_time_entry(
+        let before = get_time_entry_by_id(&database, &target.id).unwrap();
+        let correction_error = update_time_entry(
             &database,
             TimeEntryUpdateRequest {
                 entry_id: target.id.clone(),
@@ -3753,12 +3927,13 @@ mod tests {
                 expected_version: target.version,
             },
         )
-        .unwrap();
-        replace_allocations(
+        .unwrap_err();
+        assert!(correction_error.starts_with("HISTORICAL_RECORD_READ_ONLY:"));
+        let allocation_error = replace_allocations(
             &database,
             AllocationReplaceRequest {
-                entry_id: corrected.id.clone(),
-                expected_version: corrected.version,
+                entry_id: target.id.clone(),
+                expected_version: target.version,
                 allocations: vec![AllocationInput {
                     task_id: task_id.clone(),
                     minutes: 5,
@@ -3768,16 +3943,8 @@ mod tests {
                 }],
             },
         )
-        .unwrap();
-        let after_edit = list_time_entry_history(
-            &database,
-            TimeEntryHistoryRequest {
-                page: 2,
-                include_breaks: true,
-            },
-        )
-        .unwrap();
-        assert_eq!(after_edit.groups[0].allocated_minutes, 5);
+        .unwrap_err();
+        assert!(allocation_error.starts_with("HISTORICAL_RECORD_READ_ONLY:"));
         let current_before = get_timer_state(&database).unwrap().unwrap();
         assert_eq!(current_before.id, active.id);
         let refreshed = list_time_entry_history(
@@ -3792,31 +3959,26 @@ mod tests {
         assert_eq!(refreshed.page, 2);
         assert_eq!(current_after.id, active.id);
         assert_eq!(current_after.state, "running");
-        let version = refreshed.groups[0].entries[0].version;
-        update_time_entry_disposition(
+        let disposition_error = update_time_entry_disposition(
             &database,
             TimeEntryDispositionRequest {
                 entry_id: refreshed.groups[0].entries[0].id.clone(),
-                expected_version: version,
+                expected_version: refreshed.groups[0].entries[0].version,
                 disposition: "discard".to_string(),
             },
         )
-        .unwrap();
-        let clamped = list_time_entry_history(
-            &database,
-            TimeEntryHistoryRequest {
-                page: 2,
-                include_breaks: true,
-            },
-        )
-        .unwrap();
-        assert_eq!(clamped.total_days, 7);
-        assert_eq!(clamped.total_pages, 1);
-        assert_eq!(clamped.page, 1);
-        assert!(clamped
-            .groups
-            .iter()
-            .all(|group| group.work_date != "2026-09-01"));
+        .unwrap_err();
+        assert!(disposition_error.starts_with("HISTORICAL_RECORD_READ_ONLY:"));
+        assert_eq!(
+            get_time_entry_by_id(&database, &target.id).unwrap().version,
+            before.version
+        );
+        assert_eq!(
+            get_time_entry_by_id(&database, &target.id)
+                .unwrap()
+                .allocated_minutes,
+            before.allocated_minutes
+        );
         assert_eq!(get_timer_state(&database).unwrap().unwrap().id, active.id);
     }
 
@@ -3959,7 +4121,7 @@ mod tests {
             &database,
             ManualEntryRequest {
                 task_id: Some(task_id.clone()),
-                work_date: "2026-10-03".to_string(),
+                work_date: test_work_date(),
                 started_at: Some(started_at),
                 ended_at: Some(ended_at),
                 minutes: None,

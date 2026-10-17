@@ -19,8 +19,10 @@ const taskSelectSource = readFileSync(resolve("src-ui/src/components/TaskSelectC
 assert.match(hoverPanelSource, /openMainTimerTaskSelection/);
 assert.doesNotMatch(hoverPanelSource, /TaskSelectControl|selectedTaskId|setHoverTaskSelectionMode/);
 assert.match(mainWorkbenchSource, /onOpenTimerTaskSelection/);
-assert.ok(mainWorkbenchSource.includes("timeTrackingWorkspaceRef.value?.focusTaskSelector()"));
-assert.ok(timeWorkspaceSource.includes("defineExpose({ focusTaskSelector })"));
+assert.ok(mainWorkbenchSource.includes('openExecutionPanel({ mode: "execute"'));
+assert.match(hoverPanelSource, /开始执行事项/);
+assert.match(hoverPanelSource, /切换执行事项/);
+assert.ok(timeWorkspaceSource.includes("defineExpose({ clearTimerNote })"));
 assert.ok(taskSelectSource.includes("defineExpose({ commit: commitText, closeSuggestions: closeTaskSuggestions, focus: focusTaskInput })"));
 
 let release;

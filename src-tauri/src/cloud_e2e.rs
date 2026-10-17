@@ -609,7 +609,7 @@ fn task_payload(task: &tasks::TaskDto) -> Value {
         "source_type": "manual",
         "source_ref": Value::Null,
         "sort_order": task.sort_order,
-        "completed_at": Value::Null,
+        "completed_at": task.completed_at,
         "created_at": now,
         "updated_at": now,
         "version": task.version,
@@ -941,6 +941,9 @@ fn handle_planning_cloud_request(
             .get("previous_entry")
             .filter(|value| !value.is_null());
         let task = payload.get("task").filter(|value| !value.is_null());
+        let reopen_base_version = payload
+            .get("reopen_task_base_version")
+            .and_then(Value::as_i64);
         let active = payload
             .get("active_entry")
             .filter(|value| !value.is_null())
@@ -980,6 +983,31 @@ fn handle_planning_cloud_request(
             }
             _ => {}
         }
+        if let Some(expected_version) = reopen_base_version {
+            let Some(task) = task else {
+                return write_http_json(
+                    &mut stream,
+                    409,
+                    json!({ "message": "VALIDATION_ERROR: missing reopen task" }),
+                );
+            };
+            let Some(remote_task) = state.tasks.get(task["id"].as_str().unwrap()) else {
+                return write_http_json(
+                    &mut stream,
+                    409,
+                    json!({ "message": "VERSION_CONFLICT: completed task changed" }),
+                );
+            };
+            if remote_task["status"].as_str() != Some("done")
+                || remote_task["version"].as_i64() != Some(expected_version)
+            {
+                return write_http_json(
+                    &mut stream,
+                    409,
+                    json!({ "message": "VERSION_CONFLICT: completed task changed" }),
+                );
+            }
+        }
         if let Some(previous) = previous {
             state.time_entries.insert(
                 previous["id"].as_str().unwrap().to_string(),
@@ -1003,7 +1031,11 @@ fn handle_planning_cloud_request(
                 workspace_id,
                 "tasks",
                 task["id"].as_str().unwrap(),
-                "insert",
+                if reopen_base_version.is_some() {
+                    "update"
+                } else {
+                    "insert"
+                },
                 task["version"].as_i64().unwrap_or(1),
             );
         }
@@ -2053,6 +2085,7 @@ fn isolated_timer_transition_offline_retry_converges_two_devices() {
             current_entry_id: None,
             current_entry_expected_version: None,
             task_id: None,
+            reopen_completed_task_version: None,
             new_task: Some(TimerTransitionNewTaskRequest {
                 subject_id: subject.id.clone(),
                 parent_id: None,
@@ -2096,6 +2129,7 @@ fn isolated_timer_transition_offline_retry_converges_two_devices() {
             current_entry_id: Some(local_result.active_entry.id.clone()),
             current_entry_expected_version: Some(local_result.active_entry.version),
             task_id: Some(initial_task.id),
+            reopen_completed_task_version: None,
             new_task: None,
             note: None,
         },
@@ -2116,6 +2150,78 @@ fn isolated_timer_transition_offline_retry_converges_two_devices() {
     assert_eq!(
         remote.time_entries[&local_result.active_entry.id]["state"].as_str(),
         Some("running")
+    );
+}
+
+#[test]
+fn isolated_completed_task_continue_converges_two_devices_atomically() {
+    let directory = tempfile::tempdir().unwrap();
+    let device_a = Database::initialize_at(directory.path().join("continue-a.sqlite3")).unwrap();
+    let device_b = Database::initialize_at(directory.path().join("continue-b.sqlite3")).unwrap();
+    let cloud = PlanningCloudServer::start();
+    let workspace_id = Uuid::now_v7().to_string();
+    let state_a = configure_isolated_planning_device(
+        &device_a,
+        &cloud.base_url,
+        &workspace_id,
+        "continue-user-a",
+    );
+    configure_isolated_planning_device(
+        &device_b,
+        &cloud.base_url,
+        &workspace_id,
+        "continue-user-b",
+    );
+    let subject = subjects::list_subjects(&device_a).unwrap().remove(0);
+    let task = create_task(&device_a, &subject.id, "今天完成后继续");
+    let now = chrono::Utc::now().timestamp_millis();
+    device_a
+        .open()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status='done',completed_at=?1,updated_at=?1,version=2 WHERE id=?2",
+            rusqlite::params![now, task.id],
+        )
+        .unwrap();
+    let completed_task = list_tasks(&device_a)
+        .into_iter()
+        .find(|candidate| candidate.id == task.id)
+        .unwrap();
+    cloud.seed(&device_a, &subject, &completed_task);
+    cloud_sync::pull_snapshot(&device_b).unwrap();
+
+    let result = time_tracking::transition_timer_for_cloud_test(
+        &device_a,
+        TimerTransitionRequest {
+            client_request_id: Uuid::now_v7().to_string(),
+            current_entry_id: None,
+            current_entry_expected_version: None,
+            task_id: Some(task.id.clone()),
+            reopen_completed_task_version: Some(2),
+            new_task: None,
+            note: None,
+        },
+        &state_a,
+    )
+    .unwrap();
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    pull_all(&device_b);
+
+    let task_on_b = list_tasks(&device_b)
+        .into_iter()
+        .find(|candidate| candidate.id == task.id)
+        .unwrap();
+    assert_eq!(task_on_b.status, "open");
+    assert_eq!(task_on_b.version, 3);
+    let active_on_b = today_entries(&device_b)
+        .entries
+        .into_iter()
+        .find(|entry| entry.id == result.active_entry.id)
+        .unwrap();
+    assert_eq!(active_on_b.state, "running");
+    assert_eq!(
+        active_on_b.default_task_id.as_deref(),
+        Some(task.id.as_str())
     );
 }
 

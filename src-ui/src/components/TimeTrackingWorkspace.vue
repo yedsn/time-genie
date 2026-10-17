@@ -1,22 +1,14 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { Check, ChevronDown, ChevronRight, CircleDot, Clock3, Coffee, Download, Eraser, Pause, Play, Plus, RotateCcw, Split, Square, TimerReset, Trash2 } from "lucide-vue-next";
+import { Check, ChevronDown, ChevronRight, CircleDot, Clock3, Coffee, Download, Pause, Play, Plus, Split, Square, TimerReset, Trash2 } from "lucide-vue-next";
 import { save } from "@tauri-apps/plugin-dialog";
 import { useWorkdayStore, type TimeEntry, type TimeEntryHistoryDay } from "../store";
 import TaskSelectControl from "./TaskSelectControl.vue";
 import { playCompletionFeedback } from "../services/completionFeedback";
-import { clampPartialAllocationMinutes } from "../services/allocationMath";
 import { historyDateLabel, historyPaginationState } from "../services/timeEntryHistoryCore";
 import { executeTimeAllocationExport, previewTimeAllocationExport, type TimeAllocationExportPreview } from "../services/tauri";
 import { defaultExportDraft, ensureXlsxExtension, exportRangeError, LatestRequestGuard } from "../services/timeAllocationExportCore";
-
-type AllocationDraft = {
-  id: string;
-  taskId: string;
-  minutes: number;
-  completeTask: boolean;
-};
 
 type TimeCorrectionDraft = {
   startedAt: string;
@@ -30,7 +22,10 @@ type TaskSelectControlInstance = {
 };
 
 const store = useWorkdayStore();
-const emit = defineEmits<{ openTimerTaskDialog: [note: string] }>();
+const emit = defineEmits<{
+  openTimerTaskDialog: [note: string];
+  openEntryAllocation: [entryId: string, subjectId?: string];
+}>();
 const expandedEntryId = ref(store.selectedEntryId);
 const manualOpen = ref(false);
 const manualTaskId = ref(store.selectedTaskId);
@@ -39,13 +34,11 @@ const manualNote = ref("");
 const manualCompleteTask = ref(false);
 const timerNote = ref("");
 const recentManualEntryId = ref("");
-const allocationDrafts = reactive<Record<string, AllocationDraft[]>>({});
 const correctionDrafts = reactive<Record<string, TimeCorrectionDraft>>({});
 const manualTaskControl = ref<TaskSelectControlInstance>();
-const allocationTaskControls = new Map<string, TaskSelectControlInstance>();
 const timerBusy = ref(false);
 const manualSaving = ref(false);
-const allocationSavingId = ref("");
+const correctionSavingId = ref("");
 const exportOpen = ref(false);
 const exportPreviewLoading = ref(false);
 const exportSaving = ref(false);
@@ -74,14 +67,6 @@ const elapsedSeconds = computed(() => {
 
 const clockText = computed(() => formatClock(elapsedSeconds.value));
 
-function setAllocationTaskControl(allocationId: string, component: unknown) {
-  if (component && typeof component === "object" && "commit" in component) {
-    allocationTaskControls.set(allocationId, component as TaskSelectControlInstance);
-  } else {
-    allocationTaskControls.delete(allocationId);
-  }
-}
-
 watch(() => store.runningEntry?.id, (currentId, previousId) => {
   if (!currentId && previousId) expandedEntryId.value = store.selectedEntryId;
 });
@@ -90,8 +75,7 @@ watch(() => store.selectedEntryId, (entryId) => {
   const entry = store.selectedEntry;
   if (!entry || entry.state !== "ended") return;
   expandedEntryId.value = entry.id;
-  ensureDraft(entry);
-  ensureCorrectionDraft(entry);
+  if (entry.workDate === store.workspaceToday) ensureCorrectionDraft(entry);
   void nextTick(() => {
     document.querySelector<HTMLElement>(`[data-entry-id="${entry.id}"]`)?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   });
@@ -99,9 +83,6 @@ watch(() => store.selectedEntryId, (entryId) => {
 
 watch(() => store.timeHistoryGroups.flatMap((group) => group.entries.map((entry) => entry.id)), (entryIds) => {
   const visibleIds = new Set(entryIds);
-  for (const entryId of Object.keys(allocationDrafts)) {
-    if (!visibleIds.has(entryId)) delete allocationDrafts[entryId];
-  }
   for (const entryId of Object.keys(correctionDrafts)) {
     if (!visibleIds.has(entryId)) delete correctionDrafts[entryId];
   }
@@ -109,8 +90,7 @@ watch(() => store.timeHistoryGroups.flatMap((group) => group.entries.map((entry)
   const selected = store.selectedEntry;
   if (selected?.state === "ended" && visibleIds.has(selected.id)) {
     expandedEntryId.value = selected.id;
-    ensureDraft(selected);
-    ensureCorrectionDraft(selected);
+    if (selected.workDate === store.workspaceToday) ensureCorrectionDraft(selected);
     void nextTick(() => {
       document.querySelector<HTMLElement>(`[data-entry-id="${selected.id}"]`)?.scrollIntoView({ behavior: "smooth", block: "nearest" });
     });
@@ -202,26 +182,25 @@ function toggleEntry(entry: TimeEntry) {
   store.selectedEntryId = entry.id;
   if (entry.state !== "ended") return;
   expandedEntryId.value = expandedEntryId.value === entry.id ? "" : entry.id;
-  ensureDraft(entry);
-  ensureCorrectionDraft(entry);
+  if (entry.workDate === store.workspaceToday) ensureCorrectionDraft(entry);
 }
 
-function ensureDraft(entry: TimeEntry) {
-  if (allocationDrafts[entry.id]) return allocationDrafts[entry.id];
-  allocationDrafts[entry.id] = entry.allocations?.length
-    ? entry.allocations.map((allocation, index) => ({
-      id: allocation.id ?? `${entry.id}-allocation-${index + 1}`,
-      taskId: allocation.taskId,
-      minutes: allocation.minutes,
-      completeTask: false,
-    }))
-    : [{
-      id: `${entry.id}-allocation-1`,
-      taskId: entry.defaultTask ?? store.selectedTaskId,
-      minutes: entry.allocated,
-      completeTask: false,
-    }];
-  return allocationDrafts[entry.id];
+function entryAllocationSummary(entry: TimeEntry) {
+  if (entry.kind === "break") return ["休息时间"];
+  if (!entry.allocations?.length) return [entry.allocated ? `已归属 ${entry.allocated} 分钟` : "未归属"];
+  return entry.allocations.map((allocation) => `${store.taskDisplayLabel(allocation.taskId)} · ${allocation.minutes} 分钟`);
+}
+
+function entrySubjectId(entry: TimeEntry) {
+  const allocationSubjectId = entry.allocations?.find((allocation) => allocation.subjectId)?.subjectId;
+  if (allocationSubjectId) return allocationSubjectId;
+  const taskId = entry.allocations?.[0]?.taskId ?? entry.defaultTask;
+  return store.tasks.find((task) => task.id === taskId)?.subjectId ?? store.selectedSubjectId;
+}
+
+function openEntryAllocation(entry: TimeEntry) {
+  if (entry.workDate !== store.workspaceToday) return;
+  emit("openEntryAllocation", entry.id, entrySubjectId(entry));
 }
 
 function formatHistoryDate(workDate: string) {
@@ -238,7 +217,17 @@ async function removeActualAdjustment(adjustment: TimeEntryHistoryDay["adjustmen
     await ElMessageBox.confirm(message, "删除实际调整", { confirmButtonText: "删除", cancelButtonText: "取消", type: "warning" });
     await store.removeActualAdjustment(adjustment.id, adjustment.version);
     ElMessage.success("实际调整已撤销");
-  } catch (error) { if (error !== "cancel" && error !== "close") ElMessage.error(errorText(error, "撤销实际调整失败")); }
+  } catch (error) {
+    if (error === "cancel" || error === "close") return;
+    const message = errorText(error, "撤销实际调整失败");
+    if (message.startsWith("HISTORICAL_RECORD_READ_ONLY:")) {
+      await store.refreshWorkspaceCalendar();
+      await store.loadTimeHistory(store.timeHistoryPage);
+      ElMessage.warning(message.replace(/^HISTORICAL_RECORD_READ_ONLY:\s*/, ""));
+      return;
+    }
+    ElMessage.error(message);
+  }
 }
 
 async function openExportDialog() {
@@ -359,88 +348,6 @@ function ensureCorrectionDraft(entry: TimeEntry) {
   return correctionDrafts[entry.id];
 }
 
-function allocationTotal(entry: TimeEntry) {
-  return ensureDraft(entry).reduce((sum, item) => sum + Math.max(0, Number(item.minutes) || 0), 0);
-}
-
-function allocationRemaining(entry: TimeEntry) {
-  return entry.minutes - allocationTotal(entry);
-}
-
-function addAllocation(entry: TimeEntry) {
-  const drafts = ensureDraft(entry);
-  drafts.push({
-    id: `${entry.id}-allocation-${Date.now()}`,
-    taskId: store.selectedTaskId,
-    minutes: Math.max(0, allocationRemaining(entry)),
-    completeTask: false,
-  });
-}
-
-function removeAllocation(entry: TimeEntry, allocationId: string) {
-  const drafts = ensureDraft(entry);
-  if (drafts.length === 1) return;
-  const index = drafts.findIndex((item) => item.id === allocationId);
-  if (index < 0) return;
-  drafts.splice(index, 1);
-}
-
-function updateAllocationMinutes(entry: TimeEntry, index: number, event: Event) {
-  const input = event.currentTarget as HTMLInputElement;
-  const drafts = ensureDraft(entry);
-  const nextMinutes = clampPartialAllocationMinutes(
-    drafts.map((item) => item.minutes),
-    index,
-    input.value,
-  );
-  nextMinutes.forEach((minutes, currentIndex) => drafts[currentIndex].minutes = minutes);
-  input.value = String(nextMinutes[index]);
-}
-
-async function saveAllocation(entry: TimeEntry) {
-  for (const draft of ensureDraft(entry)) {
-    const taskId = allocationTaskControls.get(draft.id)?.commit();
-    if (taskId) draft.taskId = taskId;
-  }
-  allocationSavingId.value = entry.id;
-  try {
-    const result = await store.allocate(entry.id, ensureDraft(entry).map((draft) => ({
-      taskId: draft.taskId,
-      minutes: Math.max(0, Number(draft.minutes) || 0),
-      completeTask: draft.completeTask,
-    })));
-    delete allocationDrafts[entry.id];
-    delete correctionDrafts[entry.id];
-    expandedEntryId.value = "";
-    ElMessage.success("工时归属已保存");
-    if (result?.completedCount) playCompletionFeedback({ completedCount: result.completedCount });
-  } catch (error) {
-    ElMessage.error(errorText(error, "工时归属保存失败"));
-  } finally {
-    allocationSavingId.value = "";
-  }
-}
-
-async function clearAllocation(entry: TimeEntry) {
-  for (const draft of ensureDraft(entry)) draft.minutes = 0;
-  ElMessage.info("已清空草稿用时，点击确认归属后保存");
-}
-
-async function markEntryDisposition(entry: TimeEntry, disposition: "break" | "discard") {
-  allocationSavingId.value = entry.id;
-  try {
-    await store.setTimeEntryDisposition(entry.id, disposition);
-    delete allocationDrafts[entry.id];
-    delete correctionDrafts[entry.id];
-    expandedEntryId.value = "";
-    ElMessage.success(disposition === "break" ? "已标记为休息时间" : "已标记为无效时间");
-  } catch (error) {
-    ElMessage.error(errorText(error, disposition === "break" ? "休息时间保存失败" : "无效时间保存失败"));
-  } finally {
-    allocationSavingId.value = "";
-  }
-}
-
 async function saveCorrection(entry: TimeEntry) {
   const draft = ensureCorrectionDraft(entry);
   const startedAt = new Date(draft.startedAt).getTime();
@@ -449,16 +356,24 @@ async function saveCorrection(entry: TimeEntry) {
     ElMessage.warning("结束时间必须晚于开始时间");
     return;
   }
-  allocationSavingId.value = entry.id;
+  correctionSavingId.value = entry.id;
   try {
     await store.correctTimeEntry(entry.id, startedAt, endedAt, draft.note);
     delete correctionDrafts[entry.id];
-    delete allocationDrafts[entry.id];
     ElMessage.success("时间记录已修正");
   } catch (error) {
-    ElMessage.error(errorText(error, "时间记录修正失败"));
+    const message = errorText(error, "时间记录修正失败");
+    if (message.startsWith("HISTORICAL_RECORD_READ_ONLY:")) {
+      delete correctionDrafts[entry.id];
+      expandedEntryId.value = "";
+      await store.refreshWorkspaceCalendar();
+      await store.loadTimeHistory(store.timeHistoryPage);
+      ElMessage.warning(message.replace(/^HISTORICAL_RECORD_READ_ONLY:\s*/, ""));
+    } else {
+      ElMessage.error(message);
+    }
   } finally {
-    allocationSavingId.value = "";
+    correctionSavingId.value = "";
   }
 }
 
@@ -537,7 +452,7 @@ defineExpose({ clearTimerNote });
           <span class="time-focus-icon"><Clock3 :size="18" /></span>
           <div>
             <span>{{ store.runningEntry?.state === 'paused' ? '计时已暂停' : store.runningEntry ? '正在计时' : '准备开始' }}</span>
-            <strong>{{ store.runningEntry ? store.timeEntryLabel(store.runningEntry) : '选择一个事项' }}</strong>
+            <strong>{{ store.runningEntry ? store.timeEntryLabel(store.runningEntry) : '选择要执行的事项' }}</strong>
           </div>
         </div>
         <time>{{ store.runningEntry ? clockText : '00:00:00' }}</time>
@@ -545,8 +460,8 @@ defineExpose({ clearTimerNote });
 
       <div class="time-focus-controls">
         <div class="time-focus-selector">
-          <span>{{ store.runningEntry ? '切换事项' : '计时事项' }}</span>
-          <button class="time-task-dialog-trigger" type="button" :disabled="timerBusy" @click="emit('openTimerTaskDialog', timerNote)"><Play :size="15" fill="currentColor" />{{ store.runningEntry ? '打开事项列表并切换' : '选择事项并开始' }}</button>
+          <span>执行事项</span>
+          <button class="time-task-dialog-trigger" type="button" :disabled="timerBusy" @click="emit('openTimerTaskDialog', timerNote)"><Play :size="15" fill="currentColor" />{{ store.runningEntry ? '切换执行事项' : '开始执行事项' }}</button>
           <input v-model="timerNote" class="time-focus-note" placeholder="备注（可选）" aria-label="计时备注" />
         </div>
         <div class="time-focus-actions">
@@ -600,7 +515,8 @@ defineExpose({ clearTimerNote });
               <span class="time-entry-title"><strong>{{ adjustment.taskTitle }}</strong><small>{{ adjustment.note || '无备注' }}</small></span>
               <span class="time-entry-duration actual-adjustment-history-delta">{{ adjustment.deltaMinutes >= 0 ? '+' : '' }}{{ adjustment.deltaMinutes }} 分钟</span>
               <span class="time-entry-status ended">实际调整</span>
-              <button class="icon-button subtle" type="button" title="删除并撤销此调整" @click="removeActualAdjustment(adjustment)"><Trash2 :size="14" /></button>
+              <button v-if="group.workDate === store.workspaceToday" class="icon-button subtle" type="button" title="删除并撤销此调整" @click="removeActualAdjustment(adjustment)"><Trash2 :size="14" /></button>
+              <span v-else class="time-entry-readonly-mark">历史只读</span>
             </div>
           </article>
           <article
@@ -627,44 +543,25 @@ defineExpose({ clearTimerNote });
             </button>
 
             <div v-if="entry.state === 'ended' && expandedEntryId === entry.id" class="inline-allocation-editor">
-              <div class="time-correction-row">
+              <div v-if="entry.workDate === store.workspaceToday" class="time-correction-row">
                 <label><span>开始</span><input v-model="ensureCorrectionDraft(entry).startedAt" type="datetime-local" /></label>
                 <label><span>结束</span><input v-model="ensureCorrectionDraft(entry).endedAt" type="datetime-local" /></label>
                 <label class="time-correction-note"><span>备注</span><input v-model="ensureCorrectionDraft(entry).note" placeholder="可选" /></label>
-                <button class="secondary-button compact" type="button" :disabled="allocationSavingId === entry.id" @click="saveCorrection(entry)">修正时间</button>
+                <button class="secondary-button compact" type="button" :disabled="correctionSavingId === entry.id" @click="saveCorrection(entry)">修正时间</button>
               </div>
-              <div class="allocation-summary-line">
-                <span><Split :size="14" />分配 {{ allocationTotal(entry) }} / {{ entry.minutes }} 分钟</span>
-                <strong>
-                  {{ allocationRemaining(entry) >= 0 ? `剩余 ${allocationRemaining(entry)} 分钟` : `超出 ${Math.abs(allocationRemaining(entry))} 分钟` }}
-                </strong>
-              </div>
-              <div v-for="(allocation, allocationIndex) in ensureDraft(entry)" :key="allocation.id" class="inline-allocation-row">
-                <TaskSelectControl
-                  :ref="(component) => setAllocationTaskControl(allocation.id, component)"
-                  v-model="allocation.taskId"
-                  variant="compact"
-                  placeholder="选择或输入临时事项"
-                  aria-label="分配事项"
-                />
-                <label><input :value="allocation.minutes" min="0" type="number" @input="updateAllocationMinutes(entry, allocationIndex, $event)" /><span>分钟</span></label>
-                <label class="allocation-complete-toggle" title="保存工时时同时完成这个事项">
-                  <input v-model="allocation.completeTask" type="checkbox" />
-                  <span>同时完成</span>
-                </label>
-                <button class="icon-button subtle" type="button" title="删除此分配" :disabled="ensureDraft(entry).length === 1" @click="removeAllocation(entry, allocation.id)"><Trash2 :size="14" /></button>
-              </div>
-              <button class="inline-add-allocation" type="button" @click="addAllocation(entry)"><Plus :size="14" />添加事项</button>
-              <div class="inline-allocation-actions">
-                <div class="inline-allocation-secondary-actions">
-                  <button class="secondary-button compact" type="button" :disabled="allocationSavingId === entry.id" @click="markEntryDisposition(entry, 'break')"><Coffee :size="14" />休息时间</button>
-                  <button class="secondary-button compact discard" type="button" :disabled="allocationSavingId === entry.id" @click="markEntryDisposition(entry, 'discard')"><Trash2 :size="14" />无效时间</button>
+              <div class="time-entry-allocation-summary">
+                <div class="allocation-summary-line">
+                  <span><Split :size="14" />已保存归属</span>
+                  <strong>{{ entry.allocated }} / {{ entry.minutes }} 分钟</strong>
                 </div>
-                <div class="inline-allocation-primary-actions">
-                  <button class="secondary-button compact" type="button" :disabled="allocationSavingId === entry.id || allocationTotal(entry) <= 0" @click="clearAllocation(entry)"><Eraser :size="14" />清空用时</button>
-                  <button class="secondary-button compact" type="button" :disabled="allocationSavingId === entry.id" @click="ensureDraft(entry).forEach((draft) => draft.minutes = draft.taskId === (entry.defaultTask ?? store.selectedTaskId) ? entry.minutes : 0)"><RotateCcw :size="14" />填满用时</button>
-                  <button class="primary-button compact" type="button" :disabled="allocationSavingId === entry.id" @click="saveAllocation(entry)"><Check :size="14" />确认归属</button>
+                <div class="time-entry-allocation-tags">
+                  <span v-for="item in entryAllocationSummary(entry)" :key="item">{{ item }}</span>
                 </div>
+                <div v-if="entry.workDate === store.workspaceToday" class="inline-allocation-actions">
+                  <span>归属、休息或丢弃都在执行事项面板中处理。</span>
+                  <button class="primary-button compact" type="button" @click="openEntryAllocation(entry)"><Split :size="14" />调整归属</button>
+                </div>
+                <div v-else class="time-entry-history-readonly">历史记录只读，仅展示已保存的时间与归属。</div>
               </div>
             </div>
           </article>

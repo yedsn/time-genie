@@ -240,8 +240,9 @@ export type ActualTimeAdjustmentRecord = {
 };
 
 export type ActualAdjustmentSnapshotTaskRecord = {
-  id: string; parentId?: string; title: string; status: "open" | "done"; completedAt?: number;
-  version: number; isLeaf: boolean; directMinutes: number; totalMinutes: number;
+  id: string; subjectId: string; parentId?: string; title: string; note?: string; status: "open" | "done"; completedAt?: number; completedToday: boolean;
+  plannedDate?: string; estimateMinutes?: number; todayEstimateMinutes?: number; dailyEstimateVersion?: number; sortOrder: number;
+  version: number; isLeaf: boolean; selectable: boolean; directMinutes: number; totalMinutes: number;
   adjustmentFingerprint: string; timerState?: "running" | "paused"; canAcceptChildren: boolean;
 };
 
@@ -295,6 +296,7 @@ export type TimeAllocationRecord = {
   id: string;
   taskId: string;
   taskTitle: string;
+  subjectId?: string;
   minutes: number;
   note?: string;
   version: number;
@@ -340,6 +342,7 @@ export type TimerTransitionRequest = {
   currentEntryId?: string;
   currentEntryExpectedVersion?: number;
   taskId?: string;
+  reopenCompletedTaskVersion?: number;
   newTask?: TimerTransitionNewTaskRequest;
   note?: string;
 };

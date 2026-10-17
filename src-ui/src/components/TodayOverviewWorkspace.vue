@@ -158,7 +158,7 @@ function taskTitle(task: TodayWorkOverviewTaskRecord) {
       <div class="today-overview-actions">
         <button class="secondary-button compact" type="button" :disabled="store.todayOverviewLoading" @click="store.loadTodayOverview()"><RefreshCw :size="14" />刷新</button>
         <button class="secondary-button compact" type="button" @click="emit('openPlan')"><ListTodo :size="14" />待办</button>
-        <button class="primary-button compact" type="button" @click="emit('openTimer', store.todayOverviewSubjectId || undefined)"><Clock3 :size="14" />计时</button>
+        <button class="primary-button compact" type="button" @click="emit('openTimer', store.todayOverviewSubjectId || undefined)"><Clock3 :size="14" />{{ store.runningEntry ? '切换执行事项' : '开始执行事项' }}</button>
       </div>
     </header>
 
@@ -175,7 +175,7 @@ function taskTitle(task: TodayWorkOverviewTaskRecord) {
       <AlertCircle :size="22" />
       <strong>今天还没有工作数据</strong>
       <span>可以先添加待办，或从计时开始。</span>
-      <div><button class="secondary-button compact" type="button" @click="emit('openPlan')">进入待办</button><button class="primary-button compact" type="button" @click="emit('openTimer', store.todayOverviewSubjectId || undefined)">开始计时</button></div>
+      <div><button class="secondary-button compact" type="button" @click="emit('openPlan')">进入待办</button><button class="primary-button compact" type="button" @click="emit('openTimer', store.todayOverviewSubjectId || undefined)">{{ store.runningEntry ? '切换执行事项' : '开始执行事项' }}</button></div>
     </div>
 
     <div v-else class="today-visual-grid">
@@ -203,7 +203,7 @@ function taskTitle(task: TodayWorkOverviewTaskRecord) {
               <small>{{ taskEstimateLabel(task) }} · 实际 {{ formatMinutes(task.actualMinutes) }}<template v-if="task.lastEntryAt"> · 最近 {{ formatTime(task.lastEntryAt) }}</template></small>
             </div>
             <span class="today-task-state">{{ statusLabel(task.status) }}</span>
-            <button class="secondary-button compact icon-button" type="button" :disabled="!task.selectable" :title="task.selectable ? '打开事项列表并计时' : '父事项不可直接计时'" @click="emit('openTimer', task.subjectId)"><Play :size="13" fill="currentColor" /></button>
+            <button class="secondary-button compact icon-button" type="button" :disabled="!task.selectable" :title="task.selectable ? (store.runningEntry ? '切换执行事项' : '开始执行事项') : '父事项不可直接执行'" :aria-label="task.selectable ? `${store.runningEntry ? '切换执行到' : '开始执行'}：${taskTitle(task)}` : `${taskTitle(task)}为父事项，不可直接执行`" @click="emit('openTimer', task.subjectId)"><Play :size="13" fill="currentColor" /></button>
           </article>
         </div>
         <p v-else class="today-muted-empty">今天没有相关事项。</p>

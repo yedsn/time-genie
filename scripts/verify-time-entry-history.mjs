@@ -49,5 +49,13 @@ assert.deepEqual(stateAfterTarget, {
 });
 assert.strictEqual(stateAfterTarget.runningEntry, runningEntry);
 
+const workspace = await import("node:fs/promises");
+const timeWorkspaceSource = await workspace.readFile(resolve("src-ui/src/components/TimeTrackingWorkspace.vue"), "utf8");
+assert(timeWorkspaceSource.includes('message.startsWith("HISTORICAL_RECORD_READ_ONLY:")'), "跨日写入拒绝应使用稳定错误码");
+assert(timeWorkspaceSource.includes('delete correctionDrafts[entry.id]'), "跨日修正拒绝后应丢弃旧日期修正草稿");
+assert(timeWorkspaceSource.includes('expandedEntryId.value = ""'), "跨日修正拒绝后应退出旧日期编辑状态");
+assert(timeWorkspaceSource.includes('await store.refreshWorkspaceCalendar()'), "跨日写入拒绝后应刷新工作日期");
+assert(timeWorkspaceSource.includes('await store.loadTimeHistory(store.timeHistoryPage)'), "跨日写入拒绝后应刷新时间历史");
+
 rmSync(resolve(".tmp-time-entry-history-test"), { recursive: true, force: true });
 console.log("time entry history verification passed");

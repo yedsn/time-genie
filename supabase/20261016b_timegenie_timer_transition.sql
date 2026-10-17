@@ -5,7 +5,7 @@ create or replace function timegenie.timer_transition_apply(
   p_workspace_id uuid,p_device_id uuid,p_operation_id uuid,p_payload jsonb
 ) returns jsonb language plpgsql security definer set search_path=timegenie,extensions,pg_catalog
 as $$
-declare cached jsonb; request_value jsonb; previous_row jsonb; task_row jsonb; active_row jsonb;
+declare cached jsonb; request_value jsonb; previous_row jsonb; task_row jsonb; active_row jsonb; reopen_base_version bigint;
 declare remote_active timegenie.time_entries; transition_at timestamptz; result_value jsonb;
 begin
   if not timegenie.is_workspace_owner(p_workspace_id) then raise exception 'AUTH_REQUIRED'; end if;
@@ -14,6 +14,7 @@ begin
   cached:=timegenie.processed_operation_result(p_workspace_id,p_operation_id,'timer_transition_apply',request_value);
   if cached is not null then return cached; end if;
   previous_row:=p_payload->'previous_entry'; task_row:=p_payload->'task'; active_row:=p_payload->'active_entry';
+  reopen_base_version:=nullif(p_payload->>'reopen_task_base_version','')::bigint;
   if active_row is null or jsonb_typeof(active_row)<>'object' then raise exception 'VALIDATION_ERROR: missing active timer'; end if;
   transition_at:=to_timestamp((active_row->>'started_at')::double precision/1000);
   perform pg_advisory_xact_lock(hashtextextended(p_workspace_id::text||':active-timer',0));
@@ -30,6 +31,11 @@ begin
       jsonb_build_object('deviceId',p_device_id,'transitionId',p_operation_id,'phase','stop','payload',previous_row));
   end if;
   if task_row is not null and task_row<>'null'::jsonb then
+    if reopen_base_version is not null then
+      if not exists(select 1 from timegenie.tasks target where target.workspace_id=p_workspace_id and target.id=(task_row->>'id')::uuid and target.status='done' and target.version=reopen_base_version and target.deleted_at is null) then
+        raise exception 'VERSION_CONFLICT: completed task changed';
+      end if;
+    end if;
     if nullif(task_row->>'parent_id','') is not null and not exists(
       select 1 from timegenie.tasks parent where parent.workspace_id=p_workspace_id and parent.id=(task_row->>'parent_id')::uuid
         and parent.subject_id=(task_row->>'subject_id')::uuid and parent.deleted_at is null and parent.status='open' and parent.parent_id is null
@@ -44,7 +50,8 @@ begin
     ) then raise exception 'VERSION_CONFLICT: parent task changed'; end if;
     perform timegenie.cloud_apply_patch_pre_calendar(
       p_workspace_id,p_device_id,timegenie.calendar_stable_uuid('timer-transition-task:'||p_operation_id),
-      'task_create_from_timer_transition','task',task_row->>'id',null,task_row);
+      case when reopen_base_version is null then 'task_create_from_timer_transition' else 'task_reopen_from_timer_transition' end,
+      'task',task_row->>'id',reopen_base_version,task_row);
   end if;
   if not exists(select 1 from timegenie.tasks target where target.workspace_id=p_workspace_id and target.id=(active_row->>'default_task_id')::uuid
     and target.deleted_at is null and not exists(select 1 from timegenie.tasks child where child.parent_id=target.id and child.deleted_at is null)) then

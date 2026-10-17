@@ -140,12 +140,13 @@ onUnmounted(() => {
       </div>
 
       <div v-if="entry" class="hover-actions">
+        <button class="secondary-button" :disabled="busy" @click="openTimerSelection"><Play :size="15" fill="currentColor" />切换执行事项</button>
         <button v-if="entry.state === 'running'" class="secondary-button" :disabled="busy" @click="runTimerAction(store.pauseTimer, '暂停计时失败')"><Pause :size="15" fill="currentColor" />暂停</button>
         <button v-else class="primary-button" :disabled="busy" @click="runTimerAction(store.resumeTimer, '继续计时失败')"><Play :size="15" fill="currentColor" />继续</button>
         <button class="danger-button" :disabled="busy" @click="runTimerAction(stopTimerFromHover, '结束计时失败')"><Square :size="14" fill="currentColor" />结束并处理</button>
       </div>
       <div v-else class="hover-actions hover-idle-actions">
-        <button class="primary-button" @click="openTimerSelection"><Play :size="15" fill="currentColor" />选择事项并开始</button>
+        <button class="primary-button" @click="openTimerSelection"><Play :size="15" fill="currentColor" />开始执行事项</button>
         <button v-if="hasUnassignedTime" class="secondary-button" @click="openUnassigned"><Clock3 :size="14" />处理未归属时间</button>
         <button v-else class="secondary-button" @click="openMain"><ArrowUpRight :size="14" />打开主窗口</button>
       </div>

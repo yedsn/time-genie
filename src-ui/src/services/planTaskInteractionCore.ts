@@ -9,6 +9,29 @@ export type PlanTaskMoveIntent = {
   nextSiblingId?: string;
 };
 
+export function taskSubtreeIds(rows: readonly PlanTaskTreeItem[], taskId: string) {
+  const ids = new Set([taskId]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const row of rows) {
+      if (row.parentId && ids.has(row.parentId) && !ids.has(row.id)) {
+        ids.add(row.id);
+        changed = true;
+      }
+    }
+  }
+  return ids;
+}
+
+export function taskDragTargetDepth(relatedDepth: number, pointerX: number, listLeft: number, indentThreshold = 92): 0 | 1 {
+  return relatedDepth > 0 || pointerX > listLeft + indentThreshold ? 1 : 0;
+}
+
+export function taskDragTargetInvalid(targetDepth: 0 | 1, movingIds: ReadonlySet<string>) {
+  return targetDepth === 1 && movingIds.size > 1;
+}
+
 export function todayEstimateDraft(current: number | undefined, parentId?: string) {
   return current ?? (parentId ? 30 : 60);
 }

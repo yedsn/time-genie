@@ -93,6 +93,20 @@ pub fn current_work_date(connection: &Connection, now_millis: i64) -> Result<Str
     work_date_at(current_workspace_timezone(connection)?, now_millis)
 }
 
+pub fn ensure_current_work_date(
+    connection: &Connection,
+    target_work_date: &str,
+    now_millis: i64,
+) -> Result<(), String> {
+    let current = current_work_date(connection, now_millis)?;
+    if target_work_date != current {
+        return Err(format!(
+            "HISTORICAL_RECORD_READ_ONLY: {target_work_date} 的历史记录不可修改（当前工作日期为 {current}）"
+        ));
+    }
+    Ok(())
+}
+
 pub fn calendar_context_at(
     connection: &Connection,
     now_millis: i64,
@@ -309,5 +323,52 @@ mod tests {
             context.current_day_end_at,
             millis("Asia/Shanghai".parse().unwrap(), "2026-10-07 00:00:00")
         );
+    }
+
+    #[test]
+    fn current_work_date_guard_uses_workspace_midnight_with_a_controlled_clock() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = crate::database::Database::initialize_at(
+            directory.path().join("calendar-write-guard.sqlite3"),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        connection
+            .execute(
+                "UPDATE workspaces SET timezone = 'Asia/Shanghai' WHERE deleted_at IS NULL",
+                [],
+            )
+            .unwrap();
+        let shanghai: Tz = "Asia/Shanghai".parse().unwrap();
+        let before_midnight = millis(shanghai, "2026-10-17 23:59:59");
+        let after_midnight = millis(shanghai, "2026-10-18 00:00:01");
+        assert!(ensure_current_work_date(&connection, "2026-10-17", before_midnight).is_ok());
+        let error =
+            ensure_current_work_date(&connection, "2026-10-17", after_midnight).unwrap_err();
+        assert!(error.starts_with("HISTORICAL_RECORD_READ_ONLY:"));
+        assert!(error.contains("当前工作日期为 2026-10-18"));
+    }
+
+    #[test]
+    fn current_work_date_guard_respects_a_non_device_timezone() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = crate::database::Database::initialize_at(
+            directory.path().join("calendar-timezone-guard.sqlite3"),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        connection
+            .execute(
+                "UPDATE workspaces SET timezone = 'America/New_York' WHERE deleted_at IS NULL",
+                [],
+            )
+            .unwrap();
+        let timestamp = Utc
+            .with_ymd_and_hms(2026, 10, 18, 2, 30, 0)
+            .unwrap()
+            .timestamp_millis();
+        assert!(ensure_current_work_date(&connection, "2026-10-17", timestamp).is_ok());
+        let error = ensure_current_work_date(&connection, "2026-10-18", timestamp).unwrap_err();
+        assert!(error.contains("当前工作日期为 2026-10-17"));
     }
 }

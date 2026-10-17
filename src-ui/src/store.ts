@@ -75,6 +75,7 @@ import {
   type UnassignedStateRecord,
   type RecurrenceRuleRecord,
   type ActualAdjustmentBatchRequest,
+  type ActualAdjustmentSnapshotRecord,
 } from "./services/tauri";
 import { TRANSIENT_MISSING_STATE_REFRESH_LIMIT, transientMissingStateResult } from "./services/transientStateGuard";
 import { canSubmitUnassignedResolution } from "./services/unassignedResolutionGuard";
@@ -126,6 +127,8 @@ export type Task = {
 export type TimeAllocation = {
   id?: string;
   taskId: string;
+  taskTitle?: string;
+  subjectId?: string;
   minutes: number;
   note?: string;
   completeTask?: boolean;
@@ -226,6 +229,8 @@ export const useWorkdayStore = defineStore("workday", () => {
   const todayOverview = ref<TodayWorkOverviewRecord | null>(null);
   const todayOverviewLoading = ref(false);
   const todayOverviewSubjectId = ref("");
+  const executionSnapshots = reactive<Record<string, ActualAdjustmentSnapshotRecord>>({});
+  const executionSnapshotLoading = reactive<Record<string, boolean>>({});
   const now = ref(Date.now());
   const workspaceTimezone = ref("Asia/Shanghai");
   const workspaceToday = ref("");
@@ -491,6 +496,8 @@ export const useWorkdayStore = defineStore("workday", () => {
       allocations: entry.allocations.map((allocation) => ({
         id: allocation.id,
         taskId: allocation.taskId,
+        taskTitle: allocation.taskTitle,
+        subjectId: allocation.subjectId,
         minutes: allocation.minutes,
         note: allocation.note,
       })),
@@ -1424,6 +1431,69 @@ export const useWorkdayStore = defineStore("workday", () => {
     }
   }
 
+  async function moveExecutionTask(
+    taskId: string,
+    expectedVersion: number,
+    subjectId: string,
+    parentId?: string,
+    previousSiblingId?: string,
+    nextSiblingId?: string,
+  ) {
+    const moved = await moveTaskRecord({
+      id: taskId,
+      expectedVersion,
+      parentId,
+      previousSiblingId,
+      nextSiblingId,
+    });
+    const snapshot = executionSnapshots[subjectId];
+    if (snapshot) {
+      const movingIds = new Set([taskId]);
+      let expanded = true;
+      while (expanded) {
+        expanded = false;
+        for (const task of snapshot.tasks) {
+          if (task.parentId && movingIds.has(task.parentId) && !movingIds.has(task.id)) {
+            movingIds.add(task.id);
+            expanded = true;
+          }
+        }
+      }
+      const movingBlock = snapshot.tasks
+        .filter((task) => movingIds.has(task.id))
+        .map((task) => task.id === taskId ? { ...task, parentId, sortOrder: moved.sortOrder, version: moved.version } : task);
+      const remaining = snapshot.tasks.filter((task) => !movingIds.has(task.id));
+      let insertIndex = remaining.length;
+      if (nextSiblingId) {
+        const nextIndex = remaining.findIndex((task) => task.id === nextSiblingId);
+        if (nextIndex >= 0) insertIndex = nextIndex;
+      } else if (previousSiblingId) {
+        const previousIds = new Set([previousSiblingId]);
+        let previousExpanded = true;
+        while (previousExpanded) {
+          previousExpanded = false;
+          for (const task of remaining) {
+            if (task.parentId && previousIds.has(task.parentId) && !previousIds.has(task.id)) {
+              previousIds.add(task.id);
+              previousExpanded = true;
+            }
+          }
+        }
+        const previousIndex = remaining.findIndex((task) => task.id === previousSiblingId);
+        if (previousIndex >= 0) {
+          insertIndex = previousIndex + 1;
+          while (insertIndex < remaining.length && previousIds.has(remaining[insertIndex].id)) insertIndex += 1;
+        }
+      } else if (parentId) {
+        const parentIndex = remaining.findIndex((task) => task.id === parentId);
+        if (parentIndex >= 0) insertIndex = parentIndex + 1;
+      }
+      snapshot.tasks.splice(0, snapshot.tasks.length, ...remaining.slice(0, insertIndex), ...movingBlock, ...remaining.slice(insertIndex));
+    }
+    replaceTask(moved);
+    return await loadExecutionSnapshot(subjectId);
+  }
+
   async function saveTaskNote(taskId: string, note: string) {
     const task = tasks.find((item) => item.id === taskId);
     if (!task || task.version <= 0) return;
@@ -1469,6 +1539,60 @@ export const useWorkdayStore = defineStore("workday", () => {
   async function loadActualAdjustmentSnapshot(subjectId = selectedSubjectId.value) {
     const workDate = await ensureWorkspaceCalendar();
     return await getActualAdjustmentSnapshot(subjectId, workDate);
+  }
+
+  async function loadExecutionSnapshot(subjectId = selectedSubjectId.value) {
+    if (!subjectId) return undefined;
+    const workDate = await ensureWorkspaceCalendar();
+    executionSnapshotLoading[subjectId] = true;
+    try {
+      const snapshot = await getActualAdjustmentSnapshot(subjectId, workDate);
+      executionSnapshots[subjectId] = snapshot;
+      return snapshot;
+    } finally {
+      executionSnapshotLoading[subjectId] = false;
+    }
+  }
+
+  async function saveExecutionTaskTitle(taskId: string, expectedVersion: number, title: string, subjectId: string) {
+    await updateTaskRecord({ id: taskId, expectedVersion, title });
+    await Promise.all([loadWorkspaceData(), loadTodayOverview()]);
+    return await loadExecutionSnapshot(subjectId);
+  }
+
+  async function saveExecutionTaskNote(taskId: string, expectedVersion: number, note: string, subjectId: string) {
+    await updateTaskRecord({ id: taskId, expectedVersion, note: note.trim() || null });
+    await loadWorkspaceData();
+    return await loadExecutionSnapshot(subjectId);
+  }
+
+  async function saveExecutionTaskDetails(task: {
+    id: string;
+    subjectId: string;
+    expectedVersion: number;
+    title: string;
+    plannedDate?: string;
+    estimateMinutes?: number;
+    note?: string;
+    projectName?: string;
+  }) {
+    await updateTaskRecord({
+      id: task.id,
+      expectedVersion: task.expectedVersion,
+      title: task.title,
+      plannedDate: task.plannedDate ?? null,
+      estimateMinutes: task.estimateMinutes ?? null,
+      note: task.note?.trim() || null,
+      projectName: task.projectName?.trim() || null,
+    });
+    await Promise.all([loadWorkspaceData(), loadTimeData(), loadTodayOverview()]);
+    return await loadExecutionSnapshot(task.subjectId);
+  }
+
+  async function deleteExecutionTask(taskId: string, expectedVersion: number, subjectId: string) {
+    await deleteTaskSubtree(taskId, expectedVersion);
+    await Promise.all([loadWorkspaceData(), loadTodayOverview()]);
+    return await loadExecutionSnapshot(subjectId);
   }
 
   async function saveActualAdjustmentBatch(request: ActualAdjustmentBatchRequest) {
@@ -1552,13 +1676,14 @@ export const useWorkdayStore = defineStore("workday", () => {
     return true;
   }
 
-  async function transitionTimer(target: { taskId: string } | { newTask: TimerTransitionNewTaskRequest }, note = ""): Promise<TimerTransitionResultRecord> {
+  async function transitionTimer(target: { taskId: string; reopenCompletedTaskVersion?: number } | { newTask: TimerTransitionNewTaskRequest }, note = ""): Promise<TimerTransitionResultRecord> {
     const current = runningEntry.value;
     markTimeDataChanged();
     const result = await transitionTimerRecord({
       currentEntryId: current?.id,
       currentEntryExpectedVersion: current?.version,
       taskId: "taskId" in target ? target.taskId : undefined,
+      reopenCompletedTaskVersion: "taskId" in target ? target.reopenCompletedTaskVersion : undefined,
       newTask: "newTask" in target ? target.newTask : undefined,
       note: note.trim() || undefined,
     });
@@ -1845,10 +1970,10 @@ export const useWorkdayStore = defineStore("workday", () => {
     planTaskTab, completedTasks, completedTasksSubjectId, completedTasksPage, completedTasksPageSize, completedTasksTotal, completedTasksTotalPages, completedTasksLoading, completedTasksError, completedTasksStale,
     workspaceTimezone, workspaceToday, workspaceDayStartAt, workspaceDayEndAt, refreshWorkspaceCalendar,
     now, todayMinutes, allocatedMinutes, pendingMinutes, doneCount, todayCompletionDoneCount, todayCompletionTotalCount, todayCompletionPercent, unassignedSeconds, unassignedStartedAt,
-    unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen, unassignedWorkDate, unassignedSessionId,
+    unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen, unassignedWorkDate, unassignedSessionId, unassignedVersion,
     unassignedCurrentSession,
-    workspaceLoaded, workspaceLoading, loadWorkspaceData, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addTaskSelectionDraft, addChildTask, addTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTaskPlanBatch, loadActualAdjustmentSnapshot, saveActualAdjustmentBatch, removeActualAdjustment, duplicateTask, deleteTask, moveTask, reorderTask, movePlanTask,
-    indentTask, outdentTask, startTimer, transitionTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, adjustTimerStopAllocation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, loadReportTemplates, createReportTemplate, updateReportTemplate, duplicateReportTemplate, setDefaultReportTemplate, deleteReportTemplate, reorderReportTemplates, getReportTemplatePlaceholders, publicReportText, previewObsidianReport, writeObsidianReport,
+    workspaceLoaded, workspaceLoading, executionSnapshots, executionSnapshotLoading, loadExecutionSnapshot, saveExecutionTaskTitle, saveExecutionTaskNote, saveExecutionTaskDetails, deleteExecutionTask, loadWorkspaceData, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addTaskSelectionDraft, addChildTask, addTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTaskPlanBatch, loadActualAdjustmentSnapshot, saveActualAdjustmentBatch, removeActualAdjustment, duplicateTask, deleteTask, moveTask, reorderTask, movePlanTask,
+    indentTask, outdentTask, moveExecutionTask, startTimer, transitionTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, adjustTimerStopAllocation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, loadReportTemplates, createReportTemplate, updateReportTemplate, duplicateReportTemplate, setDefaultReportTemplate, deleteReportTemplate, reorderReportTemplates, getReportTemplatePlaceholders, publicReportText, previewObsidianReport, writeObsidianReport,
     beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, dismissUnassignedResolution, resolveUnassignedTime
   };
 });

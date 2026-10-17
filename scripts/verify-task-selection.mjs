@@ -48,22 +48,19 @@ assert.match(store, /canAcceptInlineTimerChild/);
 assert.match(store, /task\.quickCreate = true/);
 assert.match(store, /async function persistTimerTask/);
 
-for (const file of [
-  "src-ui/src/components/TimeTrackingWorkspace.vue",
-  "src-ui/src/components/UnassignedTimeDialog.vue",
-]) {
-  assert.match(readFileSync(file, "utf8"), /TaskSelectControl/);
-}
+const tracking = readFileSync("src-ui/src/components/TimeTrackingWorkspace.vue", "utf8");
+assert.match(tracking, /TaskSelectControl/);
+assert.match(tracking, /aria-label="补录事项"/);
+assert.doesNotMatch(tracking, /aria-label="分配事项"/);
 const globalTimer = readFileSync("src-ui/src/components/GlobalTimerBar.vue", "utf8");
 assert.doesNotMatch(globalTimer, /TaskSelectControl/);
-assert.match(globalTimer, /开始计时/);
-assert.match(globalTimer, /切换事项/);
+assert.match(globalTimer, /开始执行事项/);
+assert.match(globalTimer, /切换执行事项/);
 
-const unassignedDialog = readFileSync("src-ui/src/components/UnassignedTimeDialog.vue", "utf8");
 const styles = readFileSync("src-ui/src/styles.css", "utf8");
-assert.match(unassignedDialog, /class="unassigned-allocation-minutes"/);
-assert.match(styles, /--unassigned-dialog-width:\s*clamp\(720px, 64vw, 980px\)/);
-assert.match(styles, /\.unassigned-allocation-row\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 92px max-content 30px/);
+const workbench = readFileSync("src-ui/src/views/MainWorkbench.vue", "utf8");
+assert.doesNotMatch(workbench, /UnassignedTimeDialog/);
+assert.match(workbench, /mode: "unassigned-allocation"/);
 assert.match(styles, /\.task-autocomplete-option\.is-root-task \.task-option-name/);
 assert.match(styles, /\.task-autocomplete-option\.is-root-task \.task-option-name\s*\{[^}]*font-weight:\s*520/);
 assert.doesNotMatch(styles, /\.task-autocomplete-option\.is-root-task \.task-option-name\s*\{[^}]*font-weight:\s*(?:6[0-9]{2}|7[0-9]{2}|bold)/);
