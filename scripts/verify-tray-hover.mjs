@@ -22,7 +22,10 @@ assert.match(mainWorkbenchSource, /onOpenTimerTaskSelection/);
 assert.ok(mainWorkbenchSource.includes('openExecutionPanel({ mode: "execute"'));
 assert.match(hoverPanelSource, /开始执行事项/);
 assert.match(hoverPanelSource, /切换执行事项/);
-assert.ok(timeWorkspaceSource.includes("defineExpose({ clearTimerNote })"));
+assert.ok(!timeWorkspaceSource.includes("clearTimerNote"));
+assert.ok(!timeWorkspaceSource.includes("store.pauseTimer"));
+assert.ok(!timeWorkspaceSource.includes("store.stopTimer"));
+assert.ok(timeWorkspaceSource.includes("时间记录"));
 assert.ok(taskSelectSource.includes("defineExpose({ commit: commitText, closeSuggestions: closeTaskSuggestions, focus: focusTaskInput })"));
 
 let release;

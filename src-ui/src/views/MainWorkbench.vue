@@ -30,7 +30,7 @@ const appVersion = __APP_VERSION__;
 const pages = [
   { id: "today", label: "今日", icon: Home },
   { id: "plan", label: "待办", icon: CalendarDays },
-  { id: "timer", label: "计时", icon: Clock3 },
+  { id: "timer", label: "时间记录", icon: Clock3 },
   { id: "reports", label: "报告", icon: FileText },
   { id: "settings", label: "设置", icon: Settings }
 ];
@@ -168,7 +168,6 @@ const executionPanelMode = ref<ExecutionPanelMode>("execute");
 const executionPanelSubjectId = ref("");
 const executionPanelEntryId = ref("");
 const executionPanelTimerNote = ref("");
-const timeTrackingWorkspaceRef = ref<{ clearTimerNote: () => void }>();
 let recentCompletedTimer: number | undefined;
 
 const cloudSyncView = computed(() => cloudSyncPresentation(storageState.value, formatSyncTime));
@@ -257,7 +256,7 @@ function updateVisibleCloudSaveState(state: StorageModeSnapshot | undefined) {
 watch(storageState, updateVisibleCloudSaveState, { immediate: true });
 watch(() => store.unassignedDialogOpen, (open) => {
   if (!open) return;
-  openExecutionPanel({ mode: "unassigned-allocation", subjectId: store.selectedSubjectId });
+  openExecutionPanel({ mode: "unassigned-allocation" });
 });
 const cloudBusinessEntities = new Set([
   "tasks",
@@ -1237,8 +1236,8 @@ function openExecutionPanel(options: {
   executionPanelOpen.value = true;
 }
 
-function openTimerTaskDialog(subjectId = "", note = "") {
-  openExecutionPanel({ mode: "execute", subjectId, timerNote: note });
+function openTimerTaskDialog(subjectId = "") {
+  openExecutionPanel({ mode: "execute", subjectId });
 }
 
 function openEntryAllocation(entryId: string, subjectId = "") {
@@ -1264,7 +1263,6 @@ async function goToPlanFromTimerDialog(subjectId: string) {
 
 function handleTimerTaskStarted() {
   executionPanelTimerNote.value = "";
-  timeTrackingWorkspaceRef.value?.clearTimerNote();
 }
 
 async function handleTaskRecurrence(
@@ -1519,8 +1517,6 @@ async function handleCompletedTaskDelete(task: Task) {
 
       <TimeTrackingWorkspace
         v-else-if="store.activePage === 'timer'"
-        ref="timeTrackingWorkspaceRef"
-        @open-timer-task-dialog="(note) => openTimerTaskDialog('', note)"
         @open-entry-allocation="openEntryAllocation"
       />
 

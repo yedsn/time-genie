@@ -14,6 +14,7 @@ import {
 import { taskSubtreeIds } from "../services/planTaskInteractionCore";
 import { createTaskTreeSortable } from "../services/taskTreeSortable";
 import { parseActualMinutes } from "../services/quickActualAdjustmentCore";
+import { readRememberedPanelSubjectId, rememberPanelSubjectId } from "../services/executionPanelSubjectPreference";
 import {
   beginTimerDialogSave,
   createTimerDialogDraft,
@@ -149,6 +150,7 @@ watch([() => props.modelValue, () => props.mode, () => props.entryId], async ([o
   subjectId.value = resolveTimerDialogSubject({
     subjects: store.subjects,
     contextSubjectId: props.contextSubjectId,
+    rememberedSubjectId: readRememberedPanelSubjectId(),
     selectedSubjectId: store.selectedSubjectId,
     activeTaskSubjectId: activeTask.value?.subjectId,
   });
@@ -168,9 +170,15 @@ watch([() => props.modelValue, () => props.mode, () => props.entryId], async ([o
 
 watch(() => store.subjects.map((subject) => subject.id).join("|"), () => {
   if (!store.subjects.some((subject) => subject.id === subjectId.value)) {
-    subjectId.value = resolveTimerDialogSubject({ subjects: store.subjects, selectedSubjectId: store.selectedSubjectId });
+    subjectId.value = resolveTimerDialogSubject({
+      subjects: store.subjects,
+      rememberedSubjectId: readRememberedPanelSubjectId(),
+      selectedSubjectId: store.selectedSubjectId,
+    });
   }
 });
+
+watch(subjectId, (currentSubjectId) => rememberPanelSubjectId(currentSubjectId));
 
 function subtreeIds(taskId: string) {
   return taskSubtreeIds(rows.value.map((row) => row.task), taskId);

@@ -174,7 +174,7 @@ function taskTitle(task: TodayWorkOverviewTaskRecord) {
     <div v-if="!hasOverviewData && !store.todayOverviewLoading" class="today-empty-state">
       <AlertCircle :size="22" />
       <strong>今天还没有工作数据</strong>
-      <span>可以先添加待办，或从计时开始。</span>
+      <span>可以先添加待办，或直接开始执行事项。</span>
       <div><button class="secondary-button compact" type="button" @click="emit('openPlan')">进入待办</button><button class="primary-button compact" type="button" @click="emit('openTimer', store.todayOverviewSubjectId || undefined)">{{ store.runningEntry ? '切换执行事项' : '开始执行事项' }}</button></div>
     </div>
 

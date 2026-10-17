@@ -107,7 +107,7 @@ function errorText(error: unknown, fallback: string) {
         <div>
           <span>默认归属</span>
           <strong>{{ canUseDefaultTask ? defaultTaskLabel : '需要选择具体事项' }}</strong>
-          <small>{{ canUseDefaultTask ? `按日期分别保存到该事项，共 ${formatMinutes(store.timerStopConfirmation?.totalSettlementMinutes ?? entry.minutes)}` : '当前计时没有有效默认事项，请进入计时页面调整' }}</small>
+          <small>{{ canUseDefaultTask ? `按日期分别保存到该事项，共 ${formatMinutes(store.timerStopConfirmation?.totalSettlementMinutes ?? entry.minutes)}` : '当前计时没有有效默认事项，请进入时间记录页面调整' }}</small>
         </div>
         <label class="allocation-complete-toggle" title="保存工时时同时完成这个事项">
           <input v-model="completeTask" :disabled="!canUseDefaultTask || saving" type="checkbox" />

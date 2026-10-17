@@ -47,11 +47,12 @@ export type TimerDialogSaveToken = { field: TimerDialogDraftField; revision: num
 export function resolveTimerDialogSubject(request: {
   subjects: readonly TimerDialogSubject[];
   contextSubjectId?: string;
+  rememberedSubjectId?: string;
   selectedSubjectId?: string;
   activeTaskSubjectId?: string;
 }) {
   const valid = new Set(request.subjects.map((subject) => subject.id));
-  return [request.contextSubjectId, request.selectedSubjectId, request.activeTaskSubjectId]
+  return [request.contextSubjectId, request.rememberedSubjectId, request.selectedSubjectId, request.activeTaskSubjectId]
     .find((subjectId) => Boolean(subjectId && valid.has(subjectId)))
     ?? request.subjects[0]?.id
     ?? "";

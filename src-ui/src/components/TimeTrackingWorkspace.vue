@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { Check, ChevronDown, ChevronRight, CircleDot, Clock3, Coffee, Download, Pause, Play, Plus, Split, Square, TimerReset, Trash2 } from "lucide-vue-next";
+import { Check, ChevronDown, ChevronRight, CircleDot, Coffee, Download, Pause, Play, Plus, Split, TimerReset, Trash2 } from "lucide-vue-next";
 import { save } from "@tauri-apps/plugin-dialog";
 import { useWorkdayStore, type TimeEntry, type TimeEntryHistoryDay } from "../store";
 import TaskSelectControl from "./TaskSelectControl.vue";
@@ -23,7 +23,6 @@ type TaskSelectControlInstance = {
 
 const store = useWorkdayStore();
 const emit = defineEmits<{
-  openTimerTaskDialog: [note: string];
   openEntryAllocation: [entryId: string, subjectId?: string];
 }>();
 const expandedEntryId = ref(store.selectedEntryId);
@@ -32,11 +31,9 @@ const manualTaskId = ref(store.selectedTaskId);
 const manualMinutes = ref(30);
 const manualNote = ref("");
 const manualCompleteTask = ref(false);
-const timerNote = ref("");
 const recentManualEntryId = ref("");
 const correctionDrafts = reactive<Record<string, TimeCorrectionDraft>>({});
 const manualTaskControl = ref<TaskSelectControlInstance>();
-const timerBusy = ref(false);
 const manualSaving = ref(false);
 const correctionSavingId = ref("");
 const exportOpen = ref(false);
@@ -59,13 +56,6 @@ const exportReady = computed(() => (exportPreview.value?.rowCount ?? 0) > 0
   && !exportValidationError.value
   && !exportPreviewLoading.value
   && !exportSaving.value);
-
-const elapsedSeconds = computed(() => {
-  const entry = store.runningEntry;
-  return entry ? store.entryDurationSeconds(entry) : 0;
-});
-
-const clockText = computed(() => formatClock(elapsedSeconds.value));
 
 watch(() => store.runningEntry?.id, (currentId, previousId) => {
   if (!currentId && previousId) expandedEntryId.value = store.selectedEntryId;
@@ -129,13 +119,6 @@ watch(manualTaskId, (taskId) => {
 watch(() => store.selectedTaskId, (taskId) => {
   if (!manualOpen.value) manualTaskId.value = taskId;
 });
-
-function formatClock(seconds: number) {
-  const hours = Math.floor(seconds / 3_600);
-  const minutes = Math.floor((seconds % 3_600) / 60);
-  const rest = seconds % 60;
-  return [hours, minutes, rest].map((value) => String(value).padStart(2, "0")).join(":");
-}
 
 function formatMinutes(minutes: number) {
   if (minutes < 60) return `${minutes} 分钟`;
@@ -414,64 +397,15 @@ async function submitManualEntry() {
   }
 }
 
-async function runTimerAction(action: () => Promise<unknown>, fallback: string) {
-  timerBusy.value = true;
-  try {
-    await action();
-  } catch (error) {
-    ElMessage.error(errorText(error, fallback));
-  } finally {
-    timerBusy.value = false;
-  }
-}
-
 function errorText(error: unknown, fallback: string) {
   if (typeof error === "string" && error.trim()) return error;
   return error instanceof Error ? error.message : fallback;
 }
 
-function clearTimerNote() {
-  timerNote.value = "";
-}
-
-defineExpose({ clearTimerNote });
-
 </script>
 
 <template>
   <section class="time-workspace">
-    <div
-      class="time-focus-panel"
-      :class="{
-        active: store.runningEntry?.state === 'running',
-        paused: store.runningEntry?.state === 'paused'
-      }"
-    >
-      <div class="time-focus-overview">
-        <div class="time-focus-state">
-          <span class="time-focus-icon"><Clock3 :size="18" /></span>
-          <div>
-            <span>{{ store.runningEntry?.state === 'paused' ? '计时已暂停' : store.runningEntry ? '正在计时' : '准备开始' }}</span>
-            <strong>{{ store.runningEntry ? store.timeEntryLabel(store.runningEntry) : '选择要执行的事项' }}</strong>
-          </div>
-        </div>
-        <time>{{ store.runningEntry ? clockText : '00:00:00' }}</time>
-      </div>
-
-      <div class="time-focus-controls">
-        <div class="time-focus-selector">
-          <span>执行事项</span>
-          <button class="time-task-dialog-trigger" type="button" :disabled="timerBusy" @click="emit('openTimerTaskDialog', timerNote)"><Play :size="15" fill="currentColor" />{{ store.runningEntry ? '切换执行事项' : '开始执行事项' }}</button>
-          <input v-model="timerNote" class="time-focus-note" placeholder="备注（可选）" aria-label="计时备注" />
-        </div>
-        <div class="time-focus-actions">
-          <button v-if="store.runningEntry?.state === 'running'" class="secondary-button" :disabled="timerBusy" @click="runTimerAction(store.pauseTimer, '暂停计时失败')"><Pause :size="15" fill="currentColor" />暂停</button>
-          <button v-else-if="store.runningEntry?.state === 'paused'" class="primary-button" :disabled="timerBusy" @click="runTimerAction(store.resumeTimer, '继续计时失败')"><Play :size="15" fill="currentColor" />继续计时</button>
-          <button v-if="store.runningEntry" class="danger-button" :disabled="timerBusy" @click="runTimerAction(store.stopTimer, '结束计时失败')"><Square :size="13" fill="currentColor" />结束计时</button>
-        </div>
-      </div>
-    </div>
-
     <div class="time-history-head">
       <div>
         <h2>时间记录</h2>
@@ -500,7 +434,7 @@ defineExpose({ clearTimerNote });
     </form>
 
     <div v-if="store.timeHistoryLoading && !store.timeHistoryGroups.length" class="time-history-empty">正在加载时间记录…</div>
-    <div v-else-if="!store.timeHistoryGroups.length" class="time-history-empty">还没有时间记录，开始计时或手动补录后会显示在这里。</div>
+    <div v-else-if="!store.timeHistoryGroups.length" class="time-history-empty">还没有时间记录，开始执行事项或手动补录后会显示在这里。</div>
     <div v-else class="time-history-groups">
       <section v-for="group in store.timeHistoryGroups" :key="group.workDate" class="time-history-group">
         <header class="time-history-group-head">

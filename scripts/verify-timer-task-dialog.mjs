@@ -15,6 +15,10 @@ const subjects = [{ id: "a" }, { id: "b" }];
 assert.equal(resolveTimerDialogSubject({ subjects, contextSubjectId: "b", selectedSubjectId: "a" }), "b");
 assert.equal(resolveTimerDialogSubject({ subjects, contextSubjectId: "missing", selectedSubjectId: "a" }), "a");
 assert.equal(resolveTimerDialogSubject({ subjects: [] }), "");
+assert.equal(resolveTimerDialogSubject({ subjects, rememberedSubjectId: "b", selectedSubjectId: "a" }), "b");
+assert.equal(resolveTimerDialogSubject({ subjects, contextSubjectId: "a", rememberedSubjectId: "b" }), "a");
+assert.equal(resolveTimerDialogSubject({ subjects, rememberedSubjectId: "gone", selectedSubjectId: "a" }), "a");
+assert.equal(resolveTimerDialogSubject({ subjects, rememberedSubjectId: "gone", selectedSubjectId: "gone-too" }), "a");
 
 const tasks = [
   { id: "p", subjectId: "a", title: "产品", status: "open", selectable: false, directMinutes: 0, totalMinutes: 50 },
@@ -55,6 +59,7 @@ const workbench = readFileSync("src-ui/src/views/MainWorkbench.vue", "utf8");
 const plan = readFileSync("src-ui/src/components/PlanListEditor.vue", "utf8");
 const storeSource = readFileSync("src-ui/src/store.ts", "utf8");
 const styles = readFileSync("src-ui/src/styles.css", "utf8");
+const subjectPreference = readFileSync("src-ui/src/services/executionPanelSubjectPreference.ts", "utf8");
 assert.match(dialog, /timer-task-subject-tabs/);
 assert.match(dialog, /store\.workspaceLoading/);
 assert.match(dialog, /@closed="restoreTriggerFocus"/);
@@ -101,7 +106,9 @@ assert.match(styles, /timer-task-complete-toggle\.empty[^}]*visibility: hidden/)
 assert.match(storeSource, /const moved = await moveTaskRecord\([\s\S]*snapshot\.tasks\.splice\([\s\S]*replaceTask\(moved\);[\s\S]*return await loadExecutionSnapshot\(subjectId\)/);
 assert.doesNotMatch(globalTimer, /TaskSelectControl/);
 assert.match(globalTimer, /emit\('open'\)/);
-assert.match(tracking, /time-task-dialog-trigger/);
+assert.doesNotMatch(tracking, /time-task-dialog-trigger/);
+assert.ok(!tracking.includes("store.resumeTimer"));
+assert.ok(!tracking.includes("openTimerTaskDialog"));
 assert.match(tracking, /<TaskSelectControl[\s\S]*aria-label="补录事项"/);
 assert.doesNotMatch(tracking, /aria-label="分配事项"/);
 assert.match(tracking, /调整归属/);
@@ -114,11 +121,17 @@ assert.match(workbench, /mode: "unassigned-allocation"/);
 assert.match(workbench, /@open-entry-allocation="openEntryAllocation"/);
 assert.doesNotMatch(workbench, /<UnassignedTimeDialog/);
 assert.match(workbench, /label: "待办"/);
-assert.match(workbench, /label: "计时"/);
+assert.ok(workbench.includes('label: "时间记录"'));
+assert.ok(!workbench.includes('label: "计时"'));
 assert.doesNotMatch(plan, /TimerTaskDialog|timer-task-dialog/);
 
 assert.ok(dialog.includes('<button v-if="!row.hasChildren" class="timer-task-primary-action"'));
 assert.ok(dialog.includes('<template v-if="row.totalTodayEstimate > 0">'));
 assert.ok(styles.includes(".timer-task-actions { min-width: 0; display: flex; flex-wrap: wrap;"));
+assert.ok(dialog.includes("rememberedSubjectId: readRememberedPanelSubjectId()"));
+assert.ok(dialog.includes("rememberPanelSubjectId(currentSubjectId)"));
+assert.ok(subjectPreference.includes("timegenie:execution-panel-subject"));
+assert.ok(subjectPreference.includes("localStorage"));
+assert.ok(workbench.includes('openExecutionPanel({ mode: "unassigned-allocation" })'));
 
 console.log("timer task dialog verification passed");
