@@ -1226,6 +1226,7 @@ fn suppress_hover() {
 fn set_hover_window_bounds(
     window: &tauri::WebviewWindow,
     bounds: PhysicalBounds,
+    _scale_factor: f64,
 ) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -1246,7 +1247,19 @@ fn set_hover_window_bounds(
         }
         return Ok(());
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        window
+            .set_size(tauri::LogicalSize::new(
+                f64::from(bounds.width) / _scale_factor,
+                f64::from(bounds.height) / _scale_factor,
+            ))
+            .map_err(|error| error.to_string())?;
+        window
+            .set_position(PhysicalPosition::new(bounds.x, bounds.y))
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         window
             .set_size(tauri::PhysicalSize::new(bounds.width, bounds.height))
@@ -1289,8 +1302,8 @@ fn schedule_hover(
             .as_ref()
             .map(|monitor| monitor.scale_factor())
             .unwrap_or(window.scale_factor().unwrap_or(1.0));
-        let anchor = rect.position.to_physical::<i32>(tray_scale_factor);
-        let anchor_size = rect.size.to_physical::<u32>(tray_scale_factor);
+        let anchor = rect.position.to_physical::<i32>(1.0);
+        let anchor_size = rect.size.to_physical::<u32>(1.0);
         let tray_bounds = if anchor_size.width > 0 && anchor_size.height > 0 {
             PhysicalBounds {
                 x: anchor.x,
@@ -1307,7 +1320,7 @@ fn schedule_hover(
             }
         };
 
-        if cursor_position().is_some_and(|position| !tray_bounds.contains(position)) {
+        if cursor_position(&app).is_some_and(|position| !tray_bounds.contains(position)) {
             cancel_pending_hover(&state);
             return;
         }
@@ -1339,7 +1352,7 @@ fn schedule_hover(
             width: window_size.width,
             height: window_size.height,
         };
-        if let Err(error) = set_hover_window_bounds(&window, window_bounds) {
+        if let Err(error) = set_hover_window_bounds(&window, window_bounds, tray_scale_factor) {
             #[cfg(debug_assertions)]
             eprintln!("取消托盘面板显示：设置窗口边界失败：{error}");
             cancel_pending_hover(&state);
@@ -1401,7 +1414,7 @@ fn monitor_hover_position(app: AppHandle, state: Arc<Mutex<HoverState>>, generat
                 return;
             }
 
-            let Some(cursor_position) = cursor_position() else {
+            let Some(cursor_position) = cursor_position(&app) else {
                 outside_since = None;
                 previous_buttons = pointer_button_state();
                 tokio::time::sleep(HOVER_POSITION_CHECK_INTERVAL).await;
@@ -1471,7 +1484,7 @@ fn monitor_hover_position(app: AppHandle, state: Arc<Mutex<HoverState>>, generat
 }
 
 #[cfg(target_os = "windows")]
-fn cursor_position() -> Option<PhysicalPosition<i32>> {
+fn cursor_position(_: &AppHandle) -> Option<PhysicalPosition<i32>> {
     let mut point = POINT { x: 0, y: 0 };
     if unsafe { GetCursorPos(&mut point) } == 0 {
         return None;
@@ -1493,11 +1506,21 @@ fn pointer_button_state() -> PointerButtonState {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn cursor_position() -> Option<PhysicalPosition<i32>> {
-    None
+fn cursor_position(app: &AppHandle) -> Option<PhysicalPosition<i32>> {
+    app.cursor_position().ok().map(|position| position.cast())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn pointer_button_state() -> PointerButtonState {
+    let pressed = objc2_app_kit::NSEvent::pressedMouseButtons();
+    PointerButtonState {
+        left: pressed & 1 != 0,
+        right: pressed & 2 != 0,
+        middle: pressed & 4 != 0,
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn pointer_button_state() -> PointerButtonState {
     PointerButtonState::default()
 }

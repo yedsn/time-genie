@@ -4499,6 +4499,7 @@ dependencies = [
  "chrono-tz",
  "futures-util",
  "keyring",
+ "objc2-app-kit",
  "reqwest 0.12.28",
  "rusqlite",
  "rust_xlsxwriter",
