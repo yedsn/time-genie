@@ -51,14 +51,6 @@ export function shouldRefreshTimeHistory(activePage: string, timeDomainChanged: 
   return activePage === "timer" && timeDomainChanged;
 }
 
-export function timerStopHistoryTarget(entryId: string) {
-  return {
-    activePage: "timer",
-    historyPage: 1,
-    selectedEntryId: entryId,
-  } as const;
-}
-
 export function historyDateLabel(workDate: string, workspaceToday: string) {
   const explicitDate = formatDate(workDate);
   if (workDate === workspaceToday) return `今天 · ${explicitDate}`;

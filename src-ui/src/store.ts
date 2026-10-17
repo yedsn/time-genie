@@ -79,7 +79,7 @@ import {
 } from "./services/tauri";
 import { TRANSIENT_MISSING_STATE_REFRESH_LIMIT, transientMissingStateResult } from "./services/transientStateGuard";
 import { canSubmitUnassignedResolution } from "./services/unassignedResolutionGuard";
-import { clampHistoryPage, collectTodayEntryTaskIds, findEntryInHistory, isTodayTimeEntry, timerStopHistoryTarget } from "./services/timeEntryHistoryCore";
+import { clampHistoryPage, collectTodayEntryTaskIds, findEntryInHistory, isTodayTimeEntry } from "./services/timeEntryHistoryCore";
 import { completedTaskHistoryFallbackPage, isCurrentCompletedTaskHistoryRequest } from "./services/completedTaskHistoryCore";
 import { canAcceptInlineTimerChild, inlineTimerParentUnavailableReason } from "./services/inlineTimerTaskCreationCore";
 import type { QuickPlanBatchRequest } from "./services/quickPlanTextCore";
@@ -1620,18 +1620,6 @@ export const useWorkdayStore = defineStore("workday", () => {
     timerStopConfirmation.value = undefined;
   }
 
-  async function adjustTimerStopAllocation(entryId = timerStopConfirmationEntryId.value) {
-    if (!entryId) return;
-    const alreadyOnTimerPage = activePage.value === "timer";
-    const target = timerStopHistoryTarget(entryId);
-    selectedEntryId.value = target.selectedEntryId;
-    timeHistoryPage.value = target.historyPage;
-    activePage.value = target.activePage;
-    if (alreadyOnTimerPage) await loadTimeHistory(target.historyPage);
-    timerStopConfirmationEntryId.value = "";
-    timerStopConfirmation.value = undefined;
-  }
-
   async function confirmTimerStopAllocation(completeTask = false) {
     const entry = timerStopConfirmationEntry.value;
     if (!entry) return false;
@@ -1710,7 +1698,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     const normalized: Array<{ taskId: string; minutes: number; note?: string; completeTask: boolean; taskExpectedVersion?: number }> = [];
     for (const item of allocations) {
       const minutes = Math.max(0, Math.round(Number(item.minutes) || 0));
-      if (!item.taskId || minutes <= 0) continue;
+      if (!item.taskId || (minutes <= 0 && !item.completeTask)) continue;
       const taskId = await persistTimerTask(item.taskId);
       if (!taskId) throw new Error("分配事项保存失败");
       const task = tasks.find((candidate) => candidate.id === taskId);
@@ -1920,7 +1908,7 @@ export const useWorkdayStore = defineStore("workday", () => {
         const taskId = await persistTimerTask(allocation.taskId);
         if (!taskId) continue;
         const allocationMinutes = Math.max(0, Number(allocation.minutes) || 0);
-        if (!allocationMinutes) continue;
+        if (!allocationMinutes && !allocation.completeTask) continue;
         const task = tasks.find((candidate) => candidate.id === taskId);
         const current = mergedAllocations.get(taskId) ?? { minutes: 0, completeTask: false, taskExpectedVersion: task?.version };
         current.minutes += allocationMinutes;
@@ -1973,7 +1961,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen, unassignedWorkDate, unassignedSessionId, unassignedVersion,
     unassignedCurrentSession,
     workspaceLoaded, workspaceLoading, executionSnapshots, executionSnapshotLoading, loadExecutionSnapshot, saveExecutionTaskTitle, saveExecutionTaskNote, saveExecutionTaskDetails, deleteExecutionTask, loadWorkspaceData, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addTaskSelectionDraft, addChildTask, addTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTaskPlanBatch, loadActualAdjustmentSnapshot, saveActualAdjustmentBatch, removeActualAdjustment, duplicateTask, deleteTask, moveTask, reorderTask, movePlanTask,
-    indentTask, outdentTask, moveExecutionTask, startTimer, transitionTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, adjustTimerStopAllocation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, loadReportTemplates, createReportTemplate, updateReportTemplate, duplicateReportTemplate, setDefaultReportTemplate, deleteReportTemplate, reorderReportTemplates, getReportTemplatePlaceholders, publicReportText, previewObsidianReport, writeObsidianReport,
+    indentTask, outdentTask, moveExecutionTask, startTimer, transitionTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, loadReportTemplates, createReportTemplate, updateReportTemplate, duplicateReportTemplate, setDefaultReportTemplate, deleteReportTemplate, reorderReportTemplates, getReportTemplatePlaceholders, publicReportText, previewObsidianReport, writeObsidianReport,
     beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, dismissUnassignedResolution, resolveUnassignedTime
   };
 });

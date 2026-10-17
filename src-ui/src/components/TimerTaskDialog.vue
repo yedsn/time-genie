@@ -131,8 +131,9 @@ const selectedAllocations = computed(() => Object.entries(allocationDrafts)
       ?? allocationEntry.value?.allocations?.find((allocation) => allocation.taskId === taskId)?.taskTitle
       ?? store.taskDisplayLabel(taskId),
     minutes: Math.max(0, Math.round(Number(draft.minutes) || 0)),
+    completeTask: Boolean(draft.completeTask),
   }))
-  .filter((item) => item.minutes > 0));
+  .filter((item) => item.minutes > 0 || item.completeTask));
 const allocationPeriodLabel = computed(() => {
   if (props.mode === "unassigned-allocation") {
     const startedAt = store.unassignedFirstStartedAt ?? store.unassignedStartedAt;
@@ -290,14 +291,23 @@ function allocateRemaining(taskId: string, title?: string) {
 }
 
 function clearAllocationDrafts() {
-  for (const draft of Object.values(allocationDrafts)) draft.minutes = 0;
+  for (const draft of Object.values(allocationDrafts)) {
+    draft.minutes = 0;
+    draft.completeTask = false;
+  }
+}
+
+function clearAllocationDraft(taskId: string) {
+  const draft = allocationDraft(taskId);
+  draft.minutes = 0;
+  draft.completeTask = false;
 }
 
 async function saveAllocationDrafts() {
   if (!presentation.value.showAllocation || allocationSaving.value) return;
   const allocations = Object.entries(allocationDrafts)
     .map(([taskId, draft]) => ({ taskId, minutes: Math.max(0, Math.round(Number(draft.minutes) || 0)), completeTask: draft.completeTask }))
-    .filter((allocation) => allocation.minutes > 0);
+    .filter((allocation) => allocation.minutes > 0 || allocation.completeTask);
   if (!allocations.length) { allocationError.value = "请至少分配 1 分钟到事项"; return; }
   if (allocationRemainingMinutes.value !== 0) {
     allocationError.value = allocationRemainingMinutes.value > 0 ? `还剩 ${allocationRemainingMinutes.value} 分钟未分配` : `已超出 ${Math.abs(allocationRemainingMinutes.value)} 分钟`;
@@ -785,6 +795,31 @@ function formatTime(timestamp: number) {
     @closed="restoreTriggerFocus"
     @update:model-value="emit('update:modelValue', $event)"
   >
+    <section v-if="props.mode === 'unassigned-allocation'" class="timer-task-allocation-overview" :class="{ over: allocationRemainingMinutes < 0 }" aria-label="未归属时间分配进度">
+      <div class="timer-task-allocation-context">
+        <span>待处理 · 未归属时间</span>
+        <strong>{{ allocationPeriodLabel }}</strong>
+        <small>请把这段时间分配到下方事项，也可以记为休息或直接丢弃。</small>
+      </div>
+      <div class="timer-task-allocation-metrics">
+        <div class="timer-task-allocation-metric total">
+          <span>总时长</span>
+          <strong>{{ allocationRequiredMinutes }}</strong>
+          <small>分钟</small>
+        </div>
+        <div class="timer-task-allocation-metric pending">
+          <span>{{ allocationRemainingMinutes >= 0 ? '待分配' : '超出' }}</span>
+          <strong>{{ Math.abs(allocationRemainingMinutes) }}</strong>
+          <small>分钟</small>
+        </div>
+        <div class="timer-task-allocation-metric assigned">
+          <span>已分配</span>
+          <strong>{{ allocationTotalMinutes }}</strong>
+          <small>分钟</small>
+        </div>
+      </div>
+    </section>
+
     <div class="timer-task-dialog-toolbar">
       <div class="timer-task-subject-tabs" role="tablist" aria-label="执行事项主体">
         <button v-for="subject in store.subjects" :key="subject.id" type="button" role="tab" :aria-selected="subjectId === subject.id" :class="{ active: subjectId === subject.id }" @click="selectSubject(subject.id)">{{ subject.name }}</button>
@@ -796,11 +831,11 @@ function formatTime(timestamp: number) {
     <div class="timer-task-dialog-summary">
       <span><strong>{{ currentSubject?.name ?? '当前主体' }}</strong></span>
       <span>{{ rows.filter((row) => !row.hasChildren).length }} 个可执行事项</span>
-      <span v-if="presentation.showAllocation">{{ allocationPeriodLabel }} · 需分配 {{ allocationRequiredMinutes }} 分钟 · 已分配 {{ allocationTotalMinutes }} · {{ allocationRemainingMinutes >= 0 ? `剩余 ${allocationRemainingMinutes}` : `超出 ${Math.abs(allocationRemainingMinutes)}` }} 分钟</span>
-      <span v-else>名称和备注会自动保存 · 今日预计请在待办页调整</span>
+      <span v-if="props.mode === 'entry-allocation'">{{ allocationPeriodLabel }} · 共 {{ allocationRequiredMinutes }} 分钟 · 已分配 {{ allocationTotalMinutes }} · {{ allocationRemainingMinutes >= 0 ? `待分配 ${allocationRemainingMinutes}` : `超出 ${Math.abs(allocationRemainingMinutes)}` }} 分钟</span>
+      <span v-else-if="props.mode === 'execute'">名称和备注会自动保存 · 今日预计请在待办页调整</span>
     </div>
     <div v-if="presentation.showAllocation && selectedAllocations.length" class="timer-task-allocation-selection" aria-label="当前已选时间分配">
-      <span v-for="item in selectedAllocations" :key="item.taskId"><strong>{{ item.title }}</strong>{{ item.minutes }} 分钟<button type="button" :aria-label="`移除${item.title}的分配`" @click="allocationDraft(item.taskId).minutes = 0">×</button></span>
+      <span v-for="item in selectedAllocations" :key="item.taskId"><strong>{{ item.title }}</strong><template v-if="item.minutes > 0">{{ item.minutes }} 分钟</template><template v-if="item.minutes > 0 && item.completeTask"> · </template><template v-if="item.completeTask">完成</template><button type="button" :aria-label="`移除${item.title}的分配与完成选择`" @click="clearAllocationDraft(item.taskId)">×</button></span>
     </div>
 
     <div class="timer-task-list" :class="{ allocation: presentation.showAllocation }" aria-live="polite" :aria-busy="store.workspaceLoading || store.executionSnapshotLoading[subjectId]">
@@ -862,7 +897,7 @@ function formatTime(timestamp: number) {
 
             <button v-if="row.hasChildren" class="secondary-button compact timer-task-add-child" type="button" @click="openNewTask(row.task.id)"><Plus :size="13" />子项</button>
             <label v-if="presentation.showAllocation && !row.hasChildren" class="timer-task-allocation-input"><input v-model.number="allocationDraft(row.task.id, row.task.title).minutes" min="0" :max="allocationRequiredMinutes" type="number" :aria-label="`${row.task.title}本次分配分钟`" /><span>分</span></label>
-            <label v-if="presentation.showAllocation && !row.hasChildren" class="timer-task-complete-toggle" :class="{ empty: allocationDraft(row.task.id, row.task.title).minutes <= 0 }" title="保存归属时同时完成事项" :aria-hidden="allocationDraft(row.task.id, row.task.title).minutes <= 0"><input v-model="allocationDraft(row.task.id, row.task.title).completeTask" type="checkbox" :disabled="allocationDraft(row.task.id, row.task.title).minutes <= 0" /><span>完成</span></label>
+            <label v-if="presentation.showAllocation && !row.hasChildren" class="timer-task-complete-toggle" title="保存归属时同时完成事项；无需为该事项分配时间"><input v-model="allocationDraft(row.task.id, row.task.title).completeTask" type="checkbox" /><span>完成</span></label>
             <button v-if="!row.hasChildren" class="timer-task-primary-action" :class="actionFor(row.task, false).mode" type="button" :disabled="!actionFor(row.task, false).actionable || Boolean(timerBusyTaskId)" :aria-label="actionFor(row.task, false).ariaLabel" @click="startOrSwitch(row.task, false)"><LoaderCircle v-if="timerBusyTaskId === row.task.id" :size="13" class="spin" /><Play v-else-if="presentation.showTimerActions && actionFor(row.task, false).actionable" :size="13" fill="currentColor" />{{ actionFor(row.task, false).label }}</button>
 
             <el-popover :visible="moreTaskId === row.task.id" placement="bottom-end" :width="330" trigger="click" @update:visible="moreTaskId = $event ? row.task.id : ''">
@@ -877,7 +912,7 @@ function formatTime(timestamp: number) {
       <div v-if="!panelInitialLoading && !rows.length && !newTask.open" class="timer-task-empty"><AlertCircle :size="22" /><strong>{{ query ? '没有匹配事项' : '当前主体暂无可执行事项' }}</strong><span>{{ query ? '换个关键词，或清空搜索查看全部事项。' : '可以直接在这里新建事项并开始执行。' }}</span><button v-if="!query" class="primary-button compact" type="button" @click="openNewTask()"><Plus :size="14" />新增事项</button></div>
     </div>
 
-    <template #footer><div class="timer-task-dialog-footer"><button class="secondary-button compact" type="button" @click="goPlan"><ListTodo :size="14" />前往待办页</button><span class="timer-task-allocation-error">{{ allocationError }}</span><template v-if="presentation.showAllocation"><button class="secondary-button compact" type="button" :disabled="allocationSaving || allocationTotalMinutes <= 0" @click="clearAllocationDrafts">清空</button><button v-if="presentation.showBreakDiscard" class="secondary-button compact" type="button" :disabled="allocationSaving" @click="resolveAllocationDisposition('break')">记为休息</button><button v-if="presentation.showBreakDiscard" class="danger-button compact" type="button" :disabled="allocationSaving" @click="resolveAllocationDisposition('discard')">丢弃</button><button class="primary-button" type="button" :disabled="allocationSaving" @click="saveAllocationDrafts">{{ allocationSaving ? '保存中...' : presentation.primaryLabel }}</button></template><button v-else class="secondary-button" type="button" :disabled="closing" @click="closeDialog">关闭</button></div></template>
+    <template #footer><div class="timer-task-dialog-footer"><button class="secondary-button compact" type="button" @click="goPlan"><ListTodo :size="14" />前往待办页</button><span class="timer-task-allocation-error">{{ allocationError }}</span><template v-if="presentation.showAllocation"><button class="secondary-button compact" type="button" :disabled="allocationSaving || !selectedAllocations.length" @click="clearAllocationDrafts">清空</button><button v-if="presentation.showBreakDiscard" class="secondary-button compact" type="button" :disabled="allocationSaving" @click="resolveAllocationDisposition('break')">记为休息</button><button v-if="presentation.showBreakDiscard" class="danger-button compact" type="button" :disabled="allocationSaving" @click="resolveAllocationDisposition('discard')">丢弃</button><button class="primary-button" type="button" :disabled="allocationSaving" @click="saveAllocationDrafts">{{ allocationSaving ? '保存中...' : presentation.primaryLabel }}</button></template><button v-else class="secondary-button" type="button" :disabled="closing" @click="closeDialog">关闭</button></div></template>
   </el-dialog>
 
 </template>

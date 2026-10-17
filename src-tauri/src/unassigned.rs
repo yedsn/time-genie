@@ -282,7 +282,7 @@ fn resolve_work_with_cloud_operation(
         if allocation.minutes < 0 {
             return Err("VALIDATION_ERROR: 分配分钟不能为负数".to_string());
         }
-        if allocation.minutes == 0 {
+        if allocation.minutes == 0 && !allocation.complete_task {
             continue;
         }
         ensure_selectable_task(&transaction, &workspace_id, &allocation.task_id)?;
@@ -315,11 +315,15 @@ fn resolve_work_with_cloud_operation(
                 .map(|version| (task_id.clone(), version))
         })
         .collect::<Vec<_>>();
-    let label = if merged.len() == 1 {
-        let task_id = merged.keys().next().expect("single allocation");
+    let allocated_task_ids = merged
+        .iter()
+        .filter_map(|(task_id, (minutes, _, _))| (*minutes > 0).then_some(task_id))
+        .collect::<Vec<_>>();
+    let label = if allocated_task_ids.len() == 1 {
+        let task_id = allocated_task_ids[0];
         task_title(&transaction, task_id)?
     } else {
-        format!("未归属时间分配到 {} 个事项", merged.len())
+        format!("未归属时间分配到 {} 个事项", allocated_task_ids.len())
     };
     insert_generated_entry(
         &transaction,
@@ -352,13 +356,15 @@ fn resolve_work_with_cloud_operation(
             &work_date,
             now,
         )?;
-        transaction
-            .execute(
-                "INSERT INTO time_allocations(id, workspace_id, entry_id, task_id, minutes, created_at, updated_at, version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 1)",
-                params![Uuid::now_v7().to_string(), workspace_id, entry_id, task_id, minutes, now],
-            )
-            .map_err(|error| error.to_string())?;
+        if minutes > 0 {
+            transaction
+                .execute(
+                    "INSERT INTO time_allocations(id, workspace_id, entry_id, task_id, minutes, created_at, updated_at, version)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 1)",
+                    params![Uuid::now_v7().to_string(), workspace_id, entry_id, task_id, minutes, now],
+                )
+                .map_err(|error| error.to_string())?;
+        }
         if complete_task {
             if let Some(occurrence_outbox) = crate::time_tracking::complete_task_if_open(
                 &transaction,
@@ -1657,6 +1663,93 @@ mod tests {
     }
 
     #[test]
+    fn unassigned_work_can_complete_a_zero_minute_task_without_allocating_to_it() {
+        let (database, allocated_task_id) = setup();
+        let subject_id: String = database
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let completion_only_task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id,
+                parent_id: None,
+                title: "未归属流程只完成".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let initial = get_state(&database).unwrap().unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE unassigned_segments SET started_at = started_at - 120000 WHERE session_id = ?1 AND ended_at IS NULL",
+                [&initial.session_id],
+            )
+            .unwrap();
+        let due = get_state(&database).unwrap().unwrap();
+
+        let result = resolve_work(
+            &database,
+            ResolveWorkRequest {
+                session_id: due.session_id,
+                allocations: vec![
+                    UnassignedAllocationInput {
+                        task_id: allocated_task_id.clone(),
+                        minutes: due.required_minutes,
+                        complete_task: false,
+                        task_expected_version: None,
+                    },
+                    UnassignedAllocationInput {
+                        task_id: completion_only_task.id.clone(),
+                        minutes: 0,
+                        complete_task: true,
+                        task_expected_version: Some(completion_only_task.version),
+                    },
+                ],
+                expected_version: due.version,
+                operation_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+
+        let entry_id = result.generated_entry_id.unwrap();
+        let connection = database.open().unwrap();
+        let allocations = connection
+            .prepare("SELECT task_id, minutes FROM time_allocations WHERE entry_id = ?1")
+            .unwrap()
+            .query_map([&entry_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let label: String = connection
+            .query_row(
+                "SELECT label_snapshot FROM time_entries WHERE id = ?1",
+                [&entry_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let completion_only_status: String = connection
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                [&completion_only_task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(allocations, vec![(allocated_task_id, due.required_minutes)]);
+        assert_eq!(label, "未归属分配事项");
+        assert_eq!(completion_only_status, "done");
+    }
+
+    #[test]
     fn allows_partial_allocation_and_can_discard_empty_allocation() {
         let (database, task_id) = setup();
         let initial = get_state(&database).unwrap().unwrap();
@@ -2176,6 +2269,25 @@ mod tests {
     #[test]
     fn cloud_mode_unassigned_work_can_write_local_cache_when_cloud_is_unavailable() {
         let (database, task_id) = setup();
+        let subject_id: String = database
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let completion_only_task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id,
+                parent_id: None,
+                title: "云端未归属只完成".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
         let cloud_workspace_id = Uuid::now_v7().to_string();
         settings::update_setting(
             &database,
@@ -2211,12 +2323,20 @@ mod tests {
             &database,
             ResolveWorkRequest {
                 session_id: due.session_id,
-                allocations: vec![UnassignedAllocationInput {
-                    task_id,
-                    minutes: due.required_minutes,
-                    complete_task: false,
-                    task_expected_version: None,
-                }],
+                allocations: vec![
+                    UnassignedAllocationInput {
+                        task_id,
+                        minutes: due.required_minutes,
+                        complete_task: false,
+                        task_expected_version: None,
+                    },
+                    UnassignedAllocationInput {
+                        task_id: completion_only_task.id.clone(),
+                        minutes: 0,
+                        complete_task: true,
+                        task_expected_version: Some(completion_only_task.version),
+                    },
+                ],
                 expected_version: due.version,
                 operation_id: operation_id.clone(),
             },
@@ -2249,7 +2369,7 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox.len(), 2);
         assert_eq!(outbox[0].0, operation_id);
         assert_eq!(outbox[0].1, "unassigned_resolve_work");
         assert_eq!(outbox[0].2, "unassigned_session");
@@ -2270,7 +2390,14 @@ mod tests {
         assert!(entry_payload
             .get("allocations")
             .and_then(serde_json::Value::as_array)
-            .is_some_and(|allocations| !allocations.is_empty()));
+            .is_some_and(|allocations| allocations.len() == 1));
+        let task_completion = outbox
+            .iter()
+            .find(|row| row.1 == "task_set_completed_from_unassigned")
+            .unwrap();
+        assert_eq!(task_completion.2, "task");
+        assert_eq!(task_completion.3, completion_only_task.id);
+        assert_eq!(task_completion.4, Some(completion_only_task.version));
     }
 
     #[test]

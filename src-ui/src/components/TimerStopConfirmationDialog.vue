@@ -6,8 +6,12 @@ import { useWorkdayStore } from "../store";
 import { playCompletionFeedback } from "../services/completionFeedback";
 
 const store = useWorkdayStore();
+const emit = defineEmits<{
+  adjustAllocation: [entryId: string, subjectId?: string];
+}>();
 const completeTask = ref(false);
 const saving = ref(false);
+const pendingAllocationTarget = ref<{ entryId: string; subjectId?: string }>();
 
 const open = computed({
   get: () => Boolean(store.timerStopConfirmationEntry),
@@ -62,7 +66,17 @@ async function markDisposition(disposition: "break" | "discard") {
 
 function adjustAllocation() {
   if (!entry.value) return;
-  store.adjustTimerStopAllocation(entry.value.id);
+  const targetEntry = entry.value;
+  const subjectId = targetEntry.allocations?.find((allocation) => allocation.subjectId)?.subjectId
+    ?? store.tasks.find((task) => task.id === targetEntry.defaultTask)?.subjectId;
+  pendingAllocationTarget.value = { entryId: targetEntry.id, subjectId };
+  store.dismissTimerStopConfirmation();
+}
+
+function handleClosed() {
+  const target = pendingAllocationTarget.value;
+  pendingAllocationTarget.value = undefined;
+  if (target) emit("adjustAllocation", target.entryId, target.subjectId);
 }
 
 function errorText(error: unknown, fallback: string) {
@@ -80,6 +94,7 @@ function errorText(error: unknown, fallback: string) {
     :show-close="false"
     :close-on-click-modal="false"
     :close-on-press-escape="false"
+    @closed="handleClosed"
   >
     <div v-if="entry" class="timer-stop-confirm-content">
       <div class="timer-stop-confirm-head">

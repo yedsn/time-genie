@@ -1616,7 +1616,7 @@ fn replace_allocations_with_cloud_operation(
         if allocation.minutes < 0 {
             return Err("VALIDATION_ERROR: 分配分钟不能为负数".to_string());
         }
-        if allocation.minutes == 0 {
+        if allocation.minutes == 0 && !allocation.complete_task {
             continue;
         }
         ensure_selectable_task(&transaction, &workspace_id, &allocation.task_id)?;
@@ -1675,13 +1675,15 @@ fn replace_allocations_with_cloud_operation(
             &current.work_date,
             now,
         )?;
-        transaction
-            .execute(
-                "INSERT INTO time_allocations(id, workspace_id, entry_id, task_id, minutes, note, created_at, updated_at, version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 1)",
-                params![Uuid::now_v7().to_string(), workspace_id, request.entry_id, task_id, minutes, note, now],
-            )
-            .map_err(|error| error.to_string())?;
+        if minutes > 0 {
+            transaction
+                .execute(
+                    "INSERT INTO time_allocations(id, workspace_id, entry_id, task_id, minutes, note, created_at, updated_at, version)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 1)",
+                    params![Uuid::now_v7().to_string(), workspace_id, request.entry_id, task_id, minutes, note, now],
+                )
+                .map_err(|error| error.to_string())?;
+        }
         if complete_task {
             if let Some(occurrence_outbox) = complete_task_if_open(
                 &transaction,
@@ -4093,6 +4095,20 @@ mod tests {
     #[test]
     fn cloud_time_entry_writes_persist_outbox_in_the_same_transaction() {
         let (database, _workspace_id, task_id) = setup();
+        let completion_only_task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id(&database),
+                parent_id: None,
+                title: "云端只完成不分配".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
         let cloud_workspace_id = Uuid::now_v7().to_string();
         settings::update_setting(
             &database,
@@ -4154,13 +4170,22 @@ mod tests {
             AllocationReplaceRequest {
                 entry_id: created.id.clone(),
                 expected_version: updated.version,
-                allocations: vec![AllocationInput {
-                    task_id: task_id.clone(),
-                    minutes: 40,
-                    note: Some("全部归属并完成".to_string()),
-                    complete_task: true,
-                    task_expected_version: Some(1),
-                }],
+                allocations: vec![
+                    AllocationInput {
+                        task_id: task_id.clone(),
+                        minutes: 40,
+                        note: Some("全部归属".to_string()),
+                        complete_task: false,
+                        task_expected_version: None,
+                    },
+                    AllocationInput {
+                        task_id: completion_only_task.id.clone(),
+                        minutes: 0,
+                        note: None,
+                        complete_task: true,
+                        task_expected_version: Some(completion_only_task.version),
+                    },
+                ],
             },
             Some((&state, "time_allocation_replace")),
         )
@@ -4210,8 +4235,11 @@ mod tests {
             .find(|row| row.1 == "task_set_completed_from_allocation")
             .unwrap();
         assert_eq!(task_completion.2, "task");
-        assert_eq!(task_completion.3.as_deref(), Some(task_id.as_str()));
-        assert_eq!(task_completion.4, Some(1));
+        assert_eq!(
+            task_completion.3.as_deref(),
+            Some(completion_only_task.id.as_str())
+        );
+        assert_eq!(task_completion.4, Some(completion_only_task.version));
         assert_eq!(task_completion.6.as_deref(), Some(operation_id.as_str()));
     }
 
@@ -5171,6 +5199,87 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn allocation_can_complete_a_zero_minute_task_without_creating_an_allocation() {
+        let (database, _, allocated_task_id) = setup();
+        let subject_id = subject_id(&database);
+        let completion_only_task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id,
+                parent_id: None,
+                title: "只完成不分配时间".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let manual = create_manual_entry(
+            &database,
+            ManualEntryRequest {
+                task_id: None,
+                work_date: test_work_date(),
+                started_at: None,
+                ended_at: None,
+                minutes: Some(30),
+                note: None,
+                complete_task: false,
+                task_expected_version: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+
+        let allocated = replace_allocations(
+            &database,
+            AllocationReplaceRequest {
+                entry_id: manual.id,
+                expected_version: manual.version,
+                allocations: vec![
+                    AllocationInput {
+                        task_id: allocated_task_id.clone(),
+                        minutes: 30,
+                        note: None,
+                        complete_task: false,
+                        task_expected_version: None,
+                    },
+                    AllocationInput {
+                        task_id: completion_only_task.id.clone(),
+                        minutes: 0,
+                        note: None,
+                        complete_task: true,
+                        task_expected_version: Some(completion_only_task.version),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(allocated.allocated_minutes, 30);
+        assert_eq!(allocated.allocations.len(), 1);
+        assert_eq!(allocated.allocations[0].task_id, allocated_task_id);
+        let connection = database.open().unwrap();
+        let completion_only_allocations: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM time_allocations WHERE entry_id = ?1 AND task_id = ?2",
+                params![allocated.id, completion_only_task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let completion_only_status: String = connection
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                [&completion_only_task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(completion_only_allocations, 0);
+        assert_eq!(completion_only_status, "done");
     }
 
     #[test]

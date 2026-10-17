@@ -1732,7 +1732,7 @@ async function handleCompletedTaskDelete(task: Task) {
       @go-plan="goToPlanFromTimerDialog"
       @timer-started="handleTimerTaskStarted"
     />
-    <TimerStopConfirmationDialog />
+    <TimerStopConfirmationDialog @adjust-allocation="openEntryAllocation" />
     <el-dialog v-model="cloudQueueDialogOpen" class="cloud-sync-queue-dialog" title="同步队列" width="min(620px, 94vw)" append-to-body :close-on-click-modal="false">
       <div class="cloud-sync-queue-summary">
         <div><strong>{{ cloudQueueItems.length }}</strong><span>本机待处理</span></div>
