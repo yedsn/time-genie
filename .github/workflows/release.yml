@@ -208,6 +208,19 @@ jobs:
       GITEE_SYNC_PROXY: ${{ vars.GITEE_SYNC_PROXY }}
 
     steps:
+      - name: Configure proxy for GitHub access
+        if: ${{ env.GITEE_SYNC_PROXY != '' }}
+        shell: bash
+        run: |
+          {
+            echo "HTTP_PROXY=$GITEE_SYNC_PROXY"
+            echo "HTTPS_PROXY=$GITEE_SYNC_PROXY"
+            echo "http_proxy=$GITEE_SYNC_PROXY"
+            echo "https_proxy=$GITEE_SYNC_PROXY"
+            echo "NO_PROXY=gitee.com,.gitee.com,localhost,127.0.0.1"
+            echo "no_proxy=gitee.com,.gitee.com,localhost,127.0.0.1"
+          } >> "$GITHUB_ENV"
+
       - name: Checkout repository
         uses: actions/checkout@v5
 

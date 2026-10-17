@@ -18,7 +18,7 @@
 - `Settings -> Actions -> General`：启用 Actions，并允许工作流写入 Release。
 - `Settings -> Secrets and variables -> Actions -> Secrets`：配置 `TAURI_SIGNING_PRIVATE_KEY` 和 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。
 - 配置 `GITEE_ACCESS_TOKEN`，发布完成后会自动同步到 Gitee latest Release。
-- `Settings -> Secrets and variables -> Actions -> Variables`：配置 `ENABLE_GITEE_SYNC=true` 开启 Gitee 同步；如自建 runner 下载 GitHub Release 资产需要代理，配置 `GITEE_SYNC_PROXY`。
+- `Settings -> Secrets and variables -> Actions -> Variables`：配置 `ENABLE_GITEE_SYNC=true` 开启 Gitee 同步；如自建 runner 访问 GitHub 需要代理，配置 `GITEE_SYNC_PROXY`。同步任务会让仓库 Checkout、GitHub API 和 Release 资产下载使用该代理，同时保持 Gitee 直连。代理地址必须能从 runner 所在机器访问，不能误用其他机器的 `127.0.0.1`。
 - `Settings -> Actions -> Runners` 中确认自建 runner 在线，标签为 `self-hosted, linux, x64, gitee-sync`。
 - 更新端点顺序必须保持 Gitee 在前、GitHub 在后：客户端会优先读取 Gitee `latest.json`，Gitee 不可用时再回退到 GitHub。
 
@@ -54,6 +54,8 @@ python scripts/release/publish_updater_json.py --tag vX.Y.Z --github-owner yedsn
 ```
 
 如果 GitHub 有 `latest.json` 但 Gitee 没有，确认 `ENABLE_GITEE_SYNC=true` 已配置在 GitHub Actions Variables 里，并重新运行 Gitee 同步。
+
+如果同步任务在 `Checkout repository` 阶段连接 GitHub 超时，确认 `GITEE_SYNC_PROXY` 已配置为 runner 可访问的完整代理地址，例如 `http://192.168.3.36:7890`。工作流会将其映射到 `HTTP_PROXY`、`HTTPS_PROXY` 及其小写变量；`gitee.com` 已加入 `NO_PROXY`，上传 Gitee 时不会绕行 GitHub 代理。
 
 ## macOS 分发说明
 
