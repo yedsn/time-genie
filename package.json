@@ -1,6 +1,6 @@
 {
     "name": "timegenie",
-    "version": "0.2.8",
+    "version": "0.3.0",
     "license": "MIT",
     "private": true,
     "type": "module",
