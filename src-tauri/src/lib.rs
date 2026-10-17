@@ -1256,7 +1256,10 @@ fn set_hover_window_bounds(
             ))
             .map_err(|error| error.to_string())?;
         window
-            .set_position(PhysicalPosition::new(bounds.x, bounds.y))
+            .set_position(tauri::LogicalPosition::new(
+                f64::from(bounds.x) / _scale_factor,
+                f64::from(bounds.y) / _scale_factor,
+            ))
             .map_err(|error| error.to_string())
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -1276,6 +1279,8 @@ fn schedule_hover(
     rect: Rect,
     fallback: PhysicalPosition<f64>,
 ) {
+    #[cfg(target_os = "macos")]
+    let (rect, fallback) = normalize_macos_tray_coordinates(&app, rect, fallback);
     let generation = {
         let Ok(mut state) = state.lock() else {
             return;
@@ -1293,11 +1298,27 @@ fn schedule_hover(
             cancel_pending_hover(&state);
             return;
         };
+        #[cfg(not(target_os = "macos"))]
         let monitor = window
             .monitor_from_point(fallback.x, fallback.y)
             .ok()
             .flatten()
             .or_else(|| window.primary_monitor().ok().flatten());
+        #[cfg(target_os = "macos")]
+        let monitor = app.available_monitors().ok().and_then(|monitors| {
+            let point = objc2_app_kit::NSEvent::mouseLocation();
+            let primary = app.primary_monitor().ok().flatten()?;
+            let y = f64::from(primary.size().height) / primary.scale_factor() - point.y;
+            monitors.into_iter().find(|monitor| {
+                let scale = monitor.scale_factor();
+                let left = f64::from(monitor.position().x) / scale;
+                let top = f64::from(monitor.position().y) / scale;
+                point.x >= left
+                    && y >= top
+                    && point.x < left + f64::from(monitor.size().width) / scale
+                    && y < top + f64::from(monitor.size().height) / scale
+            })
+        });
         let tray_scale_factor = monitor
             .as_ref()
             .map(|monitor| monitor.scale_factor())
@@ -1516,15 +1537,73 @@ fn cursor_position(app: &AppHandle) -> Option<PhysicalPosition<i32>> {
 
 #[cfg(target_os = "macos")]
 fn cursor_position(app: &AppHandle) -> Option<PhysicalPosition<i32>> {
-    // AppKit uses logical points with a bottom-left origin. Flip Y in points
-    // before scaling: Tao 0.35 mixes physical screen height with logical Y.
-    let monitor = app.primary_monitor().ok().flatten()?;
-    let scale = monitor.scale_factor();
+    let primary = app.primary_monitor().ok().flatten()?;
     let point = objc2_app_kit::NSEvent::mouseLocation();
+    let x = point.x;
+    let y = f64::from(primary.size().height) / primary.scale_factor() - point.y;
+    let monitor = app.available_monitors().ok()?.into_iter().find(|monitor| {
+        let scale = monitor.scale_factor();
+        let left = f64::from(monitor.position().x) / scale;
+        let top = f64::from(monitor.position().y) / scale;
+        x >= left
+            && y >= top
+            && x < left + f64::from(monitor.size().width) / scale
+            && y < top + f64::from(monitor.size().height) / scale
+    })?;
+    let scale = monitor.scale_factor();
     Some(PhysicalPosition::new(
-        (point.x * scale).round() as i32,
-        (f64::from(monitor.size().height) - point.y * scale).round() as i32,
+        (x * scale).round() as i32,
+        (y * scale).round() as i32,
     ))
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_macos_tray_coordinates(
+    app: &AppHandle,
+    rect: Rect,
+    fallback: PhysicalPosition<f64>,
+) -> (Rect, PhysicalPosition<f64>) {
+    // tray-icon 0.24 flips AppKit Y using the primary display's pixel height.
+    // Recover the event's screen scale from its mouse position, then correct
+    // the shared Y offset without changing the tray's actual size or X.
+    let Some(primary) = app.primary_monitor().ok().flatten() else {
+        return (rect, fallback);
+    };
+    let primary_height = f64::from(primary.size().height) / primary.scale_factor();
+    let point = objc2_app_kit::NSEvent::mouseLocation();
+    // CGDisplayPixelsHigh is the height used by tray-icon. Obtain it directly
+    // rather than assuming it equals the monitor's logical height.
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGMainDisplayID() -> u32;
+        fn CGDisplayPixelsHigh(display: u32) -> usize;
+    }
+    let event_height = unsafe { CGDisplayPixelsHigh(CGMainDisplayID()) } as f64;
+    let scale = app
+        .available_monitors()
+        .ok()
+        .and_then(|monitors| {
+            monitors
+                .into_iter()
+                .map(|monitor| monitor.scale_factor())
+                .min_by(|a, b| {
+                    let error = |scale: f64| {
+                        (fallback.x / scale - point.x)
+                            .hypot(event_height - fallback.y / scale - point.y)
+                    };
+                    error(*a).total_cmp(&error(*b))
+                })
+        })
+        .unwrap_or(primary.scale_factor());
+    let offset = (event_height - primary_height) * scale;
+    let position = rect.position.to_physical::<f64>(1.0);
+    (
+        Rect {
+            position: PhysicalPosition::new(position.x, position.y - offset).into(),
+            size: rect.size,
+        },
+        PhysicalPosition::new(fallback.x, fallback.y - offset),
+    )
 }
 
 #[cfg(target_os = "macos")]
