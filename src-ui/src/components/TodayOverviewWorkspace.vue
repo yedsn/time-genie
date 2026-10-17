@@ -25,8 +25,8 @@ const summary = computed(() => overview.value?.summary ?? {
 const subjectOptions = computed(() => [{ id: "", name: "全部主体" }, ...store.subjects.map((subject) => ({ id: subject.id, name: subject.name }))]);
 const trendDays = computed(() => (overview.value?.days ?? []).slice(-14));
 const heatmapDays = computed(() => overview.value?.days ?? []);
-const timelineItems = computed(() => overview.value?.timeline ?? []);
-const overviewTasks = computed(() => overview.value?.tasks ?? []);
+const timelineItems = computed(() => [...(overview.value?.timeline ?? [])].sort((left, right) => right.startedAt - left.startedAt));
+const overviewTasks = computed(() => [...(overview.value?.tasks ?? [])].sort((left, right) => (right.lastEntryAt ?? 0) - (left.lastEntryAt ?? 0)));
 const completionPercent = computed(() => Math.round(summary.value.completionRate * 100));
 const allSubjectScope = computed(() => !store.todayOverviewSubjectId);
 const maxTrendMinutes = computed(() => Math.max(1, ...trendDays.value.map((day) => day.actualMinutes)));
@@ -181,16 +181,18 @@ function taskTitle(task: TodayWorkOverviewTaskRecord) {
     <div v-else class="today-visual-grid">
       <section class="today-panel timeline-panel">
         <div class="today-panel-head"><h2>今日时间分布</h2><span>{{ timelineItems.length }} 段</span></div>
-        <div v-if="timelineItems.length" class="today-timeline">
+        <template v-if="timelineItems.length">
           <div class="today-timeline-scale"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
-          <div v-for="item in timelineItems" :key="item.id" class="today-timeline-row" :class="timelineClass(item)">
-            <div class="timeline-copy">
-              <strong>{{ timelineLabel(item) }}</strong>
-              <small>{{ formatTime(item.startedAt) }} - {{ item.endedAt ? formatTime(item.endedAt) : '现在' }} · {{ formatMinutes(item.minutes) }} · {{ timelineStateLabel(item) }}<template v-if="allSubjectScope && item.subjectName"> · {{ item.subjectName }}</template></small>
+          <div class="today-timeline">
+            <div v-for="item in timelineItems" :key="item.id" class="today-timeline-row" :class="timelineClass(item)">
+              <div class="timeline-copy">
+                <strong>{{ timelineLabel(item) }}</strong>
+                <small>{{ formatTime(item.startedAt) }} - {{ item.endedAt ? formatTime(item.endedAt) : '现在' }} · {{ formatMinutes(item.minutes) }} · {{ timelineStateLabel(item) }}<template v-if="allSubjectScope && item.subjectName"> · {{ item.subjectName }}</template></small>
+              </div>
+              <div class="timeline-track"><i :style="timelineStyle(item)"></i></div>
             </div>
-            <div class="timeline-track"><i :style="timelineStyle(item)"></i></div>
           </div>
-        </div>
+        </template>
         <p v-else class="today-muted-empty">今天还没有时间段。</p>
       </section>
 
