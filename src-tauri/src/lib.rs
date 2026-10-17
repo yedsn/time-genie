@@ -1385,6 +1385,10 @@ fn schedule_hover(
             let _ = window.hide();
             return;
         }
+        #[cfg(target_os = "macos")]
+        if let Err(error) = window.set_focus() {
+            eprintln!("托盘面板聚焦失败: {error}");
+        }
         let _ = app.emit("tray-hover-shown", ());
         monitor_hover_position(app, state, generation);
     });
@@ -1505,9 +1509,22 @@ fn pointer_button_state() -> PointerButtonState {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn cursor_position(app: &AppHandle) -> Option<PhysicalPosition<i32>> {
     app.cursor_position().ok().map(|position| position.cast())
+}
+
+#[cfg(target_os = "macos")]
+fn cursor_position(app: &AppHandle) -> Option<PhysicalPosition<i32>> {
+    // AppKit uses logical points with a bottom-left origin. Flip Y in points
+    // before scaling: Tao 0.35 mixes physical screen height with logical Y.
+    let monitor = app.primary_monitor().ok().flatten()?;
+    let scale = monitor.scale_factor();
+    let point = objc2_app_kit::NSEvent::mouseLocation();
+    Some(PhysicalPosition::new(
+        (point.x * scale).round() as i32,
+        (f64::from(monitor.size().height) - point.y * scale).round() as i32,
+    ))
 }
 
 #[cfg(target_os = "macos")]

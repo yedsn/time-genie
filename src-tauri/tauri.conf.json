@@ -29,6 +29,7 @@
                                 {
                                     "label":  "hover",
                                     "title":  "今日计时",
+                                    "acceptFirstMouse":  true,
                                     "url":  "/?view=hover",
                                     "width":  420,
                                     "height":  360,
