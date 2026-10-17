@@ -73,7 +73,7 @@ assert.match(dialog, /今日预计请在待办页调整/);
 assert.match(dialog, /timer-task-estimate-cell readonly/);
 assert.ok(dialog.includes("estimateCellLabel(row)"));
 assert.ok(dialog.includes("row.estimateSource === 'overall'"));
-assert.ok(dialog.includes("{{ row.task.recurrence ? '每次预计' : '整体预计' }}"));
+assert.ok(dialog.includes("row.estimateSource === 'overall' && !row.task.recurrence"));
 assert.ok(dialog.includes("{ summary: row.hasChildren, empty: row.totalTodayEstimate <= 0 }"));
 assert.match(dialog, /executionPanelAction/);
 assert.match(dialog, /executionPanelRows/);
@@ -116,5 +116,9 @@ assert.doesNotMatch(workbench, /<UnassignedTimeDialog/);
 assert.match(workbench, /label: "待办"/);
 assert.match(workbench, /label: "计时"/);
 assert.doesNotMatch(plan, /TimerTaskDialog|timer-task-dialog/);
+
+assert.ok(dialog.includes('<button v-if="!row.hasChildren" class="timer-task-primary-action"'));
+assert.ok(dialog.includes('<template v-if="row.totalTodayEstimate > 0">'));
+assert.ok(styles.includes(".timer-task-actions { min-width: 0; display: flex; flex-wrap: wrap;"));
 
 console.log("timer task dialog verification passed");

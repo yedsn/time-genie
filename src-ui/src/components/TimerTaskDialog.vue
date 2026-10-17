@@ -823,7 +823,7 @@ function formatTime(timestamp: number) {
           <span class="timer-task-estimate-cell readonly" :class="{ summary: row.hasChildren, empty: row.totalTodayEstimate <= 0 }" :aria-label="estimateCellLabel(row)">
             <strong>{{ row.totalTodayEstimate > 0 ? formatMinutes(row.totalTodayEstimate) : '—' }}</strong>
             <small v-if="row.hasChildren && row.totalTodayEstimate > 0">汇总</small>
-            <small v-else-if="row.estimateSource === 'overall'">{{ row.task.recurrence ? '每次预计' : '整体预计' }}</small>
+            <small v-else-if="row.estimateSource === 'overall' && !row.task.recurrence">整体预计</small>
           </span>
 
           <div class="timer-task-actual-cell">
