@@ -4,7 +4,7 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { Check, ChevronDown, ChevronRight, CircleDot, Clock3, Coffee, Download, Eraser, Pause, Play, Plus, RotateCcw, Split, Square, TimerReset, Trash2 } from "lucide-vue-next";
 import { save } from "@tauri-apps/plugin-dialog";
 import { useWorkdayStore, type TimeEntry, type TimeEntryHistoryDay } from "../store";
-import TaskSelectControl, { type TaskSelectIntent } from "./TaskSelectControl.vue";
+import TaskSelectControl from "./TaskSelectControl.vue";
 import { playCompletionFeedback } from "../services/completionFeedback";
 import { clampPartialAllocationMinutes } from "../services/allocationMath";
 import { historyDateLabel, historyPaginationState } from "../services/timeEntryHistoryCore";
@@ -30,6 +30,7 @@ type TaskSelectControlInstance = {
 };
 
 const store = useWorkdayStore();
+const emit = defineEmits<{ openTimerTaskDialog: [note: string] }>();
 const expandedEntryId = ref(store.selectedEntryId);
 const manualOpen = ref(false);
 const manualTaskId = ref(store.selectedTaskId);
@@ -40,7 +41,6 @@ const timerNote = ref("");
 const recentManualEntryId = ref("");
 const allocationDrafts = reactive<Record<string, AllocationDraft[]>>({});
 const correctionDrafts = reactive<Record<string, TimeCorrectionDraft>>({});
-const timerTaskControl = ref<TaskSelectControlInstance>();
 const manualTaskControl = ref<TaskSelectControlInstance>();
 const allocationTaskControls = new Map<string, TaskSelectControlInstance>();
 const timerBusy = ref(false);
@@ -441,19 +441,6 @@ async function markEntryDisposition(entry: TimeEntry, disposition: "break" | "di
   }
 }
 
-async function submitTimerIntent(intent: TaskSelectIntent) {
-  timerBusy.value = true;
-  try {
-    const result = await store.transitionTimer(intent, timerNote.value);
-    timerNote.value = "";
-    if (result.previousStopResult && !result.noOp) ElMessage.success("已切换事项，上一段计时可稍后确认归属");
-  } catch (error) {
-    ElMessage.error(errorText(error, store.runningEntry ? "切换计时失败" : "开始计时失败"));
-  } finally {
-    timerBusy.value = false;
-  }
-}
-
 async function saveCorrection(entry: TimeEntry) {
   const draft = ensureCorrectionDraft(entry);
   const startedAt = new Date(draft.startedAt).getTime();
@@ -528,13 +515,12 @@ function errorText(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
 }
 
-async function focusTaskSelector() {
-  if (store.runningEntry) return;
-  await nextTick();
-  timerTaskControl.value?.focus();
+function clearTimerNote() {
+  timerNote.value = "";
 }
 
-defineExpose({ focusTaskSelector });
+defineExpose({ clearTimerNote });
+
 </script>
 
 <template>
@@ -560,16 +546,7 @@ defineExpose({ focusTaskSelector });
       <div class="time-focus-controls">
         <div class="time-focus-selector">
           <span>{{ store.runningEntry ? '切换事项' : '计时事项' }}</span>
-          <TaskSelectControl
-            ref="timerTaskControl"
-            v-model="store.selectedTaskId"
-            variant="focus"
-            intent-mode
-            :busy="timerBusy"
-            :placeholder="store.runningEntry ? '选择或输入新事项并切换' : '选择或输入新事项'"
-            :aria-label="store.runningEntry ? '切换计时事项' : '选择计时事项'"
-            @submit="submitTimerIntent"
-          />
+          <button class="time-task-dialog-trigger" type="button" :disabled="timerBusy" @click="emit('openTimerTaskDialog', timerNote)"><Play :size="15" fill="currentColor" />{{ store.runningEntry ? '打开事项列表并切换' : '选择事项并开始' }}</button>
           <input v-model="timerNote" class="time-focus-note" placeholder="备注（可选）" aria-label="计时备注" />
         </div>
         <div class="time-focus-actions">

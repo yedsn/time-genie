@@ -49,12 +49,15 @@ assert.match(store, /task\.quickCreate = true/);
 assert.match(store, /async function persistTimerTask/);
 
 for (const file of [
-  "src-ui/src/components/GlobalTimerBar.vue",
   "src-ui/src/components/TimeTrackingWorkspace.vue",
   "src-ui/src/components/UnassignedTimeDialog.vue",
 ]) {
   assert.match(readFileSync(file, "utf8"), /TaskSelectControl/);
 }
+const globalTimer = readFileSync("src-ui/src/components/GlobalTimerBar.vue", "utf8");
+assert.doesNotMatch(globalTimer, /TaskSelectControl/);
+assert.match(globalTimer, /开始计时/);
+assert.match(globalTimer, /切换事项/);
 
 const unassignedDialog = readFileSync("src-ui/src/components/UnassignedTimeDialog.vue", "utf8");
 const styles = readFileSync("src-ui/src/styles.css", "utf8");

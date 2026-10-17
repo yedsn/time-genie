@@ -13,7 +13,7 @@ assert.ok(editor.includes('target.closest("input, textarea")'));
 assert.ok(editor.includes('document.addEventListener("pointerdown"'));
 assert.ok(editor.includes('document.addEventListener("keydown"'));
 assert.ok(editor.includes('window.addEventListener("scroll"'));
-assert.ok(editor.includes('closeContextMenu();\n      isSorting.value = true;'));
+assert.match(editor, /closeContextMenu\(\);\r?\n\s+isSorting\.value = true;/);
 assert.ok(editor.includes('todayEstimateDraftValue'));
 assert.ok(editor.includes('v-model.number="todayEstimateDraftValue"'));
 assert.ok(editor.includes('noteDialogOpen'));

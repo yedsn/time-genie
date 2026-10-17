@@ -14,6 +14,7 @@ import TodayOverviewWorkspace from "../components/TodayOverviewWorkspace.vue";
 import ReportWorkspace from "../components/ReportWorkspace.vue";
 import AutomationHooksSettings from "../components/AutomationHooksSettings.vue";
 import TimerStopConfirmationDialog from "../components/TimerStopConfirmationDialog.vue";
+import TimerTaskDialog from "../components/TimerTaskDialog.vue";
 import appIconUrl from "../../../src-tauri/icons/icon.svg";
 import { cloudSaveStatusLabel, cloudSyncPresentation } from "../services/cloudSyncPresentation";
 import { cloudSessionLabel, cloudSessionNeedsPassword } from "../services/cloudSessionPresentation";
@@ -162,7 +163,10 @@ let cloudSaveSettledTimer: number | undefined;
 let cloudSavePendingSince = 0;
 const completingTaskIds = new Set<string>();
 const recentCompletedTaskId = ref("");
-const timeTrackingWorkspaceRef = ref<{ focusTaskSelector: () => Promise<void> }>();
+const timerTaskDialogOpen = ref(false);
+const timerTaskDialogSubjectId = ref("");
+const timerTaskDialogNote = ref("");
+const timeTrackingWorkspaceRef = ref<{ clearTimerNote: () => void }>();
 let recentCompletedTimer: number | undefined;
 
 const cloudSyncView = computed(() => cloudSyncPresentation(storageState.value, formatSyncTime));
@@ -952,11 +956,7 @@ onMounted(async () => {
   unlistenNavigatePage = await onNavigatePage((page) => {
     if (pages.some((item) => item.id === page)) store.activePage = page;
   });
-  unlistenOpenTimerTaskSelection = await onOpenTimerTaskSelection(async () => {
-    store.activePage = "timer";
-    await nextTick();
-    await timeTrackingWorkspaceRef.value?.focusTaskSelector();
-  });
+  unlistenOpenTimerTaskSelection = await onOpenTimerTaskSelection(() => openTimerTaskDialog());
   unlistenCloudSyncState = await onCloudSyncStateChanged((state) => {
     updateVisibleCloudSaveState(state);
     storageState.value = state;
@@ -1218,16 +1218,25 @@ async function retrySeaTableFailures() {
   }
 }
 
-async function startTimerForTask(taskId: string) {
-  if (store.runningEntry?.defaultTask === taskId) {
-    store.activePage = "timer";
-    return;
-  }
-  try {
-    await store.transitionTimer({ taskId });
-  } catch (error) {
-    ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "开始计时失败");
-  }
+function openTimerTaskDialog(subjectId = "", note = "") {
+  timerTaskDialogSubjectId.value = subjectId;
+  timerTaskDialogNote.value = note;
+  timerTaskDialogOpen.value = true;
+}
+
+function openTimerDialogForTask(taskId: string) {
+  const task = store.tasks.find((item) => item.id === taskId);
+  openTimerTaskDialog(task?.subjectId ?? store.selectedSubjectId);
+}
+
+async function goToPlanFromTimerDialog(subjectId: string) {
+  if (subjectId && subjectId !== store.selectedSubjectId) await store.selectSubject(subjectId);
+  store.activePage = "plan";
+}
+
+function handleTimerTaskStarted() {
+  timerTaskDialogNote.value = "";
+  timeTrackingWorkspaceRef.value?.clearTimerNote();
 }
 
 async function handleTaskRecurrence(
@@ -1409,15 +1418,14 @@ async function handleCompletedTaskDelete(task: Task) {
         </div>
         <div class="topbar-tools">
           <UnassignedTimeIndicator />
-          <GlobalTimerBar @open="store.activePage = 'timer'" />
+          <GlobalTimerBar @open="openTimerTaskDialog()" />
         </div>
       </header>
 
       <div class="content-scroll" @scroll="handleSettingsScroll">
         <TodayOverviewWorkspace
           v-if="store.activePage === 'today'"
-          @start-timer="startTimerForTask"
-          @open-timer="store.activePage = 'timer'"
+          @open-timer="openTimerTaskDialog"
           @open-plan="store.activePage = 'plan'"
           @resolve-unassigned="store.promptUnassignedResolution(true)"
         />
@@ -1459,7 +1467,7 @@ async function handleCompletedTaskDelete(task: Task) {
           @toggle="handleTaskToggle"
           @indent="store.indentTask"
           @outdent="store.outdentTask"
-          @start-timer="startTimerForTask"
+          @start-timer="openTimerDialogForTask"
           @move="handleTaskMove"
           @set-recurrence="handleTaskRecurrence"
         />
@@ -1481,7 +1489,7 @@ async function handleCompletedTaskDelete(task: Task) {
         />
       </section>
 
-      <TimeTrackingWorkspace v-else-if="store.activePage === 'timer'" ref="timeTrackingWorkspaceRef" />
+      <TimeTrackingWorkspace v-else-if="store.activePage === 'timer'" ref="timeTrackingWorkspaceRef" @open-timer-task-dialog="(note) => openTimerTaskDialog('', note)" />
 
       <ReportWorkspace v-else-if="store.activePage === 'reports'" />
 
@@ -1684,6 +1692,8 @@ async function handleCompletedTaskDelete(task: Task) {
         </button>
       </footer>
     </section>
+
+    <TimerTaskDialog v-model="timerTaskDialogOpen" :context-subject-id="timerTaskDialogSubjectId" :timer-note="timerTaskDialogNote" @go-plan="goToPlanFromTimerDialog" @timer-started="handleTimerTaskStarted" />
     <UnassignedTimeDialog />
     <TimerStopConfirmationDialog />
     <el-dialog v-model="cloudQueueDialogOpen" class="cloud-sync-queue-dialog" title="同步队列" width="min(620px, 94vw)" append-to-body :close-on-click-modal="false">
