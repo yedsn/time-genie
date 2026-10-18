@@ -29,6 +29,79 @@ export type WorkspaceCalendarContext = {
   currentDayEndAt: number;
 };
 
+export type DataBackupExportResult = {
+  path: string;
+  createdAt: string;
+  backupKind: "standard" | "stale_epoch_rescue";
+  sourceMode: "local" | "cloud";
+  cloudConsistent: boolean;
+  entityCounts: Record<string, number>;
+  excludedCategories: string[];
+  checksum: string;
+};
+
+export type DataBackupPreview = {
+  path: string;
+  formatVersion: number;
+  appVersion: string;
+  createdAt: string;
+  frozenAt: number;
+  backupKind: "standard" | "stale_epoch_rescue";
+  sourceMode: "local" | "cloud";
+  cloudConsistent: boolean;
+  pendingOperationCount: number;
+  workspaceName: string;
+  timezone: string;
+  entityCounts: Record<string, number>;
+  excludedCategories: string[];
+  replacedEntityCounts: Record<string, number>;
+};
+
+export type DataBackupImportResult = {
+  workspaceId: string;
+  safetyBackupPath: string;
+  importedEntityCounts: Record<string, number>;
+};
+
+export type DataBackupHistoryItem = {
+  id: string;
+  path: string;
+  fileName: string;
+  createdAt: string;
+  backupKind: "standard" | "stale_epoch_rescue";
+  sourceMode: "local" | "cloud";
+  cloudConsistent: boolean;
+  entityCount: number;
+  sizeBytes: number;
+  checksum: string;
+  origin: "manual" | "safety";
+  fileExists: boolean;
+};
+
+export async function exportDataBackup(path: string): Promise<DataBackupExportResult> {
+  return await invoke("data_backup_export", { request: { path, rescue: false } });
+}
+
+export async function exportRescueDataBackup(path: string): Promise<DataBackupExportResult> {
+  return await invoke("data_backup_export_rescue", { request: { path } });
+}
+
+export async function previewDataBackup(path: string): Promise<DataBackupPreview> {
+  return await invoke("data_backup_preview", { request: { path } });
+}
+
+export async function importDataBackup(path: string): Promise<DataBackupImportResult> {
+  return await invoke("data_backup_import", { request: { path, confirmed: true } });
+}
+
+export async function listDataBackupHistory(): Promise<DataBackupHistoryItem[]> {
+  return await invoke("data_backup_history_list");
+}
+
+export async function openDataBackup(path: string, reveal = false): Promise<void> {
+  await invoke("data_backup_open", { request: { path, reveal } });
+}
+
 export type AppUpdateSummary = {
   version: string;
   currentVersion: string;
@@ -116,6 +189,9 @@ export type StorageModeSnapshot = {
   lastError?: string;
   authBlocked: boolean;
   authBlockedReason?: string;
+  workspaceEpoch: number;
+  epochBlocked: boolean;
+  epochBlockedReason?: string;
 };
 
 export type CloudDevice = {
@@ -130,6 +206,139 @@ export type CloudDevice = {
   revokedAt?: string;
   current: boolean;
 };
+
+export type CloudOperationHistoryCursor = { occurredAt: string; id: string };
+export type CloudOperationHistoryItem = {
+  id: string;
+  operationId: string;
+  businessType: string;
+  source: "user" | "automation" | "import" | "migration" | "restore" | "system";
+  deviceId?: string;
+  deviceName: string;
+  summary: string;
+  affectedEntityCount: number;
+  occurredAt: string;
+  expiresAt: string;
+  metadata: Record<string, unknown>;
+};
+export type CloudOperationHistoryPage = { items: CloudOperationHistoryItem[]; nextCursor?: CloudOperationHistoryCursor };
+export type CloudOperationHistoryDetailItem = {
+  id: number; entityType: string; entityId: string; entityLabel: string; action: "create" | "update" | "delete" | "restore";
+  before?: Record<string, unknown>; after?: Record<string, unknown>; changedFields: string[];
+};
+export type CloudOperationHistoryDetail = {
+  id: string; operationId: string; businessType: string; source: string; deviceId?: string; deviceNameSnapshot: string; summary: string;
+  affectedEntityCount: number; metadata: Record<string, unknown>; occurredAt: string; expiresAt: string; items: CloudOperationHistoryDetailItem[];
+};
+export type CloudOperationHistoryFilter = {
+  limit?: number; cursor?: CloudOperationHistoryCursor; from?: string; to?: string; deviceId?: string; source?: string; businessType?: string; query?: string;
+};
+
+export async function listCloudOperationHistory(request: CloudOperationHistoryFilter = {}): Promise<CloudOperationHistoryPage> {
+  return await invoke("cloud_operation_history_list", { request });
+}
+
+export async function getCloudOperationHistoryDetail(logId: string): Promise<CloudOperationHistoryDetail> {
+  return await invoke("cloud_operation_history_detail", { request: { logId } });
+}
+
+export type CloudWorkspaceSnapshot = {
+  id: string;
+  snapshotType: "manual" | "automatic" | "pre_restore";
+  name: string;
+  note?: string;
+  status: "creating" | "ready" | "corrupt" | "failed";
+  formatVersion: number;
+  baseChangeSeq: number;
+  workspaceEpoch: number;
+  entityCounts: Record<string, number>;
+  groupHashes: Record<string, string>;
+  contentHash?: string;
+  sizeBytes: number;
+  chunkCount: number;
+  deviceName: string;
+  protected: boolean;
+  protectedAt?: string;
+  expiresAt?: string;
+  createdAt: string;
+  completedAt?: string;
+  failureReason?: string;
+};
+
+export type CloudWorkspaceSnapshotDiff = { added: number; modified: number; deleted: number };
+export type CloudWorkspaceSnapshotPreview = {
+  snapshotId: string;
+  restorable: boolean;
+  errorCode?: string;
+  entityCounts?: Record<string, number>;
+  currentEntityCounts?: Record<string, number>;
+  groups?: Record<string, CloudWorkspaceSnapshotDiff>;
+  entities?: Record<string, CloudWorkspaceSnapshotDiff>;
+  contentHash?: string;
+};
+
+export async function createCloudWorkspaceSnapshot(request: {
+  name: string;
+  note?: string;
+  snapshotType?: "manual" | "automatic" | "pre_restore";
+  lazy?: boolean;
+}): Promise<CloudWorkspaceSnapshot> {
+  return await invoke("cloud_workspace_snapshot_create", { request });
+}
+
+export async function listCloudWorkspaceSnapshots(): Promise<CloudWorkspaceSnapshot[]> {
+  return await invoke("cloud_workspace_snapshot_list");
+}
+
+export async function setCloudWorkspaceSnapshotProtected(snapshotId: string, protectedValue: boolean): Promise<CloudWorkspaceSnapshot> {
+  return await invoke("cloud_workspace_snapshot_set_protected", { request: { snapshotId, protected: protectedValue } });
+}
+
+export async function deleteCloudWorkspaceSnapshot(snapshotId: string): Promise<{ deleted: boolean; snapshotId: string }> {
+  return await invoke("cloud_workspace_snapshot_delete", { request: { snapshotId } });
+}
+
+export async function previewCloudWorkspaceSnapshot(snapshotId: string): Promise<CloudWorkspaceSnapshotPreview> {
+  return await invoke("cloud_workspace_snapshot_preview", { request: { snapshotId } });
+}
+
+export type CloudWorkspaceSnapshotSettings = {
+  automaticSnapshotEnabled: boolean;
+  automaticSnapshotTime: string;
+  automaticSnapshotTimezone: string;
+  snapshotRetentionDays: number;
+  nextAutomaticSnapshotAt: string | null;
+  lastAutomaticSnapshotAt: string | null;
+  schedulerActive: boolean;
+};
+
+export async function getCloudWorkspaceSnapshotSettings(): Promise<CloudWorkspaceSnapshotSettings> {
+  return await invoke("cloud_workspace_snapshot_settings_get");
+}
+
+export async function updateCloudWorkspaceSnapshotSettings(automaticSnapshotEnabled: boolean, automaticSnapshotTime: string, snapshotRetentionDays: number): Promise<CloudWorkspaceSnapshotSettings> {
+  return await invoke("cloud_workspace_snapshot_settings_update", { request: { automaticSnapshotEnabled, automaticSnapshotTime, snapshotRetentionDays } });
+}
+
+export type CloudWorkspaceRestorePrepareResult = {
+  lockToken: string; targetSnapshotId: string; targetContentHash: string; preparedEpoch: number;
+  safetySnapshotId: string; expiresAt: string; preview: CloudWorkspaceSnapshotPreview;
+};
+export type CloudWorkspaceRestoreResult = {
+  restored: boolean; targetSnapshotId: string; safetySnapshotId: string; previousEpoch: number;
+  workspaceEpoch: number; resetChangeSeq: number;
+};
+export async function prepareCloudWorkspaceRestore(snapshotId: string): Promise<CloudWorkspaceRestorePrepareResult> {
+  return await invoke("cloud_workspace_restore_prepare", { request: { snapshotId } });
+}
+export async function commitCloudWorkspaceRestore(request: {
+  lockToken: string; targetSnapshotId: string; targetContentHash: string; preparedEpoch: number;
+}): Promise<CloudWorkspaceRestoreResult> {
+  return await invoke("cloud_workspace_restore_commit", { request });
+}
+export async function cancelCloudWorkspaceRestore(lockToken: string): Promise<{ cancelled: boolean; safetySnapshotId?: string }> {
+  return await invoke("cloud_workspace_restore_cancel", { request: { lockToken } });
+}
 
 export type StorageMigrationPreview = {
   direction: "local_to_cloud" | "cloud_to_local_snapshot";
@@ -1328,6 +1537,10 @@ export async function resetLocalCacheFromCloud(): Promise<StorageModeSnapshot> {
   return await invoke("cloud_sync_reset_local_cache");
 }
 
+export async function discardOldEpochChangesAndRedownload(): Promise<StorageModeSnapshot> {
+  return await invoke("cloud_sync_discard_old_epoch_changes");
+}
+
 export async function listCloudSyncConflicts(): Promise<CloudSyncConflict[]> {
   return await invoke("cloud_sync_conflicts");
 }
@@ -1481,6 +1694,20 @@ export async function onCloudSyncStateChanged(handler: (payload: StorageModeSnap
     return await listen("cloud-sync-state-changed", ({ payload }) => {
       handler(payload as StorageModeSnapshot & { error?: string });
     });
+  } catch {
+    return () => {};
+  }
+}
+
+export type TimerFactFollowedEvent = {
+  operationType: string;
+  entityId: string;
+  version: number;
+};
+
+export async function onTimerFactFollowed(handler: (payload: TimerFactFollowedEvent) => void) {
+  try {
+    return await listen<TimerFactFollowedEvent>("timer-fact-followed", ({ payload }) => handler(payload));
   } catch {
     return () => {};
   }

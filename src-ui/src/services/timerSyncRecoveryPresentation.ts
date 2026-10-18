@@ -11,7 +11,6 @@ export function timerSyncRecoveryLabel(item: TimerSyncRecoveryItem) {
   const labels: Record<string, string> = {
     historical_candidate: "等待自动恢复",
     rebased: "已自动压缩，等待保存",
-    lease_wait: "等待计时写入权",
     competing_edit: "需要处理的设备冲突",
   };
   return item.recoveryKind ? labels[item.recoveryKind] ?? item.recoveryKind : "";

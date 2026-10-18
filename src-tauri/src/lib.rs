@@ -16,6 +16,7 @@ mod automation_hooks;
 #[cfg(test)]
 mod cloud_e2e;
 mod cloud_sync;
+mod data_protection;
 #[cfg(target_os = "windows")]
 mod native_tray;
 mod obsidian;
@@ -413,6 +414,12 @@ pub fn run() {
             download_and_install_update,
             restart_app,
             database::database_status,
+            data_protection::data_backup_export,
+            data_protection::data_backup_export_rescue,
+            data_protection::data_backup_preview,
+            data_protection::data_backup_import,
+            data_protection::data_backup_history_list,
+            data_protection::data_backup_open,
             automation_hooks::automation_hook_list,
             automation_hooks::automation_hook_create,
             automation_hooks::automation_hook_update,
@@ -440,6 +447,18 @@ pub fn run() {
             supabase::cloud_device_list,
             supabase::cloud_device_revoke,
             supabase::cloud_sync_resume_after_reauth,
+            supabase::cloud_operation_history_list,
+            supabase::cloud_operation_history_detail,
+            supabase::cloud_workspace_snapshot_create,
+            supabase::cloud_workspace_snapshot_list,
+            supabase::cloud_workspace_snapshot_set_protected,
+            supabase::cloud_workspace_snapshot_delete,
+            supabase::cloud_workspace_snapshot_preview,
+            supabase::cloud_workspace_snapshot_settings_get,
+            supabase::cloud_workspace_snapshot_settings_update,
+            supabase::cloud_workspace_restore_prepare,
+            supabase::cloud_workspace_restore_commit,
+            supabase::cloud_workspace_restore_cancel,
             supabase::storage_migration_preview,
             supabase::storage_migration_execute,
             cloud_sync::cloud_sync_status,
@@ -447,6 +466,7 @@ pub fn run() {
             cloud_sync::cloud_sync_refresh,
             cloud_sync::cloud_sync_save,
             cloud_sync::cloud_sync_reset_local_cache,
+            cloud_sync::cloud_sync_discard_old_epoch_changes,
             cloud_sync::cloud_sync_conflicts,
             cloud_sync::cloud_sync_resolve_conflict,
             cloud_sync::cloud_sync_resolve_all_conflicts,

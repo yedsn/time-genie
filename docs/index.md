@@ -27,6 +27,9 @@ features:
 
 - 查看 [`数据结构设计`](/20260924_timegenie_数据结构设计)
 - 查看 [`后端接口设计`](/20260924_timegenie_后端接口设计)
+- 查看 [`多设备计时同步`](/timer-multi-device-sync)
+- 查看 [`数据备份与恢复`](/data-protection)
+- 查看 [`云端操作记录`](/cloud-operation-history)
 - 查看 [`GitHub Release 发布说明`](/github-release)
 - 查看 [`GitHub Pages 部署`](/develop/github-pages)
 - 本地预览文档：`npm run docs:dev`

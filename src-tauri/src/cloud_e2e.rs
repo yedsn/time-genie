@@ -20,6 +20,7 @@ use crate::cloud_sync::{
     self, CloudConflictResolveRequest, CloudSyncPullRequest, CloudTimerStartRequest,
     CloudTimerVersionRequest, TrackingLeaseRequest,
 };
+use crate::data_protection::{self, BackupExportRequest};
 use crate::database::Database;
 use crate::recurring::{self, RecurrenceSaveRequest};
 use crate::reports::{
@@ -29,7 +30,9 @@ use crate::reports::{
 };
 use crate::subjects;
 use crate::supabase::{
-    self, CloudConfigureRequest, CloudDeviceRegisterRequest, CloudSignInRequest,
+    self, CloudConfigureRequest, CloudDeviceRegisterRequest, CloudOperationHistoryListRequest,
+    CloudSignInRequest, CloudWorkspaceRestoreCommitRequest, CloudWorkspaceSnapshotCreateRequest,
+    CloudWorkspaceSnapshotIdRequest, CloudWorkspaceSnapshotSettingsUpdateRequest,
     MigrationExecuteRequest,
 };
 use crate::tasks::{
@@ -217,6 +220,22 @@ fn task_version(database: &Database, task_id: &str) -> i64 {
             |row| row.get(0),
         )
         .unwrap()
+}
+
+fn settle_local_restore_gates(database: &Database) {
+    let connection = database.open().unwrap();
+    connection
+        .execute(
+            "UPDATE time_entries SET state='ended',ended_at=COALESCE(ended_at,started_at),updated_at=MAX(updated_at,started_at) WHERE state IN ('running','paused')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE unassigned_sessions SET state='discarded',resolution_type='discard',resolved_at=COALESCE(resolved_at,first_started_at),updated_at=MAX(updated_at,first_started_at) WHERE state IN ('collecting','awaiting_resolution')",
+            [],
+        )
+        .unwrap();
 }
 
 fn daily_estimate(database: &Database, task_id: &str, work_date: &str) -> Option<i64> {
@@ -417,9 +436,23 @@ fn report_unassigned_e2e(
     );
 }
 
-#[derive(Default)]
+#[derive(Clone)]
+struct PlanningSnapshotState {
+    subjects: HashMap<String, Value>,
+    tasks: HashMap<String, Value>,
+    occurrences: HashMap<String, Value>,
+    daily_estimates: HashMap<String, Value>,
+    recurrence_rules: HashMap<String, Vec<Value>>,
+    time_entries: HashMap<String, Value>,
+    report_templates: HashMap<String, Value>,
+    reports: HashMap<String, Value>,
+    base_change_seq: i64,
+    workspace_epoch: i64,
+}
+
 struct PlanningCloudState {
     latest_change_seq: i64,
+    workspace_epoch: i64,
     subjects: HashMap<String, Value>,
     tasks: HashMap<String, Value>,
     occurrences: HashMap<String, Value>,
@@ -432,10 +465,55 @@ struct PlanningCloudState {
     incremental_pull_count: usize,
     snapshot_get_count: usize,
     force_reset_required_once: bool,
+    snapshots: HashMap<String, PlanningSnapshotState>,
+    automatic_snapshot_enabled: bool,
+    automatic_snapshot_time: String,
+    automatic_snapshot_retention_days: i64,
+    requested_rpc_paths: Vec<String>,
+    restore_target_snapshot_id: Option<String>,
+    restore_safety_snapshot_id: Option<String>,
+    restore_lock_token: Option<String>,
+    restore_operation_count: usize,
+    operation_history_item_count: usize,
     tracking_lease_holder_device_id: Option<String>,
     tracking_lease_token: Option<String>,
     tracking_lease_version: i64,
     tracking_lease_expired: bool,
+}
+
+impl Default for PlanningCloudState {
+    fn default() -> Self {
+        Self {
+            latest_change_seq: 0,
+            workspace_epoch: 1,
+            subjects: HashMap::new(),
+            tasks: HashMap::new(),
+            occurrences: HashMap::new(),
+            daily_estimates: HashMap::new(),
+            recurrence_rules: HashMap::new(),
+            time_entries: HashMap::new(),
+            report_templates: HashMap::new(),
+            reports: HashMap::new(),
+            changes: Vec::new(),
+            incremental_pull_count: 0,
+            snapshot_get_count: 0,
+            force_reset_required_once: false,
+            snapshots: HashMap::new(),
+            automatic_snapshot_enabled: true,
+            automatic_snapshot_time: "03:00".to_string(),
+            automatic_snapshot_retention_days: 30,
+            requested_rpc_paths: Vec::new(),
+            restore_target_snapshot_id: None,
+            restore_safety_snapshot_id: None,
+            restore_lock_token: None,
+            restore_operation_count: 0,
+            operation_history_item_count: 0,
+            tracking_lease_holder_device_id: None,
+            tracking_lease_token: None,
+            tracking_lease_version: 0,
+            tracking_lease_expired: false,
+        }
+    }
 }
 
 struct PlanningCloudServer {
@@ -548,13 +626,44 @@ impl PlanningCloudServer {
         self.state.lock().unwrap().force_reset_required_once = true;
     }
 
+    fn capture_snapshot(&self) -> String {
+        let mut state = self.state.lock().unwrap();
+        let snapshot_id = Uuid::now_v7().to_string();
+        let snapshot = PlanningSnapshotState {
+            subjects: state.subjects.clone(),
+            tasks: state.tasks.clone(),
+            occurrences: state.occurrences.clone(),
+            daily_estimates: state.daily_estimates.clone(),
+            recurrence_rules: state.recurrence_rules.clone(),
+            time_entries: state.time_entries.clone(),
+            report_templates: state.report_templates.clone(),
+            reports: state.reports.clone(),
+            base_change_seq: state.latest_change_seq,
+            workspace_epoch: state.workspace_epoch,
+        };
+        state.snapshots.insert(snapshot_id.clone(), snapshot);
+        snapshot_id
+    }
+
+    fn restore_audit(&self) -> (i64, i64, Option<String>, usize) {
+        let state = self.state.lock().unwrap();
+        (
+            state.workspace_epoch,
+            state.latest_change_seq,
+            state.restore_safety_snapshot_id.clone(),
+            state.restore_operation_count,
+        )
+    }
+
     fn expire_tracking_lease(&self) {
         let mut state = self.state.lock().unwrap();
-        assert!(
-            state.tracking_lease_holder_device_id.is_some(),
-            "没有可供过期的隔离测试租约"
-        );
-        state.tracking_lease_expired = true;
+        if state.tracking_lease_holder_device_id.is_some() {
+            state.tracking_lease_expired = true;
+        }
+    }
+
+    fn requested_rpc_paths(&self) -> Vec<String> {
+        self.state.lock().unwrap().requested_rpc_paths.clone()
     }
 
     fn delay_next_apply_patch(&self, delay: Duration) {
@@ -567,7 +676,7 @@ impl PlanningCloudServer {
     }
 
     fn wait_for_delayed_apply_patch(&self) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !self
             .apply_patch_started
             .load(std::sync::atomic::Ordering::Acquire)
@@ -644,14 +753,10 @@ fn read_http_request(stream: &mut TcpStream) -> (String, Value) {
         .windows(4)
         .position(|value| value == b"\r\n\r\n")
         .unwrap_or(request.len());
-    let first_line = String::from_utf8_lossy(&request[..header_end])
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .to_string();
+    let request_head = String::from_utf8_lossy(&request[..header_end]).to_string();
     let body = request.get(header_end + 4..).unwrap_or_default();
     let json = serde_json::from_slice(body).unwrap_or(Value::Null);
-    (first_line, json)
+    (request_head, json)
 }
 
 fn write_http_json(stream: &mut TcpStream, status: u16, body: Value) {
@@ -662,6 +767,53 @@ fn write_http_json(stream: &mut TcpStream, status: u16, body: Value) {
         body.len()
     );
     stream.write_all(response.as_bytes()).unwrap();
+}
+
+fn request_workspace_epoch(request_line: &str) -> i64 {
+    request_line
+        .split("\r\n")
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-timegenie-workspace-epoch"))
+        .and_then(|(_, value)| value.trim().parse().ok())
+        .unwrap_or(1)
+}
+
+fn planning_snapshot_settings(state: &PlanningCloudState) -> Value {
+    json!({
+        "automaticSnapshotEnabled": state.automatic_snapshot_enabled,
+        "automaticSnapshotTime": state.automatic_snapshot_time,
+        "automaticSnapshotTimezone": "Asia/Shanghai",
+        "snapshotRetentionDays": state.automatic_snapshot_retention_days,
+        "nextAutomaticSnapshotAt": "2026-10-19T03:00:00+08:00",
+        "lastAutomaticSnapshotAt": Value::Null,
+        "schedulerActive": true
+    })
+}
+
+fn planning_snapshot_record(state: &PlanningCloudState) -> PlanningSnapshotState {
+    PlanningSnapshotState {
+        subjects: state.subjects.clone(),
+        tasks: state.tasks.clone(),
+        occurrences: state.occurrences.clone(),
+        daily_estimates: state.daily_estimates.clone(),
+        recurrence_rules: state.recurrence_rules.clone(),
+        time_entries: state.time_entries.clone(),
+        report_templates: state.report_templates.clone(),
+        reports: state.reports.clone(),
+        base_change_seq: state.latest_change_seq,
+        workspace_epoch: state.workspace_epoch,
+    }
+}
+
+fn restore_planning_snapshot(state: &mut PlanningCloudState, snapshot: &PlanningSnapshotState) {
+    state.subjects = snapshot.subjects.clone();
+    state.tasks = snapshot.tasks.clone();
+    state.occurrences = snapshot.occurrences.clone();
+    state.daily_estimates = snapshot.daily_estimates.clone();
+    state.recurrence_rules = snapshot.recurrence_rules.clone();
+    state.time_entries = snapshot.time_entries.clone();
+    state.report_templates = snapshot.report_templates.clone();
+    state.reports = snapshot.reports.clone();
 }
 
 fn record_change(
@@ -688,6 +840,7 @@ fn record_change(
 fn planning_snapshot(state: &PlanningCloudState) -> Value {
     json!({
         "latest_change_seq": state.latest_change_seq,
+        "workspace_epoch": state.workspace_epoch,
         "subjects": state.subjects.values().cloned().collect::<Vec<_>>(),
         "tasks": state.tasks.values().cloned().collect::<Vec<_>>(),
         "task_status_events": [],
@@ -791,7 +944,8 @@ fn planning_incremental_pull(state: &PlanningCloudState, body: &Value) -> Value 
         "covered_change_seq": covered_change_seq,
         "latest_change_seq": state.latest_change_seq,
         "has_more": covered_change_seq < state.latest_change_seq,
-        "reset_required": false
+        "reset_required": false,
+        "workspace_epoch": state.workspace_epoch
     })
 }
 
@@ -803,16 +957,162 @@ fn handle_planning_cloud_request(
 ) {
     let (request_line, body) = read_http_request(&mut stream);
     let mut state = state.lock().unwrap();
+    let request_epoch = request_workspace_epoch(&request_line);
+    state.requested_rpc_paths.push(request_line.clone());
     if request_line.contains("/rest/v1/rpc/device_authorization_get") {
         return write_http_json(&mut stream, 200, json!({ "authorized": true }));
+    }
+    if request_line.contains("/rest/v1/rpc/workspace_snapshot_settings_get") {
+        let settings = planning_snapshot_settings(&state);
+        return write_http_json(&mut stream, 200, settings);
+    }
+    if request_line.contains("/rest/v1/rpc/workspace_snapshot_settings_update") {
+        state.automatic_snapshot_enabled = body["p_automatic_snapshot_enabled"]
+            .as_bool()
+            .unwrap_or(true);
+        state.automatic_snapshot_time = body["p_automatic_snapshot_time"]
+            .as_str()
+            .unwrap_or("03:00")
+            .to_string();
+        if let Some(days) = body["p_snapshot_retention_days"].as_i64() {
+            state.automatic_snapshot_retention_days = days;
+        }
+        let settings = planning_snapshot_settings(&state);
+        return write_http_json(&mut stream, 200, settings);
+    }
+    if request_line.contains("/rest/v1/rpc/workspace_snapshot_create") {
+        let snapshot_id = Uuid::now_v7().to_string();
+        let snapshot = planning_snapshot_record(&state);
+        let name = body["p_name"].as_str().unwrap_or("测试镜像");
+        let content_hash = format!("hash-{snapshot_id}");
+        let workspace_epoch = snapshot.workspace_epoch;
+        let base_change_seq = snapshot.base_change_seq;
+        state.snapshots.insert(snapshot_id.clone(), snapshot);
+        return write_http_json(
+            &mut stream,
+            200,
+            json!({
+                "id": snapshot_id, "snapshotType": body["p_snapshot_type"].as_str().unwrap_or("manual"),
+                "name": name, "note": body["p_note"], "status": "ready", "formatVersion": 1,
+                "baseChangeSeq": base_change_seq, "workspaceEpoch": workspace_epoch,
+                "entityCounts": {"tasks": state.tasks.len()}, "groupHashes": {}, "contentHash": content_hash,
+                "sizeBytes": 1, "chunkCount": 1, "deviceName": "隔离设备", "protected": false,
+                "protectedAt": null, "expiresAt": null, "createdAt": "2026-10-18T00:00:00Z",
+                "completedAt": "2026-10-18T00:00:00Z", "failureReason": null
+            }),
+        );
+    }
+    if request_line.contains("/rest/v1/rpc/workspace_restore_prepare") {
+        if request_epoch != state.workspace_epoch {
+            return write_http_json(
+                &mut stream,
+                409,
+                json!({"message": format!("WORKSPACE_EPOCH_STALE: server={}", state.workspace_epoch)}),
+            );
+        }
+        let target_snapshot_id = body["p_target_snapshot_id"].as_str().unwrap().to_string();
+        if !state.snapshots.contains_key(&target_snapshot_id) {
+            return write_http_json(&mut stream, 409, json!({"message": "SNAPSHOT_NOT_FOUND"}));
+        }
+        let safety_snapshot_id = Uuid::now_v7().to_string();
+        let safety_snapshot = planning_snapshot_record(&state);
+        state
+            .snapshots
+            .insert(safety_snapshot_id.clone(), safety_snapshot);
+        let lock_token = Uuid::now_v7().to_string();
+        state.restore_target_snapshot_id = Some(target_snapshot_id.clone());
+        state.restore_safety_snapshot_id = Some(safety_snapshot_id.clone());
+        state.restore_lock_token = Some(lock_token.clone());
+        return write_http_json(
+            &mut stream,
+            200,
+            json!({
+                "lockToken": lock_token, "targetSnapshotId": target_snapshot_id.clone(),
+                "targetContentHash": format!("hash-{target_snapshot_id}"), "preparedEpoch": state.workspace_epoch,
+                "safetySnapshotId": safety_snapshot_id, "expiresAt": "2099-01-01T00:10:00Z",
+                "preview": {"snapshotId": target_snapshot_id, "restorable": true, "errorCode": null,
+                    "entityCounts": {"tasks": state.tasks.len()}, "currentEntityCounts": {"tasks": state.tasks.len()},
+                    "groups": {}, "entities": {}, "contentHash": format!("hash-{}", body["p_target_snapshot_id"].as_str().unwrap())}
+            }),
+        );
+    }
+    if request_line.contains("/rest/v1/rpc/workspace_restore_commit") {
+        let lock_token = body["p_lock_token"].as_str().unwrap_or_default();
+        if state.restore_lock_token.as_deref() != Some(lock_token) {
+            return write_http_json(&mut stream, 409, json!({"message": "RESTORE_LOCK_INVALID"}));
+        }
+        let target_snapshot_id = body["p_target_snapshot_id"].as_str().unwrap().to_string();
+        let target = state.snapshots.get(&target_snapshot_id).cloned().unwrap();
+        let safety_snapshot_id = state.restore_safety_snapshot_id.clone().unwrap();
+        let previous_epoch = state.workspace_epoch;
+        restore_planning_snapshot(&mut state, &target);
+        state.workspace_epoch += 1;
+        state.latest_change_seq += 1;
+        let reset_change_seq = state.latest_change_seq;
+        let workspace_epoch = state.workspace_epoch;
+        state.changes.push(json!({
+            "change_seq": reset_change_seq, "workspace_id": body["p_workspace_id"],
+            "entity_type": "workspace_reset", "entity_id": body["p_workspace_id"], "operation": "reset",
+            "entity_version": workspace_epoch, "changed_at": "2026-10-18T00:00:00Z"
+        }));
+        state.restore_operation_count += 1;
+        state.restore_lock_token = None;
+        return write_http_json(
+            &mut stream,
+            200,
+            json!({
+                "restored": true, "targetSnapshotId": target_snapshot_id, "safetySnapshotId": safety_snapshot_id,
+                "previousEpoch": previous_epoch, "workspaceEpoch": state.workspace_epoch, "resetChangeSeq": reset_change_seq
+            }),
+        );
     }
     if request_line.contains("/rest/v1/rpc/cloud_snapshot_get") {
         state.snapshot_get_count += 1;
         return write_http_json(&mut stream, 200, planning_snapshot(&state));
     }
+    if request_line.contains("/rest/v1/rpc/cloud_operation_history_list") {
+        let history_count = if state.operation_history_item_count > 0 {
+            state.operation_history_item_count
+        } else if state.restore_operation_count > 0 {
+            1
+        } else {
+            0
+        };
+        let all_items = if history_count > 0 {
+            (0..history_count).map(|index| json!({
+                "id": format!("restore-log-{index}"), "operationId": format!("restore-operation-{index}"), "businessType": "restore",
+                "source": "restore", "deviceId": "device-a", "deviceName": "设备 A",
+                "summary": "将工作空间回滚到历史镜像", "affectedEntityCount": 1,
+                "occurredAt": format!("2026-10-{:02}T00:00:00Z", 18 - (index / 24)), "expiresAt": "2027-01-16T00:00:00Z", "metadata": {}
+            })).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let limit = body["p_limit"].as_u64().unwrap_or(50) as usize;
+        let offset = body["p_cursor_id"]
+            .as_str()
+            .and_then(|value| value.strip_prefix("cursor-"))
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let items = all_items
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        let next_offset = offset + items.len();
+        let next_cursor = (next_offset < all_items.len()).then(
+            || json!({"occurredAt": "2026-10-01T00:00:00Z", "id": format!("cursor-{next_offset}")}),
+        );
+        return write_http_json(
+            &mut stream,
+            200,
+            json!({ "items": items, "nextCursor": next_cursor }),
+        );
+    }
     if request_line.contains("/rest/v1/rpc/cloud_incremental_pull") {
         state.incremental_pull_count += 1;
-        if state.force_reset_required_once {
+        if state.force_reset_required_once || request_epoch != state.workspace_epoch {
             state.force_reset_required_once = false;
             return write_http_json(
                 &mut stream,
@@ -823,7 +1123,8 @@ fn handle_planning_cloud_request(
                     "covered_change_seq": body["p_after_change_seq"].as_i64().unwrap_or_default(),
                     "latest_change_seq": state.latest_change_seq,
                     "has_more": false,
-                    "reset_required": true
+                    "reset_required": true,
+                    "workspace_epoch": state.workspace_epoch
                 }),
             );
         }
@@ -843,6 +1144,69 @@ fn handle_planning_cloud_request(
             .cloned()
             .collect::<Vec<_>>();
         return write_http_json(&mut stream, 200, Value::Array(changes));
+    }
+    if request_line.contains("/rest/v1/rpc/timer_sync_context_get") {
+        let entity_id = body["p_entity_id"].as_str();
+        let authoritative = entity_id
+            .and_then(|id| state.time_entries.get(id).cloned())
+            .or_else(|| {
+                state
+                    .time_entries
+                    .values()
+                    .find(|entry| {
+                        entry["source_type"].as_str() == Some("timer")
+                            && matches!(entry["state"].as_str(), Some("running" | "paused"))
+                            && entry["deleted_at"].is_null()
+                    })
+                    .cloned()
+            });
+        return write_http_json(
+            &mut stream,
+            200,
+            json!({
+                "processedOperation": null,
+                "entityId": entity_id,
+                "currentVersion": authoritative.as_ref().and_then(|entry| entry["version"].as_i64()),
+                "authoritative": authoritative
+            }),
+        );
+    }
+    if request_line.contains("/rest/v1/rpc/tracking_lease_takeover_for_timer_write") {
+        let device_id = body["p_device_id"].as_str().unwrap();
+        let lease_token = body["p_lease_token"].as_str().unwrap();
+        let previous_holder = state.tracking_lease_holder_device_id.clone();
+        let takeover = previous_holder
+            .as_deref()
+            .is_some_and(|holder| holder != device_id);
+        state.tracking_lease_holder_device_id = Some(device_id.to_string());
+        state.tracking_lease_token = Some(lease_token.to_string());
+        state.tracking_lease_version += 1;
+        state.tracking_lease_expired = false;
+        let authoritative_timer = takeover.then(|| {
+            state
+                .time_entries
+                .values()
+                .filter(|entry| {
+                    entry["source_type"].as_str() == Some("timer")
+                        && matches!(entry["state"].as_str(), Some("running" | "paused"))
+                        && entry["deleted_at"].is_null()
+                })
+                .max_by_key(|entry| entry["started_at"].as_i64().unwrap_or_default())
+                .cloned()
+        });
+        return write_http_json(
+            &mut stream,
+            200,
+            json!({
+                "acquired": true,
+                "leaseToken": lease_token,
+                "expiresAt": "2099-01-01T00:00:45Z",
+                "version": state.tracking_lease_version,
+                "takeover": takeover,
+                "previousHolderDeviceId": previous_holder,
+                "authoritativeTimer": authoritative_timer.flatten()
+            }),
+        );
     }
     if request_line.contains("/rest/v1/rpc/tracking_lease_acquire") {
         let device_id = body["p_device_id"].as_str().unwrap();
@@ -1061,6 +1425,13 @@ fn handle_planning_cloud_request(
             &mut stream,
             409,
             json!({ "message": format!("unexpected request: {request_line}") }),
+        );
+    }
+    if request_epoch != state.workspace_epoch {
+        return write_http_json(
+            &mut stream,
+            409,
+            json!({ "message": format!("WORKSPACE_EPOCH_STALE: server={}", state.workspace_epoch) }),
         );
     }
     apply_patch_started.store(true, std::sync::atomic::Ordering::Release);
@@ -2054,6 +2425,402 @@ fn isolated_supabase_planning_two_device_flow() {
 }
 
 #[test]
+fn isolated_automatic_snapshot_settings_are_shared_across_devices() {
+    let directory = tempfile::tempdir().unwrap();
+    let device_a = Database::initialize_at(directory.path().join("snapshot-a.sqlite3")).unwrap();
+    let device_b = Database::initialize_at(directory.path().join("snapshot-b.sqlite3")).unwrap();
+    let cloud = PlanningCloudServer::start();
+    let workspace_id = Uuid::now_v7().to_string();
+    configure_isolated_planning_device(
+        &device_a,
+        &cloud.base_url,
+        &workspace_id,
+        "snapshot-user-a",
+    );
+    configure_isolated_planning_device(
+        &device_b,
+        &cloud.base_url,
+        &workspace_id,
+        "snapshot-user-b",
+    );
+
+    let initial = supabase::workspace_snapshot_settings_get(&device_a).unwrap();
+    assert!(initial.automatic_snapshot_enabled);
+    assert_eq!(initial.automatic_snapshot_time, "03:00");
+    assert_eq!(initial.automatic_snapshot_timezone, "Asia/Shanghai");
+    assert_eq!(initial.snapshot_retention_days, 30);
+    assert!(initial.scheduler_active);
+    assert!(initial.next_automatic_snapshot_at.is_some());
+    assert!(initial.last_automatic_snapshot_at.is_none());
+
+    supabase::workspace_snapshot_settings_update(
+        &device_a,
+        CloudWorkspaceSnapshotSettingsUpdateRequest {
+            automatic_snapshot_enabled: true,
+            automatic_snapshot_time: "21:30".to_string(),
+            snapshot_retention_days: 7,
+        },
+    )
+    .unwrap();
+    let shared = supabase::workspace_snapshot_settings_get(&device_b).unwrap();
+    assert_eq!(shared.automatic_snapshot_time, "21:30");
+    assert_eq!(shared.snapshot_retention_days, 7);
+
+    supabase::workspace_snapshot_settings_update(
+        &device_b,
+        CloudWorkspaceSnapshotSettingsUpdateRequest {
+            automatic_snapshot_enabled: false,
+            automatic_snapshot_time: "21:30".to_string(),
+            snapshot_retention_days: 7,
+        },
+    )
+    .unwrap();
+    assert!(!supabase::workspace_snapshot_settings_get(&device_a)
+        .unwrap()
+        .automatic_snapshot_enabled);
+
+    assert!(supabase::workspace_snapshot_settings_update(
+        &device_a,
+        CloudWorkspaceSnapshotSettingsUpdateRequest {
+            automatic_snapshot_enabled: true,
+            automatic_snapshot_time: "24:00".to_string(),
+            snapshot_retention_days: 7,
+        },
+    )
+    .is_err());
+    assert!(supabase::workspace_snapshot_settings_update(
+        &device_a,
+        CloudWorkspaceSnapshotSettingsUpdateRequest {
+            automatic_snapshot_enabled: true,
+            automatic_snapshot_time: "03:00".to_string(),
+            snapshot_retention_days: 0,
+        },
+    )
+    .is_err());
+}
+
+#[test]
+fn isolated_sync_round_never_requests_automatic_snapshots() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::initialize_at(directory.path().join("snapshot-sync.sqlite3")).unwrap();
+    let cloud = PlanningCloudServer::start();
+    let workspace_id = Uuid::now_v7().to_string();
+    configure_isolated_planning_device(
+        &database,
+        &cloud.base_url,
+        &workspace_id,
+        "snapshot-sync-user",
+    );
+
+    let source = cloud_sync::run_sync_coordinator_round_for_test(&database).unwrap();
+    assert_ne!(source, "offline");
+    let paths = cloud.requested_rpc_paths();
+    assert!(
+        !paths.is_empty(),
+        "the sync round must reach the cloud before this assertion means anything"
+    );
+    assert!(
+        paths
+            .iter()
+            .all(|path| !path.to_lowercase().contains("automatic")),
+        "a sync round must never schedule automatic snapshots: {paths:?}"
+    );
+}
+#[test]
+fn isolated_operation_history_uses_fifty_row_cursor_pages_without_duplicates() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::initialize_at(directory.path().join("history-pages.sqlite3")).unwrap();
+    let cloud = PlanningCloudServer::start();
+    let workspace_id = Uuid::now_v7().to_string();
+    configure_isolated_planning_device(&database, &cloud.base_url, &workspace_id, "history-user");
+    cloud.state.lock().unwrap().operation_history_item_count = 75;
+    let first = supabase::operation_history_list(
+        &database,
+        CloudOperationHistoryListRequest {
+            limit: None,
+            cursor: None,
+            from: None,
+            to: None,
+            device_id: None,
+            source: None,
+            business_type: None,
+            query: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(first.items.len(), 50);
+    assert!(first.next_cursor.is_some());
+    let second = supabase::operation_history_list(
+        &database,
+        CloudOperationHistoryListRequest {
+            limit: None,
+            cursor: first.next_cursor,
+            from: None,
+            to: None,
+            device_id: None,
+            source: None,
+            business_type: None,
+            query: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(second.items.len(), 25);
+    assert!(second.next_cursor.is_none());
+    let first_ids = first
+        .items
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(second
+        .items
+        .iter()
+        .all(|item| !first_ids.contains(item.id.as_str())));
+}
+
+#[test]
+fn isolated_workspace_restore_rebuilds_clean_second_device() {
+    let directory = tempfile::tempdir().unwrap();
+    let device_a =
+        Database::initialize_at(directory.path().join("restore-clean-a.sqlite3")).unwrap();
+    let device_b =
+        Database::initialize_at(directory.path().join("restore-clean-b.sqlite3")).unwrap();
+    let cloud = PlanningCloudServer::start();
+    let workspace_id = Uuid::now_v7().to_string();
+    configure_isolated_planning_device(
+        &device_a,
+        &cloud.base_url,
+        &workspace_id,
+        "restore-clean-user-a",
+    );
+    configure_isolated_planning_device(
+        &device_b,
+        &cloud.base_url,
+        &workspace_id,
+        "restore-clean-user-b",
+    );
+    let subject = subjects::list_subjects(&device_a).unwrap().remove(0);
+    let task = create_task(&device_a, &subject.id, "回滚前标题");
+    cloud.seed(&device_a, &subject, &task);
+    cloud_sync::pull_snapshot(&device_b).unwrap();
+
+    let snapshot = supabase::workspace_snapshot_create(
+        &device_a,
+        CloudWorkspaceSnapshotCreateRequest {
+            name: "回滚目标".to_string(),
+            note: Some("双设备自动重建验收".to_string()),
+            snapshot_type: Some("manual".to_string()),
+            lazy: Some(false),
+        },
+    )
+    .unwrap();
+    let changed = update_task_title(&device_a, &task, "回滚后应被移除的标题");
+    cloud_sync::enqueue_entity(
+        &device_a,
+        "task_update",
+        "task",
+        Some(&changed.id),
+        Some(task.version),
+        None,
+    )
+    .unwrap();
+    assert_eq!(push_all(&device_a).pending, 0);
+    pull_all(&device_b);
+    assert_eq!(
+        list_tasks(&device_b)
+            .into_iter()
+            .find(|item| item.id == task.id)
+            .unwrap()
+            .title,
+        "回滚后应被移除的标题"
+    );
+    settle_local_restore_gates(&device_a);
+
+    let prepared = supabase::workspace_restore_prepare(
+        &device_a,
+        CloudWorkspaceSnapshotIdRequest {
+            snapshot_id: snapshot.id.clone(),
+        },
+    )
+    .unwrap();
+    let restored = supabase::workspace_restore_commit(
+        &device_a,
+        CloudWorkspaceRestoreCommitRequest {
+            lock_token: prepared.lock_token,
+            target_snapshot_id: prepared.target_snapshot_id,
+            target_content_hash: prepared.target_content_hash,
+            prepared_epoch: prepared.prepared_epoch,
+        },
+    )
+    .unwrap();
+    assert_eq!((restored.previous_epoch, restored.workspace_epoch), (1, 2));
+
+    let pulled = cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: None,
+            limit: None,
+        },
+    )
+    .unwrap();
+    let status = cloud_sync::sync_status(&device_b).unwrap();
+    assert_eq!(status.workspace_epoch, 2);
+    assert!(!status.epoch_blocked);
+    assert_eq!(pulled.last_change_seq, restored.reset_change_seq);
+    assert_eq!(
+        list_tasks(&device_b)
+            .into_iter()
+            .find(|item| item.id == task.id)
+            .unwrap()
+            .title,
+        "回滚前标题"
+    );
+    let (epoch, latest_seq, safety_snapshot_id, restore_logs) = cloud.restore_audit();
+    assert_eq!(
+        (epoch, latest_seq, restore_logs),
+        (2, restored.reset_change_seq, 1)
+    );
+    assert_eq!(
+        safety_snapshot_id.as_deref(),
+        Some(restored.safety_snapshot_id.as_str())
+    );
+    assert!(cloud
+        .state
+        .lock()
+        .unwrap()
+        .snapshots
+        .contains_key(&restored.safety_snapshot_id));
+    let history = supabase::operation_history_list(
+        &device_a,
+        CloudOperationHistoryListRequest {
+            limit: Some(20),
+            cursor: None,
+            from: None,
+            to: None,
+            device_id: None,
+            source: Some("restore".to_string()),
+            business_type: None,
+            query: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(history.items.len(), 1);
+    assert_eq!(history.items[0].source, "restore");
+    assert_eq!(history.items[0].business_type, "restore");
+}
+
+#[test]
+fn isolated_workspace_restore_blocks_old_epoch_and_allows_rescue_then_discard() {
+    let directory = tempfile::tempdir().unwrap();
+    let device_a =
+        Database::initialize_at(directory.path().join("restore-dirty-a.sqlite3")).unwrap();
+    let device_b =
+        Database::initialize_at(directory.path().join("restore-dirty-b.sqlite3")).unwrap();
+    let cloud = PlanningCloudServer::start();
+    let workspace_id = Uuid::now_v7().to_string();
+    configure_isolated_planning_device(
+        &device_a,
+        &cloud.base_url,
+        &workspace_id,
+        "restore-dirty-user-a",
+    );
+    configure_isolated_planning_device(
+        &device_b,
+        &cloud.base_url,
+        &workspace_id,
+        "restore-dirty-user-b",
+    );
+    let subject = subjects::list_subjects(&device_a).unwrap().remove(0);
+    let task = create_task(&device_a, &subject.id, "云端回滚目标标题");
+    cloud.seed(&device_a, &subject, &task);
+    cloud_sync::pull_snapshot(&device_b).unwrap();
+    let snapshot_id = cloud.capture_snapshot();
+
+    let offline = update_task_title(&device_b, &task, "设备 B 离线旧世代标题");
+    cloud_sync::enqueue_entity_deferred(
+        &device_b,
+        "task_update",
+        "task",
+        Some(&offline.id),
+        Some(task.version),
+        None,
+    )
+    .unwrap();
+    settle_local_restore_gates(&device_a);
+
+    let prepared = supabase::workspace_restore_prepare(
+        &device_a,
+        CloudWorkspaceSnapshotIdRequest {
+            snapshot_id: snapshot_id.clone(),
+        },
+    )
+    .unwrap();
+    let restored = supabase::workspace_restore_commit(
+        &device_a,
+        CloudWorkspaceRestoreCommitRequest {
+            lock_token: prepared.lock_token,
+            target_snapshot_id: snapshot_id,
+            target_content_hash: prepared.target_content_hash,
+            prepared_epoch: prepared.prepared_epoch,
+        },
+    )
+    .unwrap();
+
+    let push = cloud_sync::push_outbox(&device_b).unwrap();
+    assert_eq!(push.pushed, 0);
+    let blocked = cloud_sync::sync_status(&device_b).unwrap();
+    assert!(
+        blocked.epoch_blocked,
+        "status={blocked:?} push={push:?} outbox={:?}",
+        outbox_debug(&device_b)
+    );
+    assert_eq!(blocked.workspace_epoch, restored.workspace_epoch);
+    let connection = device_b.open().unwrap();
+    let old_outbox: (i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*),MIN(workspace_epoch) FROM sync_outbox WHERE workspace_id=?1",
+            [&workspace_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(old_outbox, (1, 1));
+    drop(connection);
+    assert_eq!(
+        cloud.state.lock().unwrap().tasks[&task.id]["title"],
+        "云端回滚目标标题"
+    );
+
+    let rescue_path = directory.path().join("old-epoch-rescue.timegenie-backup");
+    let rescue = data_protection::export_backup(
+        &device_b,
+        BackupExportRequest {
+            path: rescue_path.display().to_string(),
+            rescue: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(rescue.backup_kind, "stale_epoch_rescue");
+    assert!(rescue_path.exists());
+
+    let reset = cloud_sync::discard_old_epoch_changes_and_redownload(&device_b).unwrap();
+    assert_eq!(reset.workspace_epoch, restored.workspace_epoch);
+    assert!(!reset.epoch_blocked);
+    assert_eq!(reset.pending_operations, 0);
+    assert_eq!(
+        list_tasks(&device_b)
+            .into_iter()
+            .find(|item| item.id == task.id)
+            .unwrap()
+            .title,
+        "云端回滚目标标题"
+    );
+    let safety_backups = std::fs::read_dir(directory.path().join("backups"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .count();
+    assert_eq!(safety_backups, 1);
+}
+
+#[test]
 fn isolated_timer_transition_offline_retry_converges_two_devices() {
     let directory = tempfile::tempdir().unwrap();
     let device_a = Database::initialize_at(directory.path().join("transition-a.sqlite3")).unwrap();
@@ -2144,12 +2911,152 @@ fn isolated_timer_transition_offline_retry_converges_two_devices() {
         .get_mut(&local_result.active_entry.id)
         .unwrap()["version"] = json!(99);
     let pushed = push_all(&device_a);
-    assert_eq!(pushed.conflicts, 1);
+    assert_eq!((pushed.pending, pushed.conflicts), (0, 0));
     let remote = cloud.state.lock().unwrap();
     assert!(!remote.time_entries.contains_key(&stale.active_entry.id));
     assert_eq!(
         remote.time_entries[&local_result.active_entry.id]["state"].as_str(),
         Some("running")
+    );
+    drop(remote);
+    let local_entries = today_entries(&device_a).entries;
+    assert!(!local_entries
+        .iter()
+        .any(|entry| entry.id == stale.active_entry.id));
+    assert!(local_entries
+        .iter()
+        .any(|entry| { entry.id == local_result.active_entry.id && entry.state == "running" }));
+}
+
+#[test]
+fn timer_write_succeeds_while_another_device_holds_background_lease() {
+    let directory = tempfile::tempdir().unwrap();
+    let device_a = Database::initialize_at(directory.path().join("lease-holder.sqlite3")).unwrap();
+    let device_b = Database::initialize_at(directory.path().join("timer-writer.sqlite3")).unwrap();
+    let cloud = PlanningCloudServer::start();
+    let workspace_id = Uuid::now_v7().to_string();
+    let state_a = configure_isolated_planning_device(
+        &device_a,
+        &cloud.base_url,
+        &workspace_id,
+        "lease-user-a",
+    );
+    configure_isolated_planning_device(&device_b, &cloud.base_url, &workspace_id, "lease-user-b");
+    let subject = subjects::list_subjects(&device_a).unwrap().remove(0);
+    let task = create_task(&device_a, &subject.id, "主动计时接管租约");
+    cloud.seed(&device_a, &subject, &task);
+    cloud_sync::pull_snapshot(&device_b).unwrap();
+
+    let holder = cloud_sync::acquire_lease(&device_a).unwrap();
+    assert_eq!(holder["acquired"], true);
+    let timer = cloud_sync::legacy_cloud_timer_start_local_first(
+        &device_b,
+        CloudTimerStartRequest {
+            task_id: Some(task.id),
+            note: None,
+            operation_id: Uuid::now_v7().to_string(),
+        },
+    )
+    .unwrap();
+
+    let started = push_all(&device_b);
+    assert_eq!((started.pending, started.conflicts), (0, 0));
+    assert_eq!(
+        cloud
+            .state
+            .lock()
+            .unwrap()
+            .tracking_lease_holder_device_id
+            .as_deref(),
+        Some(state_a.device_id.as_str())
+    );
+
+    cloud_sync::legacy_cloud_timer_stop_local_first(
+        &device_b,
+        CloudTimerVersionRequest {
+            entry_id: timer.id,
+            expected_version: timer.version,
+            operation_id: Uuid::now_v7().to_string(),
+        },
+    )
+    .unwrap();
+    let stopped = push_all(&device_b);
+    assert_eq!((stopped.pending, stopped.conflicts), (0, 0));
+    assert_eq!(
+        cloud
+            .state
+            .lock()
+            .unwrap()
+            .tracking_lease_holder_device_id
+            .as_deref(),
+        Some(state_a.device_id.as_str())
+    );
+}
+
+#[test]
+fn competing_timer_stops_follow_first_cloud_result_without_conflict() {
+    let directory = tempfile::tempdir().unwrap();
+    let device_a = Database::initialize_at(directory.path().join("stop-a.sqlite3")).unwrap();
+    let device_b = Database::initialize_at(directory.path().join("stop-b.sqlite3")).unwrap();
+    let cloud = PlanningCloudServer::start();
+    let workspace_id = Uuid::now_v7().to_string();
+    configure_isolated_planning_device(&device_a, &cloud.base_url, &workspace_id, "stop-user-a");
+    configure_isolated_planning_device(&device_b, &cloud.base_url, &workspace_id, "stop-user-b");
+    let subject = subjects::list_subjects(&device_a).unwrap().remove(0);
+    let task = create_task(&device_a, &subject.id, "竞争结束计时");
+    cloud.seed(&device_a, &subject, &task);
+    cloud_sync::pull_snapshot(&device_b).unwrap();
+
+    let timer = cloud_sync::legacy_cloud_timer_start_local_first(
+        &device_a,
+        CloudTimerStartRequest {
+            task_id: Some(task.id),
+            note: None,
+            operation_id: Uuid::now_v7().to_string(),
+        },
+    )
+    .unwrap();
+    let started = push_all(&device_a);
+    assert_eq!((started.pending, started.conflicts), (0, 0));
+    pull_all(&device_b);
+
+    let stop_a = cloud_sync::legacy_cloud_timer_stop_local_first(
+        &device_a,
+        CloudTimerVersionRequest {
+            entry_id: timer.id.clone(),
+            expected_version: timer.version,
+            operation_id: Uuid::now_v7().to_string(),
+        },
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(5));
+    let stop_b = cloud_sync::legacy_cloud_timer_stop_local_first(
+        &device_b,
+        CloudTimerVersionRequest {
+            entry_id: timer.id.clone(),
+            expected_version: timer.version,
+            operation_id: Uuid::now_v7().to_string(),
+        },
+    )
+    .unwrap();
+    assert!(stop_b.ended_at >= stop_a.ended_at);
+
+    let first = push_all(&device_a);
+    let follower = push_all(&device_b);
+    assert_eq!((first.pending, first.conflicts), (0, 0));
+    assert_eq!((follower.pending, follower.conflicts), (0, 0));
+    assert!(cloud_sync::list_conflicts(&device_b).unwrap().is_empty());
+    let cloud_entry = cloud.state.lock().unwrap().time_entries[&timer.id].clone();
+    let followed = today_entries(&device_b)
+        .entries
+        .into_iter()
+        .find(|entry| entry.id == timer.id)
+        .unwrap();
+    assert_eq!(followed.state, "ended");
+    assert_eq!(followed.ended_at, cloud_entry["ended_at"].as_i64());
+    assert_eq!(
+        followed.duration_seconds,
+        cloud_entry["duration_seconds"].as_i64().unwrap()
     );
 }
 

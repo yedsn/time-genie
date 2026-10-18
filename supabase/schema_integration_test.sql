@@ -52,12 +52,34 @@ end $$;
 \ir 20261013_timegenie_unassigned_lease_continuity_fix.sql
 \ir 20261014_timegenie_timer_sync_authority.sql
 \ir 20261014_timegenie_timer_sync_authority.sql
+\ir 20261018_timegenie_timer_write_lease_takeover.sql
+\ir 20261018_timegenie_timer_write_lease_takeover.sql
+\ir 20261018f_timegenie_timer_fact_convergence.sql
+\ir 20261018f_timegenie_timer_fact_convergence.sql
 \ir 20261015_timegenie_actual_adjustment_batch.sql
 \ir 20261015_timegenie_actual_adjustment_batch.sql
 \ir 20261016_timegenie_named_template_bootstrap_fix.sql
 \ir 20261016_timegenie_named_template_bootstrap_fix.sql
 \ir 20261016b_timegenie_timer_transition.sql
 \ir 20261016b_timegenie_timer_transition.sql
+\ir 20261018b_timegenie_operation_history.sql
+\ir 20261018b_timegenie_operation_history.sql
+\ir 20261018c_timegenie_workspace_snapshots.sql
+\ir 20261018c_timegenie_workspace_snapshots.sql
+\ir 20261018d_timegenie_workspace_epoch.sql
+\ir 20261018d_timegenie_workspace_epoch.sql
+\ir 20261018e_timegenie_workspace_restore.sql
+\ir 20261018e_timegenie_workspace_restore.sql
+\ir 20261018g_timegenie_automatic_snapshot_schedule.sql
+\ir 20261018g_timegenie_automatic_snapshot_schedule.sql
+\ir 20261018h_timegenie_operation_history_page_size.sql
+\ir 20261018h_timegenie_operation_history_page_size.sql
+\ir 20261018i_timegenie_history_detail_and_snapshot_timeout.sql
+\ir 20261018i_timegenie_history_detail_and_snapshot_timeout.sql
+\ir 20261018j_timegenie_snapshot_retention.sql
+\ir 20261018j_timegenie_snapshot_retention.sql
+\ir 20261018k_timegenie_fixed_daily_snapshot.sql
+\ir 20261018k_timegenie_fixed_daily_snapshot.sql
 
 do $$
 begin
@@ -115,6 +137,7 @@ begin
   end if;
   if not has_function_privilege('authenticated', 'timegenie.tracking_lease_acquire(uuid, uuid, uuid)', 'execute')
      or not has_function_privilege('authenticated', 'timegenie.tracking_lease_renew(uuid, uuid, uuid)', 'execute')
+     or not has_function_privilege('authenticated', 'timegenie.tracking_lease_takeover_for_timer_write(uuid, uuid, uuid)', 'execute')
      or not has_function_privilege('authenticated', 'timegenie.tracking_lease_release(uuid, uuid, uuid)', 'execute')
      or not has_function_privilege('authenticated', 'timegenie.unassigned_tick(uuid, uuid, uuid)', 'execute') then
     raise exception 'authenticated is missing tracking lease RPC privileges';
@@ -1628,9 +1651,10 @@ do $$
 declare timer_payload jsonb; first_result jsonb; retry_result jsonb; timer_change_count bigint;
 declare sync_context jsonb; rejected jsonb;
 begin
+  -- Device 2 holds the background lease; device 1 timer writes must still be accepted.
   perform timegenie.tracking_lease_acquire(
     '20000000-0000-0000-0000-000000000001',
-    '30000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000002',
     '49000000-0000-0000-0000-000000000001'
   );
   timer_payload := jsonb_build_object(
@@ -1792,9 +1816,11 @@ begin
       2,
       jsonb_set(timer_payload, '{version}', '4'::jsonb, true)
     );
-  if rejected->'error'->>'code'<>'LEASE_NOT_HELD'
-     or (rejected->>'currentVersion')::bigint<>3 then
-    raise exception 'non-holder timer write did not return structured authority context: %',rejected;
+  if coalesce((rejected->>'accepted')::boolean,true)
+     or rejected->'error'->>'code'<>'SYNC_CONFLICT'
+     or (rejected->>'currentVersion')::bigint<>3
+     or rejected->'authoritative'->>'id'<>'70000000-0000-0000-0000-000000000099' then
+    raise exception 'competing timer write did not return the authoritative first-arrival result: %',rejected;
   end if;
 
   begin
@@ -1822,6 +1848,14 @@ begin
     when others then
       if sqlerrm not like '%VERSION_CONFLICT%' then raise; end if;
   end;
+
+  if not timegenie.tracking_lease_release(
+    '20000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000002',
+    '49000000-0000-0000-0000-000000000001'
+  ) then
+    raise exception 'non-holder timer write test failed to release its fixture lease';
+  end if;
 end $$;
 
 -- Lease acquire/renew/release and unassigned ticks must never mutate an
@@ -2435,7 +2469,10 @@ begin
   active_anchor:=timegenie.unassigned_get_state('20000000-0000-0000-0000-000000000002');
   if first_stop is distinct from retry_stop
      or active_anchor is null
-     or (active_anchor->>'first_started_at')::timestamptz<>to_timestamp(stop_millis::double precision/1000)
+     or (active_anchor->>'first_started_at')::timestamptz<>(
+       select ended_at from timegenie.time_entries
+       where id='74000000-0000-0000-0000-000000000001'
+     )
      or active_anchor->>'session_id' is null then
     raise exception 'timer stop did not create one idempotent authoritative anchor: %',active_anchor;
   end if;
@@ -2756,6 +2793,601 @@ begin
   set role authenticated;
 end $$;
 reset role;
+
+-- Semantic operation history is idempotent, sanitized, read-only and isolated.
+set local role authenticated;
+select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+do $$
+declare list_result jsonb; detail_result jsonb; before_task_count bigint; before_change_count bigint; before_log_count bigint;
+begin
+  reset role;
+  if (select count(*) from timegenie.cloud_operation_logs where workspace_id='20000000-0000-0000-0000-000000000001')=0 then
+    raise exception 'successful cloud writes did not produce operation history';
+  end if;
+  if exists(
+    select 1 from timegenie.cloud_operation_log_items item
+    where coalesce(item.before_json,'{}'::jsonb)::text||coalesce(item.after_json,'{}'::jsonb)::text
+      ~* '(token|password|secret_ref|access_token|refresh_token|service_role|action_config)'
+  ) then raise exception 'operation history leaked protected fields'; end if;
+  if (select count(*) from timegenie.cloud_operation_logs where workspace_id='20000000-0000-0000-0000-000000000001' and operation_id='40000000-0000-0000-0000-000000000195')<>1 then
+    raise exception 'idempotent batch produced duplicate operation history';
+  end if;
+  if exists(select 1 from timegenie.cloud_operation_logs where operation_id in('40000000-0000-0000-0000-000000000196','40000000-0000-0000-0000-000000000197')) then
+    raise exception 'failed operation was recorded as successful history';
+  end if;
+  before_task_count:=(select count(*) from timegenie.tasks where workspace_id='20000000-0000-0000-0000-000000000001');
+  before_change_count:=(select count(*) from timegenie.workspace_changes where workspace_id='20000000-0000-0000-0000-000000000001');
+  set role authenticated;
+  list_result:=timegenie.cloud_operation_history_list('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002',2,null,null,null,null,null,null,null,null);
+  if jsonb_array_length(list_result->'items')=0 then raise exception 'operation history list returned no rows'; end if;
+  if pg_get_function_arguments('timegenie.cloud_operation_history_list(uuid,uuid,integer,timestamptz,uuid,timestamptz,timestamptz,uuid,text,text,text)'::regprocedure) not like '%p_limit integer DEFAULT 50%' then raise exception 'operation history RPC default page size is not 50'; end if;
+  detail_result:=timegenie.cloud_operation_history_detail('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002',(list_result->'items'->0->>'id')::uuid);
+  if jsonb_array_length(detail_result->'items')=0 then raise exception 'operation history detail returned no items'; end if;
+  if detail_result->>'operationId' is null
+     or detail_result->>'businessType' is null
+     or detail_result->>'deviceNameSnapshot' is null
+     or detail_result->>'occurredAt' is null then
+    raise exception 'operation history detail did not return the camelCase API contract: %',detail_result;
+  end if;
+  reset role;
+  if before_task_count<>(select count(*) from timegenie.tasks where workspace_id='20000000-0000-0000-0000-000000000001')
+     or before_change_count<>(select count(*) from timegenie.workspace_changes where workspace_id='20000000-0000-0000-0000-000000000001') then
+    raise exception 'operation history browsing changed business or sync data';
+  end if;
+  begin
+    set role authenticated;
+    perform timegenie.cloud_operation_history_list('20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000002',30,null,null,null,null,null,null,null,null);
+    raise exception 'cross-workspace operation history read succeeded';
+  exception when others then if sqlerrm not like '%DEVICE_NOT_REGISTERED%' then raise; end if; end;
+  reset role;
+  update timegenie.cloud_operation_logs set expires_at=now()-interval '1 second' where workspace_id='20000000-0000-0000-0000-000000000001';
+  before_log_count:=(select count(*) from timegenie.cloud_operation_logs where workspace_id='20000000-0000-0000-0000-000000000001');
+  set role authenticated;
+  perform timegenie.cloud_operation_history_cleanup('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002');
+  reset role;
+  if before_log_count=0 or exists(select 1 from timegenie.cloud_operation_logs where workspace_id='20000000-0000-0000-0000-000000000001' and expires_at<=now()) then
+    raise exception 'expired operation history was not cleaned';
+  end if;
+  if before_task_count<>(select count(*) from timegenie.tasks where workspace_id='20000000-0000-0000-0000-000000000001') then
+    raise exception 'operation history cleanup changed business data';
+  end if;
+  set role authenticated;
+end $$;
+reset role;
+
+-- Workspace snapshots are grouped, checksummed, isolated, previewable and retained safely.
+set local role authenticated;
+select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+do $$
+declare manual_result jsonb; automatic_result jsonb; repeated_result jsonb; preview_result jsonb; delete_result jsonb;
+  manual_id uuid; automatic_id uuid; delete_id uuid; corrupt_id uuid; protected_id uuid; failed_id uuid;
+  before_task_count bigint; before_change_count bigint; before_log_count bigint; before_expiry timestamptz;
+begin
+  if not exists(
+    select 1 from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+    where n.nspname='timegenie' and p.proname='workspace_snapshot_create'
+      and 'statement_timeout=120s'=any(coalesce(p.proconfig,array[]::text[]))
+  ) or exists(
+    select 1 from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+    where n.nspname='timegenie'
+      and p.proname in('workspace_snapshot_ensure_automatic','workspace_snapshot_ensure_automatic_at','workspace_snapshot_slot_key')
+  ) then raise exception 'obsolete sync-triggered automatic snapshot RPC still exists'; end if;
+  manual_result:=timegenie.workspace_snapshot_create(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002','40000000-0000-0000-0000-000000000201',
+    'manual','集成测试手动镜像','验证四组分块、哈希和预览',false
+  );
+  manual_id:=(manual_result->>'id')::uuid;
+  if manual_result->>'status'<>'ready' or (manual_result->>'chunkCount')::integer<21 then raise exception 'manual snapshot was not published with entity chunks: %',manual_result; end if;
+  reset role;
+  if (select count(distinct group_name) from timegenie.workspace_snapshot_chunks where snapshot_id=manual_id)<>4 then raise exception 'snapshot did not contain four protected entity groups'; end if;
+  if exists(select 1 from timegenie.workspace_snapshot_chunks where snapshot_id=manual_id and content_json::text~*'(secret_ref|access_token|refresh_token|lease_token|action_config_json)') then raise exception 'snapshot chunk leaked protected fields'; end if;
+  if (select count(*) from timegenie.workspace_snapshot_chunks where snapshot_id=manual_id)<>(select chunk_count from timegenie.workspace_snapshots where id=manual_id) then raise exception 'snapshot chunk count metadata is inconsistent'; end if;
+  set role authenticated;
+  reset role;
+  before_task_count:=(select count(*) from timegenie.tasks where workspace_id='20000000-0000-0000-0000-000000000001');
+  before_change_count:=(select count(*) from timegenie.workspace_changes where workspace_id='20000000-0000-0000-0000-000000000001');
+  before_expiry:=(select expires_at from timegenie.workspace_snapshots where id=manual_id);
+  set role authenticated;
+  preview_result:=timegenie.workspace_snapshot_preview('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002',manual_id);
+  if not coalesce((preview_result->>'restorable')::boolean,false) or preview_result->'groups' is null or preview_result->'entities' is null then raise exception 'valid snapshot preview failed: %',preview_result; end if;
+  reset role;
+  if before_task_count<>(select count(*) from timegenie.tasks where workspace_id='20000000-0000-0000-0000-000000000001')
+     or before_change_count<>(select count(*) from timegenie.workspace_changes where workspace_id='20000000-0000-0000-0000-000000000001')
+     or before_expiry is distinct from (select expires_at from timegenie.workspace_snapshots where id=manual_id) then raise exception 'snapshot preview changed business data, sync state or retention'; end if;
+  set role authenticated;
+
+  begin
+    perform timegenie.workspace_snapshot_list('20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000002');
+    raise exception 'cross-workspace snapshot access succeeded';
+  exception when others then if sqlerrm not like '%DEVICE_NOT_REGISTERED%' then raise; end if; end;
+  begin
+    perform timegenie.workspace_snapshot_list('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000098');
+    raise exception 'revoked device read snapshots';
+  exception when others then if sqlerrm not like '%DEVICE_NOT_REGISTERED%' then raise; end if; end;
+
+  delete_result:=timegenie.workspace_snapshot_create(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002','40000000-0000-0000-0000-000000000202',
+    'manual','待删除镜像',null,false
+  );
+  delete_id:=(delete_result->>'id')::uuid;
+  perform timegenie.workspace_snapshot_delete('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002',delete_id);
+  reset role;
+  if exists(select 1 from timegenie.workspace_snapshot_chunks where snapshot_id=delete_id) then raise exception 'snapshot delete did not cascade to chunks'; end if;
+  set role authenticated;
+
+  automatic_result:=timegenie.workspace_snapshot_create(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001','40000000-0000-0000-0000-000000000203',
+    'automatic','每日自动镜像',null,true
+  );
+  automatic_id:=(automatic_result->>'id')::uuid;
+  repeated_result:=timegenie.workspace_snapshot_create(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002','40000000-0000-0000-0000-000000000204',
+    'automatic','并发自动镜像',null,true
+  );
+  if (repeated_result->>'id')::uuid<>automatic_id then raise exception 'same-day automatic snapshot was duplicated'; end if;
+  reset role;
+  if (select count(*) from timegenie.workspace_snapshots where workspace_id='20000000-0000-0000-0000-000000000001' and snapshot_type='automatic' and snapshot_day=current_date and status='ready')<>1 then raise exception 'automatic snapshot uniqueness failed'; end if;
+  if (select expires_at-created_at from timegenie.workspace_snapshots where id=automatic_id) not between interval '29 days 23 hours' and interval '30 days 1 hour' then raise exception 'automatic snapshot retention is not 30 days'; end if;
+  set role authenticated;
+
+  protected_id:=(timegenie.workspace_snapshot_create(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002','40000000-0000-0000-0000-000000000205',
+    'pre_restore','回滚前保护镜像',null,false
+  )->>'id')::uuid;
+  perform timegenie.workspace_snapshot_set_protected('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002',protected_id,true);
+  reset role;
+  update timegenie.workspace_snapshots set expires_at=now()-interval '1 second' where id in(automatic_id,protected_id);
+  set role authenticated;
+  perform timegenie.workspace_snapshot_cleanup('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002');
+  reset role;
+  if exists(select 1 from timegenie.workspace_snapshots where id=automatic_id) then raise exception 'expired automatic snapshot was not cleaned'; end if;
+  if not exists(select 1 from timegenie.workspace_snapshots where id=protected_id and protected and protected_at is not null) then raise exception 'protected snapshot was removed by cleanup'; end if;
+  set role authenticated;
+
+  corrupt_id:=(timegenie.workspace_snapshot_create(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002','40000000-0000-0000-0000-000000000206',
+    'manual','待篡改镜像',null,false
+  )->>'id')::uuid;
+  reset role;
+  update timegenie.workspace_snapshot_chunks set content_json=content_json||jsonb_build_object('tampered',true) where snapshot_id=corrupt_id and chunk_index=(select min(chunk_index) from timegenie.workspace_snapshot_chunks where snapshot_id=corrupt_id);
+  set role authenticated;
+  preview_result:=timegenie.workspace_snapshot_preview('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002',corrupt_id);
+  if coalesce((preview_result->>'restorable')::boolean,true) or preview_result->>'errorCode'<>'SNAPSHOT_CORRUPT' then raise exception 'tampered snapshot remained restorable'; end if;
+  reset role;
+  if (select status from timegenie.workspace_snapshots where id=corrupt_id)<>'corrupt' then raise exception 'tampered snapshot was not marked corrupt'; end if;
+
+  update timegenie.workspace_history_settings set snapshot_max_bytes=1048576,manual_snapshot_limit=2 where workspace_id='20000000-0000-0000-0000-000000000001';
+  insert into timegenie.app_settings(workspace_id,key,value_json,updated_at,version) values('20000000-0000-0000-0000-000000000001','snapshot_failure_probe',jsonb_build_object('payload',repeat('x',1100000)),now(),1);
+  set role authenticated;
+  failed_id:=(timegenie.workspace_snapshot_create(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002','40000000-0000-0000-0000-000000000207',
+    'manual','容量失败诊断',null,false
+  )->>'id')::uuid;
+  reset role;
+  if (select status from timegenie.workspace_snapshots where id=failed_id)<>'failed' or exists(select 1 from timegenie.workspace_snapshot_chunks where snapshot_id=failed_id) then raise exception 'failed snapshot exposed a ready partial artifact'; end if;
+  delete from timegenie.app_settings where workspace_id='20000000-0000-0000-0000-000000000001' and key='snapshot_failure_probe';
+  update timegenie.workspace_history_settings set snapshot_max_bytes=104857600 where workspace_id='20000000-0000-0000-0000-000000000001';
+  set role authenticated;
+  perform timegenie.workspace_snapshot_create('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002','40000000-0000-0000-0000-000000000208','manual','保留边界一',null,false);
+  perform timegenie.workspace_snapshot_create('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002','40000000-0000-0000-0000-000000000209','manual','保留边界二',null,false);
+  perform timegenie.workspace_snapshot_create('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002','40000000-0000-0000-0000-000000000210','manual','保留边界三',null,false);
+  reset role;
+  if (select count(*) from timegenie.workspace_snapshots where workspace_id='20000000-0000-0000-0000-000000000001' and snapshot_type='manual' and status='ready' and not protected)>2 then raise exception 'manual snapshot count retention was not enforced'; end if;
+  before_log_count:=(select count(*) from timegenie.cloud_operation_logs where workspace_id='20000000-0000-0000-0000-000000000001' and business_type='workspace_snapshot.create');
+  if before_log_count=0 then raise exception 'snapshot creation did not produce operation history'; end if;
+  if before_task_count<>(select count(*) from timegenie.tasks where workspace_id='20000000-0000-0000-0000-000000000001') then raise exception 'snapshot retention changed business data'; end if;
+  set role authenticated;
+end $$;
+reset role;
+
+-- Automatic full snapshots run once per workspace-local day at a fixed time.
+select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+do $$
+declare settings_value jsonb; early_result jsonb; due_result jsonb; repeat_result jsonb;
+  next_day_result jsonb; before_count bigint; first_id uuid; second_id uuid;
+begin
+  set role authenticated;
+  settings_value:=timegenie.workspace_snapshot_settings_get(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001');
+  if not coalesce((settings_value->>'automaticSnapshotEnabled')::boolean,false) then
+    raise exception 'automatic snapshots are not enabled by default: %',settings_value;
+  end if;
+  if settings_value->>'automaticSnapshotTime'<>'03:00'
+     or settings_value->>'automaticSnapshotTimezone'<>'Asia/Shanghai'
+     or settings_value->>'snapshotRetentionDays'<>'30' then
+    raise exception 'automatic snapshot defaults are wrong: %',settings_value;
+  end if;
+  if coalesce(settings_value->>'schedulerActive','false')<>'false' then
+    raise exception 'plain PostgreSQL must report the cron scheduler as inactive: %',settings_value;
+  end if;
+  if not exists(
+    select 1 from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+    where n.nspname='timegenie' and p.proname='workspace_snapshot_run_scheduled'
+      and 'statement_timeout=600s'=any(coalesce(p.proconfig,array[]::text[]))
+  ) then raise exception 'the scheduled snapshot runner must bound its statement timeout'; end if;
+  if has_function_privilege('authenticated','timegenie.workspace_snapshot_run_scheduled(timestamp with time zone)','execute')
+     or has_function_privilege('anon','timegenie.workspace_snapshot_run_scheduled(timestamp with time zone)','execute') then
+    raise exception 'clients must not schedule automatic snapshots';
+  end if;
+  if to_char((settings_value->>'nextAutomaticSnapshotAt')::timestamptz at time zone 'Asia/Shanghai','HH24:MI')<>'03:00' then
+    raise exception 'next automatic snapshot time is wrong: %',settings_value;
+  end if;
+  settings_value:=timegenie.workspace_snapshot_settings_update(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000211',true,'21:30'::time,30);
+  if settings_value->>'automaticSnapshotTime'<>'21:30' then
+    raise exception 'automatic snapshot time update failed: %',settings_value;
+  end if;
+  settings_value:=timegenie.workspace_snapshot_settings_get(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002');
+  if settings_value->>'automaticSnapshotTime'<>'21:30' then
+    raise exception 'automatic snapshot time was not shared across devices: %',settings_value;
+  end if;
+  begin
+    perform timegenie.workspace_snapshot_settings_update(
+      '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+      '40000000-0000-0000-0000-000000000212',true,'21:30'::time,0);
+    raise exception 'zero snapshot retention was accepted';
+  exception when others then if sqlerrm not like '%VALIDATION_ERROR%' then raise; end if; end;
+  reset role;
+
+  before_count:=(select count(*) from timegenie.workspace_snapshots
+    where workspace_id='20000000-0000-0000-0000-000000000001' and snapshot_type='automatic');
+  early_result:=timegenie.workspace_snapshot_run_scheduled('2026-10-18 12:00:00+00');
+  if (select count(*) from timegenie.workspace_snapshots
+      where workspace_id='20000000-0000-0000-0000-000000000001' and snapshot_type='automatic')<>before_count then
+    raise exception 'scheduled snapshot ran before its workspace-local time: %',early_result;
+  end if;
+  due_result:=timegenie.workspace_snapshot_run_scheduled('2026-10-18 13:30:00+00');
+  if (select count(*) from timegenie.workspace_snapshots
+      where workspace_id='20000000-0000-0000-0000-000000000001' and snapshot_type='automatic')<>before_count+1 then
+    raise exception 'scheduled snapshot did not create exactly one recovery point: %',due_result;
+  end if;
+  select id into first_id from timegenie.workspace_snapshots
+  where workspace_id='20000000-0000-0000-0000-000000000001' and snapshot_type='automatic'
+    and schedule_slot_key='daily:2026-10-18';
+  if first_id is null or (select status from timegenie.workspace_snapshots where id=first_id)<>'ready' then
+    raise exception 'scheduled snapshot was not a ready recovery point: %',due_result;
+  end if;
+  if (select expires_at-created_at from timegenie.workspace_snapshots where id=first_id)
+     not between interval '29 days 23 hours' and interval '30 days 1 hour' then
+    raise exception 'scheduled snapshot retention is not 30 days';
+  end if;
+  repeat_result:=timegenie.workspace_snapshot_run_scheduled('2026-10-18 15:59:00+00');
+  if (select count(*) from timegenie.workspace_snapshots
+      where workspace_id='20000000-0000-0000-0000-000000000001' and snapshot_type='automatic')<>before_count+1 then
+    raise exception 'the same workspace-local day created a second recovery point: %',repeat_result;
+  end if;
+  next_day_result:=timegenie.workspace_snapshot_run_scheduled('2026-10-19 13:30:00+00');
+  select id into second_id from timegenie.workspace_snapshots
+  where workspace_id='20000000-0000-0000-0000-000000000001' and snapshot_type='automatic'
+    and schedule_slot_key='daily:2026-10-19';
+  if second_id is null or second_id=first_id then
+    raise exception 'the next workspace-local day did not create a new recovery point: %',next_day_result;
+  end if;
+  if (select count(*) from timegenie.workspace_snapshots
+      where workspace_id='20000000-0000-0000-0000-000000000001' and snapshot_type='automatic')<>before_count+2 then
+    raise exception 'scheduled snapshots were duplicated';
+  end if;
+
+  set role authenticated;
+  settings_value:=timegenie.workspace_snapshot_settings_update(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000215',false,'21:30'::time,30);
+  reset role;
+  if coalesce((settings_value->>'automaticSnapshotEnabled')::boolean,true) then
+    raise exception 'automatic snapshots could not be disabled: %',settings_value;
+  end if;
+  early_result:=timegenie.workspace_snapshot_run_scheduled('2026-10-20 13:30:00+00');
+  if (select count(*) from timegenie.workspace_snapshots
+      where workspace_id='20000000-0000-0000-0000-000000000001' and snapshot_type='automatic')<>before_count+2 then
+    raise exception 'disabled automatic snapshots still created: %',early_result;
+  end if;
+  if not exists(select 1 from timegenie.workspace_snapshots where id=first_id) then
+    raise exception 'settings update removed an existing snapshot';
+  end if;
+end $$;
+reset role;
+
+-- Snapshot retention is shared across automatic and manual recovery points.
+reset role;
+select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+do $$
+declare settings_value jsonb; manual_result jsonb; manual_id uuid; expired_id uuid; protected_id uuid;
+  before_task_count bigint; before_change_count bigint;
+begin
+  before_task_count:=(select count(*) from timegenie.tasks where workspace_id='20000000-0000-0000-0000-000000000001');
+  before_change_count:=(select count(*) from timegenie.workspace_changes where workspace_id='20000000-0000-0000-0000-000000000001');
+  set role authenticated;
+  settings_value:=timegenie.workspace_snapshot_settings_update(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000220',true,'03:00'::time,7
+  );
+  if settings_value->>'snapshotRetentionDays'<>'7' then raise exception 'snapshot retention update was not returned: %',settings_value; end if;
+  settings_value:=timegenie.workspace_snapshot_settings_get('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002');
+  if settings_value->>'snapshotRetentionDays'<>'7' then raise exception 'snapshot retention was not shared across devices: %',settings_value; end if;
+  if settings_value->>'automaticSnapshotTime'<>'03:00' then raise exception 'retention update reset the automatic snapshot time: %',settings_value; end if;
+  begin
+    perform timegenie.workspace_snapshot_settings_update(
+      '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+      '40000000-0000-0000-0000-000000000222',true,'03:00'::time,0
+    );
+    raise exception 'zero snapshot retention was accepted';
+  exception when others then if sqlerrm not like '%VALIDATION_ERROR%' then raise; end if; end;
+  begin
+    perform timegenie.workspace_snapshot_settings_update(
+      '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+      '40000000-0000-0000-0000-000000000223',true,'03:00'::time,366
+    );
+    raise exception 'snapshot retention above 365 days was accepted';
+  exception when others then if sqlerrm not like '%VALIDATION_ERROR%' then raise; end if; end;
+  manual_result:=timegenie.workspace_snapshot_create(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002',
+    '40000000-0000-0000-0000-000000000224','manual','保留策略手动快照',null,false
+  );
+  manual_id:=(manual_result->>'id')::uuid;
+  reset role;
+  if (select expires_at-created_at from timegenie.workspace_snapshots where id=manual_id) not between interval '6 days 23 hours' and interval '7 days 1 hour' then raise exception 'manual snapshot did not use the shared retention window'; end if;
+  insert into timegenie.workspace_snapshots(
+    workspace_id,snapshot_type,name,status,created_by_device_name,protected,created_at
+  ) values(
+    '20000000-0000-0000-0000-000000000001','manual','过期未保护快照','ready','integration-test',false,now()-interval '8 days'
+  ) returning id into expired_id;
+  if (select expires_at from timegenie.workspace_snapshots where id=expired_id)>now() then raise exception 'expired snapshot did not receive an elapsed retention timestamp'; end if;
+  set role authenticated;
+  perform timegenie.workspace_snapshot_cleanup('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002');
+  reset role;
+  if exists(select 1 from timegenie.workspace_snapshots where id=expired_id) then raise exception 'unprotected snapshot past retention was not cleaned'; end if;
+  protected_id:=(timegenie.workspace_snapshot_create(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002',
+    '40000000-0000-0000-0000-000000000225','pre_restore','保护快照保留测试',null,false
+  )->>'id')::uuid;
+  set role authenticated;
+  perform timegenie.workspace_snapshot_set_protected('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002',protected_id,true);
+  reset role;
+  if (select expires_at from timegenie.workspace_snapshots where id=protected_id) is not null then raise exception 'protected snapshot kept an automatic expiry'; end if;
+  update timegenie.workspace_snapshots set created_at=now()-interval '30 days' where id=protected_id;
+  set role authenticated;
+  perform timegenie.workspace_snapshot_cleanup('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002');
+  reset role;
+  if not exists(select 1 from timegenie.workspace_snapshots where id=protected_id and protected) then raise exception 'protected snapshot was removed by retention cleanup'; end if;
+  if before_task_count<>(select count(*) from timegenie.tasks where workspace_id='20000000-0000-0000-0000-000000000001')
+     or before_change_count<>(select count(*) from timegenie.workspace_changes where workspace_id='20000000-0000-0000-0000-000000000001') then raise exception 'snapshot retention changed business or sync data'; end if;
+  set role authenticated;
+end $$;
+reset role;
+
+-- The old timer-write takeover RPC remains callable for compatibility but
+-- cannot change a live background lease.
+update timegenie.tracking_leases set holder_device_id=null,lease_token=null,expires_at=null
+where workspace_id='20000000-0000-0000-0000-000000000001';
+set local role authenticated;
+select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+do $$
+declare first_lease jsonb; blocked_lease jsonb; takeover_lease jsonb;
+begin
+  first_lease:=timegenie.tracking_lease_acquire(
+    '20000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '49000000-0000-0000-0000-000000000091'
+  );
+  blocked_lease:=timegenie.tracking_lease_acquire(
+    '20000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000002',
+    '49000000-0000-0000-0000-000000000092'
+  );
+  if coalesce((blocked_lease->>'acquired')::boolean,false) then
+    raise exception 'ordinary background lease acquisition preempted a live holder';
+  end if;
+  takeover_lease:=timegenie.tracking_lease_takeover_for_timer_write(
+    '20000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000002',
+    '49000000-0000-0000-0000-000000000093'
+  );
+  if not coalesce((takeover_lease->>'acquired')::boolean,false)
+     or coalesce((takeover_lease->>'takeover')::boolean,true)
+     or not coalesce((takeover_lease->>'compatibilityOnly')::boolean,false)
+     or takeover_lease->>'holderDeviceId'<>'30000000-0000-0000-0000-000000000001' then
+    raise exception 'legacy timer write takeover was not a non-mutating compatibility response';
+  end if;
+  perform timegenie.tracking_lease_renew(
+    '20000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '49000000-0000-0000-0000-000000000091'
+  );
+  perform timegenie.tracking_lease_release(
+    '20000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    '49000000-0000-0000-0000-000000000091'
+  );
+end $$;
+reset role;
+
+-- Timer stop accepts writes without a lease. A future client timestamp is
+-- clamped to server receipt time, while an offline stop in the past is kept.
+set local role authenticated;
+select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+do $$
+declare observed_at timestamptz:=clock_timestamp(); observed_ms bigint; start_ms bigint; future_payload jsonb; offline_payload jsonb; result_value jsonb; saved_end timestamptz;
+begin
+  observed_ms:=floor(extract(epoch from observed_at)*1000)::bigint;
+  start_ms:=observed_ms-60000;
+  future_payload:=jsonb_build_object(
+    'id','70000000-0000-0000-0000-000000000196','work_date',timegenie.workspace_work_date('20000000-0000-0000-0000-000000000001',observed_at),
+    'kind','work','source_type','timer','state','ended','default_task_id','60000000-0000-0000-0000-000000000002',
+    'label_snapshot','未来时钟收敛','started_at',start_ms,'ended_at',observed_ms+300000,'duration_seconds',360,
+    'created_at',start_ms,'updated_at',observed_ms+300000,'version',1,'segments',jsonb_build_array(jsonb_build_object(
+      'id','73000000-0000-0000-0000-000000000196','sequence_no',1,'started_at',start_ms,'ended_at',observed_ms+300000,'duration_seconds',360
+    )),'allocations','[]'::jsonb
+  );
+  result_value:=timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000196','timer_stop','time_entry','70000000-0000-0000-0000-000000000196',null,1,1,future_payload
+  );
+  if not coalesce((result_value->>'accepted')::boolean,false) then raise exception 'timer stop without a lease was rejected: %',result_value; end if;
+  select ended_at into saved_end from timegenie.time_entries where id='70000000-0000-0000-0000-000000000196';
+  if saved_end>clock_timestamp()+interval '1 second' then raise exception 'future timer stop was not clamped: %',saved_end; end if;
+
+  offline_payload:=future_payload||jsonb_build_object(
+    'id','70000000-0000-0000-0000-000000000197','label_snapshot','离线结束保留',
+    'ended_at',observed_ms-30000,'updated_at',observed_ms-30000,'duration_seconds',30,
+    'segments',jsonb_build_array(jsonb_build_object('id','73000000-0000-0000-0000-000000000197','sequence_no',1,'started_at',start_ms,'ended_at',observed_ms-30000,'duration_seconds',30))
+  );
+  perform timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000197','timer_stop','time_entry','70000000-0000-0000-0000-000000000197',null,1,1,offline_payload
+  );
+  if abs(extract(epoch from ((select ended_at from timegenie.time_entries where id='70000000-0000-0000-0000-000000000197')-to_timestamp((observed_ms-30000)::double precision/1000))))>0.001 then
+    raise exception 'offline timer stop boundary was changed';
+  end if;
+end $$;
+reset role;
+
+-- Workspace epoch 1 accepts legacy clients, but epoch > 1 requires an exact
+-- request header for every business write and returns reset-only pull data.
+set local role authenticated;
+select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+select set_config('request.headers','{}',true);
+do $$
+declare legacy_snapshot jsonb;
+begin
+  legacy_snapshot:=timegenie.cloud_snapshot_get('20000000-0000-0000-0000-000000000001');
+  if (legacy_snapshot->>'workspace_epoch')::bigint<>1 then
+    raise exception 'epoch 1 legacy snapshot did not report the server epoch: %',legacy_snapshot;
+  end if;
+end $$;
+select set_config('request.headers','{"x-timegenie-workspace-epoch":"1"}',true);
+select timegenie.cloud_apply_patch(
+  '20000000-0000-0000-0000-000000000001',
+  '30000000-0000-0000-0000-000000000001',
+  '4e000000-0000-0000-0000-000000000001',
+  'app_setting.update','app_setting','workspace_epoch_probe',null,
+  jsonb_build_object('key','workspace_epoch_probe','value_json','1'::jsonb,'updated_at',1792272000000,'version',1)
+);
+reset role;
+update timegenie.workspaces set workspace_epoch=2 where id='20000000-0000-0000-0000-000000000001';
+set local role authenticated;
+select set_config('request.headers','{}',true);
+do $$
+begin
+  begin
+    perform timegenie.cloud_apply_patch(
+      '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+      '4e000000-0000-0000-0000-000000000002','app_setting.update','app_setting','workspace_epoch_probe',1,
+      jsonb_build_object('key','workspace_epoch_probe','value_json','2'::jsonb,'updated_at',1792272001000,'version',2)
+    );
+    raise exception 'epoch > 1 accepted a missing header';
+  exception when others then
+    if sqlerrm not like '%WORKSPACE_EPOCH_STALE%' then raise; end if;
+  end;
+end $$;
+select set_config('request.headers','{"x-timegenie-workspace-epoch":"1"}',true);
+do $$
+declare retry integer;
+begin
+  for retry in 1..2 loop
+    begin
+      perform timegenie.cloud_apply_patch(
+        '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+        '4e000000-0000-0000-0000-000000000003','app_setting.update','app_setting','workspace_epoch_probe',1,
+        jsonb_build_object('key','workspace_epoch_probe','value_json','3'::jsonb,'updated_at',1792272002000,'version',2)
+      );
+      raise exception 'old epoch retry % was accepted',retry;
+    exception when others then
+      if sqlerrm not like '%WORKSPACE_EPOCH_STALE%' then raise; end if;
+    end;
+  end loop;
+end $$;
+select set_config('request.headers','{"x-timegenie-workspace-epoch":"2"}',true);
+select timegenie.cloud_apply_patch(
+  '20000000-0000-0000-0000-000000000001',
+  '30000000-0000-0000-0000-000000000001',
+  '4e000000-0000-0000-0000-000000000004',
+  'app_setting.update','app_setting','workspace_epoch_probe',1,
+  jsonb_build_object('key','workspace_epoch_probe','value_json','4'::jsonb,'updated_at',1792272003000,'version',2)
+);
+do $$
+declare snapshot jsonb; mismatch jsonb;
+begin
+  snapshot:=timegenie.cloud_snapshot_get('20000000-0000-0000-0000-000000000001');
+  if (snapshot->>'workspace_epoch')::bigint<>2 then
+    raise exception 'snapshot omitted the current workspace epoch: %',snapshot;
+  end if;
+  perform set_config('request.headers','{"x-timegenie-workspace-epoch":"1"}',true);
+  mismatch:=timegenie.cloud_incremental_pull(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',0,100
+  );
+  if not coalesce((mismatch->>'reset_required')::boolean,false)
+     or (mismatch->>'workspace_epoch')::bigint<>2
+     or jsonb_array_length(mismatch->'changes')<>0
+     or jsonb_array_length(mismatch->'entities')<>0 then
+    raise exception 'epoch mismatch pull was not reset-only: %',mismatch;
+  end if;
+end $$;
+reset role;
+
+-- A restore lock excludes ordinary writes, creates a safety snapshot, restores
+-- atomically in place, increments epoch, emits reset, and is idempotent.
+select set_config('request.headers','{"x-timegenie-workspace-epoch":"2"}',true);
+update timegenie.time_entries set state='ended',ended_at=coalesce(ended_at,updated_at),duration_seconds=greatest(duration_seconds,0)
+where workspace_id='20000000-0000-0000-0000-000000000001' and state in('running','paused');
+update timegenie.time_segments set ended_at=coalesce(ended_at,started_at),duration_seconds=greatest(duration_seconds,0)
+where workspace_id='20000000-0000-0000-0000-000000000001' and ended_at is null;
+update timegenie.unassigned_sessions set state='resolved',resolution_type='discard',resolved_at=coalesce(resolved_at,updated_at)
+where workspace_id='20000000-0000-0000-0000-000000000001' and state in('collecting','paused','awaiting_resolution');
+set local role authenticated;
+select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+do $$
+declare target_id uuid; prepared jsonb; restored jsonb; repeated jsonb; before_task_count bigint; restored_snapshot jsonb;
+begin
+  target_id:=(timegenie.workspace_snapshot_create(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '4f000000-0000-0000-0000-000000000001','manual','回滚协议目标',null,false
+  )->>'id')::uuid;
+  before_task_count:=jsonb_array_length(timegenie.cloud_snapshot_get('20000000-0000-0000-0000-000000000001')->'tasks');
+  perform timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '4f000000-0000-0000-0000-000000000002','app_setting.update','app_setting','workspace_epoch_probe',2,
+    jsonb_build_object('key','workspace_epoch_probe','value_json','99'::jsonb,'updated_at',1792272100000,'version',3)
+  );
+  prepared:=timegenie.workspace_restore_prepare(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',target_id,2
+  );
+  if prepared->>'safetySnapshotId' is null or prepared->>'lockToken' is null then raise exception 'restore prepare omitted safety or lock metadata: %',prepared; end if;
+  begin
+    perform timegenie.cloud_apply_patch(
+      '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+      '4f000000-0000-0000-0000-000000000003','app_setting.update','app_setting','restore_lock_probe',null,
+      jsonb_build_object('key','restore_lock_probe','value_json','true'::jsonb,'updated_at',1792272101000,'version',1)
+    );
+    raise exception 'ordinary write bypassed restore lock';
+  exception when others then
+    if sqlerrm not like '%WORKSPACE_RESTORE_IN_PROGRESS%' then raise; end if;
+  end;
+  restored:=timegenie.workspace_restore_commit(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    (prepared->>'lockToken')::uuid,target_id,prepared->>'targetContentHash',(prepared->>'preparedEpoch')::bigint,
+    '4f000000-0000-0000-0000-000000000004',true
+  );
+  repeated:=timegenie.workspace_restore_commit(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    (prepared->>'lockToken')::uuid,target_id,prepared->>'targetContentHash',(prepared->>'preparedEpoch')::bigint,
+    '4f000000-0000-0000-0000-000000000004',true
+  );
+  if restored is distinct from repeated or (restored->>'workspaceEpoch')::bigint<>3 then raise exception 'restore commit was not idempotent or did not advance epoch: % / %',restored,repeated; end if;
+  perform set_config('request.headers','{"x-timegenie-workspace-epoch":"3"}',true);
+  restored_snapshot:=timegenie.cloud_snapshot_get('20000000-0000-0000-0000-000000000001');
+  if not exists(select 1 from jsonb_array_elements(restored_snapshot->'app_settings') value where value->>'key'='workspace_epoch_probe' and value->'value_json'='4'::jsonb) then raise exception 'restore did not recover target business value'; end if;
+  if before_task_count<>jsonb_array_length(restored_snapshot->'tasks') then raise exception 'restore changed target task count'; end if;
+  perform set_config('timegenie.restore_test_safety_id',restored->>'safetySnapshotId',true);
+end $$;
+reset role;
+do $$ begin
+  if exists(select 1 from timegenie.workspace_restore_locks where workspace_id='20000000-0000-0000-0000-000000000001') then raise exception 'restore lock was not released'; end if;
+  if not exists(select 1 from timegenie.workspace_snapshots where id=current_setting('timegenie.restore_test_safety_id')::uuid and snapshot_type='pre_restore' and status='ready') then raise exception 'restore safety snapshot missing'; end if;
+  if not exists(select 1 from timegenie.workspace_changes where workspace_id='20000000-0000-0000-0000-000000000001' and entity_type='workspace_reset' and entity_version=3) then raise exception 'workspace reset event missing'; end if;
+  if not exists(select 1 from timegenie.cloud_operation_logs where workspace_id='20000000-0000-0000-0000-000000000001' and operation_id='4f000000-0000-0000-0000-000000000004' and source='restore') then raise exception 'restore operation history missing'; end if;
+end $$;
 
 select 'Supabase schema integration tests passed' as result;
 

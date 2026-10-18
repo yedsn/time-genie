@@ -100,6 +100,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "actual_time_adjustments",
         sql: include_str!("../migrations/0017_actual_time_adjustments.sql"),
     },
+    Migration {
+        version: 18,
+        name: "workspace_epoch",
+        sql: include_str!("../migrations/0018_workspace_epoch.sql"),
+    },
+    Migration {
+        version: 19,
+        name: "local_backup_history",
+        sql: include_str!("../migrations/0019_local_backup_history.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -157,6 +167,13 @@ impl Database {
         configure_connection(&connection)
             .map_err(|error| format!("无法配置 SQLite {}: {error}", self.path.display()))?;
         Ok(connection)
+    }
+
+    pub(crate) fn data_directory(&self) -> PathBuf {
+        self.path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
     }
 
     pub fn status(&self) -> Result<DatabaseStatus, String> {
@@ -540,12 +557,19 @@ mod tests {
         "tracking_runtime_state",
     ];
 
+    fn latest_migration_version() -> i64 {
+        MIGRATIONS
+            .last()
+            .map(|migration| migration.version)
+            .unwrap_or(0)
+    }
+
     #[test]
     fn first_start_applies_migration_and_seeds_local_workspace() {
         let directory = tempdir().unwrap();
         let database = Database::initialize_at(directory.path().join("test.sqlite3")).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 17);
+        assert_eq!(status.schema_version, latest_migration_version());
         for table in REQUIRED_TABLES {
             assert!(
                 status.tables.iter().any(|value| value == table),
@@ -585,8 +609,68 @@ mod tests {
         let workspace_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migration_count, 17);
+        assert_eq!(migration_count, 19);
         assert_eq!(workspace_count, 1);
+    }
+
+    #[test]
+    fn workspace_epoch_migration_defaults_existing_sync_state_and_outbox() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("workspace-epoch-upgrade.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                   version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        for migration in &MIGRATIONS[..17] {
+            let transaction = connection.transaction().unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version,name,applied_at) VALUES (?1,?2,1)",
+                    params![migration.version, migration.name],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        connection.execute_batch(
+            "INSERT INTO workspaces(id,name,timezone,storage_mode,created_at,updated_at,version)
+               VALUES ('epoch-ws','Epoch','Asia/Shanghai','cloud',1,1,1);
+             INSERT INTO devices(id,workspace_id,device_name,platform,app_version,last_seen_at,created_at)
+               VALUES ('epoch-device','epoch-ws','Device','test','1',1,1);
+             INSERT INTO local_sync_state(workspace_id,device_id,last_change_seq)
+               VALUES ('epoch-ws','epoch-device',5);
+             INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,payload_json,state,created_at)
+               VALUES ('epoch-operation','epoch-ws','epoch-device','task_update','task',NULL,'{}','pending',1);",
+        ).unwrap();
+        drop(connection);
+
+        let database = Database::initialize_at(path).unwrap();
+        let connection = database.open().unwrap();
+        let sync_state: (i64, bool, Option<String>, Option<i64>) = connection
+            .query_row(
+                "SELECT workspace_epoch,epoch_blocked,epoch_blocked_reason,epoch_blocked_at FROM local_sync_state WHERE workspace_id='epoch-ws'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(sync_state, (1, false, None, None));
+        let outbox_epoch: i64 = connection
+            .query_row(
+                "SELECT workspace_epoch FROM sync_outbox WHERE operation_id='epoch-operation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outbox_epoch, 1);
+        assert_eq!(
+            database.status().unwrap().schema_version,
+            latest_migration_version()
+        );
     }
 
     #[test]
@@ -656,7 +740,10 @@ mod tests {
         drop(connection);
 
         let database = Database::initialize_at(path).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 17);
+        assert_eq!(
+            database.status().unwrap().schema_version,
+            latest_migration_version()
+        );
         let connection = database.open().unwrap();
         let queue: (String,String,i64,String,String,i64,Option<String>,String,Option<String>) = connection.query_row(
             "SELECT operation_id,state,attempt_count,payload_json,error_json,coalesced_count,depends_on_operation_id,recovery_kind,recovery_context_json FROM sync_outbox WHERE operation_id='legacy-timer-op'",
@@ -883,7 +970,10 @@ mod tests {
         assert_eq!(task_title, "升级前事项");
         assert_eq!(queued, 1);
         assert_eq!(deferred_table, 6);
-        assert_eq!(database.status().unwrap().schema_version, 17);
+        assert_eq!(
+            database.status().unwrap().schema_version,
+            latest_migration_version()
+        );
     }
 
     #[test]
@@ -1323,7 +1413,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outbox_operations, vec!["keep-op", "sending-op"]);
-        assert_eq!(database.status().unwrap().schema_version, 17);
+        assert_eq!(
+            database.status().unwrap().schema_version,
+            latest_migration_version()
+        );
 
         // Deployment rollback keeps the migrated database in place. Rehearse
         // the previous client's read path against that database and verify
@@ -1410,7 +1503,10 @@ mod tests {
         drop(connection);
 
         let database = Database::initialize_at(path).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 17);
+        assert_eq!(
+            database.status().unwrap().schema_version,
+            latest_migration_version()
+        );
         let connection = database.open().unwrap();
 
         let stale_index_count: i64 = connection
@@ -1756,7 +1852,7 @@ mod tests {
 
         let database = Database::initialize_at(path).unwrap();
         let status = database.status().unwrap();
-        assert_eq!(status.schema_version, 17);
+        assert_eq!(status.schema_version, latest_migration_version());
         assert!(status.tables.iter().any(|table| table == "device_hooks"));
         assert!(status
             .tables

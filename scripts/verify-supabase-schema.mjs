@@ -23,6 +23,13 @@ const unassignedSegmentBoundaryPatchFile = path.join(repoRoot, "supabase", "2026
 const simplifiedUnassignedAnchorPatchFile = path.join(repoRoot, "supabase", "20261008_timegenie_simplified_unassigned_anchor.sql");
 const unassignedLeaseContinuityPatchFile = path.join(repoRoot, "supabase", "20261013_timegenie_unassigned_lease_continuity_fix.sql");
 const timerSyncAuthorityPatchFile = path.join(repoRoot, "supabase", "20261014_timegenie_timer_sync_authority.sql");
+const timerWriteLeaseTakeoverPatchFile = path.join(repoRoot, "supabase", "20261018_timegenie_timer_write_lease_takeover.sql");
+const automaticSnapshotSchedulePatchFile = path.join(repoRoot, "supabase", "20261018g_timegenie_automatic_snapshot_schedule.sql");
+const operationHistoryPageSizePatchFile = path.join(repoRoot, "supabase", "20261018h_timegenie_operation_history_page_size.sql");
+const historyDetailAndSnapshotTimeoutPatchFile = path.join(repoRoot, "supabase", "20261018i_timegenie_history_detail_and_snapshot_timeout.sql");
+const snapshotRetentionPatchFile = path.join(repoRoot, "supabase", "20261018j_timegenie_snapshot_retention.sql");
+const fixedDailySnapshotPatchFile = path.join(repoRoot, "supabase", "20261018k_timegenie_fixed_daily_snapshot.sql");
+const timerFactConvergencePatchFile = path.join(repoRoot, "supabase", "20261018f_timegenie_timer_fact_convergence.sql");
 const actualAdjustmentBatchPatchFile = path.join(repoRoot, "supabase", "20261015_timegenie_actual_adjustment_batch.sql");
 const namedTemplateBootstrapFixFile = path.join(repoRoot, "supabase", "20261016_timegenie_named_template_bootstrap_fix.sql");
 const timerTransitionPatchFile = path.join(repoRoot, "supabase", "20261016b_timegenie_timer_transition.sql");
@@ -96,10 +103,105 @@ function verifyStaticSchemaInvariants() {
   const simplifiedUnassignedAnchorPatch = fs.readFileSync(simplifiedUnassignedAnchorPatchFile, "utf8");
   const unassignedLeaseContinuityPatch = fs.readFileSync(unassignedLeaseContinuityPatchFile, "utf8");
   const timerSyncAuthorityPatch = fs.readFileSync(timerSyncAuthorityPatchFile, "utf8");
+  const timerWriteLeaseTakeoverPatch = fs.readFileSync(timerWriteLeaseTakeoverPatchFile, "utf8");
+  const automaticSnapshotSchedulePatch = fs.readFileSync(automaticSnapshotSchedulePatchFile, "utf8");
+  const operationHistoryPageSizePatch = fs.readFileSync(operationHistoryPageSizePatchFile, "utf8");
+  const historyDetailAndSnapshotTimeoutPatch = fs.readFileSync(historyDetailAndSnapshotTimeoutPatchFile, "utf8");
+  const snapshotRetentionPatch = fs.readFileSync(snapshotRetentionPatchFile, "utf8");
+  const fixedDailySnapshotPatch = fs.readFileSync(fixedDailySnapshotPatchFile, "utf8");
+  const timerFactConvergencePatch = fs.readFileSync(timerFactConvergencePatchFile, "utf8");
   const actualAdjustmentBatchPatch = fs.readFileSync(actualAdjustmentBatchPatchFile, "utf8");
   const namedTemplateBootstrapFix = fs.readFileSync(namedTemplateBootstrapFixFile, "utf8");
   const timerTransitionPatch = fs.readFileSync(timerTransitionPatchFile, "utf8");
   const schemaIntegrationTest = fs.readFileSync(schemaTestFile, "utf8");
+  for (const expected of [
+    "automatic_snapshot_frequency",
+    "schedule_slot_key",
+    "create or replace function timegenie.workspace_snapshot_settings_get",
+    "create or replace function timegenie.workspace_snapshot_settings_update",
+    "create or replace function timegenie.workspace_snapshot_ensure_automatic",
+    "uq_workspace_snapshots_automatic_slot",
+  ]) {
+    if (!automaticSnapshotSchedulePatch.replaceAll(" ", "").toLowerCase().includes(expected.replaceAll(" ", "").toLowerCase())) {
+      throw new Error(`The automatic snapshot schedule patch must include: ${expected}`);
+    }
+  }
+  if (!schema.includes("\\ir 20261018g_timegenie_automatic_snapshot_schedule.sql")) {
+    throw new Error("The source schema must apply the automatic snapshot schedule patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261018g_timegenie_automatic_snapshot_schedule\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the automatic snapshot schedule patch is idempotent.");
+  }
+  if (!operationHistoryPageSizePatch.includes("p_limit integer default 50")
+      || !operationHistoryPageSizePatch.includes("coalesce(p_limit,50)")) {
+    throw new Error("The operation history page-size patch must default to 50 rows.");
+  }
+  if (!schema.includes("\\ir 20261018h_timegenie_operation_history_page_size.sql")) {
+    throw new Error("The source schema must apply the operation history 50-row page-size patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261018h_timegenie_operation_history_page_size\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the operation history page-size patch is idempotent.");
+  }
+  for (const expected of [
+    "'operationId',log.operation_id",
+    "'deviceNameSnapshot',log.device_name_snapshot",
+    "alter function timegenie.workspace_snapshot_create",
+    "alter function timegenie.workspace_snapshot_ensure_automatic_at",
+    "alter function timegenie.workspace_snapshot_ensure_automatic",
+    "set statement_timeout='120s'",
+  ]) {
+    if (!historyDetailAndSnapshotTimeoutPatch.includes(expected)) {
+      throw new Error(`The history detail and snapshot timeout patch must include: ${expected}`);
+    }
+  }
+  if (!schema.includes("\\ir 20261018i_timegenie_history_detail_and_snapshot_timeout.sql")) {
+    throw new Error("The source schema must apply the history detail and snapshot timeout patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261018i_timegenie_history_detail_and_snapshot_timeout\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the history detail and snapshot timeout patch is idempotent.");
+  }
+  for (const expected of [
+    "snapshot_retention_days",
+    "workspace_snapshot_apply_retention",
+    "before insert or update of protected,created_at",
+    "workspace_snapshot_settings_update_with_retention",
+    "snapshotRetentionDays",
+    "expires_at",
+    "where protected and expires_at is not null",
+    "set statement_timeout='120s'",
+  ]) {
+    if (!snapshotRetentionPatch.includes(expected)) {
+      throw new Error(`The snapshot retention patch must include: ${expected}`);
+    }
+  }
+  if (!schema.includes("\\ir 20261018j_timegenie_snapshot_retention.sql")) {
+    throw new Error("The source schema must apply the snapshot retention patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261018j_timegenie_snapshot_retention\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the snapshot retention patch is idempotent.");
+  }
+  for (const expected of [
+    "automatic_snapshot_enabled",
+    "automatic_snapshot_time",
+    "drop column automatic_snapshot_frequency",
+    "workspace_snapshot_run_scheduled",
+    "workspace_snapshot_next_scheduled_at",
+    "cron.schedule",
+    "timegenie-daily-automatic-snapshot",
+    "workspace_snapshot_settings_update(uuid,uuid,uuid,boolean,time,integer)",
+    "drop function if exists timegenie.workspace_snapshot_ensure_automatic",
+    "set statement_timeout='600s'",
+  ]) {
+    if (!fixedDailySnapshotPatch.replaceAll(" ", "").toLowerCase().includes(expected.replaceAll(" ", "").toLowerCase())) {
+      throw new Error(`The fixed daily snapshot patch must include: ${expected}`);
+    }
+  }
+  if (!schema.includes("\\ir 20261018k_timegenie_fixed_daily_snapshot.sql")) {
+    throw new Error("The source schema must apply the fixed daily snapshot patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261018k_timegenie_fixed_daily_snapshot\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the fixed daily snapshot patch is idempotent.");
+  }
   for (const expected of [
     "create or replace function timegenie.timer_transition_apply",
     "expected_parent_version",
@@ -212,6 +314,9 @@ function verifyStaticSchemaInvariants() {
   if ((schemaIntegrationTest.match(/\\ir 20261014_timegenie_timer_sync_authority\.sql/g) ?? []).length < 2) {
     throw new Error("The schema integration test must prove the timer sync authority patch is idempotent.");
   }
+  if ((schemaIntegrationTest.match(/\\ir 20261018f_timegenie_timer_fact_convergence\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the timer-fact convergence patch is idempotent.");
+  }
   if ((schemaIntegrationTest.match(/\\ir 20261015_timegenie_actual_adjustment_batch\.sql/g) ?? []).length < 2) {
     throw new Error("The schema integration test must prove the actual adjustment batch patch is idempotent.");
   }
@@ -262,19 +367,31 @@ function verifyStaticSchemaInvariants() {
     "matchesRequest",
     "'code','IDEMPOTENCY_CONFLICT'",
     "'code','SYNC_CONFLICT'",
-    "'code','LEASE_NOT_HELD'",
-    "'authoritativeTimer',authoritative_timer",
+    "create or replace function timegenie.timegenie_clamp_timer_stop_payload",
     "grant execute on function timegenie.timer_sync_context_get(uuid,uuid,uuid) to authenticated",
     "grant execute on function timegenie.timer_sync_context_get(uuid,uuid,uuid,text,jsonb) to authenticated",
     "revoke execute on function timegenie.apply_calendar_time_entry(uuid,uuid,uuid,text,text,bigint,jsonb,jsonb) from public,anon,authenticated",
     "grant execute on function timegenie.unassigned_tick(uuid,uuid,uuid) to authenticated",
     "grant execute on function timegenie.tracking_lease_acquire(uuid,uuid,uuid) to authenticated",
     "grant execute on function timegenie.tracking_lease_renew(uuid,uuid,uuid) to authenticated",
+    "grant execute on function timegenie.tracking_lease_takeover_for_timer_write(uuid,uuid,uuid) to authenticated",
     "grant execute on function timegenie.tracking_lease_release(uuid,uuid,uuid) to authenticated",
   ]) {
-    if (!timerSyncAuthorityPatch.replaceAll(" ", "").toLowerCase().includes(expected.replaceAll(" ", "").toLowerCase())) {
-      throw new Error(`The timer sync authority patch must include: ${expected}`);
+    const timerLeaseSources = `${timerSyncAuthorityPatch}\n${timerWriteLeaseTakeoverPatch}\n${timerFactConvergencePatch}`;
+    if (!timerLeaseSources.replaceAll(" ", "").toLowerCase().includes(expected.replaceAll(" ", "").toLowerCase())) {
+      throw new Error(`The timer lease patches must include: ${expected}`);
     }
+  }
+  if (timerFactConvergencePatch.includes("LEASE_NOT_HELD")
+      || timerFactConvergencePatch.includes("timer_write_lease_context(p_workspace_id,p_device_id)")) {
+    throw new Error("Timer-fact writes must not require a tracking lease.");
+  }
+  if (!timerFactConvergencePatch.includes("'compatibilityOnly',true")
+      || !timerFactConvergencePatch.includes("'takeover',false")) {
+    throw new Error("The legacy timer-write takeover RPC must be a non-mutating compatibility response.");
+  }
+  if (!schema.includes("\\ir 20261018f_timegenie_timer_fact_convergence.sql")) {
+    throw new Error("The source schema must finish with the timer-fact convergence patch.");
   }
   for (const expected of [
     "create or replace function timegenie.unassigned_anchor_reset",

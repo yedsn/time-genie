@@ -3077,6 +3077,9 @@ mod tests {
             last_error: None,
             auth_blocked: false,
             auth_blocked_reason: None,
+            workspace_epoch: 1,
+            epoch_blocked: false,
+            epoch_blocked_reason: None,
         }
     }
 

@@ -22,6 +22,7 @@ const SESSION_CREDENTIAL_SERVICE: &str = "timegenie";
 const SESSION_CREDENTIAL_TARGET_PREFIX: &str = "com.timegenie.desktop";
 const SESSION_METADATA_SETTING: &str = "supabase_session_metadata";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 12;
+const SNAPSHOT_TIMEOUT_SECONDS: u64 = 150;
 pub(crate) const CLOUD_SCHEMA: &str = "timegenie";
 const CLOUD_BUSINESS_ENTITIES: [&str; 8] = [
     "tasks",
@@ -106,6 +107,9 @@ pub struct StorageModeSnapshot {
     pub last_error: Option<String>,
     pub auth_blocked: bool,
     pub auth_blocked_reason: Option<String>,
+    pub workspace_epoch: i64,
+    pub epoch_blocked: bool,
+    pub epoch_blocked_reason: Option<String>,
 }
 
 #[cfg(test)]
@@ -139,6 +143,210 @@ pub struct MigrationPreview {
     pub entities: Vec<MigrationEntityCount>,
     pub conflicts: Vec<String>,
     pub can_execute: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudOperationHistoryCursor {
+    pub occurred_at: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudOperationHistoryItem {
+    pub id: String,
+    pub operation_id: String,
+    pub business_type: String,
+    pub source: String,
+    pub device_id: Option<String>,
+    pub device_name: String,
+    pub summary: String,
+    pub affected_entity_count: i64,
+    pub occurred_at: String,
+    pub expires_at: String,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudOperationHistoryPage {
+    pub items: Vec<CloudOperationHistoryItem>,
+    pub next_cursor: Option<CloudOperationHistoryCursor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudOperationHistoryDetailItem {
+    pub id: i64,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub entity_label: String,
+    pub action: String,
+    pub before: Option<Value>,
+    pub after: Option<Value>,
+    pub changed_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudOperationHistoryDetail {
+    pub id: String,
+    pub operation_id: String,
+    pub business_type: String,
+    pub source: String,
+    pub device_id: Option<String>,
+    pub device_name_snapshot: String,
+    pub summary: String,
+    pub affected_entity_count: i64,
+    pub metadata: Value,
+    pub occurred_at: String,
+    pub expires_at: String,
+    pub items: Vec<CloudOperationHistoryDetailItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudOperationHistoryListRequest {
+    pub limit: Option<i64>,
+    pub cursor: Option<CloudOperationHistoryCursor>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub device_id: Option<String>,
+    pub source: Option<String>,
+    pub business_type: Option<String>,
+    pub query: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudOperationHistoryDetailRequest {
+    pub log_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudWorkspaceSnapshot {
+    pub id: String,
+    pub snapshot_type: String,
+    pub name: String,
+    pub note: Option<String>,
+    pub status: String,
+    pub format_version: i64,
+    pub base_change_seq: i64,
+    pub workspace_epoch: i64,
+    pub entity_counts: Value,
+    pub group_hashes: Value,
+    pub content_hash: Option<String>,
+    pub size_bytes: i64,
+    pub chunk_count: i64,
+    pub device_name: String,
+    pub protected: bool,
+    pub protected_at: Option<String>,
+    pub expires_at: Option<String>,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudWorkspaceSnapshotPreview {
+    pub snapshot_id: String,
+    pub restorable: bool,
+    pub error_code: Option<String>,
+    pub entity_counts: Option<Value>,
+    pub current_entity_counts: Option<Value>,
+    pub groups: Option<Value>,
+    pub entities: Option<Value>,
+    pub content_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudWorkspaceSnapshotSettings {
+    pub automatic_snapshot_enabled: bool,
+    pub automatic_snapshot_time: String,
+    pub automatic_snapshot_timezone: String,
+    pub snapshot_retention_days: i64,
+    pub next_automatic_snapshot_at: Option<String>,
+    pub last_automatic_snapshot_at: Option<String>,
+    pub scheduler_active: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudWorkspaceSnapshotSettingsUpdateRequest {
+    pub automatic_snapshot_enabled: bool,
+    pub automatic_snapshot_time: String,
+    pub snapshot_retention_days: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudWorkspaceSnapshotCreateRequest {
+    pub name: String,
+    pub note: Option<String>,
+    pub snapshot_type: Option<String>,
+    pub lazy: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudWorkspaceSnapshotIdRequest {
+    pub snapshot_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudWorkspaceSnapshotProtectRequest {
+    pub snapshot_id: String,
+    pub protected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudWorkspaceSnapshotDeleteResult {
+    pub deleted: bool,
+    pub snapshot_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudWorkspaceRestorePrepareResult {
+    pub lock_token: String,
+    pub target_snapshot_id: String,
+    pub target_content_hash: String,
+    pub prepared_epoch: i64,
+    pub safety_snapshot_id: String,
+    pub expires_at: String,
+    pub preview: CloudWorkspaceSnapshotPreview,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudWorkspaceRestoreResult {
+    pub restored: bool,
+    pub target_snapshot_id: String,
+    pub safety_snapshot_id: String,
+    pub previous_epoch: i64,
+    pub workspace_epoch: i64,
+    pub reset_change_seq: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudWorkspaceRestoreCommitRequest {
+    pub lock_token: String,
+    pub target_snapshot_id: String,
+    pub target_content_hash: String,
+    pub prepared_epoch: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudWorkspaceRestoreCancelRequest {
+    pub lock_token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,6 +480,337 @@ pub fn storage_mode(database: &Database) -> Result<StorageModeSnapshot, String> 
     storage_mode_from_connection(&connection, current_session(database).is_ok())
 }
 
+pub fn operation_history_list(
+    database: &Database,
+    request: CloudOperationHistoryListRequest,
+) -> Result<CloudOperationHistoryPage, String> {
+    let state = storage_mode(database)?;
+    if state.mode != "cloud" {
+        return Err("CLOUD_MODE_REQUIRED: 操作记录仅在云端模式可用".to_string());
+    }
+    let session = current_session(database)?;
+    let value = client(database)?.rpc_for_database(
+        database,
+        "cloud_operation_history_list",
+        json!({
+            "p_workspace_id": state.workspace_id,
+            "p_device_id": state.device_id,
+            "p_limit": request.limit.unwrap_or(50).clamp(1, 100),
+            "p_cursor_time": request.cursor.as_ref().map(|cursor| cursor.occurred_at.clone()),
+            "p_cursor_id": request.cursor.as_ref().map(|cursor| cursor.id.clone()),
+            "p_from": request.from,
+            "p_to": request.to,
+            "p_filter_device_id": request.device_id,
+            "p_source": request.source,
+            "p_business_type": request.business_type,
+            "p_query": request.query,
+        }),
+        &session,
+    )?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 操作记录响应无效: {error}"))
+}
+
+pub fn operation_history_detail(
+    database: &Database,
+    request: CloudOperationHistoryDetailRequest,
+) -> Result<CloudOperationHistoryDetail, String> {
+    let state = storage_mode(database)?;
+    if state.mode != "cloud" {
+        return Err("CLOUD_MODE_REQUIRED: 操作记录仅在云端模式可用".to_string());
+    }
+    let session = current_session(database)?;
+    let value = client(database)?.rpc_for_database(
+        database,
+        "cloud_operation_history_detail",
+        json!({
+            "p_workspace_id": state.workspace_id,
+            "p_device_id": state.device_id,
+            "p_log_id": request.log_id,
+        }),
+        &session,
+    )?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 操作记录详情无效: {error}"))
+}
+
+fn cloud_workspace_context(
+    database: &Database,
+    capability: &str,
+) -> Result<(StorageModeSnapshot, CloudSession), String> {
+    let state = storage_mode(database)?;
+    if state.mode != "cloud" {
+        return Err(format!("CLOUD_MODE_REQUIRED: {capability}仅在云端模式可用"));
+    }
+    if state.workspace_id.trim().is_empty() || state.device_id.trim().is_empty() {
+        return Err("CLOUD_DEVICE_REQUIRED: 请先完成云端设备注册".to_string());
+    }
+    Ok((state, current_session(database)?))
+}
+
+pub fn workspace_snapshot_create(
+    database: &Database,
+    request: CloudWorkspaceSnapshotCreateRequest,
+) -> Result<CloudWorkspaceSnapshot, String> {
+    let (state, session) = cloud_workspace_context(database, "云端快照")?;
+    let snapshot_type = request
+        .snapshot_type
+        .unwrap_or_else(|| "manual".to_string());
+    if !matches!(
+        snapshot_type.as_str(),
+        "manual" | "automatic" | "pre_restore"
+    ) {
+        return Err("VALIDATION_ERROR: 不支持的镜像类型".to_string());
+    }
+    let name = request.name.trim();
+    if name.is_empty() || name.chars().count() > 120 {
+        return Err("VALIDATION_ERROR: 镜像名称应为 1 到 120 个字符".to_string());
+    }
+    let value = client(database)?.rpc_for_database_with_timeout(
+        database,
+        "workspace_snapshot_create",
+        json!({
+            "p_workspace_id": state.workspace_id,
+            "p_device_id": state.device_id,
+            "p_operation_id": Uuid::now_v7().to_string(),
+            "p_snapshot_type": snapshot_type,
+            "p_name": name,
+            "p_note": request.note.and_then(|note| {
+                let note = note.trim().to_string();
+                (!note.is_empty()).then_some(note)
+            }),
+            "p_lazy": request.lazy.unwrap_or(false),
+        }),
+        &session,
+        SNAPSHOT_TIMEOUT_SECONDS,
+    )?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 镜像创建响应无效: {error}"))
+}
+
+pub fn workspace_snapshot_list(database: &Database) -> Result<Vec<CloudWorkspaceSnapshot>, String> {
+    let (state, session) = cloud_workspace_context(database, "云端快照")?;
+    let value = client(database)?.rpc_for_database(
+        database,
+        "workspace_snapshot_list",
+        json!({"p_workspace_id": state.workspace_id, "p_device_id": state.device_id}),
+        &session,
+    )?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 镜像列表响应无效: {error}"))
+}
+
+pub fn workspace_snapshot_set_protected(
+    database: &Database,
+    request: CloudWorkspaceSnapshotProtectRequest,
+) -> Result<CloudWorkspaceSnapshot, String> {
+    let (state, session) = cloud_workspace_context(database, "云端快照")?;
+    let value = client(database)?.rpc_for_database(
+        database,
+        "workspace_snapshot_set_protected",
+        json!({
+            "p_workspace_id": state.workspace_id,
+            "p_device_id": state.device_id,
+            "p_snapshot_id": request.snapshot_id,
+            "p_protected": request.protected,
+        }),
+        &session,
+    )?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 镜像保护响应无效: {error}"))
+}
+
+pub fn workspace_snapshot_delete(
+    database: &Database,
+    request: CloudWorkspaceSnapshotIdRequest,
+) -> Result<CloudWorkspaceSnapshotDeleteResult, String> {
+    let (state, session) = cloud_workspace_context(database, "云端快照")?;
+    let value = client(database)?.rpc_for_database(
+        database,
+        "workspace_snapshot_delete",
+        json!({
+            "p_workspace_id": state.workspace_id,
+            "p_device_id": state.device_id,
+            "p_snapshot_id": request.snapshot_id,
+        }),
+        &session,
+    )?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 镜像删除响应无效: {error}"))
+}
+
+pub fn workspace_snapshot_preview(
+    database: &Database,
+    request: CloudWorkspaceSnapshotIdRequest,
+) -> Result<CloudWorkspaceSnapshotPreview, String> {
+    let (state, session) = cloud_workspace_context(database, "云端快照")?;
+    let value = client(database)?.rpc_for_database(
+        database,
+        "workspace_snapshot_preview",
+        json!({
+            "p_workspace_id": state.workspace_id,
+            "p_device_id": state.device_id,
+            "p_snapshot_id": request.snapshot_id,
+        }),
+        &session,
+    )?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 快照差异响应无效: {error}"))
+}
+
+fn validate_automatic_snapshot_time(value: &str) -> Result<&str, String> {
+    let trimmed = value.trim();
+    let mut parts = trimmed.split(':');
+    let hour = parts.next().and_then(|part| part.parse::<u32>().ok());
+    let minute = parts.next().and_then(|part| part.parse::<u32>().ok());
+    let valid = trimmed.len() == 5
+        && trimmed.as_bytes()[2] == b':'
+        && parts.next().is_none()
+        && hour.is_some_and(|hour| hour < 24)
+        && minute.is_some_and(|minute| minute < 60);
+    if valid {
+        Ok(trimmed)
+    } else {
+        Err("VALIDATION_ERROR: 自动快照时间格式必须为 HH:MM".to_string())
+    }
+}
+
+fn validate_snapshot_retention_days(value: i64) -> Result<i64, String> {
+    if (1..=365).contains(&value) {
+        Ok(value)
+    } else {
+        Err("VALIDATION_ERROR: 快照最长保留天数必须在 1 到 365 天之间".to_string())
+    }
+}
+
+#[cfg(test)]
+mod snapshot_setting_tests {
+    use super::{validate_automatic_snapshot_time, validate_snapshot_retention_days};
+
+    #[test]
+    fn accepts_only_24_hour_clock_times() {
+        assert_eq!(validate_automatic_snapshot_time("00:00").unwrap(), "00:00");
+        assert_eq!(validate_automatic_snapshot_time("03:00").unwrap(), "03:00");
+        assert_eq!(validate_automatic_snapshot_time("23:59").unwrap(), "23:59");
+        assert!(validate_automatic_snapshot_time("24:00").is_err());
+        assert!(validate_automatic_snapshot_time("03:60").is_err());
+        assert!(validate_automatic_snapshot_time("3:00").is_err());
+        assert!(validate_automatic_snapshot_time("03:00:00").is_err());
+        assert!(validate_automatic_snapshot_time("daily").is_err());
+    }
+
+    #[test]
+    fn accepts_snapshot_retention_between_one_and_365_days() {
+        assert_eq!(validate_snapshot_retention_days(1).unwrap(), 1);
+        assert_eq!(validate_snapshot_retention_days(7).unwrap(), 7);
+        assert_eq!(validate_snapshot_retention_days(365).unwrap(), 365);
+        assert!(validate_snapshot_retention_days(0).is_err());
+        assert!(validate_snapshot_retention_days(366).is_err());
+    }
+}
+
+pub fn workspace_snapshot_settings_get(
+    database: &Database,
+) -> Result<CloudWorkspaceSnapshotSettings, String> {
+    let (state, session) = cloud_workspace_context(database, "云端快照")?;
+    let value = client(database)?.rpc_for_database(
+        database,
+        "workspace_snapshot_settings_get",
+        json!({"p_workspace_id": state.workspace_id, "p_device_id": state.device_id}),
+        &session,
+    )?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 快照设置响应无效: {error}"))
+}
+
+pub fn workspace_snapshot_settings_update(
+    database: &Database,
+    request: CloudWorkspaceSnapshotSettingsUpdateRequest,
+) -> Result<CloudWorkspaceSnapshotSettings, String> {
+    let (state, session) = cloud_workspace_context(database, "云端快照")?;
+    let time = validate_automatic_snapshot_time(&request.automatic_snapshot_time)?;
+    let retention_days = validate_snapshot_retention_days(request.snapshot_retention_days)?;
+    let value = client(database)?.rpc_for_database(
+        database,
+        "workspace_snapshot_settings_update",
+        json!({
+            "p_workspace_id": state.workspace_id,
+            "p_device_id": state.device_id,
+            "p_operation_id": Uuid::now_v7().to_string(),
+            "p_automatic_snapshot_enabled": request.automatic_snapshot_enabled,
+            "p_automatic_snapshot_time": time,
+            "p_snapshot_retention_days": retention_days,
+        }),
+        &session,
+    )?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 快照设置保存响应无效: {error}"))
+}
+
+fn ensure_local_restore_gate(database: &Database, workspace_id: &str) -> Result<(), String> {
+    let connection = database.open()?;
+    let dirty: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1 AND state IN ('pending','sending','failed','conflict')",
+        [workspace_id], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if dirty > 0 {
+        return Err(
+            "SYNC_PENDING: 当前设备仍有待同步、失败或冲突操作，不能开始云端回滚".to_string(),
+        );
+    }
+    let active_timer: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM time_entries WHERE state IN ('running','paused') AND deleted_at IS NULL)", [], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if active_timer {
+        return Err("RESTORE_ACTIVE_TIMER: 请先结束当前活动计时".to_string());
+    }
+    let active_unassigned: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM unassigned_sessions WHERE state IN ('collecting','paused','awaiting_resolution'))", [], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if active_unassigned {
+        return Err("RESTORE_ACTIVE_UNASSIGNED: 请先处理当前未归属时间".to_string());
+    }
+    Ok(())
+}
+
+pub fn workspace_restore_prepare(
+    database: &Database,
+    request: CloudWorkspaceSnapshotIdRequest,
+) -> Result<CloudWorkspaceRestorePrepareResult, String> {
+    let (state, session) = cloud_workspace_context(database, "云端回滚")?;
+    ensure_local_restore_gate(database, &state.workspace_id)?;
+    let value = client(database)?.rpc_for_database_with_epoch(database, "workspace_restore_prepare", json!({
+        "p_workspace_id":state.workspace_id,"p_device_id":state.device_id,"p_target_snapshot_id":request.snapshot_id,"p_expected_epoch":state.workspace_epoch
+    }), &session, state.workspace_epoch)?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 回滚准备响应无效: {error}"))
+}
+
+pub fn workspace_restore_commit(
+    database: &Database,
+    request: CloudWorkspaceRestoreCommitRequest,
+) -> Result<CloudWorkspaceRestoreResult, String> {
+    let (state, session) = cloud_workspace_context(database, "云端回滚")?;
+    ensure_local_restore_gate(database, &state.workspace_id)?;
+    let value = client(database)?.rpc_for_database_with_epoch(database, "workspace_restore_commit", json!({
+        "p_workspace_id":state.workspace_id,"p_device_id":state.device_id,"p_lock_token":request.lock_token,
+        "p_target_snapshot_id":request.target_snapshot_id,"p_target_content_hash":request.target_content_hash,
+        "p_prepared_epoch":request.prepared_epoch,"p_operation_id":Uuid::now_v7().to_string(),"p_confirmed":true
+    }), &session, request.prepared_epoch)?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 回滚提交响应无效: {error}"))
+}
+
+pub fn workspace_restore_cancel(
+    database: &Database,
+    request: CloudWorkspaceRestoreCancelRequest,
+) -> Result<Value, String> {
+    let (state, session) = cloud_workspace_context(database, "云端回滚")?;
+    client(database)?.rpc_for_database_with_epoch(database, "workspace_restore_cancel", json!({
+        "p_workspace_id":state.workspace_id,"p_device_id":state.device_id,"p_lock_token":request.lock_token
+    }), &session, state.workspace_epoch)
+}
+
 pub(crate) fn storage_mode_from_connection(
     connection: &rusqlite::Connection,
     online: bool,
@@ -318,13 +857,13 @@ pub(crate) fn storage_mode_from_connection(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|error| error.to_string())?;
-    let (last_change_seq, last_synced_at, last_error): (i64, Option<i64>, Option<String>) = connection
+    let (last_change_seq, last_synced_at, last_error, workspace_epoch, epoch_blocked, epoch_blocked_reason): (i64, Option<i64>, Option<String>, i64, bool, Option<String>) = connection
         .query_row(
-            "SELECT last_change_seq, last_full_sync_at, last_error FROM local_sync_state WHERE workspace_id = ?1",
+            "SELECT last_change_seq, last_full_sync_at, last_error, workspace_epoch, epoch_blocked, epoch_blocked_reason FROM local_sync_state WHERE workspace_id = ?1",
             [&sync_workspace_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         )
-        .unwrap_or((0, None, None));
+        .unwrap_or((0, None, None, 1, false, None));
     let cloud_workspace_id: Option<String> = connection
         .query_row(
             "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'cloud_workspace_id'",
@@ -349,7 +888,9 @@ pub(crate) fn storage_mode_from_connection(
         .unwrap_or((false, None));
     Ok(StorageModeSnapshot {
         online: mode == "local" || online,
-        sync_state: if conflicts > 0 {
+        sync_state: if epoch_blocked {
+            "epoch_blocked".to_string()
+        } else if conflicts > 0 {
             "conflict".to_string()
         } else if pending > 0 {
             "pending".to_string()
@@ -368,6 +909,9 @@ pub(crate) fn storage_mode_from_connection(
         last_error,
         auth_blocked,
         auth_blocked_reason,
+        workspace_epoch,
+        epoch_blocked,
+        epoch_blocked_reason,
     })
 }
 
@@ -1369,7 +1913,7 @@ impl SupabaseClient {
         let response = request
             .bearer_auth(&session.access_token)
             .send()
-            .map_err(|error| format!("NETWORK_ERROR: Supabase 请求失败: {error}"))?;
+            .map_err(map_supabase_request_error)?;
         if !response.status().is_success() {
             return Err(map_http_error(response, "CLOUD_REQUEST_FAILED"));
         }
@@ -1404,15 +1948,96 @@ impl SupabaseClient {
         body: Value,
         session: &CloudSession,
     ) -> Result<Value, String> {
+        let workspace_epoch = body
+            .get("p_workspace_id")
+            .and_then(Value::as_str)
+            .and_then(|workspace_id| {
+                database
+                    .open()
+                    .ok()?
+                    .query_row(
+                        "SELECT workspace_epoch FROM local_sync_state WHERE workspace_id=?1",
+                        [workspace_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or(1);
         self.request_for_database(
             database,
             self.post(format!("{}/rest/v1/rpc/{function}", self.project_url))
+                .header("x-timegenie-workspace-epoch", workspace_epoch.to_string())
                 .json(&body),
             session,
         )?
         .json()
         .map_err(|error| format!("NETWORK_ERROR: Supabase RPC 响应无效: {error}"))
     }
+
+    pub(crate) fn rpc_for_database_with_timeout(
+        &self,
+        database: &Database,
+        function: &str,
+        body: Value,
+        session: &CloudSession,
+        timeout_seconds: u64,
+    ) -> Result<Value, String> {
+        let workspace_epoch = body
+            .get("p_workspace_id")
+            .and_then(Value::as_str)
+            .and_then(|workspace_id| {
+                database
+                    .open()
+                    .ok()?
+                    .query_row(
+                        "SELECT workspace_epoch FROM local_sync_state WHERE workspace_id=?1",
+                        [workspace_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or(1);
+        self.request_for_database(
+            database,
+            self.post(format!("{}/rest/v1/rpc/{function}", self.project_url))
+                .timeout(std::time::Duration::from_secs(timeout_seconds))
+                .header("x-timegenie-workspace-epoch", workspace_epoch.to_string())
+                .json(&body),
+            session,
+        )?
+        .json()
+        .map_err(|error| format!("NETWORK_ERROR: Supabase RPC 响应无效: {error}"))
+    }
+
+    pub(crate) fn rpc_for_database_with_epoch(
+        &self,
+        database: &Database,
+        function: &str,
+        body: Value,
+        session: &CloudSession,
+        workspace_epoch: i64,
+    ) -> Result<Value, String> {
+        self.request_for_database(
+            database,
+            self.post(format!("{}/rest/v1/rpc/{function}", self.project_url))
+                .header("x-timegenie-workspace-epoch", workspace_epoch.to_string())
+                .json(&body),
+            session,
+        )?
+        .json()
+        .map_err(|error| format!("NETWORK_ERROR: Supabase RPC 响应无效: {error}"))
+    }
+}
+
+fn map_supabase_request_error(error: reqwest::Error) -> String {
+    if error.is_timeout() {
+        return "CLOUD_TIMEOUT: 云端操作处理时间较长，请稍后刷新确认结果后再重试".to_string();
+    }
+    format!("NETWORK_ERROR: Supabase 请求失败: {error}")
 }
 
 pub(crate) fn client(database: &Database) -> Result<SupabaseClient, String> {
@@ -2475,6 +3100,100 @@ pub fn cloud_sync_resume_after_reauth(
     database: tauri::State<'_, Database>,
 ) -> Result<StorageModeSnapshot, String> {
     resume_pending_sync(&database)
+}
+
+#[tauri::command]
+pub fn cloud_operation_history_list(
+    database: tauri::State<'_, Database>,
+    request: CloudOperationHistoryListRequest,
+) -> Result<CloudOperationHistoryPage, String> {
+    operation_history_list(&database, request)
+}
+
+#[tauri::command]
+pub fn cloud_operation_history_detail(
+    database: tauri::State<'_, Database>,
+    request: CloudOperationHistoryDetailRequest,
+) -> Result<CloudOperationHistoryDetail, String> {
+    operation_history_detail(&database, request)
+}
+
+#[tauri::command]
+pub fn cloud_workspace_snapshot_create(
+    database: tauri::State<'_, Database>,
+    request: CloudWorkspaceSnapshotCreateRequest,
+) -> Result<CloudWorkspaceSnapshot, String> {
+    workspace_snapshot_create(&database, request)
+}
+
+#[tauri::command]
+pub fn cloud_workspace_snapshot_list(
+    database: tauri::State<'_, Database>,
+) -> Result<Vec<CloudWorkspaceSnapshot>, String> {
+    workspace_snapshot_list(&database)
+}
+
+#[tauri::command]
+pub fn cloud_workspace_snapshot_set_protected(
+    database: tauri::State<'_, Database>,
+    request: CloudWorkspaceSnapshotProtectRequest,
+) -> Result<CloudWorkspaceSnapshot, String> {
+    workspace_snapshot_set_protected(&database, request)
+}
+
+#[tauri::command]
+pub fn cloud_workspace_snapshot_delete(
+    database: tauri::State<'_, Database>,
+    request: CloudWorkspaceSnapshotIdRequest,
+) -> Result<CloudWorkspaceSnapshotDeleteResult, String> {
+    workspace_snapshot_delete(&database, request)
+}
+
+#[tauri::command]
+pub fn cloud_workspace_snapshot_preview(
+    database: tauri::State<'_, Database>,
+    request: CloudWorkspaceSnapshotIdRequest,
+) -> Result<CloudWorkspaceSnapshotPreview, String> {
+    workspace_snapshot_preview(&database, request)
+}
+
+#[tauri::command]
+pub fn cloud_workspace_snapshot_settings_get(
+    database: tauri::State<'_, Database>,
+) -> Result<CloudWorkspaceSnapshotSettings, String> {
+    workspace_snapshot_settings_get(&database)
+}
+
+#[tauri::command]
+pub fn cloud_workspace_snapshot_settings_update(
+    database: tauri::State<'_, Database>,
+    request: CloudWorkspaceSnapshotSettingsUpdateRequest,
+) -> Result<CloudWorkspaceSnapshotSettings, String> {
+    workspace_snapshot_settings_update(&database, request)
+}
+
+#[tauri::command]
+pub fn cloud_workspace_restore_prepare(
+    database: tauri::State<'_, Database>,
+    request: CloudWorkspaceSnapshotIdRequest,
+) -> Result<CloudWorkspaceRestorePrepareResult, String> {
+    workspace_restore_prepare(&database, request)
+}
+
+#[tauri::command]
+pub fn cloud_workspace_restore_commit(
+    database: tauri::State<'_, Database>,
+    request: CloudWorkspaceRestoreCommitRequest,
+) -> Result<CloudWorkspaceRestoreResult, String> {
+    workspace_restore_commit(&database, request)
+}
+
+#[tauri::command]
+pub fn cloud_workspace_restore_cancel(
+    database: tauri::State<'_, Database>,
+    request: CloudWorkspaceRestoreCancelRequest,
+) -> Result<Value, String> {
+    workspace_restore_cancel(&database, request)
 }
 
 #[tauri::command]

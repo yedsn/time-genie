@@ -1,5 +1,6 @@
 import { computed, reactive, ref, watch } from "vue";
 import { defineStore } from "pinia";
+import { derivedUnassignedSeconds } from "./services/unassignedTimeDisplayCore";
 import {
   createSubject as createSubjectRecord,
   createPositionedTask,
@@ -237,6 +238,8 @@ export const useWorkdayStore = defineStore("workday", () => {
   const workspaceDayStartAt = ref(0);
   const workspaceDayEndAt = ref(0);
   const unassignedStartedAt = ref<number>();
+  const unassignedElapsedBaseSeconds = ref(0);
+  const unassignedElapsedSyncedAt = ref(0);
   const unassignedFirstStartedAt = ref<number>();
   const unassignedLastEndedAt = ref<number>();
   const unassignedDialogOpen = ref(false);
@@ -301,11 +304,11 @@ export const useWorkdayStore = defineStore("workday", () => {
   const todayCompletionPercent = computed(() => todayCompletionTotalCount.value
     ? Math.round(todayCompletionDoneCount.value / todayCompletionTotalCount.value * 100)
     : 0);
-  const unassignedSeconds = computed(() => {
-    return unassignedStartedAt.value
-      ? Math.max(0, Math.floor((now.value - unassignedStartedAt.value) / 1_000))
-      : 0;
-  });
+  const unassignedSeconds = computed(() => derivedUnassignedSeconds(
+    unassignedElapsedBaseSeconds.value,
+    unassignedElapsedSyncedAt.value,
+    now.value,
+  ));
   const visibleTasks = computed(() => {
     const childMap = new Map<string, Task[]>();
     const roots: Task[] = [];
@@ -732,6 +735,8 @@ export const useWorkdayStore = defineStore("workday", () => {
     unassignedFirstStartedAt.value = state.firstStartedAt;
     unassignedLastEndedAt.value = state.lastEndedAt;
     unassignedStartedAt.value = state.currentSegmentStartedAt ?? state.firstStartedAt;
+    unassignedElapsedBaseSeconds.value = Math.max(0, state.elapsedSeconds);
+    unassignedElapsedSyncedAt.value = syncedAt;
   }
 
   function replaceTask(record: TaskRecord) {
@@ -808,9 +813,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   function promptUnassignedResolution(force = false) {
     const checkedAt = Date.now();
     now.value = checkedAt;
-    const totalSeconds = unassignedStartedAt.value
-      ? Math.max(0, Math.floor((checkedAt - unassignedStartedAt.value) / 1_000))
-      : 0;
+    const totalSeconds = unassignedSeconds.value;
     if (unassignedDialogOpen.value) return false;
     if (totalSeconds < 1) return false;
     if (!force && totalSeconds <= unassignedThresholdSeconds.value) return false;
@@ -921,6 +924,8 @@ export const useWorkdayStore = defineStore("workday", () => {
     unassignedDialogOpen.value = false;
     dismissedUnassignedSessionId.value = "";
     unassignedStartedAt.value = undefined;
+    unassignedElapsedBaseSeconds.value = 0;
+    unassignedElapsedSyncedAt.value = 0;
     unassignedFirstStartedAt.value = undefined;
     unassignedLastEndedAt.value = undefined;
     unassignedSessionId.value = "";

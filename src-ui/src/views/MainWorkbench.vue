@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, h, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { AlertTriangle, CalendarDays, CheckCircle2, Clock3, Copy, Database, FileText, Folder, Home, LoaderCircle, Minus, Pencil, Plus, RefreshCw, Save, Settings, Square, UserRound, X } from "lucide-vue-next";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useWorkdayStore, type Task } from "../store";
-import { checkAppUpdate, closeMainWindow, confirmObsidianPlan, configureCloud, downloadAndInstallUpdate, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listCloudSyncConflicts, listCloudSyncQueue, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onOpenTimerTaskSelection, onTrayCheckUpdate, previewObsidianPlan, previewSeaTableTaskSync, previewStorageMigration, registerCloudDevice, resetLocalCacheFromCloud, resolveAllCloudSyncConflicts, restartApp, resumeCloudSyncAfterReauth, retryFailedSeaTableSync, revokeCloudDevice, saveCloudSync, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudSessionSnapshot, type CloudSyncConflict, type CloudSyncQueueItem, type PlanImportPreviewResult, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
+import { checkAppUpdate, closeMainWindow, confirmObsidianPlan, configureCloud, discardOldEpochChangesAndRedownload, downloadAndInstallUpdate, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listCloudSyncConflicts, listCloudSyncQueue, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onOpenTimerTaskSelection, onTimerFactFollowed, onTrayCheckUpdate, previewObsidianPlan, previewSeaTableTaskSync, previewStorageMigration, registerCloudDevice, resetLocalCacheFromCloud, resolveAllCloudSyncConflicts, restartApp, resumeCloudSyncAfterReauth, retryFailedSeaTableSync, revokeCloudDevice, saveCloudSync, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudSessionSnapshot, type CloudSyncConflict, type CloudSyncQueueItem, type PlanImportPreviewResult, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
 import PlanListEditor from "../components/PlanListEditor.vue";
 import CompletedTaskHistory from "../components/CompletedTaskHistory.vue";
 import GlobalTimerBar from "../components/GlobalTimerBar.vue";
@@ -12,6 +12,9 @@ import TimeTrackingWorkspace from "../components/TimeTrackingWorkspace.vue";
 import TodayOverviewWorkspace from "../components/TodayOverviewWorkspace.vue";
 import ReportWorkspace from "../components/ReportWorkspace.vue";
 import AutomationHooksSettings from "../components/AutomationHooksSettings.vue";
+import DataBackupSettings from "../components/DataBackupSettings.vue";
+import CloudOperationHistorySettings from "../components/CloudOperationHistorySettings.vue";
+import CloudSnapshotsSettings from "../components/CloudSnapshotsSettings.vue";
 import TimerStopConfirmationDialog from "../components/TimerStopConfirmationDialog.vue";
 import TimerTaskDialog from "../components/TimerTaskDialog.vue";
 import appIconUrl from "../../../src-tauri/icons/icon.svg";
@@ -40,7 +43,10 @@ const settingsNavGroups = [
   ] },
   { label: "数据与集成", items: [
     { id: "seatable", label: "SeaTable", icon: Database },
-    { id: "storage", label: "数据存储", icon: Database }
+    { id: "storage", label: "数据存储", icon: Database },
+    { id: "backup", label: "本地备份", icon: Save },
+    { id: "history", label: "操作记录", icon: RefreshCw },
+    { id: "snapshots", label: "历史镜像", icon: Save }
   ] },
   { label: "行为与自动化", items: [
     { id: "feedback", label: "交互与托盘", icon: CheckCircle2 },
@@ -81,6 +87,7 @@ const cloudQueueLoading = ref(false);
 const cloudQueueItems = ref<CloudSyncQueueItem[]>([]);
 const resetLocalCacheDialogOpen = ref(false);
 const resetLocalCacheWorking = ref(false);
+const epochRecoveryWorking = ref(false);
 const importDialogOpen = ref(false);
 const importLoading = ref(false);
 const importSaving = ref(false);
@@ -157,11 +164,13 @@ let unlistenWindowResize: (() => void) | undefined;
 let unlistenNavigatePage: (() => void) | undefined;
 let unlistenOpenTimerTaskSelection: (() => void) | undefined;
 let unlistenCloudSyncState: (() => void) | undefined;
+let unlistenTimerFactFollowed: (() => void) | undefined;
 let unlistenTrayCheckUpdate: (() => void) | undefined;
 let unlistenAppUpdateEvent: (() => void) | undefined;
 let cloudSaveSettledTimer: number | undefined;
 let cloudSavePendingSince = 0;
 const completingTaskIds = new Set<string>();
+const startingTimerTaskIds = new Set<string>();
 const recentCompletedTaskId = ref("");
 const executionPanelOpen = ref(false);
 const executionPanelMode = ref<ExecutionPanelMode>("execute");
@@ -967,6 +976,29 @@ onMounted(async () => {
     storageState.value = state;
     void refreshOpenCloudSyncQueue();
   });
+  unlistenTimerFactFollowed = await onTimerFactFollowed((event) => {
+    void Promise.all([store.loadTimeData(), store.loadTimeHistory(store.timeHistoryPage), store.loadUnassignedState()]);
+    ElMessage({
+      type: "info",
+      message: h("span", { class: "timer-followed-message" }, [
+        "已在另一台设备保存，已跟随该结果 ",
+        h(
+          "button",
+          {
+            type: "button",
+            class: "timer-followed-message__link",
+            onClick: () => {
+              store.activePage = "timer";
+              store.selectedEntryId = event.entityId;
+            },
+          },
+          "查看记录",
+        ),
+      ]),
+      duration: 5000,
+      showClose: true,
+    });
+  });
   unlistenTrayCheckUpdate = await onTrayCheckUpdate(() => {
     void handleCheckUpdate();
   });
@@ -978,6 +1010,7 @@ onUnmounted(() => {
   unlistenNavigatePage?.();
   unlistenOpenTimerTaskSelection?.();
   unlistenCloudSyncState?.();
+  unlistenTimerFactFollowed?.();
   unlistenTrayCheckUpdate?.();
   unlistenAppUpdateEvent?.();
   if (recentCompletedTimer) window.clearTimeout(recentCompletedTimer);
@@ -1236,6 +1269,31 @@ function openExecutionPanel(options: {
   executionPanelOpen.value = true;
 }
 
+async function discardOldEpochChanges() {
+  if (epochRecoveryWorking.value) return;
+  try {
+    await ElMessageBox.confirm(
+      "TimeGenie 会先在本机生成安全备份，再放弃旧世代待同步修改并下载回滚后的云端数据。此操作不会把旧修改上传到云端。",
+      "放弃旧修改并重新下载？",
+      { confirmButtonText: "生成备份并继续", cancelButtonText: "取消", type: "warning" }
+    );
+    epochRecoveryWorking.value = true;
+    storageState.value = await discardOldEpochChangesAndRedownload();
+    ElMessage.success("已生成本机安全备份，并按云端新世代重建本地数据");
+    await Promise.all([store.loadWorkspaceData(), store.loadTimeData(), store.loadReports(), store.loadUnassignedState()]);
+  } catch (error) {
+    if (error === "cancel" || error === "close") return;
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    epochRecoveryWorking.value = false;
+  }
+}
+
+async function handleBackupImported() {
+  await Promise.all([store.loadWorkspaceData(), store.loadTimeData(), store.loadReports(), store.loadUnassignedState()]);
+  await loadSettings();
+}
+
 function openTimerTaskDialog(subjectId = "") {
   openExecutionPanel({ mode: "execute", subjectId });
 }
@@ -1251,9 +1309,21 @@ function updateExecutionPanelOpen(open: boolean) {
   }
 }
 
-function openTimerDialogForTask(taskId: string) {
-  const task = store.tasks.find((item) => item.id === taskId);
-  openTimerTaskDialog(task?.subjectId ?? store.selectedSubjectId);
+async function startTimerForTask(taskId: string) {
+  if (startingTimerTaskIds.has(taskId)) return;
+  startingTimerTaskIds.add(taskId);
+  try {
+    const task = store.tasks.find((item) => item.id === taskId);
+    if (!task || store.runningEntry?.defaultTask === taskId) return;
+    const persistedTaskId = task.version > 0 ? task.id : await store.saveTask(task.id);
+    if (!persistedTaskId) throw new Error("计时事项保存失败");
+    const result = await store.transitionTimer({ taskId: persistedTaskId });
+    if (result.previousStopResult && !result.noOp) ElMessage.success("已切换事项，上一段计时可稍后确认归属");
+  } catch (error) {
+    ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "开始计时失败");
+  } finally {
+    startingTimerTaskIds.delete(taskId);
+  }
 }
 
 async function goToPlanFromTimerDialog(subjectId: string) {
@@ -1493,7 +1563,7 @@ async function handleCompletedTaskDelete(task: Task) {
           @toggle="handleTaskToggle"
           @indent="store.indentTask"
           @outdent="store.outdentTask"
-          @start-timer="openTimerDialogForTask"
+          @start-timer="startTimerForTask"
           @move="handleTaskMove"
           @set-recurrence="handleTaskRecurrence"
         />
@@ -1617,6 +1687,7 @@ async function handleCompletedTaskDelete(task: Task) {
           </div>
 
           <p v-if="cloudSession?.status === 'offline_saved'" class="settings-help">账号已安全保存在本机，当前无法连接 Supabase；恢复网络后会自动续期，无需重新输入密码。</p>
+          <div v-if="storageState?.epochBlocked" class="cloud-sync-banner warning"><AlertTriangle :size="16" /><div><strong>当前设备保留着回滚前的旧世代修改</strong><span>{{ storageState.epochBlockedReason || '同步已暂停，本机数据和待处理修改不会被静默覆盖或上传。' }} 当前云端世代：{{ storageState.workspaceEpoch }}。请先到“本地备份”导出设备救援备份，或明确放弃旧修改后重新下载。</span></div><button class="danger-button compact" type="button" :disabled="epochRecoveryWorking || !storageState.online" @click="discardOldEpochChanges"><LoaderCircle v-if="epochRecoveryWorking" class="sync-spin" :size="13" />{{ epochRecoveryWorking ? '重建中...' : '放弃旧修改并重新下载' }}</button></div>
           <div v-if="cloudAuthBlocked" class="cloud-sync-banner warning"><AlertTriangle :size="16" /><div><strong>待同步修改已暂停</strong><span>{{ cloudSession?.signedIn ? '重新登录后不会自动上传，请确认后恢复。' : '本地数据和待同步修改均已保留，重新登录后再确认是否恢复上传。' }}</span></div><button v-if="cloudSession?.signedIn" class="secondary-button compact" type="button" :disabled="cloudWorking" @click="resumeBlockedCloudSync">确认恢复</button></div>
 
           <div v-if="storageState?.mode === 'cloud'" class="storage-section local-cache-section">
@@ -1658,6 +1729,19 @@ async function handleCompletedTaskDelete(task: Task) {
               </div>
             </div>
           </template>
+        </div>
+
+        <div id="settings-backup" data-settings-section="backup" class="work-panel settings-panel settings-backup-panel">
+          <DataBackupSettings @imported="handleBackupImported" />
+        </div>
+
+        <div id="settings-history" data-settings-section="history" class="work-panel settings-panel settings-history-panel">
+          <CloudOperationHistorySettings :enabled="storageState?.mode === 'cloud' && Boolean(cloudSession?.signedIn)" />
+        </div>
+
+        <div id="settings-snapshots" data-settings-section="snapshots" class="work-panel settings-panel settings-snapshots-panel">
+          <CloudSnapshotsSettings :enabled="storageState?.mode === 'cloud' && Boolean(cloudSession?.signedIn)" />
+          <p v-if="storageState?.mode === 'cloud' && storageState.workspaceEpoch === 1" class="settings-help">首次执行云端回滚前，请确保其他设备已升级到支持工作空间世代隔离的版本。回滚后旧客户端将被强制拒绝写入，以保护恢复后的数据。</p>
         </div>
 
         <div id="settings-feedback" data-settings-section="feedback" class="work-panel settings-panel">

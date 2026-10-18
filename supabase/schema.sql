@@ -3624,5 +3624,25 @@ notify pgrst, 'reload schema';
 -- above so lease traffic cannot re-enable server-side timer coordination.
 \ir 20261014_timegenie_timer_sync_authority.sql
 
+-- User timer writes may preempt an idle/background tracking lease.
+\ir 20261018_timegenie_timer_write_lease_takeover.sql
+
+-- Timer facts converge by server acceptance order without a write lease.
+\ir 20261018f_timegenie_timer_fact_convergence.sql
+
 -- Keep workspace bootstrap independent from pre-named-template wrappers.
 \ir 20261016_timegenie_named_template_bootstrap_fix.sql
+
+-- Semantic cloud operation history and retention.
+\ir 20261018b_timegenie_operation_history.sql
+\ir 20261018c_timegenie_workspace_snapshots.sql
+\ir 20261018d_timegenie_workspace_epoch.sql
+\ir 20261018e_timegenie_workspace_restore.sql
+\ir 20261018g_timegenie_automatic_snapshot_schedule.sql
+\ir 20261018h_timegenie_operation_history_page_size.sql
+\ir 20261018i_timegenie_history_detail_and_snapshot_timeout.sql
+\ir 20261018j_timegenie_snapshot_retention.sql
+
+-- Automatic snapshots run on a fixed workspace-local schedule in the database,
+-- never on the desktop sync path.
+\ir 20261018k_timegenie_fixed_daily_snapshot.sql
