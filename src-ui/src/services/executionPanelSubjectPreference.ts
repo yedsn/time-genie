@@ -1,4 +1,5 @@
 const EXECUTION_PANEL_SUBJECT_KEY = "timegenie:execution-panel-subject";
+const subjectPreferenceListeners = new Set<(subjectId: string) => void>();
 
 /**
  * 共享执行事项面板最近使用的主体，按设备保存，
@@ -19,5 +20,10 @@ export function rememberPanelSubjectId(subjectId: string) {
   } catch {
     // 存储不可用时只是不记住上次主体，不影响面板本身的切换与执行。
   }
+  for (const listener of subjectPreferenceListeners) listener(subjectId);
 }
 
+export function onRememberedPanelSubjectChange(listener: (subjectId: string) => void) {
+  subjectPreferenceListeners.add(listener);
+  return () => subjectPreferenceListeners.delete(listener);
+}

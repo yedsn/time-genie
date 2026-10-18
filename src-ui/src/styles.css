@@ -1386,7 +1386,7 @@ pre {
   border-radius: 8px;
   background: var(--panel-solid);
 }
-.report-library { min-width: 0; display: grid; grid-template-rows: auto auto auto minmax(0, 1fr); border-right: 1px solid var(--line-soft); background: var(--panel); }
+.report-library { min-width: 0; display: grid; grid-template-rows: auto auto auto auto minmax(0, 1fr); border-right: 1px solid var(--line-soft); background: var(--panel); }
 .report-library-head { min-height: 62px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 11px 12px 8px; }
 .report-library-head > div { display: grid; gap: 3px; }
 .report-library-head h2 { margin: 0; color: var(--text); font-size: 16px; }
@@ -1395,6 +1395,8 @@ pre {
 .report-search-field:focus-within { border-color: color-mix(in srgb, var(--accent) 32%, var(--line)); color: var(--text-soft); }
 .report-search-field input { height: 30px; border: 0; padding: 0; color: var(--text); background: transparent; font-size: 10px; }
 .report-search-field input::placeholder { color: var(--muted); }
+.report-library .report-subject-tabs { margin: 0 10px 8px; padding-bottom: 2px; }
+.report-library .report-subject-tabs button { height: 29px; padding: 0 10px; font-size: 10px; }
 .report-filter-tabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 2px; margin: 0 10px 8px; padding: 2px; border-radius: 6px; background: var(--surface-soft); }
 .report-filter-tabs button { min-width: 0; min-height: 29px; display: flex; align-items: center; justify-content: center; gap: 4px; border-radius: 4px; color: var(--muted); background: transparent; font-size: 10px; }
 .report-filter-tabs button small { min-width: 13px; color: var(--muted); font-size: 8px; font-variant-numeric: tabular-nums; }

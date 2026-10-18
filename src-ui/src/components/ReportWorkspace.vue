@@ -18,11 +18,14 @@ import {
   validateReportTemplateDraft,
 } from "../services/reportTemplateEditorCore";
 import { loadSubjectWorkSchedule, workPeriodTextForDate } from "../services/subjectWorkScheduleMock";
+import { onRememberedPanelSubjectChange, readRememberedPanelSubjectId, rememberPanelSubjectId } from "../services/executionPanelSubjectPreference";
 
 const store = useWorkdayStore();
 const { reports } = storeToRefs(store);
 const reportFilter = ref<"all" | ReportType>("all");
 const reportQuery = ref("");
+const reportSubjectId = ref("");
+const rememberedReportSubjectId = ref(readRememberedPanelSubjectId());
 const selectedReportId = ref("");
 const editorDraft = ref("");
 const editorMode = ref<"edit" | "preview">("edit");
@@ -69,6 +72,7 @@ const selectedReport = computed(() => reports.value.find((report) => report.id =
 const filteredReports = computed(() => {
   const query = reportQuery.value.trim().toLocaleLowerCase();
   return reports.value.filter((report) => {
+    if (report.subjectId !== reportSubjectId.value) return false;
     if (reportFilter.value !== "all" && report.type !== reportFilter.value) return false;
     if (!query) return true;
     return `${report.period} ${report.subjectName} ${reportTypeLabel(report.type)}`.toLocaleLowerCase().includes(query);
@@ -101,10 +105,10 @@ const existingDraftReport = computed(() => {
     && report.period === period);
 });
 const reportCounts = computed(() => ({
-  all: reports.value.length,
-  daily: reports.value.filter((report) => report.type === "daily").length,
-  weekly: reports.value.filter((report) => report.type === "weekly").length,
-  monthly: reports.value.filter((report) => report.type === "monthly").length
+  all: reports.value.filter((report) => report.subjectId === reportSubjectId.value).length,
+  daily: reports.value.filter((report) => report.subjectId === reportSubjectId.value && report.type === "daily").length,
+  weekly: reports.value.filter((report) => report.subjectId === reportSubjectId.value && report.type === "weekly").length,
+  monthly: reports.value.filter((report) => report.subjectId === reportSubjectId.value && report.type === "monthly").length
 }));
 const draftSummary = computed(() => {
   const selected = new Set(draftTaskIds.value);
@@ -176,6 +180,45 @@ watch(draftType, () => {
   templatePickerOpen.value = false;
   void loadDraftTemplates(true);
 });
+watch([
+  () => store.subjects.map((subject) => subject.id).join("|"),
+  () => reports.value.map((report) => `${report.id}:${report.subjectId}`).join("|"),
+], () => {
+  if (store.subjects.some((subject) => subject.id === rememberedReportSubjectId.value)
+    && reportSubjectId.value !== rememberedReportSubjectId.value) {
+    reportSubjectId.value = rememberedReportSubjectId.value;
+  } else if (!store.subjects.some((subject) => subject.id === reportSubjectId.value)) {
+    reportSubjectId.value = store.subjects.some((subject) => subject.id === rememberedReportSubjectId.value)
+      ? rememberedReportSubjectId.value
+      : store.selectedSubjectId || store.subjects[0]?.id || "";
+  }
+  if (selectedReport.value?.subjectId !== reportSubjectId.value) {
+    selectedReportId.value = reports.value.find((report) => report.subjectId === reportSubjectId.value)?.id ?? "";
+  }
+}, { immediate: true });
+
+async function selectReportSubject(subjectId: string) {
+  if (subjectId === reportSubjectId.value || !store.subjects.some((subject) => subject.id === subjectId)) return;
+  const nextReport = reports.value.find((report) => report.subjectId === subjectId);
+  if (hasUnsavedChanges.value && selectedReport.value?.subjectId !== subjectId) {
+    try {
+      await ElMessageBox.confirm("当前报告有未保存修改，保存后再切换主体。", "保存当前修改", {
+        type: "warning",
+        confirmButtonText: "保存并切换",
+        cancelButtonText: "留在当前主体",
+        customClass: "work-confirm-dialog",
+        closeOnClickModal: false,
+      });
+    } catch {
+      return;
+    }
+    if (!await saveMarkdown(false)) return;
+  }
+  reportSubjectId.value = subjectId;
+  selectedReportId.value = nextReport?.id ?? "";
+  rememberedReportSubjectId.value = subjectId;
+  rememberPanelSubjectId(subjectId);
+}
 
 function reportTypeLabel(type: ReportType) {
   if (type === "daily") return "日报";
@@ -336,7 +379,7 @@ async function loadSuggestedTasks(applySelection = false) {
 async function openCreateDialog() {
   dialogMode.value = "create";
   draftType.value = "daily";
-  draftSubjectId.value = store.selectedSubjectId || store.subjects[0]?.id || "";
+  draftSubjectId.value = reportSubjectId.value || store.subjects[0]?.id || "";
   draftReferenceDate.value = new Date();
   draftTaskQuery.value = "";
   reportDialogOpen.value = true;
@@ -444,6 +487,8 @@ async function saveReportDialog() {
         });
         const updated = await store.regenerateReport(scoped);
         selectedReportId.value = updated.id;
+        reportSubjectId.value = updated.subjectId;
+        rememberPanelSubjectId(updated.subjectId);
         editorDraft.value = updated.markdown;
         reportFilter.value = "all";
         reportDialogOpen.value = false;
@@ -459,6 +504,8 @@ async function saveReportDialog() {
         templateId: draftTemplateId.value,
       });
       selectedReportId.value = report.id;
+      reportSubjectId.value = report.subjectId;
+      rememberPanelSubjectId(report.subjectId);
       reportFilter.value = "all";
       reportDialogOpen.value = false;
       editorMode.value = "edit";
@@ -475,6 +522,8 @@ async function saveReportDialog() {
       templateId: draftTemplateId.value,
     });
     selectedReportId.value = updated.id;
+    reportSubjectId.value = updated.subjectId;
+    rememberPanelSubjectId(updated.subjectId);
     reportDialogOpen.value = false;
     ElMessage.success("报告范围已更新，可重新生成内容");
   } catch (error) {
@@ -495,6 +544,8 @@ async function saveReportDialog() {
       });
       const updated = await store.regenerateReport(scoped);
       selectedReportId.value = updated.id;
+      reportSubjectId.value = updated.subjectId;
+      rememberPanelSubjectId(updated.subjectId);
       editorDraft.value = updated.markdown;
       reportFilter.value = "all";
       reportDialogOpen.value = false;
@@ -691,6 +742,10 @@ function onWorkspaceKeydown(event: KeyboardEvent) {
 
 onMounted(async () => {
   window.addEventListener("keydown", onWorkspaceKeydown);
+  stopSubjectPreferenceSync = onRememberedPanelSubjectChange((subjectId) => {
+    rememberedReportSubjectId.value = subjectId;
+    if (subjectId !== reportSubjectId.value && store.subjects.some((subject) => subject.id === subjectId)) void selectReportSubject(subjectId);
+  });
   try {
     const settings = await getSettings();
     reportDurationFormat.value = settings.shared.report_duration_format === "hours" ? "hours" : "minutes";
@@ -698,7 +753,11 @@ onMounted(async () => {
     reportDurationFormat.value = "minutes";
   }
 });
-onUnmounted(() => window.removeEventListener("keydown", onWorkspaceKeydown));
+let stopSubjectPreferenceSync: (() => void) | undefined;
+onUnmounted(() => {
+  window.removeEventListener("keydown", onWorkspaceKeydown);
+  stopSubjectPreferenceSync?.();
+});
 
 async function regenerateReport(report: ReportRecord) {
   try {
@@ -740,7 +799,7 @@ async function deleteReport(report: ReportRecord) {
   reportSaving.value = true;
   try {
     await store.deleteReport(report);
-    if (selectedReportId.value === report.id) selectedReportId.value = reports.value[0]?.id ?? "";
+    if (selectedReportId.value === report.id) selectedReportId.value = reports.value.find((item) => item.subjectId === reportSubjectId.value)?.id ?? "";
     ElMessage.success("报告已删除");
   } catch (error) {
     ElMessage.error(errorText(error, "报告删除失败"));
@@ -825,7 +884,7 @@ function existingReportId(error: unknown) {
   <section class="report-workspace">
     <aside class="report-library">
       <header class="report-library-head">
-        <div><h2>报告</h2><span>{{ reports.length ? `${reports.length} 份记录` : '按日期与周期归档' }}</span></div>
+        <div><h2>报告</h2><span>{{ reportCounts.all ? `${reportCounts.all} 份记录` : '当前主体暂无记录' }}</span></div>
         <div class="report-library-actions"><button class="secondary-button compact" type="button" @click="openTemplateSettings()"><Braces :size="14" />模板</button><button class="primary-button compact" type="button" @click="openCreateDialog"><Plus :size="14" />创建</button></div>
       </header>
 
@@ -833,6 +892,10 @@ function existingReportId(error: unknown) {
         <Search :size="13" />
         <input v-model="reportQuery" type="search" placeholder="搜索日期或主体" />
       </label>
+
+      <div class="report-subject-tabs timer-task-subject-tabs" role="tablist" aria-label="报告主体筛选">
+        <button v-for="subject in store.subjects" :key="subject.id" type="button" role="tab" :aria-selected="reportSubjectId === subject.id" :class="{ active: reportSubjectId === subject.id }" @click="selectReportSubject(subject.id)">{{ subject.name }}</button>
+      </div>
 
       <div class="report-filter-tabs" role="tablist" aria-label="报告类型筛选">
         <button v-for="option in [{ value: 'all', label: '全部' }, { value: 'daily', label: '日报' }, { value: 'weekly', label: '周报' }, { value: 'monthly', label: '月报' }]" :key="option.value" type="button" :class="[{ active: reportFilter === option.value }, option.value === 'all' ? 'type-all' : reportTypeClass(option.value as ReportType)]" @click="reportFilter = option.value as 'all' | ReportType"><span>{{ option.label }}</span><small>{{ reportCounts[option.value as keyof typeof reportCounts] }}</small></button>
@@ -866,7 +929,7 @@ function existingReportId(error: unknown) {
       <div v-else class="report-empty-list">
         <FileText :size="23" />
         <strong>暂无报告</strong>
-        <span>创建日报、周报或月报后会显示在这里</span>
+        <span>当前主体还没有符合条件的日报、周报或月报</span>
       </div>
     </aside>
 

@@ -57,6 +57,7 @@ const tracking = readFileSync("src-ui/src/components/TimeTrackingWorkspace.vue",
 const today = readFileSync("src-ui/src/components/TodayOverviewWorkspace.vue", "utf8");
 const workbench = readFileSync("src-ui/src/views/MainWorkbench.vue", "utf8");
 const plan = readFileSync("src-ui/src/components/PlanListEditor.vue", "utf8");
+const reports = readFileSync("src-ui/src/components/ReportWorkspace.vue", "utf8");
 const storeSource = readFileSync("src-ui/src/store.ts", "utf8");
 const styles = readFileSync("src-ui/src/styles.css", "utf8");
 const subjectPreference = readFileSync("src-ui/src/services/executionPanelSubjectPreference.ts", "utf8");
@@ -155,6 +156,12 @@ assert.ok(dialog.includes("rememberedSubjectId: readRememberedPanelSubjectId()")
 assert.ok(dialog.includes("rememberPanelSubjectId(currentSubjectId)"));
 assert.ok(subjectPreference.includes("timegenie:execution-panel-subject"));
 assert.ok(subjectPreference.includes("localStorage"));
+assert.ok(subjectPreference.includes("onRememberedPanelSubjectChange"));
+assert.ok(reports.includes('aria-label="报告主体筛选"'));
+assert.ok(reports.includes("report.subjectId !== reportSubjectId.value"));
+assert.ok(reports.includes("rememberPanelSubjectId(subjectId)"));
+assert.ok(reports.includes("readRememberedPanelSubjectId()"));
+assert.ok(reports.includes("onRememberedPanelSubjectChange"));
 assert.ok(workbench.includes('openExecutionPanel({ mode: "unassigned-allocation" })'));
 
 console.log("timer task dialog verification passed");
