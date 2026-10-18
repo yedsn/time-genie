@@ -3646,3 +3646,19 @@ notify pgrst, 'reload schema';
 -- Automatic snapshots run on a fixed workspace-local schedule in the database,
 -- never on the desktop sync path.
 \ir 20261018k_timegenie_fixed_daily_snapshot.sql
+
+-- Snapshot details use creation-time metadata; expensive reconstruction is
+-- reserved for the explicit restore flow.
+\ir 20261018l_timegenie_snapshot_metadata_detail.sql
+
+-- Current unassigned-time collection does not block a full workspace restore.
+\ir 20261018m_timegenie_restore_ignore_unassigned.sql
+
+-- Full restore phases must not inherit the short authenticated-role timeout.
+\ir 20261018n_timegenie_restore_timeout.sql
+
+-- A pre-restore snapshot is an explicit confirmation-time opt-in.
+\ir 20261018o_timegenie_optional_pre_restore_snapshot.sql
+
+-- Restored unassigned collection uses a valid stopped state.
+\ir 20261018p_timegenie_restore_unassigned_state.sql

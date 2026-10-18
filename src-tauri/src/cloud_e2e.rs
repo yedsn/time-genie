@@ -31,8 +31,8 @@ use crate::reports::{
 use crate::subjects;
 use crate::supabase::{
     self, CloudConfigureRequest, CloudDeviceRegisterRequest, CloudOperationHistoryListRequest,
-    CloudSignInRequest, CloudWorkspaceRestoreCommitRequest, CloudWorkspaceSnapshotCreateRequest,
-    CloudWorkspaceSnapshotIdRequest, CloudWorkspaceSnapshotSettingsUpdateRequest,
+    CloudSignInRequest, CloudWorkspaceRestoreCommitRequest, CloudWorkspaceRestorePrepareRequest,
+    CloudWorkspaceSnapshotCreateRequest, CloudWorkspaceSnapshotSettingsUpdateRequest,
     MigrationExecuteRequest,
 };
 use crate::tasks::{
@@ -227,12 +227,6 @@ fn settle_local_restore_gates(database: &Database) {
     connection
         .execute(
             "UPDATE time_entries SET state='ended',ended_at=COALESCE(ended_at,started_at),updated_at=MAX(updated_at,started_at) WHERE state IN ('running','paused')",
-            [],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "UPDATE unassigned_sessions SET state='discarded',resolution_type='discard',resolved_at=COALESCE(resolved_at,first_started_at),updated_at=MAX(updated_at,first_started_at) WHERE state IN ('collecting','awaiting_resolution')",
             [],
         )
         .unwrap();
@@ -1014,14 +1008,19 @@ fn handle_planning_cloud_request(
         if !state.snapshots.contains_key(&target_snapshot_id) {
             return write_http_json(&mut stream, 409, json!({"message": "SNAPSHOT_NOT_FOUND"}));
         }
-        let safety_snapshot_id = Uuid::now_v7().to_string();
-        let safety_snapshot = planning_snapshot_record(&state);
-        state
-            .snapshots
-            .insert(safety_snapshot_id.clone(), safety_snapshot);
+        let safety_snapshot_id = body["p_create_safety_snapshot"]
+            .as_bool()
+            .unwrap_or(false)
+            .then(|| Uuid::now_v7().to_string());
+        if let Some(safety_snapshot_id) = safety_snapshot_id.as_ref() {
+            let safety_snapshot = planning_snapshot_record(&state);
+            state
+                .snapshots
+                .insert(safety_snapshot_id.clone(), safety_snapshot);
+        }
         let lock_token = Uuid::now_v7().to_string();
         state.restore_target_snapshot_id = Some(target_snapshot_id.clone());
-        state.restore_safety_snapshot_id = Some(safety_snapshot_id.clone());
+        state.restore_safety_snapshot_id = safety_snapshot_id.clone();
         state.restore_lock_token = Some(lock_token.clone());
         return write_http_json(
             &mut stream,
@@ -1031,8 +1030,9 @@ fn handle_planning_cloud_request(
                 "targetContentHash": format!("hash-{target_snapshot_id}"), "preparedEpoch": state.workspace_epoch,
                 "safetySnapshotId": safety_snapshot_id, "expiresAt": "2099-01-01T00:10:00Z",
                 "preview": {"snapshotId": target_snapshot_id, "restorable": true, "errorCode": null,
-                    "entityCounts": {"tasks": state.tasks.len()}, "currentEntityCounts": {"tasks": state.tasks.len()},
-                    "groups": {}, "entities": {}, "contentHash": format!("hash-{}", body["p_target_snapshot_id"].as_str().unwrap())}
+                    "entityCounts": {"tasks": state.tasks.len()}, "groupCounts": {"planning": state.tasks.len()},
+                    "groupHashes": {"planning": "planning-hash"}, "contentHash": format!("hash-{}", body["p_target_snapshot_id"].as_str().unwrap()),
+                    "sizeBytes": 128, "chunkCount": 1, "baseChangeSeq": state.latest_change_seq, "workspaceEpoch": state.workspace_epoch}
             }),
         );
     }
@@ -1043,7 +1043,7 @@ fn handle_planning_cloud_request(
         }
         let target_snapshot_id = body["p_target_snapshot_id"].as_str().unwrap().to_string();
         let target = state.snapshots.get(&target_snapshot_id).cloned().unwrap();
-        let safety_snapshot_id = state.restore_safety_snapshot_id.clone().unwrap();
+        let safety_snapshot_id = state.restore_safety_snapshot_id.clone();
         let previous_epoch = state.workspace_epoch;
         restore_planning_snapshot(&mut state, &target);
         state.workspace_epoch += 1;
@@ -1112,7 +1112,14 @@ fn handle_planning_cloud_request(
     }
     if request_line.contains("/rest/v1/rpc/cloud_incremental_pull") {
         state.incremental_pull_count += 1;
-        if state.force_reset_required_once || request_epoch != state.workspace_epoch {
+        if request_epoch != state.workspace_epoch {
+            return write_http_json(
+                &mut stream,
+                409,
+                json!({ "message": format!("WORKSPACE_EPOCH_STALE: client={request_epoch}, server={}", state.workspace_epoch) }),
+            );
+        }
+        if state.force_reset_required_once {
             state.force_reset_required_once = false;
             return write_http_json(
                 &mut stream,
@@ -2475,9 +2482,11 @@ fn isolated_automatic_snapshot_settings_are_shared_across_devices() {
         },
     )
     .unwrap();
-    assert!(!supabase::workspace_snapshot_settings_get(&device_a)
-        .unwrap()
-        .automatic_snapshot_enabled);
+    assert!(
+        !supabase::workspace_snapshot_settings_get(&device_a)
+            .unwrap()
+            .automatic_snapshot_enabled
+    );
 
     assert!(supabase::workspace_snapshot_settings_update(
         &device_a,
@@ -2637,11 +2646,21 @@ fn isolated_workspace_restore_rebuilds_clean_second_device() {
 
     let prepared = supabase::workspace_restore_prepare(
         &device_a,
-        CloudWorkspaceSnapshotIdRequest {
+        CloudWorkspaceRestorePrepareRequest {
             snapshot_id: snapshot.id.clone(),
+            create_safety_snapshot: true,
         },
     )
     .unwrap();
+    assert!(device_a
+        .open()
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM unassigned_sessions WHERE state IN ('collecting','paused','awaiting_resolution'))",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap());
     let restored = supabase::workspace_restore_commit(
         &device_a,
         CloudWorkspaceRestoreCommitRequest {
@@ -2653,6 +2672,19 @@ fn isolated_workspace_restore_rebuilds_clean_second_device() {
     )
     .unwrap();
     assert_eq!((restored.previous_epoch, restored.workspace_epoch), (1, 2));
+    assert!(restored.local_cache_rebuilt);
+    let restoring_status = cloud_sync::sync_status(&device_a).unwrap();
+    assert_eq!(restoring_status.workspace_epoch, 2);
+    assert!(!restoring_status.epoch_blocked);
+    assert_eq!(restoring_status.last_change_seq, restored.reset_change_seq);
+    assert_eq!(
+        list_tasks(&device_a)
+            .into_iter()
+            .find(|item| item.id == task.id)
+            .unwrap()
+            .title,
+        "回滚前标题"
+    );
 
     let pulled = cloud_sync::pull(
         &device_b,
@@ -2681,14 +2713,14 @@ fn isolated_workspace_restore_rebuilds_clean_second_device() {
     );
     assert_eq!(
         safety_snapshot_id.as_deref(),
-        Some(restored.safety_snapshot_id.as_str())
+        restored.safety_snapshot_id.as_deref()
     );
     assert!(cloud
         .state
         .lock()
         .unwrap()
         .snapshots
-        .contains_key(&restored.safety_snapshot_id));
+        .contains_key(restored.safety_snapshot_id.as_deref().unwrap()));
     let history = supabase::operation_history_list(
         &device_a,
         CloudOperationHistoryListRequest {
@@ -2749,8 +2781,9 @@ fn isolated_workspace_restore_blocks_old_epoch_and_allows_rescue_then_discard() 
 
     let prepared = supabase::workspace_restore_prepare(
         &device_a,
-        CloudWorkspaceSnapshotIdRequest {
+        CloudWorkspaceRestorePrepareRequest {
             snapshot_id: snapshot_id.clone(),
+            create_safety_snapshot: false,
         },
     )
     .unwrap();

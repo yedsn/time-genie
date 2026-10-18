@@ -130,7 +130,7 @@ workspace_snapshot_chunks
 
 回滚分两步：
 
-1. `workspace_restore_prepare` 校验权限、镜像完整性、云端活动计时/未归属采集、当前 epoch 和锁状态，获取恢复锁，在同一锁上下文中创建并校验 `pre_restore` 安全镜像，返回差异摘要、锁 token 和安全镜像 ID。
+1. `workspace_restore_prepare` 校验权限、镜像完整性、云端活动计时、当前 epoch 和锁状态，获取恢复锁，在同一锁上下文中创建并校验 `pre_restore` 安全镜像，返回快照摘要、锁 token 和安全镜像 ID。当前未归属采集不阻止恢复，由安全镜像保留恢复前状态，再由目标快照完整替换。
 2. 用户二次确认后调用 `workspace_restore_commit`，携带锁 token、目标镜像 ID、目标镜像哈希、准备阶段 epoch 和明确确认标记。RPC 再次检查全部前置条件，在一个事务内按外键顺序删除/写回可恢复业务表、递增 epoch、清理当前租约、写入恢复操作日志和 reset 变更，最后释放锁。
 
 客户端在 prepare 前检查本机活动计时、outbox 的 pending/sending/failed/conflict；服务器再次检查云端权威状态和当前设备授权。其他离线设备是否持有未上传操作无法提前获知，由 epoch 屏障在恢复后拦截。

@@ -226,6 +226,9 @@ fn spawn_tracking_lease_maintainer(database: Database, app: AppHandle) {
             })
             .await;
             if let Ok(Err(error)) = result {
+                if is_workspace_epoch_stale_error(&error) {
+                    signal_cloud_sync(SYNC_SIGNAL_CONNECTION_READY, None);
+                }
                 emit_cloud_error(&app, &database, &error);
             }
         }
@@ -233,9 +236,10 @@ fn spawn_tracking_lease_maintainer(database: Database, app: AppHandle) {
 }
 
 fn acquire_or_renew_tracking_lease(database: &Database) -> Result<Value, String> {
+    let _operation_guard = cloud_sync_operation_guard();
     let token = current_tracking_lease_token(database);
     let result = if let Some(token) = token {
-        match renew_lease(
+        match renew_lease_locked(
             database,
             TrackingLeaseRequest {
                 lease_token: Some(token),
@@ -244,11 +248,11 @@ fn acquire_or_renew_tracking_lease(database: &Database) -> Result<Value, String>
             Ok(value) => Ok(value),
             Err(_) => {
                 clear_tracking_lease_token(database);
-                acquire_lease(database)
+                acquire_lease_locked(database)
             }
         }
     } else {
-        acquire_lease(database)
+        acquire_lease_locked(database)
     };
     match &result {
         Ok(value) => {
@@ -1028,6 +1032,7 @@ fn run_sync_coordinator_round(
     signals: u8,
     observed_remote_seq: i64,
 ) -> Result<SyncCoordinatorRoundResult, String> {
+    let _operation_guard = cloud_sync_operation_guard();
     let state = storage_mode(database)?;
     if state.mode != "cloud" {
         CLOUD_SYNC_ENABLED.store(false, Ordering::Release);
@@ -1074,14 +1079,41 @@ fn run_sync_coordinator_round(
         });
     }
     recover_interrupted_sending_operations(database, &state.workspace_id)?;
-    let push =
-        push_outbox_with_retry_mode(database, signals & SYNC_SIGNAL_MANUAL_RETRY != 0, true)?;
+    let push = match push_outbox_locked(database, signals & SYNC_SIGNAL_MANUAL_RETRY != 0, true) {
+        Ok(push) => push,
+        Err(error) if is_workspace_epoch_stale_error(&error) => {
+            let server_epoch = parse_server_workspace_epoch(&error).ok_or(error)?;
+            if has_old_epoch_local_changes(database, &state.workspace_id, server_epoch)? {
+                mark_epoch_blocked(
+                    database,
+                    &state.workspace_id,
+                    server_epoch,
+                    "云端工作空间已恢复，本机仍保留旧世代修改",
+                )?;
+                return Err(
+                    "WORKSPACE_EPOCH_STALE: 本机仍有旧世代修改，请先导出救援备份或明确放弃后重新下载"
+                        .to_string(),
+                );
+            }
+            let last_change_seq = pull_snapshot_for_epoch(database, server_epoch, true)?;
+            return Ok(SyncCoordinatorRoundResult {
+                domains: vec!["subjects", "tasks", "time", "reports", "settings"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                last_change_seq,
+                source: "epoch-reset".to_string(),
+                retry_after: None,
+            });
+        }
+        Err(error) => return Err(error),
+    };
     let mut domains = HashSet::<String>::new();
     rewind_for_ready_deferred_entities(database, &state.workspace_id)?;
     let mut last_change_seq = storage_mode(database)?.last_change_seq;
     if push.conflicts == 0 {
         loop {
-            let pulled = pull(
+            let pulled = pull_locked(
                 database,
                 CloudSyncPullRequest {
                     after_change_seq: Some(last_change_seq),
@@ -1201,6 +1233,14 @@ pub fn pull(
     database: &Database,
     request: CloudSyncPullRequest,
 ) -> Result<CloudSyncPullResult, String> {
+    let _operation_guard = cloud_sync_operation_guard();
+    pull_locked(database, request)
+}
+
+fn pull_locked(
+    database: &Database,
+    request: CloudSyncPullRequest,
+) -> Result<CloudSyncPullResult, String> {
     let state = storage_mode(database)?;
     if state.mode != "cloud" {
         return Err("OFFLINE_RESTRICTED: 只有云端模式可以拉取 Supabase 增量".to_string());
@@ -1222,7 +1262,36 @@ pub fn pull(
         }),
         &session,
         state.workspace_epoch,
-    )?;
+    );
+    let response = match response {
+        Ok(response) => response,
+        Err(error) if is_workspace_epoch_stale_error(&error) => {
+            let server_epoch = parse_server_workspace_epoch(&error).ok_or(error)?;
+            if has_old_epoch_local_changes(database, &state.workspace_id, server_epoch)? {
+                mark_epoch_blocked(
+                    database,
+                    &state.workspace_id,
+                    server_epoch,
+                    "云端工作空间已恢复，本机仍保留旧世代修改",
+                )?;
+                return Err(
+                    "WORKSPACE_EPOCH_STALE: 本机仍有旧世代修改，请先导出救援备份或明确放弃后重新下载"
+                        .to_string(),
+                );
+            }
+            let last_change_seq = pull_snapshot_for_epoch(database, server_epoch, true)?;
+            return Ok(CloudSyncPullResult {
+                changes: Vec::new(),
+                last_change_seq,
+                has_more: false,
+                domains: vec!["subjects", "tasks", "time", "reports", "settings"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
     let batch: IncrementalPullResponse = serde_json::from_value(response)
         .map_err(|error| format!("NETWORK_ERROR: 云端增量响应无效: {error}"))?;
     if batch.reset_required || batch.workspace_epoch != state.workspace_epoch {
@@ -3164,11 +3233,22 @@ fn push_outbox_with_retry_mode(
     retry_immediately: bool,
     drain_queue: bool,
 ) -> Result<CloudSyncPushResult, String> {
-    let _operation_guard = CLOUD_SYNC_OPERATION_LOCK
+    let _operation_guard = cloud_sync_operation_guard();
+    push_outbox_locked(database, retry_immediately, drain_queue)
+}
+
+fn cloud_sync_operation_guard() -> std::sync::MutexGuard<'static, ()> {
+    CLOUD_SYNC_OPERATION_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    push_outbox_locked(database, retry_immediately, drain_queue)
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub(crate) fn with_cloud_sync_operation_lock<T>(
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _operation_guard = cloud_sync_operation_guard();
+    operation()
 }
 
 fn push_outbox_locked(
@@ -5591,10 +5671,7 @@ fn pull_snapshot_for_epoch(
 }
 
 pub fn reset_local_cache_from_cloud(database: &Database) -> Result<CloudSyncStatus, String> {
-    let _operation_guard = CLOUD_SYNC_OPERATION_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _operation_guard = cloud_sync_operation_guard();
     let state = storage_mode(database)?;
     if state.mode != "cloud" {
         return Err("OFFLINE_RESTRICTED: 当前不是 Supabase 云端模式".to_string());
@@ -5632,13 +5709,78 @@ pub fn reset_local_cache_from_cloud(database: &Database) -> Result<CloudSyncStat
     sync_status(database)
 }
 
+/// Rebuilds the restoring device from a newly committed workspace epoch. This
+/// differs from the ordinary cache reset: the local state still contains the
+/// previous epoch immediately after the restore RPC succeeds, so the server
+/// epoch supplied by the restore result is authoritative for this one download.
+pub fn rebuild_local_cache_after_workspace_restore(
+    database: &Database,
+    restored_epoch: i64,
+    reset_change_seq: i64,
+) -> Result<CloudSyncStatus, String> {
+    let _operation_guard = cloud_sync_operation_guard();
+    rebuild_local_cache_after_workspace_restore_locked(database, restored_epoch, reset_change_seq)
+}
+
+pub(crate) fn rebuild_local_cache_after_workspace_restore_locked(
+    database: &Database,
+    restored_epoch: i64,
+    reset_change_seq: i64,
+) -> Result<CloudSyncStatus, String> {
+    let state = storage_mode(database)?;
+    if state.mode != "cloud" {
+        return Err("OFFLINE_RESTRICTED: 当前不是 Supabase 云端模式".to_string());
+    }
+    if !state.online {
+        return Err("AUTH_REQUIRED: 云端会话不可用".to_string());
+    }
+    if restored_epoch <= state.workspace_epoch {
+        return Err("WORKSPACE_EPOCH_INVALID: 恢复结果没有返回新的工作空间世代".to_string());
+    }
+    let expected_local_revision = local_revision(database)?;
+    let session = current_session(database)?;
+    let snapshot = client(database)?.rpc_for_database_with_epoch(
+        database,
+        "cloud_snapshot_get",
+        json!({ "p_workspace_id": state.workspace_id }),
+        &session,
+        restored_epoch,
+    )?;
+    let server_epoch = snapshot
+        .get("workspace_epoch")
+        .and_then(Value::as_i64)
+        .unwrap_or(restored_epoch);
+    if server_epoch != restored_epoch {
+        return Err(format!(
+            "WORKSPACE_EPOCH_STALE: 恢复后下载期间工作空间世代从 {restored_epoch} 变为 {server_epoch}"
+        ));
+    }
+    let latest_change_seq = snapshot
+        .get("latest_change_seq")
+        .and_then(Value::as_i64)
+        .unwrap_or(reset_change_seq)
+        .max(reset_change_seq);
+    apply_snapshot_with_reset_options(
+        database,
+        &snapshot,
+        Some(expected_local_revision),
+        Some(&state.workspace_id),
+        Some((
+            &state.workspace_id,
+            &state.device_id,
+            latest_change_seq,
+            restored_epoch,
+        )),
+        false,
+        true,
+    )?;
+    sync_status(database)
+}
+
 pub fn discard_old_epoch_changes_and_redownload(
     database: &Database,
 ) -> Result<CloudSyncStatus, String> {
-    let _operation_guard = CLOUD_SYNC_OPERATION_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _operation_guard = cloud_sync_operation_guard();
     let state = storage_mode(database)?;
     if state.mode != "cloud" || !state.epoch_blocked {
         return Err("WORKSPACE_EPOCH_NOT_BLOCKED: 当前设备没有待处理的旧世代修改".to_string());
@@ -5691,6 +5833,11 @@ pub fn discard_old_epoch_changes_and_redownload(
 }
 
 pub fn acquire_lease(database: &Database) -> Result<Value, String> {
+    let _operation_guard = cloud_sync_operation_guard();
+    acquire_lease_locked(database)
+}
+
+fn acquire_lease_locked(database: &Database) -> Result<Value, String> {
     let state = require_cloud(database)?;
     let session = current_session(database)?;
     let api = client(database)?;
@@ -5707,6 +5854,11 @@ pub fn acquire_lease(database: &Database) -> Result<Value, String> {
 }
 
 pub fn renew_lease(database: &Database, request: TrackingLeaseRequest) -> Result<Value, String> {
+    let _operation_guard = cloud_sync_operation_guard();
+    renew_lease_locked(database, request)
+}
+
+fn renew_lease_locked(database: &Database, request: TrackingLeaseRequest) -> Result<Value, String> {
     let token = request
         .lease_token
         .ok_or_else(|| "VALIDATION_ERROR: 缺少租约令牌".to_string())?;
@@ -5721,6 +5873,14 @@ pub fn renew_lease(database: &Database, request: TrackingLeaseRequest) -> Result
 }
 
 pub fn release_lease(database: &Database, request: TrackingLeaseRequest) -> Result<Value, String> {
+    let _operation_guard = cloud_sync_operation_guard();
+    release_lease_locked(database, request)
+}
+
+fn release_lease_locked(
+    database: &Database,
+    request: TrackingLeaseRequest,
+) -> Result<Value, String> {
     let token = request
         .lease_token
         .ok_or_else(|| "VALIDATION_ERROR: 缺少租约令牌".to_string())?;
@@ -6839,6 +6999,7 @@ fn apply_snapshot_with_policy(
         "unassigned_sessions",
         &local_workspace_id,
     )?;
+    restore_snapshot_time_entry_links(&transaction, snapshot, &local_workspace_id)?;
     replace_snapshot_table(
         &transaction,
         snapshot,
@@ -7426,17 +7587,33 @@ fn replace_snapshot_table(
             })?
         }
         "time_entries" => {
-            replace_simple_rows(transaction, table, workspace_id, rows, |tx, row, ws| {
-                let entry_id = text(row, "id");
-                let source_type = text(row, "source_type");
-                let timer_chain_id = optional_text(row, "timer_chain_id")
-                    .or_else(|| (source_type == "timer").then(|| entry_id.clone()));
-                let last_continuous_at = optional_millis(row, "last_continuous_at")
-                    .or_else(|| optional_millis(row, "ended_at"))
-                    .or_else(|| optional_millis(row, "updated_at"))
-                    .or_else(|| optional_millis(row, "started_at"));
-                tx.execute("INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,default_task_id,label_snapshot,started_at,ended_at,duration_seconds,note,origin_unassigned_session_id,created_at,updated_at,version,deleted_at,timer_chain_id,previous_entry_id,split_boundary_at,last_continuous_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)", params![entry_id,ws,text(row,"work_date"),text(row,"kind"),source_type,text(row,"state"),optional_text(row,"default_task_id"),text(row,"label_snapshot"),millis(row,"started_at"),optional_millis(row,"ended_at"),integer(row,"duration_seconds"),optional_text(row,"note"),optional_text(row,"origin_unassigned_session_id"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version"),optional_millis(row,"deleted_at"),timer_chain_id,optional_text(row,"previous_entry_id"),optional_millis(row,"split_boundary_at"),last_continuous_at])
-            })?
+            replace_simple_rows(
+                transaction,
+                table,
+                workspace_id,
+                rows.clone(),
+                |tx, row, ws| {
+                    let entry_id = text(row, "id");
+                    let source_type = text(row, "source_type");
+                    let timer_chain_id = optional_text(row, "timer_chain_id")
+                        .or_else(|| (source_type == "timer").then(|| entry_id.clone()));
+                    let last_continuous_at = optional_millis(row, "last_continuous_at")
+                        .or_else(|| optional_millis(row, "ended_at"))
+                        .or_else(|| optional_millis(row, "updated_at"))
+                        .or_else(|| optional_millis(row, "started_at"));
+                    tx.execute("INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,default_task_id,label_snapshot,started_at,ended_at,duration_seconds,note,origin_unassigned_session_id,created_at,updated_at,version,deleted_at,timer_chain_id,previous_entry_id,split_boundary_at,last_continuous_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL,?13,?14,?15,?16,?17,NULL,?18,?19)", params![entry_id,ws,text(row,"work_date"),text(row,"kind"),source_type,text(row,"state"),optional_text(row,"default_task_id"),text(row,"label_snapshot"),millis(row,"started_at"),optional_millis(row,"ended_at"),integer(row,"duration_seconds"),optional_text(row,"note"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version"),optional_millis(row,"deleted_at"),timer_chain_id,optional_millis(row,"split_boundary_at"),last_continuous_at])
+                },
+            )?;
+            for row in rows {
+                if let Some(previous_entry_id) = optional_text(&row, "previous_entry_id") {
+                    transaction
+                        .execute(
+                            "UPDATE time_entries SET previous_entry_id=?1 WHERE workspace_id=?2 AND id=?3",
+                            params![previous_entry_id, workspace_id, text(&row, "id")],
+                        )
+                        .map_err(|error| format!("LOCAL_SNAPSHOT_APPLY_FAILED: time_entries.previous_entry_id: {error}"))?;
+                }
+            }
         }
         "time_segments" => {
             replace_simple_rows(transaction, table, workspace_id, rows, |tx, row, ws| {
@@ -7515,10 +7692,44 @@ fn replace_simple_rows<F>(
 where
     F: FnMut(&Transaction<'_>, &Value, &str) -> rusqlite::Result<usize>,
 {
-    let _ = table;
     let _ = workspace_id;
     for row in &rows {
-        insert(transaction, row, workspace_id).map_err(|error| error.to_string())?;
+        insert(transaction, row, workspace_id)
+            .map_err(|error| format!("LOCAL_SNAPSHOT_APPLY_FAILED: {table}: {error}"))?;
+    }
+    Ok(())
+}
+
+fn restore_snapshot_time_entry_links(
+    transaction: &Transaction<'_>,
+    snapshot: &Value,
+    workspace_id: &str,
+) -> Result<(), String> {
+    let rows = snapshot
+        .get("time_entries")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for row in rows {
+        let Some(origin_unassigned_session_id) =
+            optional_text(&row, "origin_unassigned_session_id")
+        else {
+            continue;
+        };
+        transaction
+            .execute(
+                "UPDATE time_entries SET origin_unassigned_session_id=?1 WHERE workspace_id=?2 AND id=?3",
+                params![
+                    origin_unassigned_session_id,
+                    workspace_id,
+                    text(&row, "id")
+                ],
+            )
+            .map_err(|error| {
+                format!(
+                    "LOCAL_SNAPSHOT_APPLY_FAILED: time_entries.origin_unassigned_session_id: {error}"
+                )
+            })?;
     }
     Ok(())
 }
@@ -7527,6 +7738,12 @@ fn clear_snapshot_cache(transaction: &Transaction<'_>, workspace_id: &str) -> Re
     transaction
         .execute(
             "UPDATE time_entries SET origin_unassigned_session_id = NULL WHERE workspace_id = ?1",
+            [workspace_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE time_entries SET previous_entry_id = NULL WHERE workspace_id = ?1",
             [workspace_id],
         )
         .map_err(|error| error.to_string())?;
@@ -7544,7 +7761,13 @@ fn clear_snapshot_cache(transaction: &Transaction<'_>, workspace_id: &str) -> Re
         .map_err(|error| error.to_string())?;
     transaction
         .execute(
-            "UPDATE plan_import_items SET confirmed_task_id = NULL WHERE workspace_id = ?1",
+            "DELETE FROM plan_import_items WHERE workspace_id = ?1",
+            [workspace_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM plan_import_batches WHERE workspace_id = ?1",
             [workspace_id],
         )
         .map_err(|error| error.to_string())?;

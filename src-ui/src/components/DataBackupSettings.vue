@@ -19,6 +19,7 @@ const emit = defineEmits<{ imported: [] }>();
 const working = ref<"export" | "preview" | "import" | "">("");
 const exportResult = ref<DataBackupExportResult>();
 const preview = ref<DataBackupPreview>();
+const restoreOpen = ref(false);
 const importResult = ref<DataBackupImportResult>();
 const history = ref<DataBackupHistoryItem[]>([]);
 const historyLoading = ref(false);
@@ -69,10 +70,12 @@ async function exportBackup() {
 
 async function previewHistory(item: DataBackupHistoryItem) {
   if (!item.fileExists) { ElMessage.warning("备份文件已被移动或删除"); return; }
+  restoreOpen.value = true;
   working.value = "preview";
   importResult.value = undefined;
+  preview.value = undefined;
   try { preview.value = await previewDataBackup(item.path); }
-  catch (error) { preview.value = undefined; ElMessage.error(errorText(error, "备份文件无法读取")); }
+  catch (error) { restoreOpen.value = false; ElMessage.error(errorText(error, "备份文件无法读取")); }
   finally { working.value = ""; }
 }
 
@@ -91,11 +94,14 @@ async function selectBackup() {
     filters: [{ name: "TimeGenie 备份", extensions: ["timegenie-backup"] }],
   });
   if (!path || Array.isArray(path)) return;
+  restoreOpen.value = true;
   working.value = "preview";
   importResult.value = undefined;
+  preview.value = undefined;
   try {
     preview.value = await previewDataBackup(path);
   } catch (error) {
+    restoreOpen.value = false;
     preview.value = undefined;
     ElMessage.error(errorText(error, "备份文件无法读取"));
   } finally {
@@ -123,6 +129,7 @@ async function restoreBackup() {
   working.value = "import";
   try {
     importResult.value = await importDataBackup(preview.value.path);
+    restoreOpen.value = false;
     await loadHistory();
     ElMessage.success("数据已恢复为独立的本地工作空间");
     emit("imported");
@@ -154,7 +161,7 @@ onMounted(() => { void loadHistory(); });
       </button>
       <button class="secondary-button compact" type="button" :disabled="Boolean(working)" @click="selectBackup">
         <LoaderCircle v-if="working === 'preview'" class="sync-spin" :size="14" /><FileSearch v-else :size="14" />
-        {{ working === 'preview' ? '正在校验...' : '选择备份并预览' }}
+        {{ working === 'preview' ? '正在校验...' : '从备份文件恢复' }}
       </button>
     </div>
     <div class="backup-history">
@@ -171,24 +178,33 @@ onMounted(() => { void loadHistory(); });
           </button>
           <span class="backup-kind">{{ !item.fileExists ? '文件不存在' : item.origin === 'safety' ? '安全备份' : '手动备份' }}</span>
           <div class="backup-row-actions">
-            <button class="text-button" type="button" :disabled="!item.fileExists || openingPath === item.path" title="使用系统打开备份文件" @click="openHistory(item, false)"><ExternalLink :size="13" />打开</button>
-            <button class="text-button" type="button" :disabled="!item.fileExists || openingPath === item.path" title="在文件夹中显示" @click="openHistory(item, true)"><FolderOpen :size="13" />位置</button>
+            <button class="backup-action danger" type="button" :disabled="!item.fileExists || Boolean(working)" title="校验并恢复这份备份" @click="previewHistory(item)"><Upload :size="13" />恢复</button>
+            <button class="backup-action" type="button" :disabled="!item.fileExists || openingPath === item.path" title="使用系统打开备份文件" @click="openHistory(item, false)"><ExternalLink :size="13" />打开</button>
+            <button class="backup-action" type="button" :disabled="!item.fileExists || openingPath === item.path" title="在文件夹中显示" @click="openHistory(item, true)"><FolderOpen :size="13" />位置</button>
           </div>
         </article>
       </div>
     </div>
-    <div v-if="preview" class="backup-preview">
-      <header><div><strong>{{ preview.workspaceName }}</strong><span>{{ new Date(preview.createdAt).toLocaleString('zh-CN') }} · v{{ preview.appVersion }}</span></div><span>{{ preview.backupKind === 'stale_epoch_rescue' ? '设备救援备份' : '普通备份' }}</span></header>
-      <div class="backup-counts"><span><strong>{{ totalEntities }}</strong><small>将恢复的数据</small></span><span><strong>{{ replacedEntities }}</strong><small>当前将被替换</small></span><span><strong>{{ preview.timezone }}</strong><small>工作空间时区</small></span></div>
-      <details><summary>不会恢复的内容</summary><ul><li v-for="item in preview.excludedCategories" :key="item">{{ item }}</li></ul></details>
-      <button class="danger-button backup-restore-button" type="button" :disabled="Boolean(working)" @click="restoreBackup">
-        <LoaderCircle v-if="working === 'import'" class="sync-spin" :size="14" /><Upload v-else :size="14" />
-        {{ working === 'import' ? '正在恢复...' : '恢复这份备份' }}
-      </button>
-    </div>
     <div v-if="importResult" class="backup-result success">
       <ShieldCheck :size="17" /><div><strong>恢复完成，导入前安全备份已保留</strong><span>{{ importResult.safetyBackupPath }}</span></div>
     </div>
+
+    <el-dialog v-model="restoreOpen" title="恢复本地备份" width="min(620px, calc(100vw - 32px))" :close-on-click-modal="!working" :show-close="!working">
+      <div v-if="working === 'preview'" class="backup-empty restore-loading"><LoaderCircle class="sync-spin" :size="20" /><strong>正在校验备份文件</strong><span>正在检查文件完整性和数据引用</span></div>
+      <div v-else-if="preview" class="backup-preview">
+        <header><div><strong>{{ preview.workspaceName }}</strong><span>{{ new Date(preview.createdAt).toLocaleString('zh-CN') }} · v{{ preview.appVersion }}</span></div><span>{{ preview.backupKind === 'stale_epoch_rescue' ? '设备救援备份' : '普通备份' }}</span></header>
+        <div class="backup-counts"><span><strong>{{ totalEntities }}</strong><small>将恢复的数据</small></span><span><strong>{{ replacedEntities }}</strong><small>当前将被替换</small></span><span><strong>{{ preview.timezone }}</strong><small>工作空间时区</small></span></div>
+        <p class="restore-impact">恢复会先自动备份当前数据，再用这份备份替换事项、时间记录、报告和共享设置。完成后将切换为独立的本地模式。</p>
+        <details><summary>不会恢复的内容</summary><ul><li v-for="item in preview.excludedCategories" :key="item">{{ item }}</li></ul></details>
+      </div>
+      <template #footer>
+        <button class="secondary-button" type="button" :disabled="Boolean(working)" @click="restoreOpen = false">取消</button>
+        <button class="danger-button backup-restore-button" type="button" :disabled="Boolean(working) || !preview" @click="restoreBackup">
+          <LoaderCircle v-if="working === 'import'" class="sync-spin" :size="14" /><Upload v-else :size="14" />
+          {{ working === 'import' ? '正在恢复...' : '创建安全备份并恢复' }}
+        </button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -196,7 +212,7 @@ onMounted(() => { void loadHistory(); });
 .backup-settings { display: grid; gap: 10px; }
 .backup-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .backup-actions button, .backup-restore-button { display: inline-flex; align-items: center; gap: 6px; }
-.backup-history { overflow: hidden; border: 1px solid var(--line-soft); border-radius: 9px; }.backup-history-title { display: flex; justify-content: space-between; align-items: center; min-height: 34px; padding: 0 10px; border-bottom: 1px solid var(--line-soft); }.backup-history-title strong { font-size: 11px; }.backup-history-title span { color: var(--text-secondary); font-size: 10px; }.backup-list { display: grid; max-height: 330px; overflow-y: auto; }.backup-row { display: grid; grid-template-columns: 30px minmax(0,1fr) auto auto; align-items: center; gap: 8px; min-height: 58px; padding: 7px 9px; border-bottom: 1px solid var(--line-soft); }.backup-row:last-child { border-bottom: 0; }.backup-row.missing { opacity: .58; }.backup-file-icon { display: grid; width: 28px; height: 28px; place-items: center; border-radius: 7px; background: color-mix(in srgb,var(--brand) 10%,transparent); color: var(--brand); }.backup-row-main { display: grid; min-width: 0; gap: 2px; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }.backup-row-main:disabled { cursor: default; }.backup-row-main strong,.backup-row-main span,.backup-row-main small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.backup-row-main strong { font-size: 11px; font-weight: 600; }.backup-row-main span { color: var(--text-secondary); font-size: 10px; }.backup-row-main small { color: var(--text-secondary); font-size: 9px; opacity: .75; }.backup-kind { padding: 2px 6px; border-radius: 5px; background: var(--surface-soft); color: var(--text-secondary); font-size: 9px; white-space: nowrap; }.backup-row-actions { display: flex; align-items: center; gap: 5px; }.backup-row-actions button { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }.backup-empty { display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 4px; min-height: 110px; padding: 18px; color: var(--text-secondary); font-size: 11px; text-align: center; }.backup-empty strong { color: var(--text-primary); font-size: 12px; }
+.backup-history { display: grid; grid-template-rows: auto minmax(0,1fr); height: 324px; overflow: hidden; border: 1px solid var(--line-soft); border-radius: 9px; }.backup-history-title { display: flex; justify-content: space-between; align-items: center; min-height: 34px; padding: 0 10px; border-bottom: 1px solid var(--line-soft); }.backup-history-title strong { font-size: 11px; }.backup-history-title span { color: var(--text-secondary); font-size: 10px; }.backup-list { display: grid; min-height: 0; overflow-y: auto; }.backup-row { display: grid; grid-template-columns: 30px minmax(0,1fr) auto auto; align-items: center; gap: 8px; height: 58px; padding: 7px 9px; border-bottom: 1px solid var(--line-soft); }.backup-row:last-child { border-bottom: 0; }.backup-row.missing { opacity: .58; }.backup-file-icon { display: grid; width: 28px; height: 28px; place-items: center; border-radius: 7px; background: color-mix(in srgb,var(--brand) 10%,transparent); color: var(--brand); }.backup-row-main { display: grid; min-width: 0; gap: 2px; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }.backup-row-main:disabled { cursor: default; }.backup-row-main strong,.backup-row-main span,.backup-row-main small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.backup-row-main strong { font-size: 11px; font-weight: 600; }.backup-row-main span { color: var(--text-secondary); font-size: 10px; }.backup-row-main small { color: var(--text-secondary); font-size: 9px; opacity: .75; }.backup-kind { padding: 2px 6px; border-radius: 5px; background: var(--surface-soft); color: var(--text-secondary); font-size: 9px; white-space: nowrap; }.backup-row-actions { display: flex; align-items: center; gap: 5px; }.backup-action { display: inline-flex; align-items: center; gap: 3px; padding: 4px 6px; border: 0; border-radius: 5px; background: transparent !important; box-shadow: none !important; color: var(--text-secondary); cursor: pointer; white-space: nowrap; }.backup-action:hover:not(:disabled) { color: var(--brand); }.backup-action.danger,.backup-action.danger:hover:not(:disabled) { color: #b44b4b; }.backup-action:disabled { background: transparent !important; color: color-mix(in srgb,var(--text-secondary) 45%,transparent); cursor: not-allowed; opacity: 1; }.backup-action.danger:disabled { color: color-mix(in srgb,#b44b4b 42%,transparent); }.backup-empty { display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 4px; min-height: 110px; padding: 18px; color: var(--text-secondary); font-size: 11px; text-align: center; }.backup-history > .backup-empty { min-height: 0; }.backup-empty strong { color: var(--text-primary); font-size: 12px; }
 .backup-result { display: flex; gap: 8px; align-items: flex-start; padding: 9px 11px; border-radius: 8px; font-size: 12px; }
 .backup-result.success { color: var(--success-text, #237451); background: rgba(50, 160, 105, .1); }
 .backup-result div { min-width: 0; display: grid; gap: 4px; }
@@ -211,6 +227,8 @@ onMounted(() => { void loadHistory(); });
 .backup-preview details { color: var(--text-secondary); font-size: 11px; }
 .backup-preview summary { cursor: pointer; color: var(--text-primary); }
 .backup-preview ul { margin: 8px 0 0; padding-left: 20px; line-height: 1.7; }
+.restore-impact { margin: 0; padding: 9px 10px; border-radius: 7px; background: color-mix(in srgb,#a84949 7%,var(--surface-soft)); color: var(--text-secondary); font-size: 11px; line-height: 1.6; }
+.restore-loading { min-height: 220px; }
 .backup-restore-button { justify-self: start; }
 @media (max-width: 720px) { .backup-counts { grid-template-columns: 1fr; }.backup-row { grid-template-columns: 30px minmax(0,1fr) auto; }.backup-kind { display: none; }.backup-row-actions { grid-column: 2 / 4; } }
 </style>

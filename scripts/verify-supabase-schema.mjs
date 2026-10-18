@@ -29,6 +29,11 @@ const operationHistoryPageSizePatchFile = path.join(repoRoot, "supabase", "20261
 const historyDetailAndSnapshotTimeoutPatchFile = path.join(repoRoot, "supabase", "20261018i_timegenie_history_detail_and_snapshot_timeout.sql");
 const snapshotRetentionPatchFile = path.join(repoRoot, "supabase", "20261018j_timegenie_snapshot_retention.sql");
 const fixedDailySnapshotPatchFile = path.join(repoRoot, "supabase", "20261018k_timegenie_fixed_daily_snapshot.sql");
+const snapshotMetadataDetailPatchFile = path.join(repoRoot, "supabase", "20261018l_timegenie_snapshot_metadata_detail.sql");
+const restoreIgnoreUnassignedPatchFile = path.join(repoRoot, "supabase", "20261018m_timegenie_restore_ignore_unassigned.sql");
+const restoreTimeoutPatchFile = path.join(repoRoot, "supabase", "20261018n_timegenie_restore_timeout.sql");
+const optionalPreRestoreSnapshotPatchFile = path.join(repoRoot, "supabase", "20261018o_timegenie_optional_pre_restore_snapshot.sql");
+const restoreUnassignedStatePatchFile = path.join(repoRoot, "supabase", "20261018p_timegenie_restore_unassigned_state.sql");
 const timerFactConvergencePatchFile = path.join(repoRoot, "supabase", "20261018f_timegenie_timer_fact_convergence.sql");
 const actualAdjustmentBatchPatchFile = path.join(repoRoot, "supabase", "20261015_timegenie_actual_adjustment_batch.sql");
 const namedTemplateBootstrapFixFile = path.join(repoRoot, "supabase", "20261016_timegenie_named_template_bootstrap_fix.sql");
@@ -109,6 +114,11 @@ function verifyStaticSchemaInvariants() {
   const historyDetailAndSnapshotTimeoutPatch = fs.readFileSync(historyDetailAndSnapshotTimeoutPatchFile, "utf8");
   const snapshotRetentionPatch = fs.readFileSync(snapshotRetentionPatchFile, "utf8");
   const fixedDailySnapshotPatch = fs.readFileSync(fixedDailySnapshotPatchFile, "utf8");
+  const snapshotMetadataDetailPatch = fs.readFileSync(snapshotMetadataDetailPatchFile, "utf8");
+  const restoreIgnoreUnassignedPatch = fs.readFileSync(restoreIgnoreUnassignedPatchFile, "utf8");
+  const restoreTimeoutPatch = fs.readFileSync(restoreTimeoutPatchFile, "utf8");
+  const optionalPreRestoreSnapshotPatch = fs.readFileSync(optionalPreRestoreSnapshotPatchFile, "utf8");
+  const restoreUnassignedStatePatch = fs.readFileSync(restoreUnassignedStatePatchFile, "utf8");
   const timerFactConvergencePatch = fs.readFileSync(timerFactConvergencePatchFile, "utf8");
   const actualAdjustmentBatchPatch = fs.readFileSync(actualAdjustmentBatchPatchFile, "utf8");
   const namedTemplateBootstrapFix = fs.readFileSync(namedTemplateBootstrapFixFile, "utf8");
@@ -201,6 +211,85 @@ function verifyStaticSchemaInvariants() {
   }
   if ((schemaIntegrationTest.match(/\\ir 20261018k_timegenie_fixed_daily_snapshot\.sql/g) ?? []).length < 2) {
     throw new Error("The schema integration test must prove the fixed daily snapshot patch is idempotent.");
+  }
+  for (const expected of [
+    "workspace_snapshot_verify_integrity",
+    "groupCounts",
+    "CHUNK_CHECKSUM_MISMATCH",
+    "verification_value:=timegenie.workspace_snapshot_verify_integrity",
+  ]) {
+    if (!snapshotMetadataDetailPatch.replaceAll(" ", "").toLowerCase().includes(expected.replaceAll(" ", "").toLowerCase())) {
+      throw new Error(`The snapshot metadata detail patch must include: ${expected}`);
+    }
+  }
+  if (snapshotMetadataDetailPatch.includes("cloud_snapshot_get(p_workspace_id)")
+      || snapshotMetadataDetailPatch.includes("workspace_snapshot_rehydrate(p_snapshot_id)")) {
+    throw new Error("Opening snapshot details must not reconstruct or compare full workspace data.");
+  }
+  if (!schema.includes("\\ir 20261018l_timegenie_snapshot_metadata_detail.sql")) {
+    throw new Error("The source schema must apply the snapshot metadata detail patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261018l_timegenie_snapshot_metadata_detail\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the snapshot metadata detail patch is idempotent.");
+  }
+  if (!restoreIgnoreUnassignedPatch.includes("create or replace function timegenie.workspace_restore_prepare")
+      || restoreIgnoreUnassignedPatch.includes("RESTORE_ACTIVE_UNASSIGNED")) {
+    throw new Error("Workspace restore must replace active unassigned time without blocking.");
+  }
+  if (!schema.includes("\\ir 20261018m_timegenie_restore_ignore_unassigned.sql")) {
+    throw new Error("The source schema must apply the restore-ignore-unassigned patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261018m_timegenie_restore_ignore_unassigned\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the restore-ignore-unassigned patch is idempotent.");
+  }
+  for (const signature of [
+    "workspace_restore_prepare(uuid,uuid,uuid,bigint)",
+    "workspace_restore_commit(uuid,uuid,uuid,uuid,text,bigint,uuid,boolean)",
+  ]) {
+    if (!restoreTimeoutPatch.replace(/\s/g, "").includes(`alterfunctiontimegenie.${signature.replace(/\s/g, "")}`)
+        || !restoreTimeoutPatch.includes("statement_timeout='600s'")) {
+      throw new Error(`Workspace restore RPC is missing the extended timeout: ${signature}`);
+    }
+  }
+  if (!schema.includes("\\ir 20261018n_timegenie_restore_timeout.sql")) {
+    throw new Error("The source schema must apply the workspace restore timeout patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261018n_timegenie_restore_timeout\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the restore-timeout patch is idempotent.");
+  }
+  for (const expected of [
+    "p_create_safety_snapshot boolean",
+    "if coalesce(p_create_safety_snapshot,false) then",
+    "workspace_restore_prepare($1,$2,$3,$4,false)",
+    "safetySnapshotId",
+  ]) {
+    if (!optionalPreRestoreSnapshotPatch.replace(/\s/g, "").toLowerCase().includes(expected.replace(/\s/g, "").toLowerCase())) {
+      throw new Error(`Optional pre-restore snapshot patch must include: ${expected}`);
+    }
+  }
+  if (!schema.includes("\\ir 20261018o_timegenie_optional_pre_restore_snapshot.sql")) {
+    throw new Error("The source schema must apply the optional pre-restore snapshot patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261018o_timegenie_optional_pre_restore_snapshot\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the optional pre-restore snapshot patch is idempotent.");
+  }
+  for (const expected of [
+    "state='awaiting_resolution'",
+    "update timegenie.unassigned_segments",
+    "lease_token=null",
+  ]) {
+    if (!restoreUnassignedStatePatch.replace(/\s/g, "").toLowerCase().includes(expected.replace(/\s/g, "").toLowerCase())) {
+      throw new Error(`Restore unassigned-state patch must include: ${expected}`);
+    }
+  }
+  if (restoreUnassignedStatePatch.includes("unassigned_sessions set state='paused'")) {
+    throw new Error("Workspace restore must not write the invalid paused unassigned-session state.");
+  }
+  if (!schema.includes("\\ir 20261018p_timegenie_restore_unassigned_state.sql")) {
+    throw new Error("The source schema must apply the restore unassigned-state patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261018p_timegenie_restore_unassigned_state\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the restore unassigned-state patch is idempotent.");
   }
   for (const expected of [
     "create or replace function timegenie.timer_transition_apply",

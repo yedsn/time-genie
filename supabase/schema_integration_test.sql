@@ -80,6 +80,16 @@ end $$;
 \ir 20261018j_timegenie_snapshot_retention.sql
 \ir 20261018k_timegenie_fixed_daily_snapshot.sql
 \ir 20261018k_timegenie_fixed_daily_snapshot.sql
+\ir 20261018l_timegenie_snapshot_metadata_detail.sql
+\ir 20261018l_timegenie_snapshot_metadata_detail.sql
+\ir 20261018m_timegenie_restore_ignore_unassigned.sql
+\ir 20261018m_timegenie_restore_ignore_unassigned.sql
+\ir 20261018n_timegenie_restore_timeout.sql
+\ir 20261018n_timegenie_restore_timeout.sql
+\ir 20261018o_timegenie_optional_pre_restore_snapshot.sql
+\ir 20261018o_timegenie_optional_pre_restore_snapshot.sql
+\ir 20261018p_timegenie_restore_unassigned_state.sql
+\ir 20261018p_timegenie_restore_unassigned_state.sql
 
 do $$
 begin
@@ -2889,7 +2899,13 @@ begin
   before_expiry:=(select expires_at from timegenie.workspace_snapshots where id=manual_id);
   set role authenticated;
   preview_result:=timegenie.workspace_snapshot_preview('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002',manual_id);
-  if not coalesce((preview_result->>'restorable')::boolean,false) or preview_result->'groups' is null or preview_result->'entities' is null then raise exception 'valid snapshot preview failed: %',preview_result; end if;
+  if not coalesce((preview_result->>'restorable')::boolean,false)
+     or preview_result->'entityCounts' is null
+     or preview_result->'groupCounts' is null
+     or preview_result->'groups' is not null
+     or preview_result->'entities' is not null then
+    raise exception 'lightweight snapshot details failed: %',preview_result;
+  end if;
   reset role;
   if before_task_count<>(select count(*) from timegenie.tasks where workspace_id='20000000-0000-0000-0000-000000000001')
      or before_change_count<>(select count(*) from timegenie.workspace_changes where workspace_id='20000000-0000-0000-0000-000000000001')
@@ -2952,6 +2968,10 @@ begin
   update timegenie.workspace_snapshot_chunks set content_json=content_json||jsonb_build_object('tampered',true) where snapshot_id=corrupt_id and chunk_index=(select min(chunk_index) from timegenie.workspace_snapshot_chunks where snapshot_id=corrupt_id);
   set role authenticated;
   preview_result:=timegenie.workspace_snapshot_preview('20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002',corrupt_id);
+  if not coalesce((preview_result->>'restorable')::boolean,false) then raise exception 'metadata details unexpectedly inspected chunk payloads'; end if;
+  reset role;
+  preview_result:=timegenie.workspace_snapshot_verify_integrity('20000000-0000-0000-0000-000000000001',corrupt_id);
+  set role authenticated;
   if coalesce((preview_result->>'restorable')::boolean,true) or preview_result->>'errorCode'<>'SNAPSHOT_CORRUPT' then raise exception 'tampered snapshot remained restorable'; end if;
   reset role;
   if (select status from timegenie.workspace_snapshots where id=corrupt_id)<>'corrupt' then raise exception 'tampered snapshot was not marked corrupt'; end if;
@@ -3338,20 +3358,48 @@ where workspace_id='20000000-0000-0000-0000-000000000001' and state in('collecti
 set local role authenticated;
 select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
 do $$
-declare target_id uuid; prepared jsonb; restored jsonb; repeated jsonb; before_task_count bigint; restored_snapshot jsonb;
+declare target_id uuid; prepared jsonb; direct_prepared jsonb; restored jsonb; repeated jsonb; before_task_count bigint; restored_snapshot jsonb; active_unassigned_id uuid; pre_restore_count bigint;
 begin
   target_id:=(timegenie.workspace_snapshot_create(
     '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
     '4f000000-0000-0000-0000-000000000001','manual','回滚协议目标',null,false
   )->>'id')::uuid;
   before_task_count:=jsonb_array_length(timegenie.cloud_snapshot_get('20000000-0000-0000-0000-000000000001')->'tasks');
+  reset role;
+  select id into active_unassigned_id from timegenie.unassigned_sessions
+  where workspace_id='20000000-0000-0000-0000-000000000001' and state in('collecting','paused','awaiting_resolution') limit 1;
+  if active_unassigned_id is null then
+    insert into timegenie.unassigned_sessions(
+      workspace_id,work_date,state,threshold_seconds,duration_seconds,first_started_at,shared_source,migration_state
+    ) values(
+      '20000000-0000-0000-0000-000000000001',current_date,'collecting',300,0,now(),'cloud','adopted'
+    ) returning id into active_unassigned_id;
+  end if;
+  set local role authenticated;
+  perform set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
   perform timegenie.cloud_apply_patch(
     '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
     '4f000000-0000-0000-0000-000000000002','app_setting.update','app_setting','workspace_epoch_probe',2,
     jsonb_build_object('key','workspace_epoch_probe','value_json','99'::jsonb,'updated_at',1792272100000,'version',3)
   );
+  reset role;
+  select count(*) into pre_restore_count from timegenie.workspace_snapshots
+  where workspace_id='20000000-0000-0000-0000-000000000001' and snapshot_type='pre_restore';
+  set local role authenticated;
+  perform set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+  direct_prepared:=timegenie.workspace_restore_prepare(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',target_id,2,false
+  );
+  if direct_prepared->>'safetySnapshotId' is not null then raise exception 'direct restore unexpectedly created a safety snapshot: %',direct_prepared; end if;
+  reset role;
+  if (select count(*) from timegenie.workspace_snapshots where workspace_id='20000000-0000-0000-0000-000000000001' and snapshot_type='pre_restore')<>pre_restore_count then raise exception 'direct restore changed safety snapshot count'; end if;
+  set local role authenticated;
+  perform set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+  perform timegenie.workspace_restore_cancel(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',(direct_prepared->>'lockToken')::uuid
+  );
   prepared:=timegenie.workspace_restore_prepare(
-    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',target_id,2
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',target_id,2,true
   );
   if prepared->>'safetySnapshotId' is null or prepared->>'lockToken' is null then raise exception 'restore prepare omitted safety or lock metadata: %',prepared; end if;
   begin
@@ -3379,6 +3427,8 @@ begin
   restored_snapshot:=timegenie.cloud_snapshot_get('20000000-0000-0000-0000-000000000001');
   if not exists(select 1 from jsonb_array_elements(restored_snapshot->'app_settings') value where value->>'key'='workspace_epoch_probe' and value->'value_json'='4'::jsonb) then raise exception 'restore did not recover target business value'; end if;
   if before_task_count<>jsonb_array_length(restored_snapshot->'tasks') then raise exception 'restore changed target task count'; end if;
+  if exists(select 1 from jsonb_array_elements(restored_snapshot->'unassigned_sessions') value where value->>'state'='paused') then raise exception 'restore wrote invalid paused unassigned state'; end if;
+  if exists(select 1 from jsonb_array_elements(restored_snapshot->'unassigned_sessions') value where value->>'state'='collecting') then raise exception 'restore resumed an active unassigned collection'; end if;
   perform set_config('timegenie.restore_test_safety_id',restored->>'safetySnapshotId',true);
 end $$;
 reset role;

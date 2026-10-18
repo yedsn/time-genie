@@ -11,7 +11,7 @@ import {
   type CloudWorkspaceRestorePrepareResult,
 } from "../services/tauri";
 
-const props = defineProps<{ enabled: boolean }>();
+const props = defineProps<{ enabled: boolean; afterRestore?: () => Promise<void> | void }>();
 const snapshots = ref<CloudWorkspaceSnapshot[]>([]);
 const loading = ref(false);
 const workingId = ref("");
@@ -28,6 +28,7 @@ const restorePreparing = ref(false);
 const restoreCommitting = ref(false);
 const restorePrepared = ref<CloudWorkspaceRestorePrepareResult>();
 const restoreNameConfirmation = ref("");
+const createPreRestoreSnapshot = ref(false);
 const automaticEnabled = ref(true);
 const automaticTime = ref("03:00");
 const automaticTimezone = ref("Asia/Shanghai");
@@ -43,6 +44,15 @@ const totalSize = computed(() => snapshots.value.reduce((sum, item) => sum + ite
 const typeLabels: Record<string, string> = { manual: "手动", automatic: "自动", pre_restore: "恢复前安全" };
 const statusLabels: Record<string, string> = { creating: "创建中", ready: "可用", corrupt: "已损坏", failed: "创建失败" };
 const groupLabels: Record<string, string> = { planning: "计划与事项", time_tracking: "时间记录", reports: "报告", shared_settings: "共享设置" };
+const entityLabels: Record<string, string> = {
+  subjects: "主体", subject_work_schedules: "工作安排", subject_work_schedule_segments: "工作时段",
+  work_days: "工作日", tasks: "事项", task_status_events: "状态记录", task_daily_estimates: "每日预估",
+  task_recurrence_rules: "重复规则", task_occurrences: "事项实例", time_entries: "时间记录", time_segments: "计时分段",
+  time_allocations: "时间分配", actual_time_adjustments: "实际工时调整", unassigned_sessions: "未归属会话",
+  unassigned_segments: "未归属分段", report_templates: "报告模板", reports: "报告", report_tasks: "报告事项",
+  app_settings: "共享设置", integration_configs: "集成配置", external_bindings: "外部绑定",
+};
+const previewEntities = computed(() => Object.entries(preview.value?.entityCounts ?? {}).filter(([, count]) => count > 0));
 const scheduleStatusText = computed(() => {
   if (!automaticEnabled.value) return lastAutomaticAt.value ? `已关闭 · 上次自动快照 ${formatDate(lastAutomaticAt.value)}` : "已关闭";
   if (!schedulerActive.value) return "云端定时任务未启用，自动快照不会执行";
@@ -159,20 +169,28 @@ async function showPreview(item: CloudWorkspaceSnapshot) {
   previewLoading.value = true;
   try {
     preview.value = await previewCloudWorkspaceSnapshot(item.id);
-    if (!preview.value.restorable) { item.status = "corrupt"; ElMessage.error("快照完整性校验失败，已标记为不可恢复"); }
+    if (!preview.value.restorable) ElMessage.error("这份快照当前不可恢复");
   } catch (error) { ElMessage.error(errorText(error, "差异预览失败")); }
   finally { previewLoading.value = false; }
 }
 
-async function beginRestore() {
-  if (!selected.value || !preview.value?.restorable || restorePreparing.value) return;
+async function beginRestore(item?: CloudWorkspaceSnapshot) {
+  if (item && selected.value?.id !== item.id) {
+    selected.value = item;
+    preview.value = undefined;
+    previewLoading.value = true;
+    try { preview.value = await previewCloudWorkspaceSnapshot(item.id); }
+    catch (error) { ElMessage.error(errorText(error, "快照校验失败")); return; }
+    finally { previewLoading.value = false; }
+  }
+  if (!selected.value || !preview.value?.restorable || restorePreparing.value) {
+    if (preview.value && !preview.value.restorable) ElMessage.error("快照完整性校验失败，不能恢复");
+    return;
+  }
   restoreOpen.value = true;
   restoreNameConfirmation.value = "";
+  createPreRestoreSnapshot.value = false;
   restorePrepared.value = undefined;
-  restorePreparing.value = true;
-  try { restorePrepared.value = await prepareCloudWorkspaceRestore(selected.value.id); }
-  catch (error) { restoreOpen.value = false; ElMessage.error(errorText(error, "恢复准备失败")); }
-  finally { restorePreparing.value = false; }
 }
 
 async function closeRestore() {
@@ -185,21 +203,34 @@ async function closeRestore() {
 }
 
 async function commitRestore() {
-  if (!selected.value || !restorePrepared.value || restoreNameConfirmation.value !== selected.value.name || restoreCommitting.value) return;
+  if (!selected.value || restoreNameConfirmation.value !== selected.value.name || restoreCommitting.value) return;
   restoreCommitting.value = true;
+  let restoreCommitted = false;
   try {
+    if (!restorePrepared.value) {
+      restorePreparing.value = true;
+      restorePrepared.value = await prepareCloudWorkspaceRestore(selected.value.id, createPreRestoreSnapshot.value);
+      restorePreparing.value = false;
+    }
     const result = await commitCloudWorkspaceRestore({
       lockToken: restorePrepared.value.lockToken,
       targetSnapshotId: restorePrepared.value.targetSnapshotId,
       targetContentHash: restorePrepared.value.targetContentHash,
       preparedEpoch: restorePrepared.value.preparedEpoch,
     });
+    restoreCommitted = result.restored && result.localCacheRebuilt;
     restorePrepared.value = undefined;
     restoreOpen.value = false;
     previewOpen.value = false;
-    ElMessage.success(`云端工作空间已恢复到“${selected.value.name}”时点，世代已更新为 ${result.workspaceEpoch}`);
-  } catch (error) { ElMessage.error(errorText(error, "云端恢复失败，当前数据未改变")); }
-  finally { restoreCommitting.value = false; await loadSnapshots(); }
+    await props.afterRestore?.();
+    ElMessage.success(`已恢复到“${selected.value.name}”时点，当前设备数据已重新下载`);
+  } catch (error) {
+    const message = errorText(error, "云端恢复失败，当前数据未改变");
+    if (restoreCommitted) ElMessage.warning("云端和本机数据已经恢复，但当前页面重新载入失败，请重新打开应用查看恢复后的数据");
+    else if (message.includes("RESTORE_LOCAL_REBUILD_FAILED")) ElMessage.error(message.replace("RESTORE_LOCAL_REBUILD_FAILED: ", ""));
+    else ElMessage.error(message);
+  }
+  finally { restorePreparing.value = false; restoreCommitting.value = false; await loadSnapshots(); }
 }
 
 watch(() => props.enabled, (enabled) => {
@@ -252,6 +283,7 @@ watch(() => props.enabled, (enabled) => {
           </button>
           <div class="snapshot-actions">
             <button :class="['snapshot-action', { active: selected?.id === item.id }]" type="button" :disabled="workingId === item.id || item.status !== 'ready'" @click="showPreview(item)"><Eye :size="13" />详情</button>
+            <button class="snapshot-action danger" type="button" :disabled="workingId === item.id || restorePreparing || restoreCommitting || item.status !== 'ready'" @click="beginRestore(item)"><History :size="13" />恢复</button>
             <button :class="['snapshot-action', { active: item.protected }]" type="button" :disabled="workingId === item.id || item.status !== 'ready'" @click="toggleProtected(item)"><ShieldOff v-if="item.protected" :size="13" /><Shield v-else :size="13" />{{ item.protected ? '解除' : '保护' }}</button>
             <button class="snapshot-action danger" type="button" :disabled="workingId === item.id || item.protected" @click="removeSnapshot(item)"><Trash2 :size="14" />删除</button>
           </div>
@@ -270,12 +302,13 @@ watch(() => props.enabled, (enabled) => {
         </div>
         <div v-if="previewLoading" class="snapshot-empty"><LoaderCircle class="sync-spin" :size="18" />正在校验并计算差异...</div>
         <template v-else-if="preview?.restorable">
-          <div class="snapshot-detail-status"><span>完整性校验通过</span><small>内容校验：{{ preview.contentHash }}</small></div>
+          <div class="snapshot-detail-status"><span>创建时已完成完整性校验</span><small>内容校验：{{ preview.contentHash }}</small></div>
           <div class="snapshot-diff-grid">
-            <div v-for="(diff, group) in preview.groups" :key="group"><strong>{{ groupLabels[group] || group }}</strong><span class="add">新增 {{ diff.added }}</span><span class="change">修改 {{ diff.modified }}</span><span class="remove">删除 {{ diff.deleted }}</span></div>
+            <div v-for="(count, group) in preview.groupCounts" :key="group"><strong>{{ groupLabels[group] || group }}</strong><span>{{ count }} 条数据</span></div>
           </div>
-          <details><summary>查看实体级差异</summary><div class="entity-diffs"><div v-for="(diff, entity) in preview.entities" :key="entity"><span>{{ entity }}</span><small>+{{ diff.added }} / ~{{ diff.modified }} / -{{ diff.deleted }}</small></div></div></details>
-          <div class="snapshot-detail-footer"><span>恢复会替换当前云端业务数据，并自动创建一份恢复前安全快照。</span><button class="danger-button snapshot-restore-button" type="button" :disabled="restorePreparing" @click="beginRestore"><History :size="14" />{{ restorePreparing ? '正在准备恢复...' : '恢复到此时点' }}</button></div>
+          <details><summary>查看快照数据组成</summary><div class="entity-diffs"><div v-for="([entity, count]) in previewEntities" :key="entity"><span>{{ entityLabels[entity] || entity }}</span><small>{{ count }} 条</small></div></div></details>
+          <p class="snapshot-detail-note">详情来自快照创建时保存的摘要，不会在打开详情时重新展开数据或计算与当前工作区的差异。恢复前会单独校验所有分块，提交时还会再次校验整体内容。</p>
+          <div class="snapshot-detail-footer"><span>恢复会替换当前云端业务数据；是否保留恢复前备份，可在确认框中选择。</span><button class="danger-button snapshot-restore-button" type="button" :disabled="restorePreparing" @click="beginRestore()"><History :size="14" />恢复到此时点</button></div>
         </template>
         <div v-else-if="preview" class="snapshot-corrupt"><TriangleAlert :size="20" /><strong>快照不可恢复</strong><p>内容分块缺失或校验和不一致，系统已阻止继续使用此快照。</p></div>
       </div>
@@ -286,13 +319,13 @@ watch(() => props.enabled, (enabled) => {
       <template #footer><button class="secondary-button" type="button" :disabled="creating" @click="createOpen = false">取消</button><button class="primary-button" type="button" :disabled="creating || !name.trim()" @click="createSnapshot"><LoaderCircle v-if="creating" class="sync-spin" :size="14" />{{ creating ? '正在创建...' : '创建并校验' }}</button></template>
     </el-dialog>
     <el-dialog v-model="restoreOpen" title="确认恢复到此时点" width="min(560px, calc(100vw - 32px))" :close-on-click-modal="false" :show-close="!restoreCommitting" @closed="closeRestore">
-      <div v-if="restorePreparing" class="snapshot-empty"><LoaderCircle class="sync-spin" :size="18" />正在获取恢复锁并创建恢复前安全快照...</div>
-      <div v-else-if="restorePrepared && selected" class="snapshot-form restore-form">
+      <div v-if="selected" class="snapshot-form restore-form">
         <div class="snapshot-corrupt restore-warning"><TriangleAlert :size="20" /><strong>这会替换同一个云端工作空间的业务数据</strong><p>设备授权、登录凭据、同步队列、操作记录和运行时租约不会从快照恢复。恢复完成后其他设备必须按新世代重建；有旧修改的设备会暂停同步。</p></div>
-        <div class="restore-summary"><span>目标快照</span><strong>{{ selected.name }}</strong><span>恢复前安全快照 ID</span><code>{{ restorePrepared.safetySnapshotId }}</code><span>准备世代</span><strong>{{ restorePrepared.preparedEpoch }}</strong></div>
+        <div class="restore-summary"><span>目标快照</span><strong>{{ selected.name }}</strong><span>恢复方式</span><strong>{{ createPreRestoreSnapshot ? '先创建恢复前备份，再执行恢复' : '直接恢复，不额外创建快照' }}</strong></div>
+        <label class="restore-safety-option"><input v-model="createPreRestoreSnapshot" type="checkbox" :disabled="restoreCommitting || Boolean(restorePrepared)" /><span><strong>恢复前创建一份备份快照</strong><small>仅在确认恢复后创建；未勾选时不会额外生成快照。</small></span></label>
         <label><span>请输入快照名称以确认：{{ selected.name }}</span><input v-model="restoreNameConfirmation" :disabled="restoreCommitting" autocomplete="off" /></label>
       </div>
-      <template #footer><button class="secondary-button" type="button" :disabled="restoreCommitting" @click="closeRestore">取消并释放锁</button><button class="danger-button" type="button" :disabled="restoreCommitting || !restorePrepared || restoreNameConfirmation !== selected?.name" @click="commitRestore"><LoaderCircle v-if="restoreCommitting" class="sync-spin" :size="14" />{{ restoreCommitting ? '正在原子恢复...' : '确认恢复' }}</button></template>
+      <template #footer><button class="secondary-button" type="button" :disabled="restoreCommitting" @click="closeRestore">取消</button><button class="danger-button" type="button" :disabled="restoreCommitting || restoreNameConfirmation !== selected?.name" @click="commitRestore"><LoaderCircle v-if="restoreCommitting" class="sync-spin" :size="14" />{{ restoreCommitting ? (createPreRestoreSnapshot ? '正在备份并恢复...' : '正在恢复...') : '确认恢复' }}</button></template>
     </el-dialog>
   </div>
 </template>
@@ -303,19 +336,20 @@ watch(() => props.enabled, (enabled) => {
 .automatic-status { display: flex; min-width: 0; align-items: center; gap: 7px; margin-top: -7px; color: var(--text-secondary); font-size: 12px; }.automatic-status span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.automatic-status.failed { color: #a84949; }
 .snapshot-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; }.snapshot-toolbar-summary { display: flex; min-width: 0; gap: 10px; color: var(--text-secondary); font-size: 11px; }.snapshot-toolbar-actions { display: flex; flex: none; align-items: center; justify-content: flex-end; gap: 7px; margin-left: auto; }.snapshot-toolbar span,.snapshot-toolbar button { white-space: nowrap; }
 .snapshot-toolbar button,.snapshot-actions button { display: inline-flex; align-items: center; gap: 5px; }
-.snapshot-list { display: grid; width: 100%; gap: 6px; align-content: start; max-height: 600px; overflow-y: auto; }
-.snapshot-card { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: stretch; width: 100%; border: 1px solid var(--line-soft); border-radius: 9px; overflow: hidden; }.snapshot-card.active { border-color: var(--brand); box-shadow: 0 0 0 1px color-mix(in srgb,var(--brand) 35%,transparent); }
-.snapshot-card.corrupt,.snapshot-card.failed { border-color: rgba(190,70,70,.35); }.snapshot-main { display: grid; gap: 4px; width: 100%; padding: 9px 10px; border: 0; text-align: left; background: transparent; color: inherit; cursor: pointer; }.snapshot-main:disabled { cursor: default; }
+.snapshot-list { display: grid; grid-auto-rows: 60px; width: 100%; height: 324px; gap: 6px; align-content: start; overflow-y: auto; }
+.snapshot-card { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: stretch; width: 100%; height: 60px; border: 1px solid var(--line-soft); border-radius: 9px; overflow: hidden; }.snapshot-card.active { border-color: var(--brand); box-shadow: 0 0 0 1px color-mix(in srgb,var(--brand) 35%,transparent); }
+.snapshot-card.corrupt,.snapshot-card.failed { border-color: rgba(190,70,70,.35); }.snapshot-main { display: grid; gap: 2px; width: 100%; padding: 6px 9px; border: 0; text-align: left; background: transparent; color: inherit; cursor: pointer; }.snapshot-main:disabled { cursor: default; }
 .snapshot-card-title,.snapshot-state { display: flex; min-width: 0; justify-content: space-between; gap: 8px; align-items: flex-start; }.snapshot-card-title strong,.snapshot-card-title span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.snapshot-card-title strong { min-width: 0; font-size: 12px; font-weight: 600; }.snapshot-card-title span { flex: none; max-width: 45%; }.snapshot-card-title span,.snapshot-meta,.snapshot-state,.snapshot-main small { color: var(--text-secondary); font-size: 10px; }.snapshot-main small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.snapshot-main p { overflow: hidden; margin: 0; color: var(--text-secondary); font-size: 10px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }.snapshot-meta { display: flex; min-width: 0; justify-content: space-between; gap: 8px; }.snapshot-meta span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.snapshot-meta span:last-child { flex: none; }.snapshot-state span { display: inline-flex; min-width: 0; gap: 4px; align-items: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.snapshot-state .corrupt,.snapshot-state .failed { color: #a84949; }
+.snapshot-main p { display: none; }.snapshot-meta { display: flex; min-width: 0; justify-content: space-between; gap: 8px; }.snapshot-meta span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.snapshot-meta span:last-child { flex: none; }.snapshot-state span { display: inline-flex; min-width: 0; gap: 4px; align-items: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.snapshot-state .corrupt,.snapshot-state .failed { color: #a84949; }
 .snapshot-actions { display: flex; align-items: center; justify-content: flex-end; gap: 3px; padding: 7px 9px; border-left: 1px solid var(--line-soft); font-size: 11px; }.snapshot-action { padding: 4px 6px; border: 0; border-radius: 5px; background: transparent !important; box-shadow: none !important; color: var(--text-secondary); cursor: pointer; white-space: nowrap; }.snapshot-action:hover:not(:disabled),.snapshot-action.active { color: var(--brand); }.snapshot-action.danger,.snapshot-action.danger:hover:not(:disabled),.snapshot-action.danger.active { color: #b44b4b; }.snapshot-action:disabled { background: transparent !important; color: color-mix(in srgb,var(--text-secondary) 45%,transparent); cursor: not-allowed; opacity: 1; }.snapshot-action.danger:disabled { color: color-mix(in srgb,#b44b4b 42%,transparent); }
 .snapshot-detail { display: grid; gap: 12px; font-size: 12px; }.snapshot-detail-meta { display: flex; flex-wrap: wrap; gap: 5px 14px; color: var(--text-secondary); font-size: 11px; }.snapshot-detail-meta span { white-space: nowrap; }.snapshot-detail-status { display: flex; align-items: center; justify-content: space-between; gap: 12px; }.snapshot-detail-status > span { color: #237451; font-weight: 600; white-space: nowrap; }.snapshot-detail-status small { overflow-wrap: anywhere; color: var(--text-secondary); font-size: 10px; }
 .snapshot-diff-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 6px; margin: 10px 0; }.snapshot-diff-grid > div { display: grid; grid-template-columns: 1fr auto; gap: 3px 8px; padding: 7px 8px; border-radius: 7px; background: var(--surface-soft); }.snapshot-diff-grid strong { grid-column: 1/-1; font-size: 11px; }.snapshot-diff-grid span { font-size: 10px; }.snapshot-diff-grid .add { color: #237451; }.snapshot-diff-grid .change { color: #8c651d; }.snapshot-diff-grid .remove { color: #a84949; }
 .snapshot-detail details { margin-top: 2px; }.snapshot-detail summary { cursor: pointer; }.entity-diffs { display: grid; gap: 5px; margin-top: 8px; }.entity-diffs > div { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; }.entity-diffs small { color: var(--text-secondary); }.snapshot-detail-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-top: 12px; border-top: 1px solid var(--line-soft); }.snapshot-detail-footer > span { color: var(--text-secondary); font-size: 11px; line-height: 1.5; }
-.snapshot-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px; min-height: 150px; padding: 20px; text-align: center; color: var(--text-secondary); }.snapshot-empty strong { color: var(--text-primary); font-size: 12px; font-weight: 600; }.snapshot-empty span { font-size: 11px; }.snapshot-corrupt { display: grid; place-items: center; gap: 8px; min-height: 260px; text-align: center; color: #a84949; }.snapshot-corrupt p { max-width: 320px; }
+.snapshot-detail-note { margin: 0; padding: 8px 9px; border-radius: 7px; background: var(--surface-soft); color: var(--text-secondary); font-size: 10px; line-height: 1.6; }
+.snapshot-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px; min-height: 150px; padding: 20px; text-align: center; color: var(--text-secondary); }.snapshot-settings > .snapshot-empty { box-sizing: border-box; height: 324px; min-height: 0; }.snapshot-empty strong { color: var(--text-primary); font-size: 12px; font-weight: 600; }.snapshot-empty span { font-size: 11px; }.snapshot-corrupt { display: grid; place-items: center; gap: 8px; min-height: 260px; text-align: center; color: #a84949; }.snapshot-corrupt p { max-width: 320px; }
 .snapshot-form { display: grid; gap: 14px; }.snapshot-form label { display: grid; gap: 6px; }.snapshot-form input,.snapshot-form textarea { width: 100%; }.snapshot-form p { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
 .snapshot-restore-button { display: inline-flex; flex: none; align-items: center; justify-content: center; gap: 6px; }.restore-warning { min-height: 0; padding: 14px; border-radius: 10px; background: color-mix(in srgb,#a84949 8%,transparent); }.restore-summary { display: grid; grid-template-columns: auto 1fr; gap: 8px 14px; padding: 12px; border-radius: 10px; background: var(--surface-soft); }.restore-summary span { color: var(--text-secondary); }.restore-summary code { overflow-wrap: anywhere; }
+.restore-safety-option { display: grid !important; grid-template-columns: 16px minmax(0,1fr); align-items: start; gap: 9px !important; padding: 10px 11px; border: 1px solid var(--line-soft); border-radius: 8px; cursor: pointer; }.restore-safety-option input { width: 14px; height: 14px; margin: 2px 0 0; accent-color: var(--brand); }.restore-safety-option > span { display: grid; gap: 2px; }.restore-safety-option strong { color: var(--text-primary); font-size: 11px; }.restore-safety-option small { color: var(--text-secondary); font-size: 10px; line-height: 1.5; }
 .snapshot-toggle { display: inline-flex; flex: none; align-items: center; gap: 4px; cursor: pointer; }.snapshot-toggle input { width: 13px; height: 13px; margin: 0; accent-color: var(--brand); }.snapshot-retention-field input[type=time] { width: 92px; }
-@media (max-width: 900px) { .snapshot-list { max-height: 430px; } }
-@media (max-width: 640px) { .snapshot-schedule,.snapshot-toolbar { align-items: flex-start; flex-wrap: wrap; }.snapshot-schedule-copy,.snapshot-toolbar-summary { width: 100%; }.snapshot-schedule-actions,.snapshot-toolbar-actions { width: 100%; margin-left: 0; }.snapshot-card { grid-template-columns: 1fr; }.snapshot-actions { border-top: 1px solid var(--line-soft); border-left: 0; }.snapshot-diff-grid { grid-template-columns: 1fr; }.snapshot-detail-footer { align-items: stretch; flex-direction: column; }.snapshot-detail-footer .snapshot-restore-button { width: 100%; } }
+@media (max-width: 640px) { .snapshot-schedule,.snapshot-toolbar { align-items: flex-start; flex-wrap: wrap; }.snapshot-schedule-copy,.snapshot-toolbar-summary { width: 100%; }.snapshot-schedule-actions,.snapshot-toolbar-actions { width: 100%; margin-left: 0; }.snapshot-list { grid-auto-rows: auto; }.snapshot-card { grid-template-columns: 1fr; height: auto; min-height: 94px; }.snapshot-actions { border-top: 1px solid var(--line-soft); border-left: 0; }.snapshot-diff-grid { grid-template-columns: 1fr; }.snapshot-detail-footer { align-items: stretch; flex-direction: column; }.snapshot-detail-footer .snapshot-restore-button { width: 100%; } }
 </style>

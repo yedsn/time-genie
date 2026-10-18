@@ -3,7 +3,7 @@ import { computed, h, nextTick, onMounted, onUnmounted, reactive, ref, watch } f
 import { AlertTriangle, CalendarDays, CheckCircle2, Clock3, Copy, Database, FileText, Folder, Home, LoaderCircle, Minus, Pencil, Plus, RefreshCw, Save, Settings, Square, UserRound, X } from "lucide-vue-next";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useWorkdayStore, type Task } from "../store";
-import { checkAppUpdate, closeMainWindow, confirmObsidianPlan, configureCloud, discardOldEpochChangesAndRedownload, downloadAndInstallUpdate, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listCloudSyncConflicts, listCloudSyncQueue, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onOpenTimerTaskSelection, onTimerFactFollowed, onTrayCheckUpdate, previewObsidianPlan, previewSeaTableTaskSync, previewStorageMigration, registerCloudDevice, resetLocalCacheFromCloud, resolveAllCloudSyncConflicts, restartApp, resumeCloudSyncAfterReauth, retryFailedSeaTableSync, revokeCloudDevice, saveCloudSync, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudSessionSnapshot, type CloudSyncConflict, type CloudSyncQueueItem, type PlanImportPreviewResult, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
+import { checkAppUpdate, closeMainWindow, confirmObsidianPlan, configureCloud, discardOldEpochChangesAndRedownload, downloadAndInstallUpdate, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listCloudSyncConflicts, listCloudSyncQueue, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onOpenTimerTaskSelection, onTimerFactFollowed, onTrayCheckUpdate, previewObsidianPlan, previewSeaTableTaskSync, previewStorageMigration, probeCloudProject, registerCloudDevice, resetLocalCacheFromCloud, resolveAllCloudSyncConflicts, restartApp, resumeCloudSyncAfterReauth, retryFailedSeaTableSync, revokeCloudDevice, saveCloudSync, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudProjectProbe, type CloudSessionSnapshot, type CloudSyncConflict, type CloudSyncQueueItem, type PlanImportPreviewResult, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
 import PlanListEditor from "../components/PlanListEditor.vue";
 import CompletedTaskHistory from "../components/CompletedTaskHistory.vue";
 import GlobalTimerBar from "../components/GlobalTimerBar.vue";
@@ -76,6 +76,8 @@ const updateProgressText = ref("");
 const cloudWorking = ref(false);
 const cloudSession = ref<CloudSessionSnapshot>();
 const cloudDevices = ref<CloudDevice[]>([]);
+const cloudProbe = ref<CloudProjectProbe>();
+const cloudProbeWorking = ref(false);
 const storageState = ref<StorageModeSnapshot>();
 const visibleCloudSaveState = ref<StorageModeSnapshot>();
 const migrationPreview = ref<StorageMigrationPreview>();
@@ -539,12 +541,51 @@ async function configureSupabase() {
     cloudSession.value = await getCloudSession();
     if (cloudSession.value.signedIn) cloudDevices.value = await listCloudDevices().catch(() => []);
     settingsSnapshot.value = await getSettings();
+    await probeSupabaseProject();
     ElMessage.success(cloudSession.value?.signedIn ? "Supabase 连接配置已保存" : "Supabase 连接配置已保存，请重新登录");
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : String(error));
   } finally {
     cloudWorking.value = false;
   }
+}
+
+const cloudProbeAlert = computed(() => {
+  const probe = cloudProbe.value;
+  if (!probe || probe.state === "ready" || probe.state === "unconfigured") return undefined;
+  const titles: Record<string, string> = {
+    schema_missing: "这个 Supabase 项目还没有初始化",
+    schema_not_exposed: "这个 Supabase 项目还没有暴露 timegenie schema",
+    unreachable: "暂时无法连接这个 Supabase 项目",
+  };
+  return {
+    title: titles[probe.state] ?? "这个 Supabase 项目检测未通过",
+    message: stripErrorCode(probe.message),
+    script: probe.state === "schema_missing" ? "supabase/schema.sql" : "",
+  };
+});
+
+function stripErrorCode(message: string) {
+  const separator = message.indexOf(": ");
+  if (separator <= 0) return message;
+  return /^[A-Z][A-Z_]*$/.test(message.slice(0, separator)) ? message.slice(separator + 2) : message;
+}
+
+async function probeSupabaseProject() {
+  if (cloudProbeWorking.value) return;
+  cloudProbeWorking.value = true;
+  try {
+    cloudProbe.value = await probeCloudProject();
+  } catch (error) {
+    cloudProbe.value = { state: "unreachable", message: error instanceof Error ? error.message : String(error) };
+  } finally {
+    cloudProbeWorking.value = false;
+  }
+}
+
+function cloudSchemaFailure(error: unknown) {
+  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  return /^CLOUD_SCHEMA_(MISSING|NOT_EXPOSED)/.test(message);
 }
 
 async function loginSupabase() {
@@ -556,11 +597,13 @@ async function loginSupabase() {
     await registerCloudDevice(settingString("device", "device_name", "当前设备"));
     cloudDevices.value = await listCloudDevices();
     storageState.value = await getStorageMode();
+    cloudProbe.value = undefined;
     settingsDraft.supabasePassword = "";
     migrationPreview.value = await previewStorageMigration();
     ElMessage.success("已登录 Supabase，可预览本地数据迁移");
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : String(error));
+    if (cloudSchemaFailure(error)) await probeSupabaseProject();
+    else ElMessage.error(error instanceof Error ? error.message : String(error));
   } finally {
     cloudWorking.value = false;
   }
@@ -1294,6 +1337,19 @@ async function handleBackupImported() {
   await loadSettings();
 }
 
+async function handleCloudSnapshotRestored() {
+  await store.refreshWorkspaceCalendar();
+  const [workspaceLoaded] = await Promise.all([
+    store.loadWorkspaceData(),
+    store.loadTimeData(),
+    store.loadReports(),
+    store.loadUnassignedState(),
+    store.loadTimeHistory(store.timeHistoryPage),
+  ]);
+  if (!workspaceLoaded) throw new Error("恢复后的事项数据重新载入失败");
+  await Promise.all([store.loadTodayOverview(), loadSettings()]);
+}
+
 function openTimerTaskDialog(subjectId = "") {
   openExecutionPanel({ mode: "execute", subjectId });
 }
@@ -1671,6 +1727,11 @@ async function handleCompletedTaskDelete(task: Task) {
             <div v-if="storageState?.mode === 'cloud'" class="storage-status-meta"><span>变更序号</span><strong>{{ storageState.lastChangeSeq }}</strong></div>
           </div>
           <p v-if="cloudSyncDetail" class="cloud-sync-detail">{{ cloudSyncDetail }}</p>
+          <div v-if="cloudProbeAlert" class="cloud-schema-guidance">
+            <AlertTriangle :size="16" />
+            <div><strong>{{ cloudProbeAlert.title }}</strong><p>{{ cloudProbeAlert.message }}</p><code v-if="cloudProbeAlert.script">{{ cloudProbeAlert.script }}</code></div>
+            <button class="secondary-button compact" type="button" :disabled="cloudProbeWorking || cloudWorking" @click="probeSupabaseProject"><LoaderCircle v-if="cloudProbeWorking" class="sync-spin" :size="13" />{{ cloudProbeWorking ? '检测中...' : '重新检测' }}</button>
+          </div>
           <div v-if="storageState?.mode === 'cloud'" class="cloud-sync-actions storage-status-actions">
             <button v-if="cloudSyncNeedsAttention" class="secondary-button compact" type="button" :disabled="cloudSyncWorking" @click="refreshCloudSyncStatus">刷新状态</button>
             <button v-if="storageState.pendingOperations && !storageState.conflictCount" class="secondary-button compact" type="button" :disabled="cloudSyncWorking || !storageState.online" @click="retryCloudSync">重试同步</button>
@@ -1740,7 +1801,7 @@ async function handleCompletedTaskDelete(task: Task) {
         </div>
 
         <div id="settings-snapshots" data-settings-section="snapshots" class="work-panel settings-panel settings-snapshots-panel">
-          <CloudSnapshotsSettings :enabled="storageState?.mode === 'cloud' && Boolean(cloudSession?.signedIn)" />
+          <CloudSnapshotsSettings :enabled="storageState?.mode === 'cloud' && Boolean(cloudSession?.signedIn)" :after-restore="handleCloudSnapshotRestored" />
           <p v-if="storageState?.mode === 'cloud' && storageState.workspaceEpoch === 1" class="settings-help">首次执行云端回滚前，请确保其他设备已升级到支持工作空间世代隔离的版本。回滚后旧客户端将被强制拒绝写入，以保护恢复后的数据。</p>
         </div>
 

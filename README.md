@@ -93,6 +93,7 @@ SeaTable Token、Supabase 会话等敏感内容会保存到系统凭据库，不
 - 桌面端只允许配置 anon key，拒绝 service role key；用户会话保存到系统凭据库。
 - 已提供 Auth、工作空间、设备注册、RLS、变更序列、迁移入口、全局单计时器 RPC 和 15 秒续租/45 秒过期的后台采集租约。
 - `schema.sql` 会在 `timegenie` schema 下创建业务表和 RPC，不在 `public` 下创建 TimeGenie 业务表；它会显式撤销匿名角色对业务表和保护 RPC 的访问，只向 `authenticated` 授予 API 所需权限；RLS 再按账号限制工作空间范围。
+- 客户端在保存连接或登录时会自动检测项目是否已初始化：缺少 `timegenie` 结构或未暴露该 schema 时，只提示用户在 Supabase SQL Editor 执行 `supabase/schema.sql` 后重新检测；桌面端只持有 anon key，不会也无法自动建表。
 - Supabase/PostgREST 需要暴露 `timegenie` schema。本地 CLI 已在 [`supabase/config.toml`](supabase/config.toml) 配置；自托管环境请把 `timegenie` 加入 `PGRST_DB_SCHEMAS` 后重启 REST/PostgREST 服务。
 - 旧 Supabase 项目升级时不需要重跑完整 schema；按发布时间顺序执行 [`supabase/20261003_timegenie_recurring_migration_patch.sql`](supabase/20261003_timegenie_recurring_migration_patch.sql)、[`supabase/20261004_timegenie_cloud_sync_patch.sql`](supabase/20261004_timegenie_cloud_sync_patch.sql)、[`supabase/20261004b_timegenie_migration_target_guard_patch.sql`](supabase/20261004b_timegenie_migration_target_guard_patch.sql)、[`supabase/20261004c_timegenie_work_day_version_guard_patch.sql`](supabase/20261004c_timegenie_work_day_version_guard_patch.sql)、[`supabase/20261004d_timegenie_session_revocation_patch.sql`](supabase/20261004d_timegenie_session_revocation_patch.sql) 和 [`supabase/20261005_timegenie_timer_sync_coordination_patch.sql`](supabase/20261005_timegenie_timer_sync_coordination_patch.sql)，用于补齐周期事项、同步实体身份、未归属会话同步、迁移目标保护、工作日版本冲突保护、长期登录与设备撤销，以及计时队列协调。
 - Realtime 订阅 `timegenie.workspace_changes`，客户端按 `change_seq` 增量补拉。

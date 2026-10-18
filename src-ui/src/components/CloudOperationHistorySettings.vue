@@ -106,11 +106,13 @@ watch(() => props.enabled, (enabled) => { if (enabled && !page.value.items.lengt
       <div v-if="loading && !page.items.length" class="history-empty"><LoaderCircle class="sync-spin" :size="22" /><strong>正在加载操作记录</strong></div>
       <div v-else-if="!page.items.length" class="history-empty"><History :size="24" /><strong>暂无操作记录</strong><span>同步产生的数据变更会显示在这里</span></div>
       <div v-else class="history-list">
+        <div class="history-scroll">
           <button v-for="item in page.items" :key="item.id" type="button" @click="openDetail(item)">
             <span :class="['history-type-mark', operationPresentation(item).tone]"><component :is="operationPresentation(item).icon" :size="14" /><small>{{ operationPresentation(item).label }}</small></span>
             <div class="history-list-main"><strong>{{ item.summary }}</strong><div class="history-list-meta"><span><i>来源</i>{{ sourceLabels[item.source] || item.source }}</span><span><i>设备</i>{{ item.deviceName }}</span><span><i>时间</i>{{ formatDate(item.occurredAt) }}</span><span><i>影响</i>{{ item.affectedEntityCount }} 项</span></div></div><ChevronRight class="history-row-arrow" :size="14" />
           </button>
-          <div class="history-pagination"><button class="secondary-button compact" type="button" :disabled="loading || pageIndex === 0" @click="previousPage"><ChevronLeft :size="14" />上一页</button><span>第 {{ pageIndex + 1 }} 页</span><button class="secondary-button compact" type="button" :disabled="loading || !page.nextCursor" @click="nextPage">下一页<ChevronRight :size="14" /></button></div>
+        </div>
+        <div class="history-pagination"><button class="secondary-button compact" type="button" :disabled="loading || pageIndex === 0" @click="previousPage"><ChevronLeft :size="14" />上一页</button><span>第 {{ pageIndex + 1 }} 页</span><button class="secondary-button compact" type="button" :disabled="loading || !page.nextCursor" @click="nextPage">下一页<ChevronRight :size="14" /></button></div>
       </div>
     </template>
 
@@ -137,10 +139,10 @@ watch(() => props.enabled, (enabled) => { if (enabled && !page.value.items.lengt
 <style scoped>
 .operation-history-settings { display: grid; gap: 9px; }
 .history-title { display: flex; justify-content: space-between; align-items: center; gap: 10px; }.history-title > button { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
-.history-list { border: 1px solid var(--line-soft); border-radius: 11px; overflow: hidden; }
-.history-list { display: flex; flex-direction: column; max-height: 520px; overflow-y: auto; }
-.history-list > button { display: grid; grid-template-columns: 40px minmax(0,1fr) 14px; align-items: center; gap: 9px; padding: 8px 9px; text-align: left; border: 0; border-bottom: 1px solid var(--line-soft); background: transparent; color: inherit; cursor: pointer; }
-.history-list > button:hover { background: var(--surface-soft); }.history-list-main { min-width: 0; display: grid; gap: 3px; }.history-list button strong { overflow: hidden; font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.history-list { display: grid; grid-template-rows: minmax(0,1fr) auto; height: 324px; border: 1px solid var(--line-soft); border-radius: 11px; overflow: hidden; }
+.history-scroll { min-height: 0; overflow-y: auto; }
+.history-scroll > button { display: grid; grid-template-columns: 40px minmax(0,1fr) 14px; align-items: center; gap: 9px; width: 100%; height: 56px; padding: 7px 9px; text-align: left; border: 0; border-bottom: 1px solid var(--line-soft); background: transparent; color: inherit; cursor: pointer; }
+.history-scroll > button:hover { background: var(--surface-soft); }.history-list-main { min-width: 0; display: grid; gap: 3px; }.history-list button strong { overflow: hidden; font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .history-type-mark { display: grid; width: 38px; min-height: 36px; place-items: center; align-content: center; gap: 1px; border-radius: 7px; background: var(--surface-soft); color: var(--text-secondary); }.history-type-mark small { color: currentColor; font-size: 8px; line-height: 1; }.history-type-mark.complete { background: rgba(50,160,105,.1); color: #237451; }.history-type-mark.delete { background: rgba(190,70,70,.1); color: #a84949; }.history-type-mark.restore { background: rgba(118,88,180,.11); color: #7452a8; }.history-type-mark.timer,.history-type-mark.time { background: rgba(52,120,190,.1); color: #376f9f; }.history-type-mark.report { background: rgba(190,135,45,.11); color: #8c651d; }.history-type-mark.setting,.history-type-mark.system { background: rgba(100,110,125,.1); color: #64707d; }.history-type-mark.change { background: color-mix(in srgb,var(--brand) 10%,transparent); color: var(--brand); }
 .history-list-meta { display: flex; min-width: 0; gap: 5px 13px; color: color-mix(in srgb,var(--text-secondary) 78%,transparent); font-size: 10px; white-space: nowrap; overflow: hidden; }.history-list-meta span { display: inline-flex; min-width: 0; gap: 4px; overflow: hidden; text-overflow: ellipsis; }.history-list-meta i { color: color-mix(in srgb,var(--text-secondary) 58%,transparent); font-size: 9px; font-style: normal; }.history-list-meta span:nth-child(2) { max-width: 180px; }.history-row-arrow { color: color-mix(in srgb,var(--text-secondary) 55%,transparent); }
 .history-list span, .history-detail header span, .history-expiry { color: var(--text-secondary); font-size: 10px; }
@@ -156,7 +158,7 @@ watch(() => props.enabled, (enabled) => { if (enabled && !page.value.items.lengt
 .history-diff del, .history-diff ins { padding: 4px 6px; border-radius: 5px; text-decoration: none; overflow-wrap: anywhere; }
 .history-diff del { background: rgba(190,70,70,.1); color: #a84949; }
 .history-diff ins { background: rgba(50,160,105,.1); color: #237451; }
-.history-empty { display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 5px; min-height: 150px; padding: 20px; color: var(--text-secondary); text-align: center; }.history-empty strong { color: var(--text-primary); font-size: 12px; font-weight: 600; }.history-empty span { max-width: 520px; font-size: 11px; }.history-empty.error { color: #a84949; }.history-empty.error strong { color: #a84949; }
+.history-empty { display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 5px; min-height: 150px; padding: 20px; color: var(--text-secondary); text-align: center; }.operation-history-settings > .history-empty { box-sizing: border-box; height: 324px; min-height: 0; }.history-empty strong { color: var(--text-primary); font-size: 12px; font-weight: 600; }.history-empty span { max-width: 520px; font-size: 11px; }.history-empty.error { color: #a84949; }.history-empty.error strong { color: #a84949; }
 .history-expiry { display: block; margin-top: 11px; }
-@media (max-width: 600px) { .history-list-meta span:nth-child(2) { display: none; }.history-list > button { grid-template-columns: 36px minmax(0,1fr) 14px; }.history-type-mark { width: 34px; } }
+@media (max-width: 600px) { .history-list-meta span:nth-child(2) { display: none; }.history-scroll > button { grid-template-columns: 36px minmax(0,1fr) 14px; }.history-type-mark { width: 34px; } }
 </style>

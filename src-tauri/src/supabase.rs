@@ -23,6 +23,7 @@ const SESSION_CREDENTIAL_TARGET_PREFIX: &str = "com.timegenie.desktop";
 const SESSION_METADATA_SETTING: &str = "supabase_session_metadata";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 12;
 const SNAPSHOT_TIMEOUT_SECONDS: u64 = 150;
+const RESTORE_TIMEOUT_SECONDS: u64 = 630;
 pub(crate) const CLOUD_SCHEMA: &str = "timegenie";
 const CLOUD_BUSINESS_ENTITIES: [&str; 8] = [
     "tasks",
@@ -256,10 +257,15 @@ pub struct CloudWorkspaceSnapshotPreview {
     pub restorable: bool,
     pub error_code: Option<String>,
     pub entity_counts: Option<Value>,
-    pub current_entity_counts: Option<Value>,
-    pub groups: Option<Value>,
-    pub entities: Option<Value>,
+    pub group_counts: Option<Value>,
+    pub group_hashes: Option<Value>,
     pub content_hash: Option<String>,
+    pub size_bytes: Option<i64>,
+    pub chunk_count: Option<i64>,
+    pub base_change_seq: Option<i64>,
+    pub workspace_epoch: Option<i64>,
+    pub created_at: Option<String>,
+    pub completed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,7 +324,7 @@ pub struct CloudWorkspaceRestorePrepareResult {
     pub target_snapshot_id: String,
     pub target_content_hash: String,
     pub prepared_epoch: i64,
-    pub safety_snapshot_id: String,
+    pub safety_snapshot_id: Option<String>,
     pub expires_at: String,
     pub preview: CloudWorkspaceSnapshotPreview,
 }
@@ -328,10 +334,12 @@ pub struct CloudWorkspaceRestorePrepareResult {
 pub struct CloudWorkspaceRestoreResult {
     pub restored: bool,
     pub target_snapshot_id: String,
-    pub safety_snapshot_id: String,
+    pub safety_snapshot_id: Option<String>,
     pub previous_epoch: i64,
     pub workspace_epoch: i64,
     pub reset_change_seq: i64,
+    #[serde(default)]
+    pub local_cache_rebuilt: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -345,6 +353,14 @@ pub struct CloudWorkspaceRestoreCommitRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CloudWorkspaceRestorePrepareRequest {
+    pub snapshot_id: String,
+    #[serde(default)]
+    pub create_safety_snapshot: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CloudWorkspaceRestoreCancelRequest {
     pub lock_token: String,
 }
@@ -354,6 +370,13 @@ pub struct CloudWorkspaceRestoreCancelRequest {
 pub struct CloudConfigureRequest {
     pub project_url: String,
     pub anon_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudProjectProbe {
+    pub state: String,
+    pub message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -655,7 +678,7 @@ pub fn workspace_snapshot_preview(
         &session,
     )?;
     serde_json::from_value(value)
-        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 快照差异响应无效: {error}"))
+        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 快照详情响应无效: {error}"))
 }
 
 fn validate_automatic_snapshot_time(value: &str) -> Result<&str, String> {
@@ -764,24 +787,19 @@ fn ensure_local_restore_gate(database: &Database, workspace_id: &str) -> Result<
     if active_timer {
         return Err("RESTORE_ACTIVE_TIMER: 请先结束当前活动计时".to_string());
     }
-    let active_unassigned: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM unassigned_sessions WHERE state IN ('collecting','paused','awaiting_resolution'))", [], |row| row.get(0),
-    ).map_err(|error| error.to_string())?;
-    if active_unassigned {
-        return Err("RESTORE_ACTIVE_UNASSIGNED: 请先处理当前未归属时间".to_string());
-    }
     Ok(())
 }
 
 pub fn workspace_restore_prepare(
     database: &Database,
-    request: CloudWorkspaceSnapshotIdRequest,
+    request: CloudWorkspaceRestorePrepareRequest,
 ) -> Result<CloudWorkspaceRestorePrepareResult, String> {
     let (state, session) = cloud_workspace_context(database, "云端回滚")?;
     ensure_local_restore_gate(database, &state.workspace_id)?;
-    let value = client(database)?.rpc_for_database_with_epoch(database, "workspace_restore_prepare", json!({
-        "p_workspace_id":state.workspace_id,"p_device_id":state.device_id,"p_target_snapshot_id":request.snapshot_id,"p_expected_epoch":state.workspace_epoch
-    }), &session, state.workspace_epoch)?;
+    let value = client(database)?.rpc_for_database_with_epoch_and_timeout(database, "workspace_restore_prepare", json!({
+        "p_workspace_id":state.workspace_id,"p_device_id":state.device_id,"p_target_snapshot_id":request.snapshot_id,"p_expected_epoch":state.workspace_epoch,
+        "p_create_safety_snapshot":request.create_safety_snapshot
+    }), &session, state.workspace_epoch, RESTORE_TIMEOUT_SECONDS)?;
     serde_json::from_value(value)
         .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 回滚准备响应无效: {error}"))
 }
@@ -790,15 +808,37 @@ pub fn workspace_restore_commit(
     database: &Database,
     request: CloudWorkspaceRestoreCommitRequest,
 ) -> Result<CloudWorkspaceRestoreResult, String> {
+    crate::cloud_sync::with_cloud_sync_operation_lock(|| {
+        workspace_restore_commit_locked(database, request)
+    })
+}
+
+fn workspace_restore_commit_locked(
+    database: &Database,
+    request: CloudWorkspaceRestoreCommitRequest,
+) -> Result<CloudWorkspaceRestoreResult, String> {
     let (state, session) = cloud_workspace_context(database, "云端回滚")?;
     ensure_local_restore_gate(database, &state.workspace_id)?;
-    let value = client(database)?.rpc_for_database_with_epoch(database, "workspace_restore_commit", json!({
+    let value = client(database)?.rpc_for_database_with_epoch_and_timeout(database, "workspace_restore_commit", json!({
         "p_workspace_id":state.workspace_id,"p_device_id":state.device_id,"p_lock_token":request.lock_token,
         "p_target_snapshot_id":request.target_snapshot_id,"p_target_content_hash":request.target_content_hash,
         "p_prepared_epoch":request.prepared_epoch,"p_operation_id":Uuid::now_v7().to_string(),"p_confirmed":true
-    }), &session, request.prepared_epoch)?;
-    serde_json::from_value(value)
-        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 回滚提交响应无效: {error}"))
+    }), &session, request.prepared_epoch, RESTORE_TIMEOUT_SECONDS)?;
+    let mut restored: CloudWorkspaceRestoreResult = serde_json::from_value(value)
+        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 回滚提交响应无效: {error}"))?;
+    if !restored.restored {
+        return Err("CLOUD_RESPONSE_INVALID: 云端没有确认恢复成功".to_string());
+    }
+    crate::cloud_sync::rebuild_local_cache_after_workspace_restore_locked(
+        database,
+        restored.workspace_epoch,
+        restored.reset_change_seq,
+    )
+    .map_err(|error| {
+        format!("RESTORE_LOCAL_REBUILD_FAILED: 云端已恢复成功，但当前设备重新下载失败：{error}")
+    })?;
+    restored.local_cache_rebuilt = true;
+    Ok(restored)
 }
 
 pub fn workspace_restore_cancel(
@@ -955,6 +995,76 @@ pub fn configure(database: &Database, request: CloudConfigureRequest) -> Result<
         clear_all_saved_sessions(database)?;
     }
     Ok(())
+}
+
+pub const CLOUD_PROJECT_READY: &str = "ready";
+pub const CLOUD_PROJECT_UNCONFIGURED: &str = "unconfigured";
+pub const CLOUD_PROJECT_SCHEMA_MISSING: &str = "schema_missing";
+pub const CLOUD_PROJECT_SCHEMA_NOT_EXPOSED: &str = "schema_not_exposed";
+pub const CLOUD_PROJECT_UNREACHABLE: &str = "unreachable";
+
+/// Checks whether the connected Supabase project already has the TimeGenie
+/// schema, using only the anon key. The desktop client never holds DDL rights,
+/// so an uninitialized project can only be reported to the user, not repaired by
+/// the app itself.
+pub fn probe_cloud_project(database: &Database) -> Result<CloudProjectProbe, String> {
+    let client = match client(database) {
+        Ok(client) => client,
+        Err(error) if error.starts_with("CLOUD_NOT_CONFIGURED") => {
+            return Ok(CloudProjectProbe {
+                state: CLOUD_PROJECT_UNCONFIGURED.to_string(),
+                message: "尚未配置 Supabase 项目地址和 anon key".to_string(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let url = format!(
+        "{}/rest/v1/workspaces?select=id&limit=1",
+        client.project_url
+    );
+    let mut request = client
+        .http
+        .get(url)
+        .header("apikey", &client.anon_key)
+        .bearer_auth(&client.anon_key)
+        .header("Accept-Profile", CLOUD_SCHEMA);
+    if let Ok(session) = current_session(database) {
+        request = request.bearer_auth(session.access_token);
+    }
+    let response = request.send();
+    match response {
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            Ok(classify_probe_response(status, &body))
+        }
+        Err(error) => Ok(CloudProjectProbe {
+            state: CLOUD_PROJECT_UNREACHABLE.to_string(),
+            message: map_supabase_request_error(error),
+        }),
+    }
+}
+
+fn classify_probe_response(status: StatusCode, body: &str) -> CloudProjectProbe {
+    let classified = classify_http_error(status, body, "CLOUD_REQUEST_FAILED");
+    let state = if classified.starts_with("CLOUD_SCHEMA_MISSING") {
+        CLOUD_PROJECT_SCHEMA_MISSING
+    } else if classified.starts_with("CLOUD_SCHEMA_NOT_EXPOSED") {
+        CLOUD_PROJECT_SCHEMA_NOT_EXPOSED
+    } else if classified.starts_with("NETWORK_ERROR") || classified.starts_with("CLOUD_TIMEOUT") {
+        CLOUD_PROJECT_UNREACHABLE
+    } else {
+        CLOUD_PROJECT_READY
+    };
+    let message = if state == CLOUD_PROJECT_READY {
+        "云端项目已初始化，可以登录并同步".to_string()
+    } else {
+        classified
+    };
+    CloudProjectProbe {
+        state: state.to_string(),
+        message,
+    }
 }
 
 pub fn sign_in_password(
@@ -2031,6 +2141,27 @@ impl SupabaseClient {
         .json()
         .map_err(|error| format!("NETWORK_ERROR: Supabase RPC 响应无效: {error}"))
     }
+
+    pub(crate) fn rpc_for_database_with_epoch_and_timeout(
+        &self,
+        database: &Database,
+        function: &str,
+        body: Value,
+        session: &CloudSession,
+        workspace_epoch: i64,
+        timeout_seconds: u64,
+    ) -> Result<Value, String> {
+        self.request_for_database(
+            database,
+            self.post(format!("{}/rest/v1/rpc/{function}", self.project_url))
+                .timeout(std::time::Duration::from_secs(timeout_seconds))
+                .header("x-timegenie-workspace-epoch", workspace_epoch.to_string())
+                .json(&body),
+            session,
+        )?
+        .json()
+        .map_err(|error| format!("NETWORK_ERROR: Supabase RPC 响应无效: {error}"))
+    }
 }
 
 fn map_supabase_request_error(error: reqwest::Error) -> String {
@@ -2863,6 +2994,10 @@ fn classify_http_error(status: StatusCode, body: &str, fallback: &str) -> String
         || lower_message.contains("does not exist")
     {
         "CLOUD_SCHEMA_MISSING"
+    } else if remote_code == "PGRST106"
+        || lower_message.contains("the schema must be one of the following")
+    {
+        "CLOUD_SCHEMA_NOT_EXPOSED"
     } else if remote_code == "42501" || lower_message.contains("permission denied") {
         "CLOUD_PERMISSION_DENIED"
     } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
@@ -2879,7 +3014,22 @@ fn classify_http_error(status: StatusCode, body: &str, fallback: &str) -> String
     } else {
         fallback
     };
+    if let Some(guidance) = cloud_schema_guidance(code) {
+        return format!("{code}: {guidance}");
+    }
     format!("{code}: {message}")
+}
+
+fn cloud_schema_guidance(code: &str) -> Option<&'static str> {
+    match code {
+        "CLOUD_SCHEMA_MISSING" => Some(
+            "这个 Supabase 项目还没有初始化 TimeGenie 数据结构。请在 Supabase SQL Editor 中执行仓库里的 supabase/schema.sql，然后回到这里点“重新检测”。",
+        ),
+        "CLOUD_SCHEMA_NOT_EXPOSED" => Some(
+            "这个 Supabase 项目还没有把 timegenie schema 暴露给 API。请在项目的 API 设置里把 timegenie 加入暴露的 schema（自托管请配置 PGRST_DB_SCHEMAS 并重启 REST 服务），然后点“重新检测”。",
+        ),
+        _ => None,
+    }
 }
 
 fn sanitize_remote_error(message: &str) -> String {
@@ -3018,6 +3168,13 @@ pub fn cloud_configure(
 ) -> Result<StorageModeSnapshot, String> {
     configure(&database, request)?;
     storage_mode(&database)
+}
+
+#[tauri::command]
+pub fn cloud_project_probe(
+    database: tauri::State<'_, Database>,
+) -> Result<CloudProjectProbe, String> {
+    probe_cloud_project(&database)
 }
 
 #[tauri::command]
@@ -3175,7 +3332,7 @@ pub fn cloud_workspace_snapshot_settings_update(
 #[tauri::command]
 pub fn cloud_workspace_restore_prepare(
     database: tauri::State<'_, Database>,
-    request: CloudWorkspaceSnapshotIdRequest,
+    request: CloudWorkspaceRestorePrepareRequest,
 ) -> Result<CloudWorkspaceRestorePrepareResult, String> {
     workspace_restore_prepare(&database, request)
 }
@@ -3923,6 +4080,58 @@ mod tests {
         let payload =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"role":"service_role"}"#);
         assert!(is_service_role_key(&format!("header.{payload}.signature")));
+    }
+
+    #[test]
+    fn cloud_schema_errors_guide_the_user_to_the_initialization_script() {
+        let missing = classify_http_error(
+            StatusCode::NOT_FOUND,
+            r#"{"code":"PGRST205","message":"Could not find the table 'timegenie.workspaces' in the schema cache"}"#,
+            "CLOUD_REQUEST_FAILED",
+        );
+        assert!(missing.starts_with("CLOUD_SCHEMA_MISSING:"));
+        assert!(missing.contains("supabase/schema.sql"));
+        assert!(!missing.contains("schema cache"));
+
+        let unexposed = classify_http_error(
+            StatusCode::NOT_ACCEPTABLE,
+            r#"{"code":"PGRST106","message":"The schema must be one of the following: public, graphql_public"}"#,
+            "CLOUD_REQUEST_FAILED",
+        );
+        assert!(unexposed.starts_with("CLOUD_SCHEMA_NOT_EXPOSED:"));
+        assert!(unexposed.contains("timegenie"));
+    }
+
+    #[test]
+    fn cloud_project_probe_distinguishes_uninitialized_projects() {
+        let missing = classify_probe_response(
+            StatusCode::NOT_FOUND,
+            r#"{"code":"PGRST205","message":"Could not find the table 'timegenie.workspaces' in the schema cache"}"#,
+        );
+        assert_eq!(missing.state, CLOUD_PROJECT_SCHEMA_MISSING);
+        assert!(missing.message.contains("supabase/schema.sql"));
+
+        let unexposed = classify_probe_response(
+            StatusCode::NOT_ACCEPTABLE,
+            r#"{"code":"PGRST106","message":"The schema must be one of the following: public, graphql_public"}"#,
+        );
+        assert_eq!(unexposed.state, CLOUD_PROJECT_SCHEMA_NOT_EXPOSED);
+
+        let ready = classify_probe_response(StatusCode::OK, "[]");
+        assert_eq!(ready.state, CLOUD_PROJECT_READY);
+        assert!(!ready.message.is_empty());
+
+        let denied = classify_probe_response(
+            StatusCode::FORBIDDEN,
+            r#"{"code":"42501","message":"permission denied for table workspaces"}"#,
+        );
+        assert_eq!(denied.state, CLOUD_PROJECT_READY);
+
+        let offline = classify_probe_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            r#"{"message":"upstream timeout"}"#,
+        );
+        assert_eq!(offline.state, CLOUD_PROJECT_UNREACHABLE);
     }
 
     #[test]

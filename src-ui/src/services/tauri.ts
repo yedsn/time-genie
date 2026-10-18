@@ -265,16 +265,20 @@ export type CloudWorkspaceSnapshot = {
   failureReason?: string;
 };
 
-export type CloudWorkspaceSnapshotDiff = { added: number; modified: number; deleted: number };
 export type CloudWorkspaceSnapshotPreview = {
   snapshotId: string;
   restorable: boolean;
   errorCode?: string;
   entityCounts?: Record<string, number>;
-  currentEntityCounts?: Record<string, number>;
-  groups?: Record<string, CloudWorkspaceSnapshotDiff>;
-  entities?: Record<string, CloudWorkspaceSnapshotDiff>;
+  groupCounts?: Record<string, number>;
+  groupHashes?: Record<string, string>;
   contentHash?: string;
+  sizeBytes?: number;
+  chunkCount?: number;
+  baseChangeSeq?: number;
+  workspaceEpoch?: number;
+  createdAt?: string;
+  completedAt?: string;
 };
 
 export async function createCloudWorkspaceSnapshot(request: {
@@ -322,14 +326,14 @@ export async function updateCloudWorkspaceSnapshotSettings(automaticSnapshotEnab
 
 export type CloudWorkspaceRestorePrepareResult = {
   lockToken: string; targetSnapshotId: string; targetContentHash: string; preparedEpoch: number;
-  safetySnapshotId: string; expiresAt: string; preview: CloudWorkspaceSnapshotPreview;
+  safetySnapshotId: string | null; expiresAt: string; preview: CloudWorkspaceSnapshotPreview;
 };
 export type CloudWorkspaceRestoreResult = {
-  restored: boolean; targetSnapshotId: string; safetySnapshotId: string; previousEpoch: number;
-  workspaceEpoch: number; resetChangeSeq: number;
+  restored: boolean; targetSnapshotId: string; safetySnapshotId: string | null; previousEpoch: number;
+  workspaceEpoch: number; resetChangeSeq: number; localCacheRebuilt: boolean;
 };
-export async function prepareCloudWorkspaceRestore(snapshotId: string): Promise<CloudWorkspaceRestorePrepareResult> {
-  return await invoke("cloud_workspace_restore_prepare", { request: { snapshotId } });
+export async function prepareCloudWorkspaceRestore(snapshotId: string, createSafetySnapshot: boolean): Promise<CloudWorkspaceRestorePrepareResult> {
+  return await invoke("cloud_workspace_restore_prepare", { request: { snapshotId, createSafetySnapshot } });
 }
 export async function commitCloudWorkspaceRestore(request: {
   lockToken: string; targetSnapshotId: string; targetContentHash: string; preparedEpoch: number;
@@ -1471,6 +1475,22 @@ export async function setLocalStorageMode(): Promise<StorageModeSnapshot> {
 
 export async function configureCloud(projectUrl: string, anonKey: string): Promise<StorageModeSnapshot> {
   return await invoke("cloud_configure", { request: { projectUrl, anonKey } });
+}
+
+export type CloudProjectProbeState =
+  | "ready"
+  | "unconfigured"
+  | "schema_missing"
+  | "schema_not_exposed"
+  | "unreachable";
+
+export interface CloudProjectProbe {
+  state: CloudProjectProbeState;
+  message: string;
+}
+
+export async function probeCloudProject(): Promise<CloudProjectProbe> {
+  return await invoke("cloud_project_probe");
 }
 
 export async function getCloudSession(): Promise<CloudSessionSnapshot> {
