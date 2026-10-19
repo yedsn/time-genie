@@ -490,6 +490,18 @@ fn transition_timer_with_cloud_operation(
         created_task = Some(task);
         id
     };
+    let created_day_plan = if created_task.is_some() {
+        Some(crate::today_plans::ensure_included_in_transaction(
+            &transaction,
+            &workspace_id,
+            &target_task_id,
+            &work_date,
+            now,
+            None,
+        )?)
+    } else {
+        None
+    };
 
     if let Some((active_id, _)) = active.as_ref() {
         let current_task_id: Option<String> = transaction
@@ -643,6 +655,16 @@ fn transition_timer_with_cloud_operation(
                 )
             })
             .transpose()?;
+        let day_plan = created_day_plan
+            .as_ref()
+            .map(|_| {
+                crate::cloud_sync::entity_payload_from_connection(
+                    &transaction,
+                    "task_day_plan",
+                    Some(&format!("{target_task_id}|{work_date}")),
+                )
+            })
+            .transpose()?;
         crate::cloud_sync::enqueue_payload_in_transaction(
             &transaction,
             state,
@@ -657,6 +679,7 @@ fn transition_timer_with_cloud_operation(
                 "reopen_task_base_version": request.reopen_completed_task_version,
                 "expected_parent_version": request.new_task.as_ref().and_then(|draft| draft.expected_parent_version),
                 "occurrence": occurrence,
+                "day_plan": day_plan,
                 "active_entry": next_entry,
             }),
             Some(&request.client_request_id),
@@ -3141,6 +3164,16 @@ mod tests {
             Some(created.id.as_str())
         );
         assert_eq!(result.active_entry.state, "running");
+        let day_plan: (String, i64) = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT state,version FROM task_day_plans WHERE task_id=?1 AND work_date=?2",
+                params![created.id, test_work_date()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(day_plan, ("included".to_string(), 1));
 
         let repeated = transition(
             &database,
@@ -3503,6 +3536,77 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+        let connection = database.open().unwrap();
+        let day_plan_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_day_plans WHERE task_id IN (SELECT id FROM tasks WHERE title='不应创建')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let active_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM time_entries WHERE state IN ('running','paused') AND deleted_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((day_plan_count, active_count), (0, 0));
+    }
+
+    #[test]
+    fn transition_rolls_back_new_task_and_day_plan_when_timer_insert_fails() {
+        let (database, _, _) = setup();
+        database
+            .open()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_transition_timer
+                 BEFORE INSERT ON time_entries
+                 BEGIN
+                   SELECT RAISE(FAIL, 'forced timer failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = transition(
+            &database,
+            TimerTransitionRequest {
+                client_request_id: Uuid::now_v7().to_string(),
+                current_entry_id: None,
+                current_entry_expected_version: None,
+                task_id: None,
+                reopen_completed_task_version: None,
+                new_task: Some(TimerTransitionNewTaskRequest {
+                    subject_id: subject_id(&database),
+                    parent_id: None,
+                    expected_parent_version: None,
+                    title: "计时失败回滚事项".to_string(),
+                }),
+                note: None,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("forced timer failure"));
+        let connection = database.open().unwrap();
+        let task_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE title='计时失败回滚事项'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let day_plan_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM task_day_plans", [], |row| row.get(0))
+            .unwrap();
+        let active_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM time_entries WHERE state IN ('running','paused') AND deleted_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((task_count, day_plan_count, active_count), (0, 0, 0));
     }
 
     #[test]
@@ -3571,17 +3675,21 @@ mod tests {
     #[test]
     fn transition_uses_workspace_work_date_across_natural_date_boundary() {
         let (database, _, _) = setup();
+        // 使用固定偏移的设备时区（UTC+14）与固定工作空间时区（UTC-10），二者恒定相差 24 小时，
+        // 因此任意时刻两侧的自然日期都不相同，从而证明事务使用的是工作空间日期而不是设备本地日期。
+        let device_timezone: chrono_tz::Tz = "Pacific/Kiritimati".parse().unwrap();
         database
             .open()
             .unwrap()
             .execute("UPDATE workspaces SET timezone='Pacific/Honolulu'", [])
             .unwrap();
+        let timestamp = now_millis();
         let expected_work_date =
-            crate::work_calendar::current_work_date(&database.open().unwrap(), now_millis())
-                .unwrap();
+            crate::work_calendar::current_work_date(&database.open().unwrap(), timestamp).unwrap();
+        let device_date = crate::work_calendar::work_date_at(device_timezone, timestamp).unwrap();
         assert_ne!(
-            expected_work_date,
-            chrono::Local::now().format("%Y-%m-%d").to_string()
+            expected_work_date, device_date,
+            "工作空间日期 {expected_work_date} 与设备日期 {device_date} 应当不同"
         );
 
         let result = transition(
@@ -3757,6 +3865,50 @@ mod tests {
                 "timer_transition".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn cloud_new_task_transition_carries_day_plan_in_atomic_payload() {
+        let (database, _, _) = setup();
+        let state = cloud_state(&database);
+        let operation_id = Uuid::now_v7().to_string();
+        let result = transition_timer_with_cloud_operation(
+            &database,
+            TimerTransitionRequest {
+                client_request_id: operation_id.clone(),
+                current_entry_id: None,
+                current_entry_expected_version: None,
+                task_id: None,
+                reopen_completed_task_version: None,
+                new_task: Some(TimerTransitionNewTaskRequest {
+                    subject_id: subject_id(&database),
+                    parent_id: None,
+                    expected_parent_version: None,
+                    title: "云端原子今日事项".to_string(),
+                }),
+                note: None,
+            },
+            Some(&state),
+        )
+        .unwrap();
+        let created = result.created_task.unwrap();
+        let payload: Value = serde_json::from_str(
+            &database
+                .open()
+                .unwrap()
+                .query_row(
+                    "SELECT payload_json FROM sync_outbox WHERE operation_id=?1",
+                    [&operation_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["task"]["id"], created.id);
+        assert_eq!(payload["day_plan"]["task_id"], created.id);
+        assert_eq!(payload["day_plan"]["work_date"], test_work_date());
+        assert_eq!(payload["day_plan"]["state"], "included");
+        assert_eq!(payload["active_entry"]["default_task_id"], created.id);
     }
 
     #[test]

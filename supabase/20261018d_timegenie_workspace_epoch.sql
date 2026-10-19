@@ -35,7 +35,7 @@ do $$
 declare table_name text;
 begin
   foreach table_name in array array[
-    'subjects','subject_work_schedules','subject_work_schedule_segments','work_days','tasks','task_status_events','task_daily_estimates',
+    'subjects','subject_work_schedules','subject_work_schedule_segments','work_days','tasks','task_status_events','task_day_plans','task_daily_estimates',
     'task_recurrence_rules','task_occurrences','time_entries','time_segments','time_allocations','actual_time_adjustments','unassigned_sessions',
     'unassigned_segments','report_templates','reports','report_tasks','app_settings','integration_configs','external_bindings'
   ] loop

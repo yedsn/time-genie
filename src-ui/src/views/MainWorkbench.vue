@@ -166,6 +166,7 @@ let unlistenWindowResize: (() => void) | undefined;
 let unlistenNavigatePage: (() => void) | undefined;
 let unlistenOpenTimerTaskSelection: (() => void) | undefined;
 let unlistenCloudSyncState: (() => void) | undefined;
+let cloudDataRefreshTimer: number | undefined;
 let unlistenTimerFactFollowed: (() => void) | undefined;
 let unlistenTrayCheckUpdate: (() => void) | undefined;
 let unlistenAppUpdateEvent: (() => void) | undefined;
@@ -271,6 +272,7 @@ watch(() => store.unassignedDialogOpen, (open) => {
 });
 const cloudBusinessEntities = new Set([
   "tasks",
+  "task_day_plans",
   "task_daily_estimates",
   "task_recurrence_rules",
   "task_occurrences",
@@ -299,6 +301,7 @@ function cloudConflictTitle(conflict: CloudSyncConflict) {
   }
   const title = payload.title ?? payload.name ?? payload.report_type ?? payload.key ?? payload.provider;
   if (conflict.entityType === "task_daily_estimate") return `按日预估 ${payload.work_date ?? conflict.entityId ?? ""}`.trim();
+  if (conflict.entityType === "task_day_plan") return `今日计划 ${payload.work_date ?? conflict.entityId ?? ""}`.trim();
   if (conflict.entityType === "task_recurrence_rule") return `重复规则 ${payload.task_id ?? conflict.entityId ?? ""}`.trim();
   return typeof title === "string" && title ? title : `${cloudConflictEntityLabel(conflict.entityType)} ${conflict.entityId ?? ""}`.trim();
 }
@@ -308,6 +311,7 @@ function cloudConflictEntityLabel(entityType: string) {
   if (entityType === "task") return "普通事项";
   if (entityType === "task_occurrence") return "周期事项";
   if (entityType === "task_daily_estimate") return "按日预估";
+  if (entityType === "task_day_plan") return "今日计划";
   if (entityType === "task_recurrence_rule") return "重复规则";
   const labels: Record<string, string> = {
     subject: "主体",
@@ -1018,6 +1022,13 @@ onMounted(async () => {
     updateVisibleCloudSaveState(state);
     storageState.value = state;
     void refreshOpenCloudSyncQueue();
+    if (state.mode === "cloud" && state.pendingOperations === 0 && !state.lastError) {
+      if (cloudDataRefreshTimer) window.clearTimeout(cloudDataRefreshTimer);
+      cloudDataRefreshTimer = window.setTimeout(() => {
+        cloudDataRefreshTimer = undefined;
+        void Promise.all([store.loadWorkspaceData(), store.loadTodayPlan(store.todayPlanSubjectId || store.selectedSubjectId), store.loadTodayOverview()]);
+      }, 250);
+    }
   });
   unlistenTimerFactFollowed = await onTimerFactFollowed((event) => {
     void Promise.all([store.loadTimeData(), store.loadTimeHistory(store.timeHistoryPage), store.loadUnassignedState()]);
@@ -1049,6 +1060,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  if (cloudDataRefreshTimer) window.clearTimeout(cloudDataRefreshTimer);
   unlistenWindowResize?.();
   unlistenNavigatePage?.();
   unlistenOpenTimerTaskSelection?.();
@@ -1405,7 +1417,9 @@ async function handleTaskRecurrence(
 
 async function handleTaskSave(taskId: string) {
   try {
-    await store.saveTask(taskId);
+    const wasNewTodayTask = store.planTaskTab === "today" && (store.tasks.find((task) => task.id === taskId)?.version ?? 0) <= 0;
+    const savedTaskId = await store.saveTask(taskId);
+    if (wasNewTodayTask && savedTaskId) await store.addTasksToToday([savedTaskId]);
   } catch (error) {
     ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "事项保存失败");
   }
@@ -1469,6 +1483,31 @@ async function handleTaskNoteSave(taskId: string, note: string) {
     await store.saveTaskNote(taskId, note);
   } catch (error) {
     ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "备注保存失败");
+  }
+}
+
+async function handleTodayPlanRemove(taskId: string) {
+  try {
+    await store.setTodayPlanMembership(taskId, "excluded");
+  } catch (error) {
+    ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "移出今日失败");
+  }
+}
+
+async function handleAddTasksToToday(taskIds: string[]) {
+  try {
+    await store.addTasksToToday(taskIds);
+  } catch (error) {
+    ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "加入今日失败");
+  }
+}
+
+async function handleTodayTaskDuplicate(taskId: string) {
+  try {
+    const duplicatedTaskId = await store.duplicateTask(taskId);
+    if (duplicatedTaskId) await store.addTasksToToday([duplicatedTaskId]);
+  } catch (error) {
+    ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "复制今日事项失败");
   }
 }
 
@@ -1584,6 +1623,9 @@ async function handleCompletedTaskDelete(task: Task) {
 
       <section v-else-if="store.activePage === 'plan'" class="plan-edit-layout">
         <div class="plan-task-tabs" role="tablist" aria-label="事项状态">
+          <button type="button" role="tab" :aria-selected="store.planTaskTab === 'today'" :class="{ active: store.planTaskTab === 'today' }" @click="store.selectPlanTaskTab('today')">
+            <span>今日</span><strong>{{ store.todayPlanTasks.filter((task) => task.todayMember).length }}</strong>
+          </button>
           <button type="button" role="tab" :aria-selected="store.planTaskTab === 'active'" :class="{ active: store.planTaskTab === 'active' }" @click="store.selectPlanTaskTab('active')">
             <span>进行中</span><strong>{{ store.selectedSubjectTasks.length }}</strong>
           </button>
@@ -1592,8 +1634,48 @@ async function handleCompletedTaskDelete(task: Task) {
           </button>
         </div>
         <PlanListEditor
+          v-if="store.planTaskTab === 'today'"
+          mode="today"
+          :tasks="store.selectedSubjectTasks"
+          :display-tasks="store.todayPlanTasks"
+          :subject-id="store.selectedSubjectId"
+          :subject-name="store.selectedSubject?.name ?? '待办'"
+          :selected-id="store.selectedTaskId"
+          :loading="store.todayPlanLoading"
+          :error="store.todayPlanError"
+          :running-task-id="store.runningEntry?.defaultTask"
+          :running-task-minutes="store.runningEntry ? Math.max(0, Math.ceil(store.entryDurationSeconds(store.runningEntry) / 60)) : 0"
+          :format-minutes="formatMinutes"
+          :today-date="store.workspaceToday"
+          :timezone="store.workspaceTimezone"
+          :save-estimate-batch="store.saveTaskEstimateBatch"
+          :save-plan-batch="store.saveTaskPlanBatch"
+          :load-actual-snapshot="store.loadActualAdjustmentSnapshot"
+          :save-actual-batch="store.saveActualAdjustmentBatch"
+          @select="store.selectedTaskId = $event"
+          @add="store.addTask('', store.selectedSubjectId)"
+          @add-child="store.addChildTask"
+          @add-relative="store.addTaskRelative"
+          @save="handleTaskSave"
+          @save-note="handleTaskNoteSave"
+          @save-today-estimate="handleTodayEstimateSave"
+          @add-today-tasks="handleAddTasksToToday"
+          @remove-today="handleTodayPlanRemove"
+          @import-plan="openPlanImport"
+          @sync-sea-table="openSeaTableSync"
+          @duplicate="handleTodayTaskDuplicate"
+          @delete="store.deleteTask"
+          @toggle="handleTaskToggle"
+          @indent="store.indentTask"
+          @outdent="store.outdentTask"
+          @start-timer="startTimerForTask"
+          @move="handleTaskMove"
+          @set-recurrence="handleTaskRecurrence"
+        />
+        <PlanListEditor
           v-if="store.planTaskTab === 'active'"
           :tasks="store.selectedSubjectTasks"
+          :today-member-ids="store.todayPlanTasks.filter((task) => task.todayMember).map((task) => task.id)"
           :subject-id="store.selectedSubjectId"
           :subject-name="store.selectedSubject?.name ?? '待办'"
           :selected-id="store.selectedTaskId"
@@ -1613,6 +1695,7 @@ async function handleCompletedTaskDelete(task: Task) {
           @save="handleTaskSave"
           @save-note="handleTaskNoteSave"
           @save-today-estimate="handleTodayEstimateSave"
+          @add-today-tasks="handleAddTasksToToday"
           @import-plan="openPlanImport"
           @sync-sea-table="openSeaTableSync"
           @duplicate="store.duplicateTask"
@@ -1625,7 +1708,7 @@ async function handleCompletedTaskDelete(task: Task) {
           @set-recurrence="handleTaskRecurrence"
         />
         <CompletedTaskHistory
-          v-else
+          v-else-if="store.planTaskTab === 'completed'"
           :tasks="store.completedTasks"
           :subject-name="store.selectedSubject?.name ?? '待办'"
           :page="store.completedTasksPage"

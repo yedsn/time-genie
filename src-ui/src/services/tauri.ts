@@ -412,6 +412,10 @@ export type TaskRecord = {
   estimateMinutes?: number;
   todayEstimateMinutes?: number;
   dailyEstimateVersion?: number;
+  dayPlanState?: "included" | "excluded";
+  dayPlanVersion?: number;
+  todayMember?: boolean;
+  todayContext?: boolean;
   note?: string;
   projectName?: string;
   solutionName?: string;
@@ -446,6 +450,19 @@ export type TaskListResult = {
   revision: number;
 };
 
+export type TaskDayPlanSnapshotRecord = {
+  subjectId: string;
+  workDate: string;
+  tasks: TaskRecord[];
+  revision: number;
+};
+
+export type TaskDayPlanBatchItem = {
+  taskId: string;
+  state: "included" | "excluded";
+  expectedVersion?: number;
+};
+
 export type ActualTimeAdjustmentRecord = {
   id: string; subjectId: string; taskId: string; taskTitle: string; workDate: string;
   deltaMinutes: number; baselineMinutes: number; targetMinutes: number; note?: string;
@@ -457,6 +474,7 @@ export type ActualAdjustmentSnapshotTaskRecord = {
   plannedDate?: string; estimateMinutes?: number; todayEstimateMinutes?: number; dailyEstimateVersion?: number; sortOrder: number;
   version: number; isLeaf: boolean; selectable: boolean; directMinutes: number; totalMinutes: number;
   adjustmentFingerprint: string; timerState?: "running" | "paused"; canAcceptChildren: boolean;
+  dayPlanState?: "included" | "excluded"; dayPlanVersion?: number; todayMember?: boolean; todayContext?: boolean;
 };
 
 export type ActualAdjustmentSnapshotRecord = {
@@ -1002,6 +1020,24 @@ export async function confirmObsidianPlan(
 ): Promise<{ batchId: string; tasks: TaskRecord[]; alreadyConfirmed: boolean }> {
   const result = await invoke<{ batchId: string; tasks: TaskRecord[]; alreadyConfirmed: boolean }>("obsidian_plan_import_confirm", { request: { batchId, items, expectedVersion } });
   if (!result.alreadyConfirmed) await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-plan-import");
+  return result;
+}
+
+export async function getTaskDayPlanSnapshot(subjectId: string, workDate: string): Promise<TaskDayPlanSnapshotRecord> {
+  return await invoke<TaskDayPlanSnapshotRecord>("task_day_plan_snapshot", { request: { subjectId, workDate } });
+}
+
+export async function setTaskDayPlan(taskId: string, workDate: string, state: "included" | "excluded", expectedVersion?: number): Promise<{ taskId: string; workDate: string; state: string; version: number }> {
+  const result = await invoke<{ taskId: string; workDate: string; state: string; version: number }>("task_day_plan_set", {
+    request: { taskId, workDate, state, expectedVersion },
+  });
+  await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-day-plan");
+  return result;
+}
+
+export async function setTaskDayPlanBatch(subjectId: string, workDate: string, items: TaskDayPlanBatchItem[]): Promise<{ changedCount: number }> {
+  const result = await invoke<{ changedCount: number }>("task_day_plan_batch_set", { request: { subjectId, workDate, items } });
+  if (result.changedCount) await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-day-plan-batch");
   return result;
 }
 

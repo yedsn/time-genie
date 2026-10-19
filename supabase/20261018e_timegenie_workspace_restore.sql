@@ -30,7 +30,7 @@ begin
 end $$;
 
 do $$ declare table_name text; begin
-  foreach table_name in array array['subjects','subject_work_schedules','subject_work_schedule_segments','work_days','tasks','task_status_events','task_daily_estimates','task_recurrence_rules','task_occurrences','time_entries','time_segments','time_allocations','actual_time_adjustments','unassigned_sessions','unassigned_segments','report_templates','reports','report_tasks','app_settings','integration_configs','external_bindings'] loop
+  foreach table_name in array array['subjects','subject_work_schedules','subject_work_schedule_segments','work_days','tasks','task_status_events','task_day_plans','task_daily_estimates','task_recurrence_rules','task_occurrences','time_entries','time_segments','time_allocations','actual_time_adjustments','unassigned_sessions','unassigned_segments','report_templates','reports','report_tasks','app_settings','integration_configs','external_bindings'] loop
     execute format('drop trigger if exists workspace_restore_write_barrier on timegenie.%I',table_name);
     execute format('create trigger workspace_restore_write_barrier before insert or update or delete on timegenie.%I for each row execute function timegenie.workspace_restore_before_business_write()',table_name);
   end loop;
@@ -95,6 +95,7 @@ begin
   delete from timegenie.unassigned_sessions where workspace_id=p_workspace_id;
   delete from timegenie.time_entries where workspace_id=p_workspace_id;
   delete from timegenie.task_status_events where workspace_id=p_workspace_id;
+  delete from timegenie.task_day_plans where workspace_id=p_workspace_id;
   delete from timegenie.task_daily_estimates where workspace_id=p_workspace_id;
   delete from timegenie.task_occurrences where workspace_id=p_workspace_id;
   delete from timegenie.task_recurrence_rules where workspace_id=p_workspace_id;

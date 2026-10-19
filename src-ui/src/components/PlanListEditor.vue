@@ -3,7 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { MdEditor } from "md-editor-v3";
 import "md-editor-v3/lib/style.css";
-import { CalendarDays, CheckCircle2, Circle, Clock3, Copy, CornerDownRight, DatabaseZap, FileInput, FilePenLine, GripVertical, IndentDecrease, IndentIncrease, MessageSquareText, Minus, Play, Plus, Radio, Repeat2, TimerReset, Trash2 } from "lucide-vue-next";
+import { CalendarDays, CheckCircle2, Circle, Clock3, Copy, CornerDownRight, DatabaseZap, FileInput, FilePenLine, GripVertical, IndentDecrease, IndentIncrease, ListMinus, ListPlus, MessageSquareText, Minus, Play, Plus, Radio, Repeat2, TimerReset, Trash2 } from "lucide-vue-next";
 import type { Task } from "../store";
 import { isActivePlanTask } from "../services/completedTaskHistoryCore";
 import { contextMenuPosition, taskSubtreeIds, todayEstimateDraft } from "../services/planTaskInteractionCore";
@@ -16,6 +16,9 @@ import { analyzeQuickPlanDraft, buildQuickPlanBatchRequest, createQuickPlanBasel
 
 const props = defineProps<{
   tasks: Task[];
+  displayTasks?: Task[];
+  todayMemberIds?: string[];
+  mode?: "active" | "today";
   subjectId: string;
   subjectName: string;
   selectedId: string;
@@ -28,6 +31,8 @@ const props = defineProps<{
   savePlanBatch: (request: QuickPlanBatchRequest) => Promise<{ createdCount: number; updatedCount: number; deletedCount: number }>;
   loadActualSnapshot: () => Promise<ActualAdjustmentSnapshotRecord>;
   saveActualBatch: (request: ActualAdjustmentBatchRequest) => Promise<ActualAdjustmentBatchResult>;
+  loading?: boolean;
+  error?: string;
 }>();
 
 const emit = defineEmits<{
@@ -47,11 +52,16 @@ const emit = defineEmits<{
   move: [taskId: string, parentId?: string, previousSiblingId?: string, nextSiblingId?: string];
   saveNote: [taskId: string, note: string];
   saveTodayEstimate: [taskId: string, estimateMinutes?: number];
+  addTodayTasks: [taskIds: string[]];
+  removeToday: [taskId: string];
   setRecurrence: [taskId: string, recurrence?: { frequency: "daily" | "weekdays" | "weekly"; weekdaysMask?: number; effectiveStart: string }];
 }>();
 
 const listRef = ref<HTMLElement | null>(null);
 const rowsRef = ref<HTMLElement | null>(null);
+const todayPickerOpen = ref(false);
+const todayPickerQuery = ref("");
+const todayPickerSelection = ref<string[]>([]);
 const editingEstimateId = ref("");
 const editingTodayEstimateId = ref("");
 const todayEstimateDraftValue = ref<number>();
@@ -132,12 +142,34 @@ const quickPlanMarkdownToolbars = [
 ] as const;
 
 
-const flatRows = computed(() => props.tasks.map((task) => ({ task, depth: getDepth(task) })));
-const pendingRows = computed(() => flatRows.value.filter((row) => isActivePlanTask({
-  status: row.task.status,
-  recurring: Boolean(row.task.recurrence),
-})));
-const quickRows = computed(() => quickEstimateRows(props.tasks));
+const mode = computed(() => props.mode ?? "active");
+const displayedTasks = computed(() => {
+  if (!props.displayTasks) return props.tasks;
+  const snapshotById = new Map(props.displayTasks.map((task) => [task.id, task]));
+  const displayedIds = new Set(snapshotById.keys());
+  if (temporaryTaskId.value) displayedIds.add(temporaryTaskId.value);
+  const ordered = props.tasks
+    .filter((task) => displayedIds.has(task.id))
+    .map((task) => snapshotById.get(task.id) ?? task);
+  const orderedIds = new Set(ordered.map((task) => task.id));
+  return [...ordered, ...props.displayTasks.filter((task) => !orderedIds.has(task.id))];
+});
+const flatRows = computed(() => displayedTasks.value.map((task) => ({ task, depth: getDepth(task) })));
+const pendingRows = computed(() => mode.value === "today"
+  ? flatRows.value
+  : flatRows.value.filter((row) => isActivePlanTask({ status: row.task.status, recurring: Boolean(row.task.recurrence) })));
+const todayPlannedIds = computed(() => new Set((props.displayTasks ?? []).filter((task) => task.todayMember).map((task) => task.id)));
+const knownTodayMemberIds = computed(() => new Set([
+  ...todayPlannedIds.value,
+  ...(props.todayMemberIds ?? []),
+]));
+const todayCandidates = computed(() => {
+  const keyword = todayPickerQuery.value.trim().toLocaleLowerCase();
+  return props.tasks
+    .filter((task) => task.status === "open" && task.selectable && !todayPlannedIds.value.has(task.id))
+    .filter((task) => !keyword || [task.pathLabel ?? task.title, task.note ?? ""].join(" ").toLocaleLowerCase().includes(keyword));
+});
+const quickRows = computed(() => quickEstimateRows(mode.value === "today" ? displayedTasks.value : props.tasks));
 const quickAllocatableRows = computed(() => quickRows.value.filter((row) => row.allocatable));
 const quickAllocatedMinutes = computed(() => allocatedMinutes(quickEstimateDrafts.value));
 const quickCapacitySummary = computed(() => capacitySummary(quickAllocatedMinutes.value, quickEstimateCapacityMinutes.value));
@@ -188,8 +220,39 @@ function childPlaceholderParent(rowIndex: number) {
   return root;
 }
 
+function isTaskGroupStart(rowIndex: number) {
+  const row = pendingRows.value[rowIndex];
+  if (!row || row.depth !== 0) return false;
+  const nextRow = pendingRows.value[rowIndex + 1];
+  return Boolean(nextRow && getRootTask(nextRow.task).id === row.task.id) || Boolean(childPlaceholderParent(rowIndex));
+}
+
 function getSubtreeIds(taskId: string) {
   return taskSubtreeIds(props.tasks, taskId);
+}
+
+function isTodayMember(task: Task) {
+  return mode.value !== "today" || Boolean(task.todayMember) || task.version <= 0;
+}
+
+function canToggleTask(task: Task) {
+  return isTodayMember(task) && !hasChildren(task.id);
+}
+
+function taskToggleTitle(task: Task) {
+  if (hasChildren(task.id)) return "父事项由子事项汇总，不能直接完成";
+  if (!isTodayMember(task)) return "上下文父事项不能直接完成";
+  if (task.recurrence) return task.status === "done" ? "恢复今天这一轮" : "完成今天这一轮";
+  return task.status === "done" ? "恢复为进行中" : "标记为完成";
+}
+
+function syncEditableTask(task: Task) {
+  const source = props.tasks.find((item) => item.id === task.id);
+  if (!source || source === task) return;
+  source.title = task.title;
+  source.planDate = task.planDate;
+  source.estimate = task.estimate;
+  source.project = task.project;
 }
 
 function prepareSubtreeDrag(taskId: string) {
@@ -287,6 +350,7 @@ function finishTaskEdit(task: Task) {
     finishTemporaryTask(task);
     return;
   }
+  syncEditableTask(task);
   emit("save", task.id);
 }
 
@@ -313,7 +377,13 @@ function closeEstimateEditor() {
 function finishEstimateEditor(task: Task) {
   if (editingEstimateId.value !== task.id) return;
   task.estimate = normalizeEstimate(task.estimate);
+  syncEditableTask(task);
   closeEstimateEditor();
+  emit("save", task.id);
+}
+
+function saveEditableTask(task: Task) {
+  syncEditableTask(task);
   emit("save", task.id);
 }
 
@@ -401,7 +471,7 @@ function formatQuickDraft(minutes?: number) {
 }
 
 function openQuickPlan() {
-  const activeTasks = pendingRows.value.map((row) => row.task);
+  const activeTasks = props.tasks.filter((task) => isActivePlanTask({ status: task.status, recurring: Boolean(task.recurrence) }));
   quickPlanBaseline.value = createQuickPlanBaseline(activeTasks);
   quickPlanSourceLines.value = createQuickPlanDraft(activeTasks);
   quickPlanLines.value = quickPlanSourceLines.value.map((line) => ({ ...line }));
@@ -819,6 +889,14 @@ async function confirmDelete(task: Task) {
   } catch {}
 }
 
+function confirmTodayAdd() {
+  if (!todayPickerSelection.value.length) return;
+  emit("addTodayTasks", [...todayPickerSelection.value]);
+  todayPickerSelection.value = [];
+  todayPickerQuery.value = "";
+  todayPickerOpen.value = false;
+}
+
 const treeSortable = createTaskTreeSortable({
   container: () => rowsRef.value,
   rowSelector: ".pending-reminder-row",
@@ -964,17 +1042,20 @@ onBeforeUnmount(() => {
   <div ref="listRef" class="plan-reminder-editor">
     <div class="plan-editor-head">
       <div>
-        <h2>{{ subjectName }}</h2>
-        <span>{{ pendingRows.length }} 项待办 · 点击文字直接编辑</span>
+        <h2>{{ mode === 'today' ? subjectName + ' · 今日计划' : subjectName }}</h2>
+        <span>{{ pendingRows.filter((row) => isTodayMember(row.task)).length }} 项待办 · 点击文字直接编辑</span>
       </div>
       <div class="plan-head-actions">
-        <button class="secondary-button quick-estimate-entry" type="button" title="连续分配今日预计" @click="openQuickEstimate"><Clock3 :size="14" />分配今日预计</button>
+        <button v-if="mode === 'today'" class="secondary-button quick-estimate-entry" type="button" title="从进行中补充今日事项" @click="todayPickerOpen = true"><ListPlus :size="14" />从进行中加入</button>
+        <button v-if="mode === 'today'" class="secondary-button quick-estimate-entry" type="button" title="连续分配今日预计" @click="openQuickEstimate"><Clock3 :size="14" />分配今日预计</button>
         <button class="secondary-button quick-estimate-entry" type="button" title="在一个编辑区调整整个计划" @click="openQuickPlan"><FilePenLine :size="14" />快速编辑计划</button>
-        <button class="icon-button subtle" type="button" title="同步到 SeaTable" aria-label="同步到 SeaTable" @click="emit('syncSeaTable')"><DatabaseZap :size="15" /></button>
-        <button class="icon-button subtle plan-import-button" type="button" title="从昨日 Obsidian 日报导入计划" aria-label="导入计划" @click="emit('importPlan')"><FileInput :size="15" /></button>
+        <button v-if="mode === 'active'" class="icon-button subtle" type="button" title="同步到 SeaTable" aria-label="同步到 SeaTable" @click="emit('syncSeaTable')"><DatabaseZap :size="15" /></button>
+        <button v-if="mode === 'active'" class="icon-button subtle plan-import-button" type="button" title="从昨日 Obsidian 日报导入计划" aria-label="导入计划" @click="emit('importPlan')"><FileInput :size="15" /></button>
       </div>
     </div>
 
+    <div v-if="mode === 'today' && error && !loading" class="today-plan-error" role="status">今日计划刷新失败，仍显示上一次成功结果：{{ error }}</div>
+    <div v-if="mode === 'today' && loading" class="today-plan-empty">正在加载今日计划…</div>
     <div :key="listRenderVersion" ref="rowsRef" class="reminder-list" :class="{ 'is-sorting': isSorting }">
       <template v-for="(row, rowIndex) in pendingRows" :key="row.task.id">
         <div
@@ -983,8 +1064,11 @@ onBeforeUnmount(() => {
             {
               child: row.depth > 0,
               selected: row.task.id === selectedId,
+              context: mode === 'today' && !isTodayMember(row.task),
+              completed: mode === 'today' && row.task.status === 'done',
               'level-changed': row.task.id === levelChangedId,
-              'task-group-start': row.depth === 0,
+              'task-group-start': isTaskGroupStart(rowIndex),
+              'task-group-single': row.depth === 0 && !isTaskGroupStart(rowIndex),
               'task-group-child': row.depth > 0
             }
           ]"
@@ -995,7 +1079,7 @@ onBeforeUnmount(() => {
           @contextmenu="openContextMenu($event, row.task)"
         >
           <button class="drag-handle" :title="getSubtreeIds(row.task.id).size > 1 ? `拖动整组（共 ${getSubtreeIds(row.task.id).size} 项）` : '拖动排序'" @pointerdown="prepareSubtreeDrag(row.task.id)"><GripVertical :size="14" /></button>
-          <button class="check-button" :class="{ completed: row.task.status === 'done' }" :title="row.task.recurrence ? (row.task.status === 'done' ? '恢复今天这一轮' : '完成今天这一轮') : '标记为完成'" @click.stop="emit('toggle', row.task, $event)">
+          <button class="check-button" :class="{ completed: row.task.status === 'done' }" :disabled="!canToggleTask(row.task)" :title="taskToggleTitle(row.task)" @click.stop="emit('toggle', row.task, $event)">
             <CheckCircle2 v-if="row.task.status === 'done'" :size="18" />
             <Circle v-else :size="18" />
           </button>
@@ -1004,7 +1088,7 @@ onBeforeUnmount(() => {
             <div class="reminder-meta">
               <span class="task-level-label"><CornerDownRight v-if="row.depth" :size="12" />{{ row.depth + 1 }}级</span>
               <span class="meta-picker" :class="{ filled: row.task.planDate }" title="设置预计开始日期" @click.stop="openNativePicker(row.task.id)">
-                <input :data-date-input="row.task.id" v-model="row.task.planDate" aria-label="预计开始日期" tabindex="-1" type="date" @change="emit('save', row.task.id)" />
+                <input :data-date-input="row.task.id" v-model="row.task.planDate" aria-label="预计开始日期" tabindex="-1" type="date" @change="saveEditableTask(row.task)" />
                 <CalendarDays :size="12" />{{ row.task.planDate || '未设置开始日期' }}
               </span>
               <span class="meta-picker estimate-picker" :class="{ filled: row.task.estimate }" :title="row.task.recurrence ? '设置每次预计用时' : '设置整体预计用时'" @click.stop="openEstimateEditor(row.task.id)">
@@ -1037,11 +1121,11 @@ onBeforeUnmount(() => {
                   @keydown.esc.prevent="closeTodayEstimateEditor"
                 />
               </span>
-              <span v-if="hasChildren(row.task.id)" class="meta-picker actual-time-picker summary" :class="{ filled: row.task.actual > 0 }" title="子事项今日用时合计">
+              <span v-if="mode === 'today' && hasChildren(row.task.id)" class="meta-picker actual-time-picker summary" :class="{ filled: row.task.actual > 0 }" title="子事项今日用时合计">
                 <Clock3 :size="12" />今日用时 {{ formatMinutes(row.task.actual) }} · 合计
               </span>
               <el-popover
-                v-else
+                v-else-if="mode === 'today'"
                 :visible="inlineActualTaskId === row.task.id"
                 placement="bottom"
                 :width="340"
@@ -1097,6 +1181,7 @@ onBeforeUnmount(() => {
           </div>
           <div class="reminder-inline-controls">
             <button
+              v-if="isTodayMember(row.task) && row.task.status !== 'done' && row.task.selectable"
               class="icon-button subtle hover-row-action task-timer-action"
               :class="{ active: runningTaskId === row.task.id }"
               :title="runningTaskId === row.task.id ? '当前事项正在计时' : runningTaskId ? '结束当前计时并切换到此事项' : '开始计时'"
@@ -1108,6 +1193,8 @@ onBeforeUnmount(() => {
             <button class="icon-button subtle hover-row-action" :title="canOutdent(row.task) ? '减少缩进（Shift+Tab）' : '当前已经是一级'" :disabled="!canOutdent(row.task)" @click.stop="changeIndent(row.task, 'outdent')"><IndentDecrease :size="14" /></button>
             <button class="icon-button subtle hover-row-action" :title="canIndent(row.task) ? '增加缩进（Tab）' : '前面没有可作为上级的同级事项'" :disabled="!canIndent(row.task)" @click.stop="changeIndent(row.task, 'indent')"><IndentIncrease :size="14" /></button>
             <button class="icon-button subtle hover-row-action" :title="getSubtreeIds(row.task.id).size > 1 ? `复制整组（共 ${getSubtreeIds(row.task.id).size} 项）` : '复制事项'" @click.stop="duplicateTask(row.task)"><Copy :size="14" /></button>
+            <button v-if="mode === 'active' && row.task.status === 'open' && row.task.selectable && !hasChildren(row.task.id) && !knownTodayMemberIds.has(row.task.id)" class="icon-button subtle hover-row-action add-today-row-action" title="加入今日" aria-label="加入今日" @click.stop="emit('addTodayTasks', [row.task.id])"><ListPlus :size="14" /></button>
+            <button v-if="mode === 'today' && isTodayMember(row.task)" class="icon-button subtle hover-row-action" title="移出今日" @click.stop="emit('removeToday', row.task.id)"><ListMinus :size="14" /></button>
             <button class="icon-button subtle hover-row-action" title="删除" @click.stop="confirmDelete(row.task)"><Trash2 :size="14" /></button>
           </div>
         </div>
@@ -1130,6 +1217,15 @@ onBeforeUnmount(() => {
         <span class="placeholder-input" aria-hidden="true"></span>
       </button>
     </div>
+
+    <el-dialog v-model="todayPickerOpen" title="从进行中加入今日" width="min(640px, 92vw)" append-to-body>
+      <input v-model="todayPickerQuery" class="today-plan-search" placeholder="搜索事项或父级路径" />
+      <div class="today-plan-candidates">
+        <label v-for="task in todayCandidates" :key="task.id"><input v-model="todayPickerSelection" type="checkbox" :value="task.id" /><span><strong>{{ task.title }}</strong><small>{{ task.pathLabel }}</small></span></label>
+        <p v-if="!todayCandidates.length">没有可加入的进行中事项</p>
+      </div>
+      <template #footer><button class="secondary-button" type="button" @click="todayPickerOpen = false">取消</button><button class="primary-button" type="button" :disabled="!todayPickerSelection.length" @click="confirmTodayAdd">加入今日（{{ todayPickerSelection.length }}）</button></template>
+    </el-dialog>
 
     <el-dialog v-model="recurrenceDialogOpen" class="recurrence-dialog" title="重复设置" width="min(430px, 92vw)" append-to-body destroy-on-close>
       <div class="recurrence-form">

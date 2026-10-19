@@ -130,6 +130,9 @@ function verifyStaticSchemaInvariants() {
     "occurrence_row:=p_payload->'occurrence'",
     "timer occurrence identity mismatch",
     "'occurrence',case when occurrence_row is null",
+    "day_plan_row:=p_payload->'day_plan'",
+    "timer day plan must be an included initial version",
+    "'dayPlan',case when day_plan_row is null",
   ]) {
     if (!timerRecurringOccurrencePatch.includes(expected)) {
       throw new Error(`The recurring timer occurrence patch must include: ${expected}`);
@@ -140,6 +143,16 @@ function verifyStaticSchemaInvariants() {
   }
   if ((schemaIntegrationTest.match(/\\ir 20261019_timegenie_timer_recurring_occurrence\.sql/g) ?? []).length < 2) {
     throw new Error("The schema integration test must prove the recurring timer occurrence patch is idempotent.");
+  }
+  for (const [fileName, contents, expected] of [
+    ["workspace snapshots", fs.readFileSync(path.join(repoRoot, "supabase", "20261018c_timegenie_workspace_snapshots.sql"), "utf8"), "('task_day_plans','planning'"],
+    ["workspace epoch", fs.readFileSync(path.join(repoRoot, "supabase", "20261018d_timegenie_workspace_epoch.sql"), "utf8"), "'task_day_plans'"],
+    ["workspace restore", fs.readFileSync(path.join(repoRoot, "supabase", "20261018e_timegenie_workspace_restore.sql"), "utf8"), "delete from timegenie.task_day_plans"],
+    ["final workspace restore", restoreUnassignedStatePatch, "delete from timegenie.task_day_plans"],
+  ]) {
+    if (!contents.includes(expected)) {
+      throw new Error(`The ${fileName} patch must preserve task_day_plans support.`);
+    }
   }
   for (const expected of [
     "automatic_snapshot_frequency",

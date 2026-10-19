@@ -620,6 +620,99 @@ mod tests {
     }
 
     #[test]
+    fn task_day_plan_migration_backfills_estimates_with_versions_idempotently() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("task-day-plan-upgrade.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                   version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        for migration in &MIGRATIONS[..19] {
+            let transaction = connection.transaction().unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version,name,applied_at) VALUES (?1,?2,1)",
+                    params![migration.version, migration.name],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO workspaces(id,name,timezone,storage_mode,created_at,updated_at,version)
+                   VALUES ('plan-ws','Plan','Asia/Shanghai','local',1,1,1);
+                 INSERT INTO subjects(id,workspace_id,name,sort_order,created_at,updated_at,version)
+                   VALUES ('plan-subject','plan-ws','Plan',10,1,1,1);
+                 INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version)
+                   VALUES ('plan-task-a','plan-ws','plan-subject','A','open','manual',10,1,1,1),
+                          ('plan-task-b','plan-ws','plan-subject','B','open','manual',20,1,1,1);
+                 INSERT INTO task_daily_estimates(workspace_id,task_id,work_date,estimate_minutes,created_at,updated_at,version)
+                   VALUES ('plan-ws','plan-task-a','2026-10-19',30,11,12,7),
+                          ('plan-ws','plan-task-b','2026-10-20',45,21,22,3);",
+            )
+            .unwrap();
+        drop(connection);
+
+        Database::initialize_at(path.clone()).unwrap();
+        Database::initialize_at(path.clone()).unwrap();
+        let connection = Connection::open(path).unwrap();
+        let rows: Vec<(String, String, String, i64, i64, i64)> = connection
+            .prepare(
+                "SELECT task_id,work_date,state,created_at,updated_at,version
+                 FROM task_day_plans WHERE workspace_id='plan-ws' ORDER BY task_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "plan-task-a".to_string(),
+                    "2026-10-19".to_string(),
+                    "included".to_string(),
+                    11,
+                    12,
+                    7,
+                ),
+                (
+                    "plan-task-b".to_string(),
+                    "2026-10-20".to_string(),
+                    "included".to_string(),
+                    21,
+                    22,
+                    3,
+                ),
+            ]
+        );
+        let migration_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version=20",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 1);
+    }
+
+    #[test]
     fn workspace_epoch_migration_defaults_existing_sync_state_and_outbox() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("workspace-epoch-upgrade.sqlite3");

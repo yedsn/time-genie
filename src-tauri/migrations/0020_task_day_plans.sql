@@ -12,9 +12,8 @@ CREATE TABLE task_day_plans (
 CREATE INDEX idx_task_day_plans_date
     ON task_day_plans(workspace_id, work_date, state, task_id);
 
-INSERT INTO task_day_plans(
+INSERT OR IGNORE INTO task_day_plans(
     workspace_id, task_id, work_date, state, created_at, updated_at, version
 )
 SELECT workspace_id, task_id, work_date, 'included', created_at, updated_at, version
-FROM task_daily_estimates
-ON CONFLICT(task_id, work_date) DO NOTHING;
+FROM task_daily_estimates;

@@ -1209,6 +1209,7 @@ fn rewind_for_ready_deferred_entities(
                WHEN 'subjects' THEN 'subject' WHEN 'tasks' THEN 'task'
                WHEN 'subject_work_schedules' THEN 'subject_work_schedule'
                WHEN 'task_daily_estimates' THEN 'task_daily_estimate'
+               WHEN 'task_day_plans' THEN 'task_day_plan'
                WHEN 'task_recurrence_rules' THEN 'task_recurrence_rule'
                WHEN 'task_occurrences' THEN 'task_occurrence'
                WHEN 'time_entries' THEN 'time_entry'
@@ -1351,6 +1352,7 @@ fn incremental_outbox_identity(entity: &IncrementalEntity) -> (&str, &str) {
         "subject_work_schedules" => ("subject_work_schedule", entity.entity_id.as_str()),
         "tasks" => ("task", entity.entity_id.as_str()),
         "task_daily_estimates" => ("task_daily_estimate", entity.entity_id.as_str()),
+        "task_day_plans" => ("task_day_plan", entity.entity_id.as_str()),
         "task_recurrence_rules" => ("task_recurrence_rule", entity.entity_id.as_str()),
         "task_occurrences" => ("task_occurrence", entity.entity_id.as_str()),
         "unassigned_sessions" => ("unassigned_session", entity.entity_id.as_str()),
@@ -1376,6 +1378,7 @@ fn expected_incremental_entity_type(source_entity_type: &str) -> Option<&str> {
         | "tasks"
         | "task_status_events"
         | "task_daily_estimates"
+        | "task_day_plans"
         | "task_recurrence_rules"
         | "task_occurrences"
         | "unassigned_sessions"
@@ -1396,6 +1399,7 @@ fn incremental_domain(entity_type: &str) -> Result<&'static str, String> {
         "tasks"
         | "task_status_events"
         | "task_daily_estimates"
+        | "task_day_plans"
         | "task_recurrence_rules"
         | "task_occurrences" => Ok("tasks"),
         "work_days" | "time_entries" | "actual_time_adjustments" => Ok("time"),
@@ -1771,10 +1775,11 @@ fn incremental_entity_needs_apply(
     };
     if entity.deleted {
         return match entity.entity_type.as_str() {
-            "task_daily_estimates" | "task_occurrences" => {
+            "task_daily_estimates" | "task_day_plans" | "task_occurrences" => {
                 let (left, right) = entity.entity_id.split_once('|').expect("validated composite key");
-                let table = if entity.entity_type == "task_daily_estimates" { "task_daily_estimates" } else { "task_occurrences" };
-                exists(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE workspace_id=?1 AND task_id=?2 AND {}=?3)", if table == "task_daily_estimates" { "work_date" } else { "occurrence_date" }), &[&workspace_id, &left, &right])
+                let table = entity.entity_type.as_str();
+                let date_column = if table == "task_occurrences" { "occurrence_date" } else { "work_date" };
+                exists(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE workspace_id=?1 AND task_id=?2 AND {date_column}=?3)"), &[&workspace_id, &left, &right])
             }
             "work_days" | "app_settings" | "integration_configs" => {
                 let (table, key) = match entity.entity_type.as_str() { "work_days" => ("work_days", "work_date"), "app_settings" => ("app_settings", "key"), _ => ("integration_configs", "provider") };
@@ -1797,9 +1802,13 @@ fn incremental_entity_needs_apply(
         "work_days" => transaction.query_row("SELECT version FROM work_days WHERE workspace_id=?1 AND work_date=?2", params![workspace_id,entity.entity_id], |row| row.get(0)).optional(),
         "app_settings" => transaction.query_row("SELECT version FROM app_settings WHERE workspace_id=?1 AND key=?2", params![workspace_id,entity.entity_id], |row| row.get(0)).optional(),
         "integration_configs" => transaction.query_row("SELECT version FROM integration_configs WHERE workspace_id=?1 AND provider=?2", params![workspace_id,entity.entity_id], |row| row.get(0)).optional(),
-        "task_daily_estimates" | "task_occurrences" => {
+        "task_daily_estimates" | "task_day_plans" | "task_occurrences" => {
             let (left,right)=entity.entity_id.split_once('|').expect("validated composite key");
-            if entity.entity_type == "task_daily_estimates" { transaction.query_row("SELECT version FROM task_daily_estimates WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3",params![workspace_id,left,right],|row|row.get(0)).optional() } else { transaction.query_row("SELECT version FROM task_occurrences WHERE workspace_id=?1 AND task_id=?2 AND occurrence_date=?3",params![workspace_id,left,right],|row|row.get(0)).optional() }
+            match entity.entity_type.as_str() {
+                "task_daily_estimates" => transaction.query_row("SELECT version FROM task_daily_estimates WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3",params![workspace_id,left,right],|row|row.get(0)).optional(),
+                "task_day_plans" => transaction.query_row("SELECT version FROM task_day_plans WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3",params![workspace_id,left,right],|row|row.get(0)).optional(),
+                _ => transaction.query_row("SELECT version FROM task_occurrences WHERE workspace_id=?1 AND task_id=?2 AND occurrence_date=?3",params![workspace_id,left,right],|row|row.get(0)).optional(),
+            }
         }
         "task_recurrence_rules" => {
             return recurrence_rules_differ(
@@ -1938,6 +1947,7 @@ fn apply_incremental_entity(
         }
         "task_status_events" => transaction.execute("INSERT INTO task_status_events(id,workspace_id,task_id,status,occurred_at,source_type,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET status=excluded.status,occurred_at=excluded.occurred_at,source_type=excluded.source_type", params![text(data,"id"),workspace_id,text(data,"task_id"),text(data,"status"),millis(data,"occurred_at"),text(data,"source_type"),millis(data,"created_at")]),
         "task_daily_estimates" => transaction.execute("INSERT INTO task_daily_estimates(workspace_id,task_id,work_date,estimate_minutes,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(task_id,work_date) DO UPDATE SET estimate_minutes=excluded.estimate_minutes,updated_at=excluded.updated_at,version=excluded.version", params![workspace_id,text(data,"task_id"),text(data,"work_date"),integer(data,"estimate_minutes"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version")]),
+        "task_day_plans" => transaction.execute("INSERT INTO task_day_plans(workspace_id,task_id,work_date,state,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(task_id,work_date) DO UPDATE SET state=excluded.state,updated_at=excluded.updated_at,version=excluded.version", params![workspace_id,text(data,"task_id"),text(data,"work_date"),text(data,"state"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version")]),
         "task_recurrence_rules" => {
             transaction.execute("DELETE FROM task_recurrence_rules WHERE workspace_id=?1 AND task_id=?2", params![workspace_id,entity.entity_id]).map_err(|error| error.to_string())?;
             for rule in data.get("rules").and_then(Value::as_array).cloned().unwrap_or_default() {
@@ -2031,7 +2041,7 @@ fn validate_incremental_identity(entity: &IncrementalEntity) -> Result<(), Strin
                 .and_then(Value::as_str)
                 == Some(entity.entity_id.as_str())
         }
-        "task_daily_estimates" => data.is_some_and(|row| {
+        "task_daily_estimates" | "task_day_plans" => data.is_some_and(|row| {
             format!("{}|{}", text(row, "task_id"), text(row, "work_date")) == entity.entity_id
         }),
         "task_occurrences" => data.is_some_and(|row| {
@@ -2061,7 +2071,7 @@ fn validate_incremental_entity_key(entity_type: &str, entity_id: &str) -> Result
     let parts = entity_id.split('|').collect::<Vec<_>>();
     let valid_date = |value: &str| chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok();
     let valid = match entity_type {
-        "task_daily_estimates" | "task_occurrences" => {
+        "task_daily_estimates" | "task_day_plans" | "task_occurrences" => {
             parts.len() == 2 && Uuid::parse_str(parts[0]).is_ok() && valid_date(parts[1])
         }
         "external_bindings" => {
@@ -2597,6 +2607,16 @@ fn delete_incremental_entity(
                 .ok_or_else(|| "VALIDATION_ERROR: 按日预估增量键无效".to_string())?;
             transaction.execute("DELETE FROM task_daily_estimates WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3", params![workspace_id,key.0,key.1])
         }
+        "task_day_plans" => {
+            let key = entity
+                .entity_id
+                .split_once('|')
+                .ok_or_else(|| "VALIDATION_ERROR: 今日计划增量键无效".to_string())?;
+            transaction.execute(
+                "DELETE FROM task_day_plans WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3",
+                params![workspace_id, key.0, key.1],
+            )
+        }
         "task_recurrence_rules" => transaction.execute(
             "DELETE FROM task_recurrence_rules WHERE workspace_id=?1 AND task_id=?2",
             params![workspace_id, entity.entity_id],
@@ -2906,6 +2926,27 @@ fn validate_planning_entity_payload(
     payload: &Value,
 ) -> Result<(), String> {
     match entity_type {
+        "task_day_plan" => {
+            let task_id = payload
+                .get("task_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "VALIDATION_ERROR: 今日计划同步缺少事项 ID".to_string())?;
+            let work_date = payload
+                .get("work_date")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "VALIDATION_ERROR: 今日计划同步缺少日期".to_string())?;
+            chrono::NaiveDate::parse_from_str(work_date, "%Y-%m-%d")
+                .map_err(|_| "VALIDATION_ERROR: 今日计划同步日期无效".to_string())?;
+            if entity_id != format!("{task_id}|{work_date}") {
+                return Err("VALIDATION_ERROR: 今日计划同步实体 ID 无效".to_string());
+            }
+            if !matches!(
+                payload.get("state").and_then(Value::as_str),
+                Some("included") | Some("excluded")
+            ) {
+                return Err("VALIDATION_ERROR: 今日计划同步状态无效".to_string());
+            }
+        }
         "task_daily_estimate" => {
             let task_id = payload
                 .get("task_id")
@@ -3199,6 +3240,7 @@ fn ensure_supported_cloud_entity_type(entity_type: &str) -> Result<(), String> {
             | "app_setting"
             | "integration_config"
             | "task_occurrence"
+            | "task_day_plan"
             | "task_daily_estimate"
             | "task_recurrence_rule"
             | "external_binding"
@@ -5278,6 +5320,7 @@ fn incremental_entity_type_for_outbox(entity_type: &str) -> Option<&'static str>
         "subject" => Some("subjects"),
         "task" => Some("tasks"),
         "task_occurrence" => Some("task_occurrences"),
+        "task_day_plan" => Some("task_day_plans"),
         "task_daily_estimate" => Some("task_daily_estimates"),
         "task_recurrence_rule" => Some("task_recurrence_rules"),
         "time_entry" => Some("time_entries"),
@@ -5814,6 +5857,18 @@ fn cloud_entity_payload<'a>(
             let expected_date = payload.get("work_date")?.as_str()?;
             return snapshot
                 .get("task_daily_estimates")?
+                .as_array()?
+                .iter()
+                .find(|row| {
+                    row.get("task_id").and_then(Value::as_str) == Some(expected_task_id)
+                        && row.get("work_date").and_then(Value::as_str) == Some(expected_date)
+                });
+        }
+        "task_day_plan" => {
+            let expected_task_id = payload.get("task_id")?.as_str()?;
+            let expected_date = payload.get("work_date")?.as_str()?;
+            return snapshot
+                .get("task_day_plans")?
                 .as_array()?
                 .iter()
                 .find(|row| {
@@ -6390,6 +6445,19 @@ pub(crate) fn entity_payload_from_connection(
             return query_json_row_with_params(
                 connection,
                 "SELECT * FROM task_daily_estimates WHERE workspace_id = ?1 AND task_id = ?2 AND work_date = ?3",
+                params![local_workspace_id, task_id, work_date],
+                key,
+            );
+        }
+        "task_day_plan" => {
+            let key = entity_id
+                .ok_or_else(|| "VALIDATION_ERROR: 今日计划同步缺少实体 ID".to_string())?;
+            let (task_id, work_date) = key
+                .split_once('|')
+                .ok_or_else(|| "VALIDATION_ERROR: 今日计划同步实体 ID 无效".to_string())?;
+            return query_json_row_with_params(
+                connection,
+                "SELECT * FROM task_day_plans WHERE workspace_id = ?1 AND task_id = ?2 AND work_date = ?3",
                 params![local_workspace_id, task_id, work_date],
                 key,
             );
@@ -7201,6 +7269,12 @@ fn apply_snapshot_with_policy(
     replace_snapshot_table(
         &transaction,
         snapshot,
+        "task_day_plans",
+        &local_workspace_id,
+    )?;
+    replace_snapshot_table(
+        &transaction,
+        snapshot,
         "task_daily_estimates",
         &local_workspace_id,
     )?;
@@ -7809,6 +7883,11 @@ fn replace_snapshot_table(
                 tx.execute("INSERT INTO task_daily_estimates(workspace_id,task_id,work_date,estimate_minutes,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![ws,text(row,"task_id"),text(row,"work_date"),integer(row,"estimate_minutes"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version")])
             })?
         }
+        "task_day_plans" => {
+            replace_simple_rows(transaction, table, workspace_id, rows, |tx, row, ws| {
+                tx.execute("INSERT INTO task_day_plans(workspace_id,task_id,work_date,state,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![ws,text(row,"task_id"),text(row,"work_date"),text(row,"state"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version")])
+            })?
+        }
         "task_recurrence_rules" => {
             replace_simple_rows(transaction, table, workspace_id, rows, |tx, row, ws| {
                 tx.execute("INSERT INTO task_recurrence_rules(id,workspace_id,task_id,frequency,weekdays_mask,effective_start,effective_end,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![text(row,"id"),ws,text(row,"task_id"),text(row,"frequency"),optional_integer(row,"weekdays_mask"),text(row,"effective_start"),optional_text(row,"effective_end"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version")])
@@ -8017,6 +8096,7 @@ fn clear_snapshot_cache(transaction: &Transaction<'_>, workspace_id: &str) -> Re
         "report_tasks",
         "task_occurrences",
         "task_recurrence_rules",
+        "task_day_plans",
         "task_daily_estimates",
         "time_allocations",
         "actual_time_adjustments",
@@ -8828,6 +8908,7 @@ mod tests {
             "subjects"
         );
         assert_eq!(incremental_domain("task_daily_estimates").unwrap(), "tasks");
+        assert_eq!(incremental_domain("task_day_plans").unwrap(), "tasks");
         assert_eq!(
             incremental_domain("task_recurrence_rules").unwrap(),
             "tasks"
@@ -9363,6 +9444,227 @@ mod tests {
             "weekly"
         );
         assert_eq!(connection.query_row("SELECT status FROM task_occurrences WHERE task_id=?1 AND occurrence_date='2026-10-06'",[&task_id],|r|r.get::<_,String>(0)).unwrap(),"done");
+    }
+
+    #[test]
+    fn incremental_day_plan_applies_overwrites_and_deletes_composite_entity() {
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, subject_id) =
+            cloud_database_for_incremental_test("incremental-day-plan.sqlite3");
+        let device_id = storage_mode(&database).unwrap().device_id;
+        let task_id = Uuid::now_v7().to_string();
+        let work_date = "2026-10-19";
+        let now = now_millis();
+        let task = json!({
+            "id":task_id,"subject_id":subject_id,"parent_id":null,"title":"云端今日事项","status":"open",
+            "planned_date":null,"planned_time":null,"estimate_minutes":null,"note":null,"project_name":null,
+            "solution_name":null,"source_type":"manual","source_ref":null,"sort_order":1,"completed_at":null,
+            "created_at":now,"updated_at":now,"version":1,"deleted_at":null
+        });
+        let entity_id = format!("{task_id}|{work_date}");
+        let included = json!({"task_id":task_id,"work_date":work_date,"state":"included","created_at":now,"updated_at":now,"version":1});
+        apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &device_id,
+            2,
+            &[
+                incremental_entity("tasks", "tasks", task_id.clone(), false, Some(task)),
+                incremental_entity(
+                    "task_day_plans",
+                    "task_day_plans",
+                    entity_id.clone(),
+                    false,
+                    Some(included),
+                ),
+            ],
+        )
+        .unwrap();
+        let included_state: (String, i64) = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT state,version FROM task_day_plans WHERE task_id=?1 AND work_date=?2",
+                params![task_id, work_date],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(included_state, ("included".to_string(), 1));
+
+        let excluded = json!({"task_id":task_id,"work_date":work_date,"state":"excluded","created_at":now,"updated_at":now + 1,"version":2});
+        apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &device_id,
+            3,
+            &[incremental_entity(
+                "task_day_plans",
+                "task_day_plans",
+                entity_id.clone(),
+                false,
+                Some(excluded),
+            )],
+        )
+        .unwrap();
+        let excluded_state: (String, i64) = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT state,version FROM task_day_plans WHERE task_id=?1 AND work_date=?2",
+                params![task_id, work_date],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(excluded_state, ("excluded".to_string(), 2));
+
+        apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &device_id,
+            4,
+            &[incremental_entity(
+                "task_day_plans",
+                "task_day_plans",
+                entity_id,
+                true,
+                None,
+            )],
+        )
+        .unwrap();
+        let count: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM task_day_plans WHERE task_id=?1 AND work_date=?2",
+                params![task_id, work_date],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn day_plan_and_estimate_reverse_arrival_orders_converge_to_membership() {
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, subject_id) =
+            cloud_database_for_incremental_test("incremental-day-plan-order.sqlite3");
+        let device_id = storage_mode(&database).unwrap().device_id;
+        let work_date = "2026-10-19";
+        let now = now_millis();
+        let first_id = Uuid::now_v7().to_string();
+        let second_id = Uuid::now_v7().to_string();
+        let task = |id: &str, title: &str| {
+            json!({
+                "id":id,"subject_id":subject_id,"parent_id":null,"title":title,"status":"open",
+                "planned_date":null,"planned_time":null,"estimate_minutes":null,"note":null,"project_name":null,
+                "solution_name":null,"source_type":"manual","source_ref":null,"sort_order":1,"completed_at":null,
+                "created_at":now,"updated_at":now,"version":1,"deleted_at":null
+            })
+        };
+        apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &device_id,
+            2,
+            &[
+                incremental_entity(
+                    "tasks",
+                    "tasks",
+                    first_id.clone(),
+                    false,
+                    Some(task(&first_id, "预计先到")),
+                ),
+                incremental_entity(
+                    "tasks",
+                    "tasks",
+                    second_id.clone(),
+                    false,
+                    Some(task(&second_id, "成员先到")),
+                ),
+            ],
+        )
+        .unwrap();
+        let estimate = |id: &str| json!({"task_id":id,"work_date":work_date,"estimate_minutes":30,"created_at":now,"updated_at":now,"version":1});
+        let plan = |id: &str| json!({"task_id":id,"work_date":work_date,"state":"included","created_at":now,"updated_at":now,"version":1});
+        apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &device_id,
+            3,
+            &[
+                incremental_entity(
+                    "task_daily_estimates",
+                    "task_daily_estimates",
+                    format!("{first_id}|{work_date}"),
+                    false,
+                    Some(estimate(&first_id)),
+                ),
+                incremental_entity(
+                    "task_day_plans",
+                    "task_day_plans",
+                    format!("{second_id}|{work_date}"),
+                    false,
+                    Some(plan(&second_id)),
+                ),
+            ],
+        )
+        .unwrap();
+        let interim = crate::today_plans::snapshot(
+            &database,
+            crate::today_plans::TaskDayPlanSnapshotRequest {
+                subject_id: subject_id.clone(),
+                work_date: work_date.to_string(),
+            },
+        )
+        .unwrap();
+        assert!(interim
+            .tasks
+            .iter()
+            .any(|task| task.id == first_id && task.today_member));
+        assert!(interim
+            .tasks
+            .iter()
+            .any(|task| task.id == second_id && task.today_member));
+
+        apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &device_id,
+            4,
+            &[
+                incremental_entity(
+                    "task_day_plans",
+                    "task_day_plans",
+                    format!("{first_id}|{work_date}"),
+                    false,
+                    Some(plan(&first_id)),
+                ),
+                incremental_entity(
+                    "task_daily_estimates",
+                    "task_daily_estimates",
+                    format!("{second_id}|{work_date}"),
+                    false,
+                    Some(estimate(&second_id)),
+                ),
+            ],
+        )
+        .unwrap();
+        let final_snapshot = crate::today_plans::snapshot(
+            &database,
+            crate::today_plans::TaskDayPlanSnapshotRequest {
+                subject_id,
+                work_date: work_date.to_string(),
+            },
+        )
+        .unwrap();
+        for task_id in [&first_id, &second_id] {
+            let row = final_snapshot
+                .tasks
+                .iter()
+                .find(|task| &task.id == task_id)
+                .unwrap();
+            assert!(row.today_member);
+            assert_eq!(row.day_plan_state.as_deref(), Some("included"));
+            assert_eq!(row.today_estimate_minutes, Some(30));
+        }
     }
 
     #[test]
@@ -10789,6 +11091,18 @@ mod tests {
         let task_id = Uuid::now_v7().to_string();
         let estimate_id = format!("{task_id}|2026-10-05");
         assert!(validate_planning_entity_payload(
+            "task_day_plan",
+            &estimate_id,
+            &json!({ "task_id": task_id, "work_date": "2026-10-05", "state": "included", "version": 1 })
+        )
+        .is_ok());
+        assert!(validate_planning_entity_payload(
+            "task_day_plan",
+            &estimate_id,
+            &json!({ "task_id": task_id, "work_date": "2026-10-05", "state": "unknown", "version": 1 })
+        )
+        .is_err());
+        assert!(validate_planning_entity_payload(
             "task_daily_estimate",
             &estimate_id,
             &json!({
@@ -10852,6 +11166,12 @@ mod tests {
                 "estimate_minutes": 45,
                 "version": 2
             }],
+            "task_day_plans": [{
+                "task_id": task_id,
+                "work_date": "2026-10-05",
+                "state": "excluded",
+                "version": 4
+            }],
             "task_recurrence_rules": [
                 { "id": history_id, "task_id": task_id, "frequency": "daily", "effective_start": "2026-10-01", "effective_end": "2026-10-04", "version": 2 },
                 { "id": active_id, "task_id": task_id, "frequency": "weekdays", "effective_start": "2026-10-05", "effective_end": null, "version": 3 }
@@ -10865,6 +11185,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(estimate["estimate_minutes"], 45);
+        let day_plan = cloud_conflict_payload(
+            &snapshot,
+            "task_day_plan",
+            Some(&format!("{task_id}|2026-10-05")),
+            &json!({ "task_id": task_id, "work_date": "2026-10-05" }),
+        )
+        .unwrap();
+        assert_eq!(day_plan["state"], "excluded");
+        assert_eq!(day_plan["version"], 4);
 
         let recurrence = cloud_conflict_payload(
             &snapshot,
@@ -13254,6 +13583,10 @@ mod tests {
             "subjects": [{"id": subject_id, "name": "默认", "sort_order": 10, "created_at": now, "updated_at": now, "version": 1, "deleted_at": null}],
             "tasks": [{"id": task_id, "subject_id": subject_id, "parent_id": null, "title": "每日复盘", "status": "open", "source_type": "manual", "sort_order": 10, "created_at": now, "updated_at": now, "version": 1}],
             "task_daily_estimates": [{"task_id": task_id, "work_date": "2026-09-29", "estimate_minutes": 40, "created_at": now, "updated_at": now, "version": 2}],
+            "task_day_plans": [
+                {"task_id": task_id, "work_date": "2026-09-29", "state": "included", "created_at": now, "updated_at": now, "version": 5},
+                {"task_id": task_id, "work_date": "2026-09-30", "state": "excluded", "created_at": now, "updated_at": now, "version": 3}
+            ],
             "task_recurrence_rules": [{"id": rule_id, "task_id": task_id, "frequency": "daily", "weekdays_mask": null, "effective_start": "2026-09-29", "effective_end": null, "created_at": now, "updated_at": now, "version": 3}],
             "task_occurrences": [{"task_id": task_id, "occurrence_date": "2026-09-29", "origin": "scheduled", "status": "open", "completed_at": null, "created_at": now, "updated_at": now, "version": 4}]
         });
@@ -13285,17 +13618,32 @@ mod tests {
         assert_eq!(daily_estimate, 40);
         assert_eq!(frequency, "daily");
         assert_eq!(occurrence_status, "open");
-        let counts: (i64, i64, i64) = connection
+        let plans: Vec<(String, String, i64)> = connection
+            .prepare("SELECT work_date,state,version FROM task_day_plans WHERE task_id=?1 ORDER BY work_date")
+            .unwrap()
+            .query_map([&task_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            plans,
+            vec![
+                ("2026-09-29".to_string(), "included".to_string(), 5),
+                ("2026-09-30".to_string(), "excluded".to_string(), 3)
+            ]
+        );
+        let counts: (i64, i64, i64, i64) = connection
             .query_row(
                 "SELECT
                    (SELECT COUNT(*) FROM task_daily_estimates WHERE task_id = ?1),
+                   (SELECT COUNT(*) FROM task_day_plans WHERE task_id = ?1),
                    (SELECT COUNT(*) FROM task_recurrence_rules WHERE task_id = ?1),
                    (SELECT COUNT(*) FROM task_occurrences WHERE task_id = ?1)",
                 [&task_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(counts, (1, 1, 1));
+        assert_eq!(counts, (1, 2, 1, 1));
     }
 
     #[test]

@@ -59,7 +59,47 @@ export type ExecutionPanelTask = {
   totalMinutes: number;
   sortOrder?: number;
   timerState?: "running" | "paused";
+  todayMember?: boolean;
+  todayContext?: boolean;
 };
+
+/**
+ * 执行模式的候选范围只允许当前主体的未完成今日成员及其父级上下文。
+ * 非执行模式（历史归属、未归属时间分配）继续沿用调用方给出的既有范围，不做缩窄。
+ */
+export function executionPanelSourceTasks<T extends ExecutionPanelTask>(
+  tasks: readonly T[],
+  subjectId: string,
+  mode: ExecutionPanelMode,
+): T[] {
+  if (mode !== "execute") return [...tasks];
+  return tasks.filter((task) => task.subjectId === subjectId
+    && (Boolean(task.todayMember) || Boolean(task.todayContext))
+    && (Boolean(task.todayContext) || task.status !== "done"));
+}
+
+export type ExecutionPanelCurrentStatus = {
+  title: string;
+  stateLabel: "计时中" | "已暂停" | "已结束";
+  /** 当前事项不在候选列表中时，只显示计时状态并说明它未加入今天计划。 */
+  outsideTodayPlan: boolean;
+};
+
+export function executionPanelCurrentStatus(request: {
+  taskId?: string;
+  taskTitle?: string;
+  entryLabel?: string;
+  entryState?: "running" | "paused" | "ended";
+  candidateTaskIds: readonly string[];
+}): ExecutionPanelCurrentStatus | undefined {
+  if (!request.taskId) return undefined;
+  const stateLabel = request.entryState === "paused" ? "已暂停" : request.entryState === "ended" ? "已结束" : "计时中";
+  return {
+    title: request.taskTitle ?? request.entryLabel ?? "当前事项",
+    stateLabel,
+    outsideTodayPlan: !request.candidateTaskIds.includes(request.taskId),
+  };
+}
 
 export type ExecutionPanelTaskRow<T extends ExecutionPanelTask = ExecutionPanelTask> = {
   task: T;

@@ -157,6 +157,18 @@ create table if not exists timegenie.task_daily_estimates (
 );
 create index if not exists idx_task_daily_estimates_date on timegenie.task_daily_estimates(workspace_id, work_date, task_id);
 
+create table if not exists timegenie.task_day_plans (
+  workspace_id uuid not null references timegenie.workspaces(id) on delete cascade,
+  task_id uuid not null references timegenie.tasks(id) on delete cascade,
+  work_date date not null,
+  state text not null check (state in ('included', 'excluded')),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  version bigint not null default 1,
+  primary key(task_id, work_date)
+);
+create index if not exists idx_task_day_plans_date on timegenie.task_day_plans(workspace_id, work_date, state, task_id);
+
 create table if not exists timegenie.task_recurrence_rules (
   id uuid primary key default gen_random_uuid(),
   workspace_id uuid not null references timegenie.workspaces(id) on delete cascade,
@@ -415,6 +427,7 @@ alter table timegenie.app_settings enable row level security;
 alter table timegenie.tasks enable row level security;
 alter table timegenie.task_status_events enable row level security;
 alter table timegenie.task_daily_estimates enable row level security;
+alter table timegenie.task_day_plans enable row level security;
 alter table timegenie.task_recurrence_rules enable row level security;
 alter table timegenie.task_occurrences enable row level security;
 alter table timegenie.time_entries enable row level security;
@@ -436,7 +449,7 @@ create policy workspaces_owner on timegenie.workspaces for all using(owner_user_
 do $$
 declare table_name text;
 begin
-  foreach table_name in array array['devices','tracking_leases','workspace_changes','processed_operations','subjects','work_days','app_settings','tasks','task_status_events','task_daily_estimates','task_recurrence_rules','task_occurrences','time_entries','time_segments','time_allocations','actual_time_adjustments','actual_adjustment_batches','unassigned_sessions','unassigned_segments','report_templates','reports','report_tasks','integration_configs','external_bindings'] loop
+  foreach table_name in array array['devices','tracking_leases','workspace_changes','processed_operations','subjects','work_days','app_settings','tasks','task_status_events','task_day_plans','task_daily_estimates','task_recurrence_rules','task_occurrences','time_entries','time_segments','time_allocations','actual_time_adjustments','actual_adjustment_batches','unassigned_sessions','unassigned_segments','report_templates','reports','report_tasks','integration_configs','external_bindings'] loop
     execute format('drop policy if exists workspace_owner on timegenie.%I', table_name);
     execute format(
       'create policy workspace_owner on timegenie.%I for all using(
@@ -501,6 +514,7 @@ begin
     when 'time_allocations' then row_image->>'entry_id'
     when 'report_tasks' then row_image->>'report_id'
     when 'task_daily_estimates' then (row_image->>'task_id') || '|' || (row_image->>'work_date')
+    when 'task_day_plans' then (row_image->>'task_id') || '|' || (row_image->>'work_date')
     when 'task_recurrence_rules' then row_image->>'task_id'
     when 'task_occurrences' then (row_image->>'task_id') || '|' || (row_image->>'occurrence_date')
     else coalesce(row_image->>'id', row_image->>'task_id')
@@ -683,7 +697,7 @@ end $$;
 do $$
 declare table_name text;
 begin
-  foreach table_name in array array['subjects','work_days','app_settings','tasks','task_status_events','task_daily_estimates','task_recurrence_rules','task_occurrences','time_entries','time_segments','time_allocations','actual_time_adjustments','unassigned_sessions','report_templates','reports','report_tasks','integration_configs','external_bindings'] loop
+  foreach table_name in array array['subjects','work_days','app_settings','tasks','task_status_events','task_day_plans','task_daily_estimates','task_recurrence_rules','task_occurrences','time_entries','time_segments','time_allocations','actual_time_adjustments','unassigned_sessions','report_templates','reports','report_tasks','integration_configs','external_bindings'] loop
     execute format('drop trigger if exists workspace_change_trigger on timegenie.%I', table_name);
     execute format('create trigger workspace_change_trigger after insert or update or delete on timegenie.%I for each row execute function timegenie.touch_workspace_change()', table_name);
   end loop;
@@ -1158,6 +1172,7 @@ begin
     'external_bindings', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.external_bindings where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
     'tasks', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.tasks where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
     'task_status_events', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.task_status_events where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
+    'task_day_plans', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.task_day_plans where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
     'task_daily_estimates', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.task_daily_estimates where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
     'task_recurrence_rules', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.task_recurrence_rules where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
     'task_occurrences', coalesce((select jsonb_agg(to_jsonb(row_value)) from (select * from timegenie.task_occurrences where workspace_id = p_workspace_id) row_value), '[]'::jsonb),
@@ -1192,6 +1207,7 @@ begin
     raise exception 'DEVICE_NOT_REGISTERED';
   end if;
   if exists(select 1 from timegenie.tasks where workspace_id = p_workspace_id)
+     or exists(select 1 from timegenie.task_day_plans where workspace_id = p_workspace_id)
      or exists(select 1 from timegenie.task_daily_estimates where workspace_id = p_workspace_id)
      or exists(select 1 from timegenie.task_recurrence_rules where workspace_id = p_workspace_id)
      or exists(select 1 from timegenie.task_occurrences where workspace_id = p_workspace_id)
@@ -1245,6 +1261,11 @@ begin
     insert into timegenie.task_status_events(id, workspace_id, task_id, status, occurred_at, source_type, created_at)
     values((row_data->>'id')::uuid, p_workspace_id, (row_data->>'task_id')::uuid, row_data->>'status', to_timestamp((row_data->>'occurred_at')::double precision / 1000), row_data->>'source_type', to_timestamp((row_data->>'created_at')::double precision / 1000))
     on conflict(id) do nothing;
+  end loop;
+  for row_data in select value from jsonb_array_elements(coalesce(p_snapshot->'task_day_plans', '[]'::jsonb)) loop
+    insert into timegenie.task_day_plans(workspace_id, task_id, work_date, state, created_at, updated_at, version)
+    values(p_workspace_id, (row_data->>'task_id')::uuid, (row_data->>'work_date')::date, row_data->>'state', to_timestamp((row_data->>'created_at')::double precision / 1000), to_timestamp((row_data->>'updated_at')::double precision / 1000), coalesce((row_data->>'version')::bigint,1))
+    on conflict(task_id, work_date) do update set state = excluded.state, updated_at = excluded.updated_at, version = greatest(timegenie.task_day_plans.version, excluded.version);
   end loop;
   for row_data in select value from jsonb_array_elements(coalesce(p_snapshot->'task_daily_estimates', '[]'::jsonb)) loop
     insert into timegenie.task_daily_estimates(workspace_id, task_id, work_date, estimate_minutes, created_at, updated_at, version)
@@ -1330,6 +1351,7 @@ begin
     when 'app_settings' then (select to_jsonb(row_value) from timegenie.app_settings row_value where workspace_id = p_workspace_id and key = p_entity_id)
     when 'tasks' then (select to_jsonb(row_value) from timegenie.tasks row_value where workspace_id = p_workspace_id and id::text = p_entity_id)
     when 'task_status_events' then (select to_jsonb(row_value) from timegenie.task_status_events row_value where workspace_id = p_workspace_id and id::text = p_entity_id)
+    when 'task_day_plans' then (select to_jsonb(row_value) from timegenie.task_day_plans row_value where workspace_id = p_workspace_id and task_id::text = key_parts[1] and work_date::text = key_parts[2])
     when 'task_daily_estimates' then (select to_jsonb(row_value) from timegenie.task_daily_estimates row_value where workspace_id = p_workspace_id and task_id::text = key_parts[1] and work_date::text = key_parts[2])
     when 'task_recurrence_rules' then jsonb_build_object(
       'task_id', p_entity_id,
@@ -1468,7 +1490,20 @@ begin
     end if;
     if not coalesce((row_data->>'deleted')::boolean, false)
        and coalesce((row_data->>'estimate_minutes')::integer, 0) <= 0 then
-      raise exception 'VALIDATION_ERROR: daily estimate minutes must be positive';
+       raise exception 'VALIDATION_ERROR: daily estimate minutes must be positive';
+    end if;
+  elsif p_entity_type = 'task_day_plan' then
+    if p_entity_id is null or p_entity_id is distinct from (row_data->>'task_id') || '|' || (row_data->>'work_date') then
+      raise exception 'VALIDATION_ERROR: entity id does not match task day plan';
+    end if;
+    if not exists(
+      select 1 from timegenie.tasks
+      where workspace_id = p_workspace_id and id = (row_data->>'task_id')::uuid and deleted_at is null
+    ) then
+      raise exception 'NOT_FOUND: task does not exist';
+    end if;
+    if coalesce(row_data->>'state','') not in ('included','excluded') then
+      raise exception 'VALIDATION_ERROR: invalid task day plan state';
     end if;
   elsif p_entity_type = 'task_recurrence_rule' then
     if p_entity_id is null or row_data->>'task_id' is distinct from p_entity_id then
@@ -1483,7 +1518,7 @@ begin
     end if;
   end if;
 
-  if p_entity_type in ('subject','task','time_entry','actual_time_adjustment','report','report_template','app_setting','integration_config','task_occurrence','task_daily_estimate') then
+  if p_entity_type in ('subject','task','time_entry','actual_time_adjustment','report','report_template','app_setting','integration_config','task_occurrence','task_day_plan','task_daily_estimate') then
     case p_entity_type
       when 'subject' then select version into current_version from timegenie.subjects where workspace_id = p_workspace_id and id = p_entity_id::uuid;
       when 'task' then select version into current_version from timegenie.tasks where workspace_id = p_workspace_id and id = p_entity_id::uuid;
@@ -1494,6 +1529,7 @@ begin
       when 'app_setting' then select version into current_version from timegenie.app_settings where workspace_id = p_workspace_id and key = row_data->>'key';
       when 'integration_config' then select version into current_version from timegenie.integration_configs where workspace_id = p_workspace_id and provider = row_data->>'provider';
       when 'task_occurrence' then select version into current_version from timegenie.task_occurrences where workspace_id = p_workspace_id and task_id = (row_data->>'task_id')::uuid and occurrence_date = (row_data->>'occurrence_date')::date;
+      when 'task_day_plan' then select version into current_version from timegenie.task_day_plans where workspace_id = p_workspace_id and task_id = (row_data->>'task_id')::uuid and work_date = (row_data->>'work_date')::date;
       when 'task_daily_estimate' then select version into current_version from timegenie.task_daily_estimates where workspace_id = p_workspace_id and task_id = (row_data->>'task_id')::uuid and work_date = (row_data->>'work_date')::date;
       else current_version := p_base_version;
     end case;
@@ -1724,6 +1760,11 @@ begin
     values(p_workspace_id, (row_data->>'task_id')::uuid, (row_data->>'occurrence_date')::date, row_data->>'origin', row_data->>'status', case when row_data->>'completed_at' is null then null else to_timestamp((row_data->>'completed_at')::double precision / 1000) end, to_timestamp(coalesce((row_data->>'created_at')::double precision, extract(epoch from now()) * 1000) / 1000), to_timestamp(coalesce((row_data->>'updated_at')::double precision, extract(epoch from now()) * 1000) / 1000), coalesce((row_data->>'version')::bigint,1))
     on conflict(task_id, occurrence_date) do update set origin = excluded.origin, status = excluded.status, completed_at = excluded.completed_at, updated_at = excluded.updated_at, version = excluded.version;
     result_value := jsonb_build_object('entityType','task_occurrence','entityId',p_entity_id,'version',(select version from timegenie.task_occurrences where workspace_id = p_workspace_id and task_id = (row_data->>'task_id')::uuid and occurrence_date = (row_data->>'occurrence_date')::date));
+  elsif p_entity_type = 'task_day_plan' then
+    insert into timegenie.task_day_plans(workspace_id, task_id, work_date, state, created_at, updated_at, version)
+    values(p_workspace_id, (row_data->>'task_id')::uuid, (row_data->>'work_date')::date, row_data->>'state', to_timestamp(coalesce((row_data->>'created_at')::double precision, extract(epoch from now()) * 1000) / 1000), to_timestamp(coalesce((row_data->>'updated_at')::double precision, extract(epoch from now()) * 1000) / 1000), coalesce((row_data->>'version')::bigint,1))
+    on conflict(task_id, work_date) do update set state = excluded.state, updated_at = excluded.updated_at, version = excluded.version;
+    result_value := jsonb_build_object('entityType','task_day_plan','entityId',p_entity_id,'version',(select version from timegenie.task_day_plans where workspace_id = p_workspace_id and task_id = (row_data->>'task_id')::uuid and work_date = (row_data->>'work_date')::date));
   elsif p_entity_type = 'task_daily_estimate' then
     if coalesce((row_data->>'deleted')::boolean, false) then
       delete from timegenie.task_daily_estimates
@@ -3251,7 +3292,7 @@ create or replace function timegenie.timer_transition_apply(
   p_workspace_id uuid,p_device_id uuid,p_operation_id uuid,p_payload jsonb
 ) returns jsonb language plpgsql security definer set search_path=timegenie,extensions,pg_catalog
 as $$
-declare cached jsonb; request_value jsonb; previous_row jsonb; task_row jsonb; occurrence_row jsonb; active_row jsonb; reopen_base_version bigint;
+declare cached jsonb; request_value jsonb; previous_row jsonb; task_row jsonb; occurrence_row jsonb; day_plan_row jsonb; active_row jsonb; reopen_base_version bigint;
 declare remote_active timegenie.time_entries; remote_occurrence timegenie.task_occurrences; transition_at timestamptz; result_value jsonb;
 begin
   if not timegenie.is_workspace_owner(p_workspace_id) then raise exception 'AUTH_REQUIRED'; end if;
@@ -3259,7 +3300,7 @@ begin
   request_value:=jsonb_build_object('deviceId',p_device_id,'payload',coalesce(p_payload,'{}'::jsonb));
   cached:=timegenie.processed_operation_result(p_workspace_id,p_operation_id,'timer_transition_apply',request_value);
   if cached is not null then return cached; end if;
-  previous_row:=p_payload->'previous_entry'; task_row:=p_payload->'task'; occurrence_row:=p_payload->'occurrence'; active_row:=p_payload->'active_entry';
+  previous_row:=p_payload->'previous_entry'; task_row:=p_payload->'task'; occurrence_row:=p_payload->'occurrence'; day_plan_row:=p_payload->'day_plan'; active_row:=p_payload->'active_entry';
   reopen_base_version:=nullif(p_payload->>'reopen_task_base_version','')::bigint;
   if active_row is null or jsonb_typeof(active_row)<>'object' then raise exception 'VALIDATION_ERROR: missing active timer'; end if;
   transition_at:=to_timestamp((active_row->>'started_at')::double precision/1000);
@@ -3328,6 +3369,21 @@ begin
       );
     end if;
   end if;
+  if day_plan_row is not null and day_plan_row<>'null'::jsonb then
+    if day_plan_row->>'task_id' is distinct from active_row->>'default_task_id'
+       or day_plan_row->>'work_date' is distinct from active_row->>'work_date'
+       or day_plan_row->>'state' is distinct from 'included'
+       or coalesce((day_plan_row->>'version')::bigint,0)<>1 then
+      raise exception 'VALIDATION_ERROR: timer day plan must be an included initial version';
+    end if;
+    insert into timegenie.task_day_plans(workspace_id,task_id,work_date,state,created_at,updated_at,version)
+    values(
+      p_workspace_id,(day_plan_row->>'task_id')::uuid,(day_plan_row->>'work_date')::date,'included',
+      to_timestamp(coalesce((day_plan_row->>'created_at')::double precision,extract(epoch from now())*1000)/1000),
+      to_timestamp(coalesce((day_plan_row->>'updated_at')::double precision,extract(epoch from now())*1000)/1000),1
+    )
+    on conflict(task_id,work_date) do update set state='included',updated_at=excluded.updated_at,version=timegenie.task_day_plans.version+1;
+  end if;
   perform timegenie.apply_calendar_time_entry_pre_simplified_anchor(
     p_workspace_id,p_device_id,timegenie.calendar_stable_uuid('timer-transition-start:'||p_operation_id),
     'timer_transition_start',active_row->>'id',null,active_row,
@@ -3336,7 +3392,8 @@ begin
   result_value:=jsonb_build_object('accepted',true,'activeEntry',timegenie.cloud_incremental_entity_get(p_workspace_id,'time_entries',active_row->>'id')->'data',
     'previousEntry',case when previous_row is null or previous_row='null'::jsonb then null else timegenie.cloud_incremental_entity_get(p_workspace_id,'time_entries',previous_row->>'id')->'data' end,
     'task',case when task_row is null or task_row='null'::jsonb then null else timegenie.cloud_incremental_entity_get(p_workspace_id,'tasks',task_row->>'id')->'data' end,
-    'occurrence',case when occurrence_row is null or occurrence_row='null'::jsonb then null else timegenie.cloud_incremental_entity_get(p_workspace_id,'task_occurrences',(occurrence_row->>'task_id')||'|'||(occurrence_row->>'occurrence_date'))->'data' end);
+    'occurrence',case when occurrence_row is null or occurrence_row='null'::jsonb then null else timegenie.cloud_incremental_entity_get(p_workspace_id,'task_occurrences',(occurrence_row->>'task_id')||'|'||(occurrence_row->>'occurrence_date'))->'data' end,
+    'dayPlan',case when day_plan_row is null or day_plan_row='null'::jsonb then null else timegenie.cloud_incremental_entity_get(p_workspace_id,'task_day_plans',(day_plan_row->>'task_id')||'|'||(day_plan_row->>'work_date'))->'data' end);
   perform timegenie.record_processed_operation(p_workspace_id,p_operation_id,p_device_id,'timer_transition_apply',request_value,result_value);
   return result_value;
 end $$;

@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import {
   executionPanelAction,
+  executionPanelCurrentStatus,
   executionPanelPresentation,
   executionPanelRows,
+  executionPanelSourceTasks,
   mergeDraftRecord,
   reconcileDraftRecord,
 } from "../.tmp-execution-task-panel-test/executionTaskPanelCore.js";
@@ -63,5 +65,32 @@ const reconciled = reconcileDraftRecord({ c1: { value: 10 }, c2: { value: 20 }, 
 assert.deepEqual(reconciled, { c1: { value: 10 }, c2: { value: 20 } });
 const merged = mergeDraftRecord(reconciled, ["c1", "new"], (taskId) => ({ value: taskId === "new" ? 0 : 99 }));
 assert.deepEqual(merged, { c1: { value: 10 }, new: { value: 0 } });
+
+// 执行模式只取当前主体的未完成今日成员及其父级上下文；非执行模式不缩窄范围
+const planTasks = [
+  { id: "parent", subjectId: "a", title: "项目", status: "open", selectable: false, directMinutes: 0, totalMinutes: 0, todayContext: true },
+  { id: "today-open", subjectId: "a", parentId: "parent", title: "今日未完成", status: "open", selectable: true, directMinutes: 0, totalMinutes: 0, todayMember: true },
+  { id: "today-done", subjectId: "a", title: "今日已完成", status: "done", selectable: true, directMinutes: 10, totalMinutes: 10, todayMember: true },
+  { id: "not-planned", subjectId: "a", title: "长期待办", status: "open", selectable: true, directMinutes: 0, totalMinutes: 0 },
+  { id: "other-subject", subjectId: "b", title: "其他主体今日", status: "open", selectable: true, directMinutes: 0, totalMinutes: 0, todayMember: true },
+  { id: "cross-day-active", subjectId: "a", title: "跨日计时", status: "open", selectable: true, directMinutes: 0, totalMinutes: 0 },
+];
+assert.deepEqual(executionPanelSourceTasks(planTasks, "a", "execute").map((task) => task.id), ["parent", "today-open"]);
+assert.deepEqual(executionPanelSourceTasks(planTasks, "a", "entry-allocation").map((task) => task.id), planTasks.map((task) => task.id));
+assert.deepEqual(executionPanelSourceTasks(planTasks, "a", "unassigned-allocation").map((task) => task.id), planTasks.map((task) => task.id));
+
+const executeRows = executionPanelRows(executionPanelSourceTasks(planTasks, "a", "execute"), "a");
+assert.deepEqual(executeRows.map((row) => row.task.id), ["parent", "today-open"]);
+assert.equal(executeRows[0].hasChildren, true);
+
+const crossDayStatus = executionPanelCurrentStatus({
+  taskId: "cross-day-active",
+  taskTitle: "跨日计时",
+  entryState: "running",
+  candidateTaskIds: executeRows.map((row) => row.task.id),
+});
+assert.deepEqual(crossDayStatus, { title: "跨日计时", stateLabel: "计时中", outsideTodayPlan: true });
+assert.equal(executionPanelCurrentStatus({ taskId: "today-open", taskTitle: "今日未完成", entryState: "paused", candidateTaskIds: ["today-open"] })?.outsideTodayPlan, false);
+assert.equal(executionPanelCurrentStatus({ candidateTaskIds: [] }), undefined);
 
 console.log("execution task panel verification passed");

@@ -128,6 +128,15 @@ pub const PROTECTED_ENTITIES: &[ProtectedEntity] = &[
         log_fields: &["status", "occurred_at", "source_type"],
     },
     ProtectedEntity {
+        table: "task_day_plans",
+        sync_entity: Some("task_day_plans"),
+        group: ProtectionGroup::Planning,
+        stable_order: "task_id,work_date",
+        import_order: 65,
+        label_field: None,
+        log_fields: &["work_date", "state"],
+    },
+    ProtectedEntity {
         table: "task_daily_estimates",
         sync_entity: Some("task_daily_estimates"),
         group: ProtectionGroup::Planning,
@@ -1350,6 +1359,7 @@ fn delete_workspace_data(transaction: &Transaction<'_>, workspace_id: &str) -> R
         "actual_time_adjustments",
         "actual_adjustment_batches",
         "task_status_events",
+        "task_day_plans",
         "task_daily_estimates",
         "task_recurrence_rules",
         "task_occurrences",
@@ -1563,6 +1573,7 @@ fn validate_references(tables: &BTreeMap<String, Vec<Value>>) -> Result<(), Stri
     }
     for table in [
         "task_status_events",
+        "task_day_plans",
         "task_daily_estimates",
         "task_recurrence_rules",
         "task_occurrences",
@@ -1856,6 +1867,7 @@ mod tests {
         "app_settings",
         "tasks",
         "task_status_events",
+        "task_day_plans",
         "task_daily_estimates",
         "task_recurrence_rules",
         "task_occurrences",
@@ -2419,6 +2431,12 @@ mod tests {
             )
             .unwrap();
         let started_at = now_millis() - 60_000;
+        connection.execute(
+            "INSERT INTO task_day_plans(workspace_id,task_id,work_date,state,created_at,updated_at,version)
+             VALUES(?1,?2,'1999-01-02','included',?3,?3,4),
+                   (?1,?2,'1999-01-03','excluded',?3,?3,2)",
+            params![old_workspace_id, task_id, started_at],
+        ).unwrap();
         connection.execute("INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,default_task_id,label_snapshot,started_at,duration_seconds,created_at,updated_at,version,origin_unassigned_session_id) VALUES('running-entry',?1,'1999-01-02','work','timer','running',?2,'运行中',?3,0,?3,?3,1,'active-unassigned')",params![old_workspace_id,task_id,started_at]).unwrap();
         connection.execute("INSERT INTO time_segments(id,workspace_id,entry_id,sequence_no,started_at,duration_seconds) VALUES('open-segment',?1,'running-entry',1,?2,0)",params![old_workspace_id,started_at]).unwrap();
         connection.execute("INSERT INTO unassigned_sessions(id,workspace_id,work_date,state,threshold_seconds,duration_seconds,first_started_at,generated_entry_id,created_at,updated_at,version) VALUES('active-unassigned',?1,'1999-01-02','collecting',300,0,?2,'running-entry',?2,?2,1)",params![old_workspace_id,started_at]).unwrap();
@@ -2506,6 +2524,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(restored_subject_id, subject_id);
+        let restored_plans = connection
+            .prepare("SELECT work_date,state,version FROM task_day_plans WHERE task_id=?1 ORDER BY work_date")
+            .unwrap()
+            .query_map([&task_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            restored_plans,
+            vec![
+                ("1999-01-02".to_string(), "included".to_string(), 4),
+                ("1999-01-03".to_string(), "excluded".to_string(), 2),
+            ]
+        );
+        let estimate_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_daily_estimates WHERE task_id=?1",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(estimate_count, 0);
     }
 
     #[test]

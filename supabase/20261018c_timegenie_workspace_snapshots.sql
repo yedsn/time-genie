@@ -66,10 +66,10 @@ end $$;
 create or replace function timegenie.workspace_snapshot_entity_catalog()
 returns table(entity_name text,group_name text,sort_order integer) language sql immutable as $$ values
   ('subjects','planning',10),('subject_work_schedules','planning',20),('subject_work_schedule_segments','planning',30),('work_days','planning',40),
-  ('tasks','planning',50),('task_status_events','planning',60),('task_daily_estimates','planning',70),('task_recurrence_rules','planning',80),('task_occurrences','planning',90),
-  ('time_entries','time_tracking',100),('time_segments','time_tracking',110),('time_allocations','time_tracking',120),('unassigned_sessions','time_tracking',130),
-  ('unassigned_segments','time_tracking',140),('actual_time_adjustments','time_tracking',150),('report_templates','reports',160),('reports','reports',170),
-  ('report_tasks','reports',180),('app_settings','shared_settings',190),('integration_configs','shared_settings',200),('external_bindings','shared_settings',210);
+  ('tasks','planning',50),('task_status_events','planning',60),('task_day_plans','planning',70),('task_daily_estimates','planning',80),('task_recurrence_rules','planning',90),('task_occurrences','planning',100),
+  ('time_entries','time_tracking',110),('time_segments','time_tracking',120),('time_allocations','time_tracking',130),('unassigned_sessions','time_tracking',140),
+  ('unassigned_segments','time_tracking',150),('actual_time_adjustments','time_tracking',160),('report_templates','reports',170),('reports','reports',180),
+  ('report_tasks','reports',190),('app_settings','shared_settings',200),('integration_configs','shared_settings',210),('external_bindings','shared_settings',220);
 $$;
 
 create or replace function timegenie.workspace_snapshot_normalized_entity(p_snapshot jsonb,p_entity_name text) returns jsonb language sql immutable as $$
@@ -84,6 +84,7 @@ $$;
 
 create or replace function timegenie.workspace_snapshot_row_identity(p_entity_name text,p_row jsonb) returns text language sql immutable as $$
   select case p_entity_name when 'work_days' then p_row->>'work_date'
+    when 'task_day_plans' then concat_ws('|',p_row->>'task_id',p_row->>'work_date')
     when 'task_daily_estimates' then concat_ws('|',p_row->>'task_id',p_row->>'work_date')
     when 'task_occurrences' then concat_ws('|',p_row->>'task_id',p_row->>'occurrence_date')
     when 'report_tasks' then concat_ws('|',p_row->>'report_id',p_row->>'task_id')

@@ -2,7 +2,7 @@ create or replace function timegenie.timer_transition_apply(
   p_workspace_id uuid,p_device_id uuid,p_operation_id uuid,p_payload jsonb
 ) returns jsonb language plpgsql security definer set search_path=timegenie,extensions,pg_catalog
 as $$
-declare cached jsonb; request_value jsonb; previous_row jsonb; task_row jsonb; occurrence_row jsonb; active_row jsonb; reopen_base_version bigint;
+declare cached jsonb; request_value jsonb; previous_row jsonb; task_row jsonb; occurrence_row jsonb; day_plan_row jsonb; active_row jsonb; reopen_base_version bigint;
 declare remote_active timegenie.time_entries; remote_occurrence timegenie.task_occurrences; transition_at timestamptz; result_value jsonb;
 begin
   if not timegenie.is_workspace_owner(p_workspace_id) then raise exception 'AUTH_REQUIRED'; end if;
@@ -10,7 +10,7 @@ begin
   request_value:=jsonb_build_object('deviceId',p_device_id,'payload',coalesce(p_payload,'{}'::jsonb));
   cached:=timegenie.processed_operation_result(p_workspace_id,p_operation_id,'timer_transition_apply',request_value);
   if cached is not null then return cached; end if;
-  previous_row:=p_payload->'previous_entry'; task_row:=p_payload->'task'; occurrence_row:=p_payload->'occurrence'; active_row:=p_payload->'active_entry';
+  previous_row:=p_payload->'previous_entry'; task_row:=p_payload->'task'; occurrence_row:=p_payload->'occurrence'; day_plan_row:=p_payload->'day_plan'; active_row:=p_payload->'active_entry';
   reopen_base_version:=nullif(p_payload->>'reopen_task_base_version','')::bigint;
   if active_row is null or jsonb_typeof(active_row)<>'object' then raise exception 'VALIDATION_ERROR: missing active timer'; end if;
   transition_at:=to_timestamp((active_row->>'started_at')::double precision/1000);
@@ -65,6 +65,19 @@ begin
         to_timestamp(coalesce((occurrence_row->>'updated_at')::double precision,extract(epoch from now())*1000)/1000),1);
     end if;
   end if;
+  if day_plan_row is not null and day_plan_row<>'null'::jsonb then
+    if day_plan_row->>'task_id' is distinct from active_row->>'default_task_id'
+       or day_plan_row->>'work_date' is distinct from active_row->>'work_date'
+       or day_plan_row->>'state' is distinct from 'included'
+       or coalesce((day_plan_row->>'version')::bigint,0)<>1 then
+      raise exception 'VALIDATION_ERROR: timer day plan must be an included initial version';
+    end if;
+    insert into timegenie.task_day_plans(workspace_id,task_id,work_date,state,created_at,updated_at,version)
+    values(p_workspace_id,(day_plan_row->>'task_id')::uuid,(day_plan_row->>'work_date')::date,'included',
+      to_timestamp(coalesce((day_plan_row->>'created_at')::double precision,extract(epoch from now())*1000)/1000),
+      to_timestamp(coalesce((day_plan_row->>'updated_at')::double precision,extract(epoch from now())*1000)/1000),1)
+    on conflict(task_id,work_date) do update set state='included',updated_at=excluded.updated_at,version=timegenie.task_day_plans.version+1;
+  end if;
   perform timegenie.apply_calendar_time_entry_pre_simplified_anchor(
     p_workspace_id,p_device_id,timegenie.calendar_stable_uuid('timer-transition-start:'||p_operation_id),
     'timer_transition_start',active_row->>'id',null,active_row,
@@ -73,7 +86,8 @@ begin
   result_value:=jsonb_build_object('accepted',true,'activeEntry',timegenie.cloud_incremental_entity_get(p_workspace_id,'time_entries',active_row->>'id')->'data',
     'previousEntry',case when previous_row is null or previous_row='null'::jsonb then null else timegenie.cloud_incremental_entity_get(p_workspace_id,'time_entries',previous_row->>'id')->'data' end,
     'task',case when task_row is null or task_row='null'::jsonb then null else timegenie.cloud_incremental_entity_get(p_workspace_id,'tasks',task_row->>'id')->'data' end,
-    'occurrence',case when occurrence_row is null or occurrence_row='null'::jsonb then null else timegenie.cloud_incremental_entity_get(p_workspace_id,'task_occurrences',(occurrence_row->>'task_id')||'|'||(occurrence_row->>'occurrence_date'))->'data' end);
+    'occurrence',case when occurrence_row is null or occurrence_row='null'::jsonb then null else timegenie.cloud_incremental_entity_get(p_workspace_id,'task_occurrences',(occurrence_row->>'task_id')||'|'||(occurrence_row->>'occurrence_date'))->'data' end,
+    'dayPlan',case when day_plan_row is null or day_plan_row='null'::jsonb then null else timegenie.cloud_incremental_entity_get(p_workspace_id,'task_day_plans',(day_plan_row->>'task_id')||'|'||(day_plan_row->>'work_date'))->'data' end);
   perform timegenie.record_processed_operation(p_workspace_id,p_operation_id,p_device_id,'timer_transition_apply',request_value,result_value);
   return result_value;
 end $$;

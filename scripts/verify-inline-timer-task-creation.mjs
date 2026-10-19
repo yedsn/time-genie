@@ -26,7 +26,9 @@ assert.doesNotMatch(selector, /@blur=/);
 assert.match(selector, /@keydown.esc.stop="handleEscape"/);
 
 const timerBar = readFileSync("src-ui/src/components/GlobalTimerBar.vue", "utf8");
-assert.match(timerBar, /@submit="submitTimerIntent"/);
-assert.match(timerBar, /上一段计时可稍后确认归属/);
+// 合并执行清单后，空状态入口改为打开共享执行弹框；内联意图表单已迁移到弹框新建行。
+assert.match(timerBar, /开始执行事项/);
+assert.match(timerBar, /@click="emit\('open'\)"/);
+assert.doesNotMatch(timerBar, /submitTimerIntent/);
 
 console.log("Inline timer task creation verification passed.");

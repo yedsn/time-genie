@@ -21,6 +21,10 @@ pub struct TaskDto {
     pub estimate_minutes: Option<i64>,
     pub today_estimate_minutes: Option<i64>,
     pub daily_estimate_version: Option<i64>,
+    pub day_plan_state: Option<String>,
+    pub day_plan_version: Option<i64>,
+    pub today_member: bool,
+    pub today_context: bool,
     pub note: Option<String>,
     pub project_name: Option<String>,
     pub solution_name: Option<String>,
@@ -591,6 +595,18 @@ fn write_daily_estimate_in_transaction(
     dependency_operation_id: Option<&str>,
     ensure_occurrence: bool,
 ) -> Result<(), String> {
+    let day_plan_operation = crate::today_plans::ensure_included_in_transaction(
+        transaction,
+        workspace_id,
+        task_id,
+        work_date,
+        now,
+        cloud_state,
+    )?;
+    let dependency_operation_id = day_plan_operation
+        .operation_id
+        .as_deref()
+        .or(dependency_operation_id);
     let previous_occurrence =
         crate::recurring::occurrence_for_date(transaction, workspace_id, task_id, work_date)?;
     let occurrence = if estimate_minutes.is_some() && ensure_occurrence {
@@ -678,6 +694,45 @@ fn write_daily_estimate_in_transaction(
             &json!({"task_id":task_id,"work_date":work_date,"deleted":true,"created_at":created_at,"updated_at":now,"version":previous_version + 1}),
             None,
             occurrence_operation_id.as_deref(),
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn clear_daily_estimate_for_day_plan_in_transaction(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    task_id: &str,
+    work_date: &str,
+    now: i64,
+    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+    dependency_operation_id: Option<&str>,
+) -> Result<(), String> {
+    let previous: Option<(i64, i64)> = transaction
+        .query_row(
+            "SELECT version,created_at FROM task_daily_estimates WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3",
+            params![workspace_id, task_id, work_date],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM task_daily_estimates WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3",
+            params![workspace_id, task_id, work_date],
+        )
+        .map_err(|error| error.to_string())?;
+    if let (Some(state), Some((version, created_at))) = (cloud_state, previous) {
+        crate::cloud_sync::enqueue_payload_in_transaction(
+            transaction,
+            state,
+            "task_daily_estimate_clear",
+            "task_daily_estimate",
+            &format!("{task_id}|{work_date}"),
+            Some(version),
+            &json!({"task_id":task_id,"work_date":work_date,"deleted":true,"created_at":created_at,"updated_at":now,"version":version + 1}),
+            None,
+            dependency_operation_id,
         )?;
     }
     Ok(())
@@ -2213,6 +2268,10 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskDto> {
         estimate_minutes: row.get(6)?,
         today_estimate_minutes: None,
         daily_estimate_version: None,
+        day_plan_state: None,
+        day_plan_version: None,
+        today_member: false,
+        today_context: false,
         note: row.get(7)?,
         project_name: row.get(8)?,
         solution_name: row.get(9)?,
@@ -3414,20 +3473,25 @@ mod tests {
         .unwrap();
         let connection = database.open().unwrap();
         let rows = connection
-            .prepare("SELECT operation_type, entity_type, entity_id, base_version, payload_json FROM sync_outbox ORDER BY rowid")
+            .prepare("SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json, depends_on_operation_id FROM sync_outbox ORDER BY rowid")
             .unwrap()
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<i64>>(3)?, row.get::<_, String>(4)?)))
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<i64>>(4)?, row.get::<_, String>(5)?, row.get::<_, Option<String>>(6)?)))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0, "task_daily_estimate_set");
-        assert_eq!(rows[0].1, "task_daily_estimate");
-        assert_eq!(rows[0].2, format!("{task_id}|2026-10-05"));
-        assert_eq!(rows[0].3, None);
-        let cleared: Value = serde_json::from_str(&rows[1].4).unwrap();
-        assert_eq!(rows[1].0, "task_daily_estimate_clear");
-        assert_eq!(rows[1].3, Some(1));
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].1, "task_day_plan_set");
+        assert_eq!(rows[0].2, "task_day_plan");
+        assert_eq!(rows[0].3, format!("{task_id}|2026-10-05"));
+        assert_eq!(rows[0].4, None);
+        assert_eq!(rows[1].1, "task_daily_estimate_set");
+        assert_eq!(rows[1].2, "task_daily_estimate");
+        assert_eq!(rows[1].3, format!("{task_id}|2026-10-05"));
+        assert_eq!(rows[1].4, None);
+        assert_eq!(rows[1].6.as_deref(), Some(rows[0].0.as_str()));
+        let cleared: Value = serde_json::from_str(&rows[2].5).unwrap();
+        assert_eq!(rows[2].1, "task_daily_estimate_clear");
+        assert_eq!(rows[2].4, Some(1));
         assert_eq!(cleared["deleted"], true);
         assert_eq!(cleared["version"], 2);
     }
@@ -3508,10 +3572,17 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(operations.len(), 2);
-        assert_eq!(operations[0].1, "task_occurrence");
-        assert_eq!(operations[1].1, "task_daily_estimate");
-        assert_eq!(operations[1].2.as_deref(), Some(operations[0].0.as_str()));
+        assert!(matches!(operations.len(), 2 | 3));
+        assert_eq!(operations[0].1, "task_day_plan");
+        if operations.len() == 3 {
+            assert_eq!(operations[1].1, "task_occurrence");
+            assert_eq!(operations[1].2.as_deref(), Some(operations[0].0.as_str()));
+            assert_eq!(operations[2].1, "task_daily_estimate");
+            assert_eq!(operations[2].2.as_deref(), Some(operations[1].0.as_str()));
+        } else {
+            assert_eq!(operations[1].1, "task_daily_estimate");
+            assert_eq!(operations[1].2.as_deref(), Some(operations[0].0.as_str()));
+        }
     }
 
     #[test]
@@ -5607,13 +5678,16 @@ mod tests {
             .unwrap()
             .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)))
             .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
-        assert_eq!(operations.len(), 4);
+        // 每次重复预计写入都会先确保今日成员，再让预计依赖成员操作落地。
+        assert_eq!(operations.len(), 6);
         assert_eq!(operations[0].1, "task");
-        assert_eq!(operations[1].1, "task_daily_estimate");
-        assert_eq!(operations[1].2.as_deref(), Some(operations[0].0.as_str()));
-        assert_eq!(operations[2].1, "task");
-        assert_eq!(operations[3].1, "task_daily_estimate");
-        assert_eq!(operations[3].2.as_deref(), Some(operations[2].0.as_str()));
+        assert_eq!(operations[1].1, "task_day_plan");
+        assert_eq!(operations[2].1, "task_daily_estimate");
+        assert_eq!(operations[2].2.as_deref(), Some(operations[1].0.as_str()));
+        assert_eq!(operations[3].1, "task");
+        assert_eq!(operations[4].1, "task_day_plan");
+        assert_eq!(operations[5].1, "task_daily_estimate");
+        assert_eq!(operations[5].2.as_deref(), Some(operations[4].0.as_str()));
     }
 
     fn create_test_task(

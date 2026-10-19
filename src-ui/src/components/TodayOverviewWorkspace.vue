@@ -120,15 +120,20 @@ function timelineStateLabel(item: TodayWorkOverviewTimelineItemRecord) {
 }
 
 function timelineTypeLabel(item: TodayWorkOverviewTimelineItemRecord) {
-  if (item.itemType === "break") return "休息记录";
-  if (item.itemType === "unassigned") return "未归属记录";
-  if (item.itemType === "actual_adjustment") return "实际调整";
-  return "工作记录";
+  if (item.itemType === "break") return "休息";
+  if (item.itemType === "unassigned") return "未归属";
+  if (item.itemType === "actual_adjustment") return "调整";
+  return "工作";
 }
 
 function timelinePeriod(item: TodayWorkOverviewTimelineItemRecord) {
-  if (item.itemType === "actual_adjustment") return `${formatTime(item.startedAt)} 调整`;
+  if (item.itemType === "actual_adjustment") return formatTime(item.startedAt);
   return `${formatTime(item.startedAt)}–${item.endedAt ? formatTime(item.endedAt) : "现在"}`;
+}
+
+function timelineDurationLabel(item: TodayWorkOverviewTimelineItemRecord) {
+  if (item.itemType === "actual_adjustment") return formatSignedMinutes(item.minutes);
+  return formatMinutes(item.minutes);
 }
 
 function timelineStyle(item: TodayWorkOverviewTimelineItemRecord) {
@@ -199,25 +204,25 @@ function taskTitle(task: TodayWorkOverviewTaskRecord) {
       <section class="today-panel timeline-panel">
         <div class="today-panel-head"><h2>今日时间分布</h2><span>{{ timelineItems.length }} 段</span></div>
         <template v-if="timelineItems.length">
-          <div class="today-timeline-scale">
-            <span aria-hidden="true"></span>
-            <div class="timeline-scale-track"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
-          </div>
           <div class="today-timeline">
+            <div class="today-timeline-scale">
+              <span class="timeline-scale-label">时间记录</span>
+              <div class="timeline-scale-track"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
+            </div>
             <div v-for="item in timelineItems" :key="item.id" class="today-timeline-row" :class="timelineClass(item)">
               <div class="timeline-copy">
-                <div class="timeline-heading">
-                  <time>{{ timelinePeriod(item) }}</time>
+                <div class="timeline-title-row">
+                  <span class="timeline-kind">{{ timelineTypeLabel(item) }}</span>
                   <strong :title="timelineLabel(item)">{{ timelineLabel(item) }}</strong>
+                  <span class="timeline-state">{{ timelineStateLabel(item) }}</span>
                 </div>
-                <small class="timeline-meta" :class="{ 'with-subject': allSubjectScope }">
-                  <em class="timeline-state"><b>状态</b><em>{{ timelineStateLabel(item) }}</em></span>
-                  <span class="timeline-duration"><b>用时</b><em>{{ formatSignedMinutes(item.minutes) }}</em></span>
-                  <span class="timeline-type"><b>类型</b><em>{{ timelineTypeLabel(item) }}</em></span>
-                  <em v-if="allSubjectScope" class="timeline-subject" :title="item.subjectName || '全局'">{{ item.subjectName || '全局' }}</em>
+                <small class="timeline-meta">
+                  <time>{{ timelinePeriod(item) }}</time>
+                  <span class="timeline-duration">{{ timelineDurationLabel(item) }}</span>
+                  <span v-if="allSubjectScope" class="timeline-subject" :title="item.subjectName || '全局'">{{ item.subjectName || '全局' }}</span>
                 </small>
               </div>
-              <div class="timeline-track"><i :style="timelineStyle(item)"></i></div>
+              <div class="timeline-track" aria-hidden="true"><i :style="timelineStyle(item)"></i></div>
             </div>
           </div>
         </template>

@@ -62,8 +62,44 @@ async function main() {
       });
     });
     let completedRequests = 0;
+    let todayPlanRequests = 0;
 
-    window.__TASK_STATUS_TEST__ = { get completedRequests() { return completedRequests; } };
+    const dayPlanSnapshot = (subjectId) => {
+      todayPlanRequests += 1;
+      const members = active.filter((item) => item.subjectId === subjectId);
+      return {
+        subjectId,
+        workDate: "2026-10-14",
+        revision: 1,
+        tasks: members.map((item, index) => ({
+          subjectId: item.subjectId,
+          id: item.id,
+          title: item.title,
+          parentId: item.parentId,
+          pathLabel: item.pathLabel,
+          projectName: "工作",
+          status: item.status,
+          completedAt: item.completedAt,
+          completedToday: item.status === "done",
+          sortOrder: item.sortOrder + index,
+          version: item.version,
+          isLeaf: !members.some((candidate) => candidate.parentId === item.id),
+          selectable: item.selectable,
+          directMinutes: item.directMinutes,
+          totalMinutes: item.totalMinutes,
+          executionState: item.executionState,
+          todayEstimateMinutes: index === 0 ? 30 : undefined,
+          dayPlanVersion: 1,
+          todayMember: !members.some((candidate) => candidate.parentId === item.id),
+          todayContext: members.some((candidate) => candidate.parentId === item.id),
+        })),
+      };
+    };
+
+    window.__TASK_STATUS_TEST__ = {
+      get completedRequests() { return completedRequests; },
+      get todayPlanRequests() { return todayPlanRequests; },
+    };
     window.__TAURI_INTERNALS__ = {
       metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
       transformCallback(callback, once) {
@@ -96,6 +132,11 @@ async function main() {
             const start = (page - 1) * pageSize;
             return { tasks: rows.slice(start, start + pageSize), page, pageSize, total: rows.length, totalPages: Math.ceil(rows.length / pageSize) };
           }
+          case "task_day_plan_snapshot":
+            return dayPlanSnapshot(args.request.subjectId);
+          case "task_day_plan_set":
+          case "task_day_plan_batch_set":
+            return { changedCount: 1 };
           case "task_set_completed": {
             const { id, done } = args.request;
             const index = completed.findIndex((item) => item.id === id);
@@ -123,8 +164,9 @@ async function main() {
           case "time_entry_history_list":
             return { page: 1, pageSize: 7, totalDays: 0, totalPages: 0, groups: [], revision: 1 };
           case "timer_get_state":
-          case "unassigned_get_state":
             return null;
+          case "unassigned_get_state":
+            return { current: undefined };
           case "today_work_overview_get":
             return { scope: { subjectName: "全部主体", todayDate: "2026-10-14" }, summary: { actualMinutes: 0, estimatedMinutes: 0, completedCount: 0, activeCount: 0, notStartedCount: 0, unassignedMinutes: 0, completionRate: 0 }, days: [], timeline: [], tasks: [], revision: 1 };
           case "report_list":
@@ -152,9 +194,23 @@ async function main() {
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await page.locator(".nav-list button", { hasText: "待办" }).click();
   await page.locator(".plan-task-tabs").waitFor({ state: "visible" });
-  if (await page.evaluate(() => window.__TASK_STATUS_TEST__.completedRequests) !== 0) throw new Error("进入进行中标签时不应请求完成明细");
-  if ((await page.getByRole("tab", { name: /进行中/ }).getAttribute("aria-selected")) !== "true") throw new Error("待办默认标签不是进行中");
+  await page.locator(".pending-reminder-row").first().waitFor({ state: "visible" });
+  if (await page.evaluate(() => window.__TASK_STATUS_TEST__.completedRequests) !== 0) throw new Error("进入今日标签时不应请求完成明细");
+  if ((await page.getByRole("tab", { name: /今日/ }).getAttribute("aria-selected")) !== "true") throw new Error("待办默认标签不是今日");
+  if (await page.evaluate(() => window.__TASK_STATUS_TEST__.todayPlanRequests) < 1) throw new Error("进入待办页未加载今日计划快照");
+  if (await page.locator(".pending-reminder-row").count() !== 3) throw new Error("今日标签成员数量异常");
+  if (await page.locator(".pending-reminder-row .drag-handle").count() !== 3) throw new Error("今日标签应复用进行中的拖动排序入口");
+  if (await page.getByRole("button", { name: "分配今日预计" }).count() !== 1) throw new Error("今日标签缺少分配今日预计入口");
+  if (await page.getByRole("button", { name: "快速编辑计划" }).count() !== 1) throw new Error("今日标签缺少快速编辑计划入口");
+  if (await page.getByRole("button", { name: "新增今日事项" }).count() !== 0) throw new Error("今日标签不应保留独立新增按钮");
+  const todayContextRow = page.locator(".pending-reminder-row.context").first();
+  if (await todayContextRow.locator(".task-timer-action").count() !== 0) throw new Error("父级上下文不应可执行");
+
+  await page.getByRole("tab", { name: /进行中/ }).click();
+  await page.locator(".pending-reminder-row").first().waitFor({ state: "visible" });
   if (await page.locator(".pending-reminder-row").count() !== 3) throw new Error("进行中列表未保留重复事项当日完成轮次");
+  if (await page.getByRole("button", { name: "分配今日预计" }).count() !== 0) throw new Error("进行中标签不应显示分配今日预计入口");
+  if (await page.getByRole("button", { name: "快速编辑计划" }).count() !== 1) throw new Error("进行中标签缺少快速编辑计划入口");
 
   await page.getByRole("tab", { name: /已完成/ }).click();
   await page.locator(".completed-history-row").first().waitFor({ state: "visible" });
@@ -191,7 +247,9 @@ async function main() {
   if (await page.locator(".completed-history-row").count() !== 19) throw new Error("恢复后历史列表未刷新");
 
   await page.locator(".subject-select-button", { hasText: "个人" }).click();
-  if ((await page.getByRole("tab", { name: /进行中/ }).getAttribute("aria-selected")) !== "true") throw new Error("切换主体后未回到进行中");
+  await page.locator(".pending-reminder-row").first().waitFor({ state: "visible" });
+  if ((await page.getByRole("tab", { name: /今日/ }).getAttribute("aria-selected")) !== "true") throw new Error("切换主体后未回到今日");
+  if (await page.locator(".pending-reminder-row").count() !== 1) throw new Error("切换主体后今日计划未切换到对应主体");
   if (pageErrors.length) throw new Error("页面错误: " + pageErrors.join("；"));
 
   await browser.close();

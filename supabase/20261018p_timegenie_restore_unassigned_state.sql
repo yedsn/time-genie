@@ -31,6 +31,7 @@ begin
   delete from timegenie.unassigned_sessions where workspace_id=p_workspace_id;
   delete from timegenie.time_entries where workspace_id=p_workspace_id;
   delete from timegenie.task_status_events where workspace_id=p_workspace_id;
+  delete from timegenie.task_day_plans where workspace_id=p_workspace_id;
   delete from timegenie.task_daily_estimates where workspace_id=p_workspace_id;
   delete from timegenie.task_occurrences where workspace_id=p_workspace_id;
   delete from timegenie.task_recurrence_rules where workspace_id=p_workspace_id;

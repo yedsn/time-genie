@@ -43,6 +43,7 @@ use crate::time_tracking::{
     self, ManualEntryRequest, TimeEntryListRequest, TimerTransitionNewTaskRequest,
     TimerTransitionRequest,
 };
+use crate::today_plans::{self, TaskDayPlanSetRequest, TaskDayPlanSnapshotRequest};
 use crate::unassigned::{
     self, ResolveSessionRequest, ResolveWorkRequest, UnassignedAllocationInput,
 };
@@ -246,6 +247,49 @@ fn daily_estimate(database: &Database, task_id: &str, work_date: &str) -> Option
         .unwrap()
 }
 
+fn day_plan_state(database: &Database, task_id: &str, work_date: &str) -> Option<String> {
+    use rusqlite::OptionalExtension;
+    database
+        .open()
+        .unwrap()
+        .query_row(
+            "SELECT state FROM task_day_plans WHERE task_id = ?1 AND work_date = ?2",
+            rusqlite::params![task_id, work_date],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
+}
+
+fn is_today_member(database: &Database, subject_id: &str, work_date: &str, task_id: &str) -> bool {
+    today_plans::snapshot(
+        database,
+        TaskDayPlanSnapshotRequest {
+            subject_id: subject_id.to_string(),
+            work_date: work_date.to_string(),
+        },
+    )
+    .unwrap()
+    .tasks
+    .iter()
+    .any(|task| task.id == task_id && task.today_member)
+}
+
+fn running_entry_count(database: &Database, work_date: &str) -> usize {
+    time_tracking::list_time_entries(
+        database,
+        TimeEntryListRequest {
+            work_date: work_date.to_string(),
+            include_breaks: true,
+        },
+    )
+    .unwrap()
+    .entries
+    .iter()
+    .filter(|entry| entry.state == "running")
+    .count()
+}
+
 fn task_estimate(database: &Database, task_id: &str) -> Option<i64> {
     database
         .open()
@@ -435,6 +479,7 @@ struct PlanningSnapshotState {
     subjects: HashMap<String, Value>,
     tasks: HashMap<String, Value>,
     occurrences: HashMap<String, Value>,
+    day_plans: HashMap<String, Value>,
     daily_estimates: HashMap<String, Value>,
     recurrence_rules: HashMap<String, Vec<Value>>,
     time_entries: HashMap<String, Value>,
@@ -450,6 +495,7 @@ struct PlanningCloudState {
     subjects: HashMap<String, Value>,
     tasks: HashMap<String, Value>,
     occurrences: HashMap<String, Value>,
+    day_plans: HashMap<String, Value>,
     daily_estimates: HashMap<String, Value>,
     recurrence_rules: HashMap<String, Vec<Value>>,
     time_entries: HashMap<String, Value>,
@@ -483,6 +529,7 @@ impl Default for PlanningCloudState {
             subjects: HashMap::new(),
             tasks: HashMap::new(),
             occurrences: HashMap::new(),
+            day_plans: HashMap::new(),
             daily_estimates: HashMap::new(),
             recurrence_rules: HashMap::new(),
             time_entries: HashMap::new(),
@@ -516,6 +563,7 @@ struct PlanningCloudServer {
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     apply_patch_delay_millis: Arc<std::sync::atomic::AtomicU64>,
     apply_patch_started: Arc<std::sync::atomic::AtomicBool>,
+    fail_apply_once: Arc<std::sync::atomic::AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -528,10 +576,12 @@ impl PlanningCloudServer {
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let apply_patch_delay_millis = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let apply_patch_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fail_apply_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_state = Arc::clone(&state);
         let thread_shutdown = Arc::clone(&shutdown);
         let thread_apply_patch_delay_millis = Arc::clone(&apply_patch_delay_millis);
         let thread_apply_patch_started = Arc::clone(&apply_patch_started);
+        let thread_fail_apply_once = Arc::clone(&fail_apply_once);
         let handle = thread::spawn(move || {
             while !thread_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                 match listener.accept() {
@@ -542,6 +592,7 @@ impl PlanningCloudServer {
                             &thread_state,
                             &thread_apply_patch_delay_millis,
                             &thread_apply_patch_started,
+                            &thread_fail_apply_once,
                         );
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -557,6 +608,7 @@ impl PlanningCloudServer {
             shutdown,
             apply_patch_delay_millis,
             apply_patch_started,
+            fail_apply_once,
             handle: Some(handle),
         }
     }
@@ -627,6 +679,7 @@ impl PlanningCloudServer {
             subjects: state.subjects.clone(),
             tasks: state.tasks.clone(),
             occurrences: state.occurrences.clone(),
+            day_plans: state.day_plans.clone(),
             daily_estimates: state.daily_estimates.clone(),
             recurrence_rules: state.recurrence_rules.clone(),
             time_entries: state.time_entries.clone(),
@@ -667,6 +720,11 @@ impl PlanningCloudServer {
             delay.as_millis() as u64,
             std::sync::atomic::Ordering::Release,
         );
+    }
+
+    fn fail_next_apply_once(&self) {
+        self.fail_apply_once
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     fn wait_for_delayed_apply_patch(&self) {
@@ -789,6 +847,7 @@ fn planning_snapshot_record(state: &PlanningCloudState) -> PlanningSnapshotState
         subjects: state.subjects.clone(),
         tasks: state.tasks.clone(),
         occurrences: state.occurrences.clone(),
+        day_plans: state.day_plans.clone(),
         daily_estimates: state.daily_estimates.clone(),
         recurrence_rules: state.recurrence_rules.clone(),
         time_entries: state.time_entries.clone(),
@@ -803,6 +862,7 @@ fn restore_planning_snapshot(state: &mut PlanningCloudState, snapshot: &Planning
     state.subjects = snapshot.subjects.clone();
     state.tasks = snapshot.tasks.clone();
     state.occurrences = snapshot.occurrences.clone();
+    state.day_plans = snapshot.day_plans.clone();
     state.daily_estimates = snapshot.daily_estimates.clone();
     state.recurrence_rules = snapshot.recurrence_rules.clone();
     state.time_entries = snapshot.time_entries.clone();
@@ -838,6 +898,7 @@ fn planning_snapshot(state: &PlanningCloudState) -> Value {
         "subjects": state.subjects.values().cloned().collect::<Vec<_>>(),
         "tasks": state.tasks.values().cloned().collect::<Vec<_>>(),
         "task_status_events": [],
+        "task_day_plans": state.day_plans.values().cloned().collect::<Vec<_>>(),
         "task_daily_estimates": state.daily_estimates.values().cloned().collect::<Vec<_>>(),
         "task_recurrence_rules": state.recurrence_rules.values().flatten().cloned().collect::<Vec<_>>(),
         "task_occurrences": state.occurrences.values().cloned().collect::<Vec<_>>(),
@@ -857,6 +918,7 @@ fn planning_incremental_entity(
     let (entity_type, data) = match source_entity_type {
         "subjects" => ("subjects", state.subjects.get(entity_id).cloned()),
         "tasks" => ("tasks", state.tasks.get(entity_id).cloned()),
+        "task_day_plans" => ("task_day_plans", state.day_plans.get(entity_id).cloned()),
         "task_daily_estimates" => (
             "task_daily_estimates",
             state.daily_estimates.get(entity_id).cloned(),
@@ -948,6 +1010,7 @@ fn handle_planning_cloud_request(
     state: &Arc<Mutex<PlanningCloudState>>,
     apply_patch_delay_millis: &std::sync::atomic::AtomicU64,
     apply_patch_started: &std::sync::atomic::AtomicBool,
+    fail_apply_once: &std::sync::atomic::AtomicBool,
 ) {
     let (request_line, body) = read_http_request(&mut stream);
     let mut state = state.lock().unwrap();
@@ -1480,6 +1543,13 @@ fn handle_planning_cloud_request(
         );
     }
     apply_patch_started.store(true, std::sync::atomic::Ordering::Release);
+    if fail_apply_once.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        return write_http_json(
+            &mut stream,
+            503,
+            json!({ "message": "SERVICE_UNAVAILABLE: 测试注入的暂时离线" }),
+        );
+    }
     let delay = apply_patch_delay_millis.swap(0, std::sync::atomic::Ordering::AcqRel);
     if delay > 0 {
         thread::sleep(Duration::from_millis(delay));
@@ -1646,6 +1716,31 @@ fn handle_planning_cloud_request(
                 } else {
                     "delete"
                 },
+                version,
+            );
+        }
+        "task_day_plan" => {
+            let current = state
+                .day_plans
+                .get(entity_id)
+                .and_then(|row| row["version"].as_i64());
+            if current != base_version {
+                return write_http_json(
+                    &mut stream,
+                    409,
+                    json!({
+                        "message": format!("SYNC_CONFLICT: expected version {base_version:?}, current version {current:?}")
+                    }),
+                );
+            }
+            let version = payload["version"].as_i64().unwrap_or(1);
+            state.day_plans.insert(entity_id.to_string(), payload);
+            record_change(
+                &mut state,
+                workspace_id,
+                "task_day_plans",
+                entity_id,
+                "update",
                 version,
             );
         }
@@ -2118,7 +2213,33 @@ fn isolated_supabase_planning_two_device_flow() {
         cloud_sync::sync_status(&device_a)
             .unwrap()
             .pending_operations,
-        1
+        2
+    );
+    let estimate_outbox: Vec<(String, String, Option<String>)> = device_a
+        .open()
+        .unwrap()
+        .prepare(
+            "SELECT operation_type,entity_type,depends_on_operation_id
+             FROM sync_outbox ORDER BY created_at,rowid",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        estimate_outbox
+            .iter()
+            .map(|(operation, entity, _)| (operation.as_str(), entity.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("task_day_plan_set", "task_day_plan"),
+            ("task_daily_estimate_set", "task_daily_estimate"),
+        ]
+    );
+    assert!(
+        estimate_outbox[1].2.is_some(),
+        "预计操作应依赖先写入的今日成员操作"
     );
     assert_eq!(push_all(&device_a).conflicts, 0);
     cloud_sync::pull(
@@ -2131,6 +2252,11 @@ fn isolated_supabase_planning_two_device_flow() {
     .unwrap();
 
     assert_eq!(daily_estimate(&device_b, &task.id, &today_text), Some(45));
+    assert_eq!(
+        day_plan_state(&device_b, &task.id, &today_text).as_deref(),
+        Some("included"),
+        "设置今日预计应随成员操作同步到另一台设备"
+    );
     let (incremental_pulls, snapshots_after_incremental) = cloud.request_counts();
     assert!(incremental_pulls > 0);
     assert_eq!(
@@ -2473,6 +2599,299 @@ fn isolated_supabase_planning_two_device_flow() {
     )
     .unwrap();
     assert_eq!(cloud.request_counts().1, snapshots_before_reset + 1);
+}
+
+#[test]
+fn isolated_supabase_today_plan_two_device_flow() {
+    let directory = tempfile::tempdir().unwrap();
+    let device_a = Database::initialize_at(directory.path().join("today-plan-a.sqlite3")).unwrap();
+    let device_b = Database::initialize_at(directory.path().join("today-plan-b.sqlite3")).unwrap();
+    let cloud = PlanningCloudServer::start();
+    let workspace_id = Uuid::now_v7().to_string();
+    let state_a = configure_isolated_planning_device(
+        &device_a,
+        &cloud.base_url,
+        &workspace_id,
+        "today-plan-user-a",
+    );
+    let state_b = configure_isolated_planning_device(
+        &device_b,
+        &cloud.base_url,
+        &workspace_id,
+        "today-plan-user-b",
+    );
+    let subject = subjects::list_subjects(&device_a).unwrap().remove(0);
+    let today = chrono::Local::now().date_naive();
+    let today_text = today.format("%Y-%m-%d").to_string();
+    let tomorrow_text = today.succ_opt().unwrap().format("%Y-%m-%d").to_string();
+    let manual = create_task(&device_a, &subject.id, "无预计手动加入");
+    let recurring = create_task(&device_a, &subject.id, "重复事项移出");
+    let concurrent = create_task(&device_a, &subject.id, "并发成员修改");
+    let mixed = create_task(&device_a, &subject.id, "并发成员预计修改");
+    let retriable = create_task(&device_a, &subject.id, "离线重试事项");
+    for task in [&manual, &recurring, &concurrent, &mixed, &retriable] {
+        cloud.seed(&device_a, &subject, task);
+    }
+    cloud_sync::pull_snapshot(&device_b).unwrap();
+
+    // 无预计手动加入只同步成员，不产生当日预计。
+    let manual_plan = today_plans::set_day_plan_for_cloud_test(
+        &device_a,
+        TaskDayPlanSetRequest {
+            task_id: manual.id.clone(),
+            work_date: today_text.clone(),
+            state: "included".to_string(),
+            expected_version: None,
+        },
+        &state_a,
+    )
+    .unwrap();
+    assert_eq!(manual_plan.version, 1);
+    assert_eq!(
+        cloud_sync::sync_status(&device_a)
+            .unwrap()
+            .pending_operations,
+        1
+    );
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    pull_all(&device_b);
+    assert_eq!(
+        day_plan_state(&device_b, &manual.id, &today_text).as_deref(),
+        Some("included")
+    );
+    assert_eq!(daily_estimate(&device_b, &manual.id, &today_text), None);
+    assert!(is_today_member(
+        &device_b,
+        &subject.id,
+        &today_text,
+        &manual.id
+    ));
+
+    // 重复规则命中的事项默认属于今日，移出后仅当天生效。
+    recurring::save_rule_for_cloud_test(
+        &device_a,
+        RecurrenceSaveRequest {
+            task_id: recurring.id.clone(),
+            task_expected_version: task_version(&device_a, &recurring.id),
+            frequency: "daily".to_string(),
+            weekdays_mask: None,
+            effective_start: today_text.clone(),
+            rule_expected_version: None,
+        },
+        &state_a,
+    )
+    .unwrap();
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    cloud_sync::pull_snapshot(&device_b).unwrap();
+    assert!(
+        is_today_member(&device_b, &subject.id, &today_text, &recurring.id),
+        "重复规则命中的事项应默认为今日成员"
+    );
+    let recurring_excluded = today_plans::set_day_plan_for_cloud_test(
+        &device_a,
+        TaskDayPlanSetRequest {
+            task_id: recurring.id.clone(),
+            work_date: today_text.clone(),
+            state: "excluded".to_string(),
+            expected_version: None,
+        },
+        &state_a,
+    )
+    .unwrap();
+    assert_eq!(recurring_excluded.version, 1);
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    pull_all(&device_b);
+    assert_eq!(
+        day_plan_state(&device_b, &recurring.id, &today_text).as_deref(),
+        Some("excluded")
+    );
+    assert!(
+        !is_today_member(&device_b, &subject.id, &today_text, &recurring.id),
+        "显式移出应覆盖重复规则命中"
+    );
+    assert!(
+        is_today_member(&device_a, &subject.id, &tomorrow_text, &recurring.id),
+        "移出今日不应影响其他日期"
+    );
+
+    // 同一成员在两端并发修改：后写入的云端版本获胜，落败方选择使用云端后收敛。
+    let concurrent_first = today_plans::set_day_plan_for_cloud_test(
+        &device_a,
+        TaskDayPlanSetRequest {
+            task_id: concurrent.id.clone(),
+            work_date: today_text.clone(),
+            state: "included".to_string(),
+            expected_version: None,
+        },
+        &state_a,
+    )
+    .unwrap();
+    assert_eq!(concurrent_first.version, 1);
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    pull_all(&device_b);
+    assert_eq!(
+        day_plan_state(&device_b, &concurrent.id, &today_text).as_deref(),
+        Some("included")
+    );
+    let concurrent_second = today_plans::set_day_plan_for_cloud_test(
+        &device_a,
+        TaskDayPlanSetRequest {
+            task_id: concurrent.id.clone(),
+            work_date: today_text.clone(),
+            state: "excluded".to_string(),
+            expected_version: Some(concurrent_first.version),
+        },
+        &state_a,
+    )
+    .unwrap();
+    assert_eq!(concurrent_second.version, 2);
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    today_plans::set_day_plan_for_cloud_test(
+        &device_b,
+        TaskDayPlanSetRequest {
+            task_id: concurrent.id.clone(),
+            work_date: today_text.clone(),
+            state: "included".to_string(),
+            expected_version: Some(concurrent_first.version),
+        },
+        &state_b,
+    )
+    .unwrap();
+    let plan_push = push_all(&device_b);
+    assert_eq!(plan_push.conflicts, 1, "过期版本写入应产生今日计划冲突");
+    let plan_conflict = cloud_sync::list_conflicts(&device_b)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.entity_type == "task_day_plan")
+        .expect("今日计划冲突没有进入冲突列表");
+    cloud_sync::resolve_conflict(
+        &device_b,
+        CloudConflictResolveRequest {
+            operation_id: plan_conflict.operation_id,
+            strategy: "use_cloud".to_string(),
+        },
+    )
+    .unwrap();
+    cloud_sync::pull(
+        &device_b,
+        CloudSyncPullRequest {
+            after_change_seq: Some(0),
+            limit: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        day_plan_state(&device_b, &concurrent.id, &today_text).as_deref(),
+        Some("excluded")
+    );
+    assert!(!is_today_member(
+        &device_b,
+        &subject.id,
+        &today_text,
+        &concurrent.id
+    ));
+
+    // 一端设置预计并自动加入、另一端同时移出：冲突解决后 excluded 优先于预计兜底。
+    tasks::set_task_daily_estimate_for_cloud_test(
+        &device_a,
+        TaskDailyEstimateSetRequest {
+            task_id: mixed.id.clone(),
+            work_date: today_text.clone(),
+            estimate_minutes: Some(35),
+        },
+        &state_a,
+    )
+    .unwrap();
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    pull_all(&device_b);
+    today_plans::set_day_plan_for_cloud_test(
+        &device_b,
+        TaskDayPlanSetRequest {
+            task_id: mixed.id.clone(),
+            work_date: today_text.clone(),
+            state: "excluded".to_string(),
+            expected_version: Some(1),
+        },
+        &state_b,
+    )
+    .unwrap();
+    let mixed_push = push_all(&device_b);
+    assert_eq!((mixed_push.pending, mixed_push.conflicts), (0, 0));
+    pull_all(&device_a);
+    pull_all(&device_b);
+    for database in [&device_a, &device_b] {
+        assert_eq!(
+            daily_estimate(database, &mixed.id, &today_text),
+            None,
+            "移出今日应清除并同步清除当日预计"
+        );
+        assert_eq!(
+            day_plan_state(database, &mixed.id, &today_text).as_deref(),
+            Some("excluded")
+        );
+        assert!(!is_today_member(
+            database,
+            &subject.id,
+            &today_text,
+            &mixed.id
+        ));
+    }
+
+    // 暂时离线时成员操作保留在队列中，恢复后重试并最终收敛。
+    today_plans::set_day_plan_for_cloud_test(
+        &device_a,
+        TaskDayPlanSetRequest {
+            task_id: retriable.id.clone(),
+            work_date: today_text.clone(),
+            state: "included".to_string(),
+            expected_version: None,
+        },
+        &state_a,
+    )
+    .unwrap();
+    cloud.fail_next_apply_once();
+    let offline = cloud_sync::push_outbox(&device_a).unwrap();
+    assert_eq!(
+        (offline.pushed, offline.pending, offline.conflicts),
+        (0, 1, 0)
+    );
+    assert_eq!(day_plan_state(&device_b, &retriable.id, &today_text), None);
+    thread::sleep(Duration::from_millis(2_100));
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    pull_all(&device_b);
+    assert_eq!(
+        day_plan_state(&device_b, &retriable.id, &today_text).as_deref(),
+        Some("included")
+    );
+
+    // 开始计时不改变今日成员，且两端只保留一个进行中的计时。
+    cloud_sync::legacy_cloud_timer_start_local_first(
+        &device_b,
+        CloudTimerStartRequest {
+            task_id: Some(manual.id.clone()),
+            note: None,
+            operation_id: Uuid::now_v7().to_string(),
+        },
+    )
+    .unwrap();
+    let timer_push = push_all(&device_b);
+    assert_eq!((timer_push.pending, timer_push.conflicts), (0, 0));
+    pull_all(&device_a);
+    for database in [&device_a, &device_b] {
+        assert_eq!(running_entry_count(database, &today_text), 1);
+        assert!(is_today_member(
+            database,
+            &subject.id,
+            &today_text,
+            &manual.id
+        ));
+        assert!(!is_today_member(
+            database,
+            &subject.id,
+            &today_text,
+            &concurrent.id
+        ));
+    }
 }
 
 #[test]
