@@ -28,6 +28,7 @@ mod subject_work_schedules;
 mod subjects;
 mod supabase;
 mod tasks;
+mod today_plans;
 mod time_allocation_export;
 mod time_tracking;
 mod today_overview;
@@ -494,6 +495,9 @@ pub fn run() {
             tasks::task_list_completed_page,
             tasks::task_daily_estimate_set,
             tasks::task_daily_estimate_batch_set,
+            today_plans::task_day_plan_snapshot,
+            today_plans::task_day_plan_set,
+            today_plans::task_day_plan_batch_set,
             tasks::task_plan_batch_apply,
             tasks::task_recurring_estimate_set,
             tasks::task_create,

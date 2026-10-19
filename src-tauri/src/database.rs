@@ -110,6 +110,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "local_backup_history",
         sql: include_str!("../migrations/0019_local_backup_history.sql"),
     },
+    Migration {
+        version: 20,
+        name: "task_day_plans",
+        sql: include_str!("../migrations/0020_task_day_plans.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -532,6 +537,7 @@ mod tests {
         "work_days",
         "tasks",
         "task_daily_estimates",
+        "task_day_plans",
         "task_recurrence_rules",
         "task_occurrences",
         "task_status_events",
@@ -609,7 +615,7 @@ mod tests {
         let workspace_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migration_count, 19);
+        assert_eq!(migration_count, 20);
         assert_eq!(workspace_count, 1);
     }
 

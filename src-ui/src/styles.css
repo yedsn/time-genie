@@ -1146,13 +1146,16 @@ pre {
 .timeline-scale-track span:last-child { text-align: right; }
 .today-timeline-row { min-width: 0; min-height: 36px; display: grid; grid-template-columns: 230px minmax(0, 1fr); align-items: center; gap: 12px; }
 .timeline-copy { min-width: 0; display: grid; gap: 3px; }
-.timeline-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.timeline-copy strong { max-width: 190px; color: var(--text); font-size: 10px; font-weight: 650; }
-.timeline-meta { min-width: 0; display: grid; grid-template-columns: 92px 58px 52px; gap: 7px; font-size: 9px; font-variant-numeric: tabular-nums; }
-.timeline-meta.with-subject { grid-template-columns: 92px 58px 52px minmax(0, 1fr); }
-.timeline-meta em { min-width: 0; overflow: hidden; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
-.timeline-period { color: var(--text); }
-.timeline-duration { color: var(--accent); font-weight: 650; }
+.timeline-heading { min-width: 0; display: grid; grid-template-columns: 92px minmax(0, 1fr); align-items: baseline; gap: 7px; }
+.timeline-heading time { color: var(--text); font-size: 9px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.timeline-heading strong { min-width: 0; overflow: hidden; color: var(--text); font-size: 10px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.timeline-meta { min-width: 0; display: grid; grid-template-columns: 52px 69px minmax(76px, 1fr); gap: 7px; font-size: 9px; font-variant-numeric: tabular-nums; }
+.timeline-meta.with-subject { grid-template-columns: 52px 69px minmax(76px, 1fr) minmax(0, 1fr); }
+.timeline-meta > em, .timeline-meta span, .timeline-meta span em { min-width: 0; overflow: hidden; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+.timeline-meta span { display: inline-flex; gap: 3px; }
+.timeline-meta b { color: var(--text-soft); font-size: 8px; font-weight: 550; }
+.timeline-duration em { color: var(--accent); font-weight: 650; }
+.timeline-type em { color: var(--muted); }
 .timeline-state { color: var(--text-soft); font-weight: 600; }
 .timeline-subject { color: var(--muted); }
 .today-timeline-row.state-running .timeline-state,

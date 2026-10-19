@@ -119,6 +119,13 @@ function timelineStateLabel(item: TodayWorkOverviewTimelineItemRecord) {
   return item.itemType === "unassigned" ? "待处理" : "已结束";
 }
 
+function timelineTypeLabel(item: TodayWorkOverviewTimelineItemRecord) {
+  if (item.itemType === "break") return "休息记录";
+  if (item.itemType === "unassigned") return "未归属记录";
+  if (item.itemType === "actual_adjustment") return "实际调整";
+  return "工作记录";
+}
+
 function timelinePeriod(item: TodayWorkOverviewTimelineItemRecord) {
   if (item.itemType === "actual_adjustment") return `${formatTime(item.startedAt)} 调整`;
   return `${formatTime(item.startedAt)}–${item.endedAt ? formatTime(item.endedAt) : "现在"}`;
@@ -199,11 +206,14 @@ function taskTitle(task: TodayWorkOverviewTaskRecord) {
           <div class="today-timeline">
             <div v-for="item in timelineItems" :key="item.id" class="today-timeline-row" :class="timelineClass(item)">
               <div class="timeline-copy">
-                <strong :title="timelineLabel(item)">{{ timelineLabel(item) }}</strong>
+                <div class="timeline-heading">
+                  <time>{{ timelinePeriod(item) }}</time>
+                  <strong :title="timelineLabel(item)">{{ timelineLabel(item) }}</strong>
+                </div>
                 <small class="timeline-meta" :class="{ 'with-subject': allSubjectScope }">
-                  <em class="timeline-period">{{ timelinePeriod(item) }}</em>
-                  <em class="timeline-duration">{{ formatSignedMinutes(item.minutes) }}</em>
-                  <em class="timeline-state">{{ timelineStateLabel(item) }}</em>
+                  <em class="timeline-state"><b>状态</b><em>{{ timelineStateLabel(item) }}</em></span>
+                  <span class="timeline-duration"><b>用时</b><em>{{ formatSignedMinutes(item.minutes) }}</em></span>
+                  <span class="timeline-type"><b>类型</b><em>{{ timelineTypeLabel(item) }}</em></span>
                   <em v-if="allSubjectScope" class="timeline-subject" :title="item.subjectName || '全局'">{{ item.subjectName || '全局' }}</em>
                 </small>
               </div>
