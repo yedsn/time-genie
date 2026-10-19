@@ -644,7 +644,7 @@ export type TodayWorkOverviewDayRecord = {
 
 export type TodayWorkOverviewTimelineItemRecord = {
   id: string;
-  itemType: "work" | "break" | "unassigned" | string;
+  itemType: "work" | "break" | "unassigned" | "actual_adjustment" | string;
   taskId?: string;
   taskTitle: string;
   subjectId?: string;

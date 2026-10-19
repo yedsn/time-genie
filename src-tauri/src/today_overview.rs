@@ -150,6 +150,13 @@ pub fn get_today_work_overview(
         &start_text,
         &request.today_date,
     )?;
+    let daily_estimates = load_daily_estimates(
+        &connection,
+        &workspace_id,
+        subject.as_deref(),
+        &start_text,
+        &request.today_date,
+    )?;
     let unassigned_by_date =
         load_unassigned_minutes(&connection, &workspace_id, &start_text, &request.today_date)?;
     let mut days = date_range(start_date, today)
@@ -160,20 +167,26 @@ pub fn get_today_work_overview(
         })
         .collect::<Vec<_>>();
 
-    let today_tasks = today_task_ids(&tasks, &task_stats, &request.today_date);
+    let today_tasks = today_task_ids(&tasks, &task_stats, &daily_estimates, &request.today_date);
     let mut today_summary = TodayWorkOverviewSummaryDto::default();
     let mut overview_tasks = Vec::new();
 
     for day in &mut days {
         day.unassigned_minutes = unassigned_by_date.get(&day.date).copied().unwrap_or(0);
-        let day_task_ids = task_ids_for_day(&tasks, &task_stats, &day.date);
+        let day_task_ids = task_ids_for_day(&tasks, &task_stats, &daily_estimates, &day.date);
         for task_id in &day_task_ids {
             let Some(task) = tasks.iter().find(|item| &item.id == task_id) else {
                 continue;
             };
             let stats = task_stats.get(&(task.id.clone(), day.date.clone()));
             day.actual_minutes += stats.map(|item| item.actual_minutes).unwrap_or(0);
-            day.estimated_minutes += estimate_for_day(&connection, &workspace_id, task, &day.date)?;
+            if !has_open_child(&tasks, &task.id, &day.date) {
+                day.estimated_minutes += daily_estimates
+                    .get(&(task.id.clone(), day.date.clone()))
+                    .copied()
+                    .or(task.estimate_minutes)
+                    .unwrap_or(0);
+            }
             day.total_count += 1;
             if effective_status(task, &day.date) == "done" {
                 day.completed_count += 1;
@@ -187,11 +200,15 @@ pub fn get_today_work_overview(
         };
         let stats = task_stats.get(&(task.id.clone(), request.today_date.clone()));
         let actual_minutes = stats.map(|item| item.actual_minutes).unwrap_or(0);
-        let today_estimate =
-            daily_estimate(&connection, &workspace_id, &task.id, &request.today_date)?;
+        let today_estimate = daily_estimates
+            .get(&(task.id.clone(), request.today_date.clone()))
+            .copied();
         let status = task_execution_status(task, actual_minutes, &request.today_date);
         today_summary.actual_minutes += actual_minutes;
-        today_summary.estimated_minutes += today_estimate.or(task.estimate_minutes).unwrap_or(0);
+        if !has_open_child(&tasks, &task.id, &request.today_date) {
+            today_summary.estimated_minutes +=
+                today_estimate.or(task.estimate_minutes).unwrap_or(0);
+        }
         match status.as_str() {
             "done" => today_summary.completed_count += 1,
             "active" | "started" => today_summary.active_count += 1,
@@ -446,6 +463,38 @@ fn load_unassigned_minutes(
     Ok(result)
 }
 
+fn load_daily_estimates(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: Option<&str>,
+    start_date: &str,
+    end_date: &str,
+) -> Result<HashMap<(String, String), i64>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT de.task_id, de.work_date, de.estimate_minutes
+             FROM task_daily_estimates de
+             JOIN tasks t ON t.id = de.task_id
+             WHERE de.workspace_id = ?1 AND de.work_date BETWEEN ?2 AND ?3
+               AND t.deleted_at IS NULL AND (?4 IS NULL OR t.subject_id = ?4)",
+        )
+        .map_err(|error| error.to_string())?;
+    let estimates = statement
+        .query_map(
+            params![workspace_id, start_date, end_date, subject_id],
+            |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(estimates)
+}
+
 fn load_timeline(
     connection: &rusqlite::Connection,
     workspace_id: &str,
@@ -517,11 +566,68 @@ fn load_timeline(
             state: Some(state),
         });
     }
+    append_actual_adjustment_timeline(
+        connection,
+        workspace_id,
+        subject_id,
+        today_date,
+        &mut timeline,
+    )?;
     if subject_id.is_none() {
         append_unassigned_timeline(connection, workspace_id, today_date, &mut timeline)?;
     }
     timeline.sort_by_key(|item| (item.started_at, item.id.clone()));
     Ok(timeline)
+}
+
+fn append_actual_adjustment_timeline(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: Option<&str>,
+    today_date: &str,
+    timeline: &mut Vec<TodayWorkOverviewTimelineItemDto>,
+) -> Result<(), String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT aa.id, aa.task_id, t.title, t.subject_id, s.name, aa.created_at, aa.delta_minutes
+             FROM actual_time_adjustments aa
+             JOIN tasks t ON t.id = aa.task_id
+             JOIN subjects s ON s.id = t.subject_id
+             WHERE aa.workspace_id = ?1 AND aa.work_date = ?2 AND aa.deleted_at IS NULL
+               AND t.deleted_at IS NULL AND (?3 IS NULL OR t.subject_id = ?3)
+             ORDER BY aa.created_at, aa.id",
+        )
+        .map_err(|error| error.to_string())?;
+    for row in statement
+        .query_map(params![workspace_id, today_date, subject_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+    {
+        let (id, task_id, task_title, subject_id, subject_name, created_at, delta_minutes) =
+            row.map_err(|error| error.to_string())?;
+        timeline.push(TodayWorkOverviewTimelineItemDto {
+            id,
+            item_type: "actual_adjustment".to_string(),
+            task_id: Some(task_id),
+            task_title,
+            subject_id: Some(subject_id),
+            subject_name: Some(subject_name),
+            started_at: created_at,
+            ended_at: Some(created_at),
+            minutes: delta_minutes,
+            state: None,
+        });
+    }
+    Ok(())
 }
 
 fn append_unassigned_timeline(
@@ -581,19 +687,23 @@ fn append_unassigned_timeline(
 fn today_task_ids(
     tasks: &[TaskRow],
     stats: &HashMap<(String, String), TaskDayStats>,
+    daily_estimates: &HashMap<(String, String), i64>,
     today_date: &str,
 ) -> HashSet<String> {
-    task_ids_for_day(tasks, stats, today_date)
+    task_ids_for_day(tasks, stats, daily_estimates, today_date)
 }
 
 fn task_ids_for_day(
     tasks: &[TaskRow],
     stats: &HashMap<(String, String), TaskDayStats>,
+    daily_estimates: &HashMap<(String, String), i64>,
     date: &str,
 ) -> HashSet<String> {
     let mut ids = HashSet::new();
     for task in tasks {
-        if stats.contains_key(&(task.id.clone(), date.to_string())) {
+        if stats.contains_key(&(task.id.clone(), date.to_string()))
+            || daily_estimates.contains_key(&(task.id.clone(), date.to_string()))
+        {
             ids.insert(task.id.clone());
             continue;
         }
@@ -638,32 +748,11 @@ fn recurrence_matches(task: &TaskRow, date: &str) -> bool {
         .any(|rule| crate::recurring::rule_matches_date(rule, date).unwrap_or(false))
 }
 
-fn estimate_for_day(
-    connection: &rusqlite::Connection,
-    workspace_id: &str,
-    task: &TaskRow,
-    date: &str,
-) -> Result<i64, String> {
-    Ok(daily_estimate(connection, workspace_id, &task.id, date)?
-        .or(task.estimate_minutes)
-        .unwrap_or(0))
-}
-
-fn daily_estimate(
-    connection: &rusqlite::Connection,
-    workspace_id: &str,
-    task_id: &str,
-    date: &str,
-) -> Result<Option<i64>, String> {
-    connection
-        .query_row(
-            "SELECT estimate_minutes FROM task_daily_estimates
-             WHERE workspace_id = ?1 AND task_id = ?2 AND work_date = ?3",
-            params![workspace_id, task_id, date],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())
+fn has_open_child(tasks: &[TaskRow], task_id: &str, date: &str) -> bool {
+    tasks.iter().any(|candidate| {
+        candidate.parent_id.as_deref() == Some(task_id)
+            && effective_status(candidate, date) != "done"
+    })
 }
 
 fn build_children(tasks: &[TaskRow]) -> HashMap<Option<String>, Vec<String>> {
@@ -902,12 +991,20 @@ mod tests {
             },
         )
         .unwrap();
-        database.open().unwrap().execute(
+        let positive_adjustment_id = Uuid::now_v7().to_string();
+        let negative_adjustment_id = Uuid::now_v7().to_string();
+        let connection = database.open().unwrap();
+        connection.execute(
             "INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,batch_id,created_at,updated_at,version) VALUES(?1,?2,?3,?4,'2026-09-29',18,0,18,?5,1,1,1)",
-            params![Uuid::now_v7().to_string(), workspace_id, subject_id, task.id, Uuid::now_v7().to_string()],
+            params![positive_adjustment_id, workspace_id, subject_id, task.id, Uuid::now_v7().to_string()],
         ).unwrap();
+        connection.execute(
+            "INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,batch_id,created_at,updated_at,version) VALUES(?1,?2,?3,?4,'2026-09-29',-3,18,15,?5,2,2,1)",
+            params![negative_adjustment_id, workspace_id, subject_id, task.id, Uuid::now_v7().to_string()],
+        ).unwrap();
+        drop(connection);
         let overview = get_today_work_overview(&database, request(Some(subject_id))).unwrap();
-        assert_eq!(overview.summary.actual_minutes, 18);
+        assert_eq!(overview.summary.actual_minutes, 15);
         assert_eq!(
             overview
                 .tasks
@@ -915,7 +1012,105 @@ mod tests {
                 .find(|item| item.task_id == task.id)
                 .unwrap()
                 .actual_minutes,
-            18
+            15
+        );
+        let positive_adjustment = overview
+            .timeline
+            .iter()
+            .find(|item| item.id == positive_adjustment_id)
+            .unwrap();
+        assert_eq!(positive_adjustment.item_type, "actual_adjustment");
+        assert_eq!(
+            positive_adjustment.task_id.as_deref(),
+            Some(task.id.as_str())
+        );
+        assert_eq!(positive_adjustment.task_title, "仅调整事项");
+        assert_eq!(positive_adjustment.minutes, 18);
+        assert_eq!(positive_adjustment.started_at, 1);
+        assert_eq!(positive_adjustment.ended_at, Some(1));
+        let negative_adjustment = overview
+            .timeline
+            .iter()
+            .find(|item| item.id == negative_adjustment_id)
+            .unwrap();
+        assert_eq!(negative_adjustment.item_type, "actual_adjustment");
+        assert_eq!(negative_adjustment.minutes, -3);
+        assert_eq!(negative_adjustment.started_at, 2);
+    }
+
+    #[test]
+    fn overview_counts_explicit_today_estimates_for_future_leaf_tasks_without_group_duplicates() {
+        let (database, workspace_id, subject_id) = setup();
+        let group = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                parent_id: None,
+                title: "未来分组".into(),
+                planned_date: Some("2026-10-01".into()),
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let child = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                parent_id: Some(group.id.clone()),
+                title: "未来子事项".into(),
+                planned_date: Some("2026-10-01".into()),
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let standalone = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                parent_id: None,
+                title: "未来独立事项".into(),
+                planned_date: Some("2026-10-01".into()),
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        for (task_id, minutes) in [(&group.id, 600), (&child.id, 240), (&standalone.id, 150)] {
+            connection.execute(
+                "INSERT INTO task_daily_estimates(
+                    workspace_id, task_id, work_date, estimate_minutes, created_at, updated_at, version
+                 ) VALUES (?1, ?2, '2026-09-29', ?3, 1, 1, 1)",
+                params![workspace_id, task_id, minutes],
+            ).unwrap();
+        }
+        drop(connection);
+
+        let overview = get_today_work_overview(&database, request(Some(subject_id))).unwrap();
+
+        assert_eq!(overview.summary.estimated_minutes, 390);
+        assert!(overview.tasks.iter().any(|item| item.task_id == group.id));
+        assert!(overview.tasks.iter().any(|item| item.task_id == child.id));
+        assert!(overview
+            .tasks
+            .iter()
+            .any(|item| item.task_id == standalone.id));
+        assert_eq!(
+            overview
+                .days
+                .iter()
+                .find(|day| day.date == "2026-09-29")
+                .unwrap()
+                .estimated_minutes,
+            390
         );
     }
 

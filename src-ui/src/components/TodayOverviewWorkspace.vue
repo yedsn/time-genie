@@ -56,6 +56,10 @@ function formatMinutes(minutes: number) {
   return rest ? `${hours}h${rest}min` : `${hours}h`;
 }
 
+function formatSignedMinutes(minutes: number) {
+  return `${minutes < 0 ? "-" : "+"}${formatMinutes(Math.abs(minutes))}`;
+}
+
 function formatShortDate(date: string) {
   return date.slice(5).replace("-", "/");
 }
@@ -109,9 +113,15 @@ function timelineLabel(item: TodayWorkOverviewTimelineItemRecord) {
 }
 
 function timelineStateLabel(item: TodayWorkOverviewTimelineItemRecord) {
+  if (item.itemType === "actual_adjustment") return "实际调整";
   if (item.state === "running" || item.state === "collecting") return "进行中";
   if (item.state === "paused") return "已暂停";
   return item.itemType === "unassigned" ? "待处理" : "已结束";
+}
+
+function timelinePeriod(item: TodayWorkOverviewTimelineItemRecord) {
+  if (item.itemType === "actual_adjustment") return `${formatTime(item.startedAt)} 调整`;
+  return `${formatTime(item.startedAt)}–${item.endedAt ? formatTime(item.endedAt) : "现在"}`;
 }
 
 function timelineStyle(item: TodayWorkOverviewTimelineItemRecord) {
@@ -182,12 +192,20 @@ function taskTitle(task: TodayWorkOverviewTaskRecord) {
       <section class="today-panel timeline-panel">
         <div class="today-panel-head"><h2>今日时间分布</h2><span>{{ timelineItems.length }} 段</span></div>
         <template v-if="timelineItems.length">
-          <div class="today-timeline-scale"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
+          <div class="today-timeline-scale">
+            <span aria-hidden="true"></span>
+            <div class="timeline-scale-track"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
+          </div>
           <div class="today-timeline">
             <div v-for="item in timelineItems" :key="item.id" class="today-timeline-row" :class="timelineClass(item)">
               <div class="timeline-copy">
-                <strong>{{ timelineLabel(item) }}</strong>
-                <small>{{ formatTime(item.startedAt) }} - {{ item.endedAt ? formatTime(item.endedAt) : '现在' }} · {{ formatMinutes(item.minutes) }} · {{ timelineStateLabel(item) }}<template v-if="allSubjectScope && item.subjectName"> · {{ item.subjectName }}</template></small>
+                <strong :title="timelineLabel(item)">{{ timelineLabel(item) }}</strong>
+                <small class="timeline-meta" :class="{ 'with-subject': allSubjectScope }">
+                  <em class="timeline-period">{{ timelinePeriod(item) }}</em>
+                  <em class="timeline-duration">{{ formatSignedMinutes(item.minutes) }}</em>
+                  <em class="timeline-state">{{ timelineStateLabel(item) }}</em>
+                  <em v-if="allSubjectScope" class="timeline-subject" :title="item.subjectName || '全局'">{{ item.subjectName || '全局' }}</em>
+                </small>
               </div>
               <div class="timeline-track"><i :style="timelineStyle(item)"></i></div>
             </div>

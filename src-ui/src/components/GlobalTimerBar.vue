@@ -45,7 +45,7 @@ function errorText(error: unknown, fallback: string) {
         <span class="global-timer-indicator" aria-hidden="true"></span>
         <span class="global-timer-copy">
           <small>{{ store.runningEntry.state === 'paused' ? '已暂停' : '正在计时' }}</small>
-          <strong>{{ store.timeEntryLabel(store.runningEntry) }}</strong>
+          <strong :title="store.timeEntryLabel(store.runningEntry)">{{ store.timeEntryLabel(store.runningEntry) }}</strong>
         </span>
         <time>{{ clockText }}</time>
       </button>
