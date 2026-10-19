@@ -38,6 +38,7 @@ const timerFactConvergencePatchFile = path.join(repoRoot, "supabase", "20261018f
 const actualAdjustmentBatchPatchFile = path.join(repoRoot, "supabase", "20261015_timegenie_actual_adjustment_batch.sql");
 const namedTemplateBootstrapFixFile = path.join(repoRoot, "supabase", "20261016_timegenie_named_template_bootstrap_fix.sql");
 const timerTransitionPatchFile = path.join(repoRoot, "supabase", "20261016b_timegenie_timer_transition.sql");
+const timerRecurringOccurrencePatchFile = path.join(repoRoot, "supabase", "20261019_timegenie_timer_recurring_occurrence.sql");
 
 const binaryNames = process.platform === "win32"
   ? {
@@ -123,7 +124,23 @@ function verifyStaticSchemaInvariants() {
   const actualAdjustmentBatchPatch = fs.readFileSync(actualAdjustmentBatchPatchFile, "utf8");
   const namedTemplateBootstrapFix = fs.readFileSync(namedTemplateBootstrapFixFile, "utf8");
   const timerTransitionPatch = fs.readFileSync(timerTransitionPatchFile, "utf8");
+  const timerRecurringOccurrencePatch = fs.readFileSync(timerRecurringOccurrencePatchFile, "utf8");
   const schemaIntegrationTest = fs.readFileSync(schemaTestFile, "utf8");
+  for (const expected of [
+    "occurrence_row:=p_payload->'occurrence'",
+    "timer occurrence identity mismatch",
+    "'occurrence',case when occurrence_row is null",
+  ]) {
+    if (!timerRecurringOccurrencePatch.includes(expected)) {
+      throw new Error(`The recurring timer occurrence patch must include: ${expected}`);
+    }
+  }
+  if (!schema.includes("\\ir 20261019_timegenie_timer_recurring_occurrence.sql")) {
+    throw new Error("The source schema must apply the recurring timer occurrence patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261019_timegenie_timer_recurring_occurrence\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the recurring timer occurrence patch is idempotent.");
+  }
   for (const expected of [
     "automatic_snapshot_frequency",
     "schedule_slot_key",

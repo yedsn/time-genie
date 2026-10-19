@@ -1598,6 +1598,7 @@ async function handleCompletedTaskDelete(task: Task) {
           :subject-name="store.selectedSubject?.name ?? '待办'"
           :selected-id="store.selectedTaskId"
           :running-task-id="store.runningEntry?.defaultTask"
+          :running-task-minutes="store.runningEntry ? Math.max(0, Math.ceil(store.entryDurationSeconds(store.runningEntry) / 60)) : 0"
           :format-minutes="formatMinutes"
           :today-date="store.workspaceToday"
           :timezone="store.workspaceTimezone"

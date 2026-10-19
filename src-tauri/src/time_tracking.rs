@@ -547,13 +547,24 @@ fn transition_timer_with_cloud_operation(
         None
     };
 
-    crate::recurring::ensure_occurrence_if_recurring(
+    let previous_occurrence = crate::recurring::occurrence_for_date(
+        &transaction,
+        &workspace_id,
+        &target_task_id,
+        &work_date,
+    )?;
+    let occurrence = crate::recurring::ensure_occurrence_if_recurring(
         &transaction,
         &workspace_id,
         &target_task_id,
         &work_date,
         now,
     )?;
+    let created_occurrence = if previous_occurrence.is_none() {
+        occurrence
+    } else {
+        None
+    };
     crate::unassigned::clear_for_timer(&transaction, &workspace_id, now, cloud_state.is_some())?;
     let label = selectable_task_title(&transaction, &workspace_id, &target_task_id)?;
     let entry_id = Uuid::now_v7().to_string();
@@ -619,6 +630,19 @@ fn transition_timer_with_cloud_operation(
             "time_entry",
             Some(&entry_id),
         )?;
+        let occurrence = created_occurrence
+            .as_ref()
+            .map(|item| {
+                crate::cloud_sync::entity_payload_from_connection(
+                    &transaction,
+                    "task_occurrence",
+                    Some(&crate::recurring::occurrence_entity_id(
+                        &item.task_id,
+                        &item.occurrence_date,
+                    )),
+                )
+            })
+            .transpose()?;
         crate::cloud_sync::enqueue_payload_in_transaction(
             &transaction,
             state,
@@ -632,6 +656,7 @@ fn transition_timer_with_cloud_operation(
                 "task": task,
                 "reopen_task_base_version": request.reopen_completed_task_version,
                 "expected_parent_version": request.new_task.as_ref().and_then(|draft| draft.expected_parent_version),
+                "occurrence": occurrence,
                 "active_entry": next_entry,
             }),
             Some(&request.client_request_id),
@@ -3732,6 +3757,142 @@ mod tests {
                 "timer_transition".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn cloud_transition_only_carries_a_new_recurring_occurrence() {
+        let (database, _, ordinary_task_id) = setup();
+        let state = cloud_state(&database);
+        let ordinary_operation_id = Uuid::now_v7().to_string();
+        transition_timer_with_cloud_operation(
+            &database,
+            TimerTransitionRequest {
+                client_request_id: ordinary_operation_id.clone(),
+                current_entry_id: None,
+                current_entry_expected_version: None,
+                task_id: Some(ordinary_task_id),
+                reopen_completed_task_version: None,
+                new_task: None,
+                note: None,
+            },
+            Some(&state),
+        )
+        .unwrap();
+        let ordinary_payload: Value = serde_json::from_str(
+            &database
+                .open()
+                .unwrap()
+                .query_row(
+                    "SELECT payload_json FROM sync_outbox WHERE operation_id=?1",
+                    [&ordinary_operation_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(ordinary_payload["occurrence"].is_null());
+
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE time_entries SET state='ended',ended_at=updated_at,version=version+1 WHERE state='running'",
+                [],
+            )
+            .unwrap();
+        let recurring = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id(&database),
+                parent_id: None,
+                title: "云端周期计时目标".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        save_rule(
+            &database,
+            RecurrenceSaveRequest {
+                task_id: recurring.id.clone(),
+                task_expected_version: recurring.version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: test_work_date(),
+                rule_expected_version: None,
+            },
+        )
+        .unwrap();
+
+        let first_operation_id = Uuid::now_v7().to_string();
+        let first = transition_timer_with_cloud_operation(
+            &database,
+            TimerTransitionRequest {
+                client_request_id: first_operation_id.clone(),
+                current_entry_id: None,
+                current_entry_expected_version: None,
+                task_id: Some(recurring.id.clone()),
+                reopen_completed_task_version: None,
+                new_task: None,
+                note: None,
+            },
+            Some(&state),
+        )
+        .unwrap();
+        let first_payload: Value = serde_json::from_str(
+            &database
+                .open()
+                .unwrap()
+                .query_row(
+                    "SELECT payload_json FROM sync_outbox WHERE operation_id=?1",
+                    [&first_operation_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first_payload["occurrence"]["task_id"], recurring.id);
+        assert_eq!(first_payload["occurrence"]["version"], 1);
+
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE time_entries SET state='ended',ended_at=updated_at,version=version+1 WHERE id=?1",
+                [&first.active_entry.id],
+            )
+            .unwrap();
+        let second_operation_id = Uuid::now_v7().to_string();
+        transition_timer_with_cloud_operation(
+            &database,
+            TimerTransitionRequest {
+                client_request_id: second_operation_id.clone(),
+                current_entry_id: None,
+                current_entry_expected_version: None,
+                task_id: Some(recurring.id),
+                reopen_completed_task_version: None,
+                new_task: None,
+                note: None,
+            },
+            Some(&state),
+        )
+        .unwrap();
+        let second_payload: Value = serde_json::from_str(
+            &database
+                .open()
+                .unwrap()
+                .query_row(
+                    "SELECT payload_json FROM sync_outbox WHERE operation_id=?1",
+                    [&second_operation_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(second_payload["occurrence"].is_null());
     }
 
     fn seed_history_entry(

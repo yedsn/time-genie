@@ -1312,6 +1312,7 @@ fn handle_planning_cloud_request(
             .get("previous_entry")
             .filter(|value| !value.is_null());
         let task = payload.get("task").filter(|value| !value.is_null());
+        let occurrence = payload.get("occurrence").filter(|value| !value.is_null());
         let reopen_base_version = payload
             .get("reopen_task_base_version")
             .and_then(Value::as_i64);
@@ -1410,6 +1411,38 @@ fn handle_planning_cloud_request(
                 task["version"].as_i64().unwrap_or(1),
             );
         }
+        let authoritative_occurrence = if let Some(occurrence) = occurrence {
+            if occurrence["task_id"] != active["default_task_id"]
+                || occurrence["occurrence_date"] != active["work_date"]
+                || occurrence["version"].as_i64() != Some(1)
+                || occurrence["status"].as_str() != Some("open")
+            {
+                return write_http_json(
+                    &mut stream,
+                    409,
+                    json!({ "message": "VALIDATION_ERROR: timer occurrence identity mismatch" }),
+                );
+            }
+            let key = format!(
+                "{}|{}",
+                occurrence["task_id"].as_str().unwrap(),
+                occurrence["occurrence_date"].as_str().unwrap()
+            );
+            if !state.occurrences.contains_key(&key) {
+                state.occurrences.insert(key.clone(), occurrence.clone());
+                record_change(
+                    &mut state,
+                    workspace_id,
+                    "task_occurrences",
+                    &key,
+                    "insert",
+                    1,
+                );
+            }
+            state.occurrences.get(&key).cloned()
+        } else {
+            None
+        };
         state
             .time_entries
             .insert(active["id"].as_str().unwrap().to_string(), active.clone());
@@ -1424,7 +1457,12 @@ fn handle_planning_cloud_request(
         return write_http_json(
             &mut stream,
             200,
-            json!({ "accepted": true, "operationId": operation_id }),
+            json!({
+                "accepted": true,
+                "operationId": operation_id,
+                "activeEntry": active,
+                "occurrence": authoritative_occurrence
+            }),
         );
     }
     if !request_line.contains("/rest/v1/rpc/cloud_apply_patch") {
@@ -1620,7 +1658,13 @@ fn handle_planning_cloud_request(
                 return write_http_json(
                     &mut stream,
                     409,
-                    json!({ "message": "SYNC_CONFLICT: occurrence version changed" }),
+                    json!({
+                        "message": format!(
+                            "SYNC_CONFLICT: expected version {}, current version {}",
+                            base_version.map(|value| value.to_string()).unwrap_or_else(|| "<NULL>".to_string()),
+                            current.map(|value| value.to_string()).unwrap_or_else(|| "<NULL>".to_string())
+                        )
+                    }),
                 );
             }
             let version = payload["version"].as_i64().unwrap_or(1);
@@ -2959,6 +3003,198 @@ fn isolated_timer_transition_offline_retry_converges_two_devices() {
     assert!(local_entries
         .iter()
         .any(|entry| { entry.id == local_result.active_entry.id && entry.state == "running" }));
+}
+
+#[test]
+fn competing_first_recurring_timers_share_one_occurrence_and_follow_first_timer() {
+    let directory = tempfile::tempdir().unwrap();
+    let device_a =
+        Database::initialize_at(directory.path().join("recurring-transition-a.sqlite3")).unwrap();
+    let device_b =
+        Database::initialize_at(directory.path().join("recurring-transition-b.sqlite3")).unwrap();
+    let cloud = PlanningCloudServer::start();
+    let workspace_id = Uuid::now_v7().to_string();
+    let state_a = configure_isolated_planning_device(
+        &device_a,
+        &cloud.base_url,
+        &workspace_id,
+        "recurring-transition-user-a",
+    );
+    let state_b = configure_isolated_planning_device(
+        &device_b,
+        &cloud.base_url,
+        &workspace_id,
+        "recurring-transition-user-b",
+    );
+    let subject = subjects::list_subjects(&device_a).unwrap().remove(0);
+    let task = create_task(&device_a, &subject.id, "双设备首次周期计时");
+    cloud.seed(&device_a, &subject, &task);
+    cloud_sync::pull_snapshot(&device_b).unwrap();
+    let work_date = crate::work_calendar::current_work_date(
+        &device_a.open().unwrap(),
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .unwrap();
+    recurring::save_rule_for_cloud_test(
+        &device_a,
+        RecurrenceSaveRequest {
+            task_id: task.id.clone(),
+            task_expected_version: task.version,
+            frequency: "daily".to_string(),
+            weekdays_mask: None,
+            effective_start: work_date.clone(),
+            rule_expected_version: None,
+        },
+        &state_a,
+    )
+    .unwrap();
+    assert_eq!(push_all(&device_a).conflicts, 0);
+    pull_all(&device_b);
+
+    let timer_a = time_tracking::transition_timer_for_cloud_test(
+        &device_a,
+        TimerTransitionRequest {
+            client_request_id: Uuid::now_v7().to_string(),
+            current_entry_id: None,
+            current_entry_expected_version: None,
+            task_id: Some(task.id.clone()),
+            reopen_completed_task_version: None,
+            new_task: None,
+            note: None,
+        },
+        &state_a,
+    )
+    .unwrap();
+    let timer_b = time_tracking::transition_timer_for_cloud_test(
+        &device_b,
+        TimerTransitionRequest {
+            client_request_id: Uuid::now_v7().to_string(),
+            current_entry_id: None,
+            current_entry_expected_version: None,
+            task_id: Some(task.id.clone()),
+            reopen_completed_task_version: None,
+            new_task: None,
+            note: None,
+        },
+        &state_b,
+    )
+    .unwrap();
+    assert_ne!(timer_a.active_entry.id, timer_b.active_entry.id);
+
+    let first = push_all(&device_a);
+    let follower = push_all(&device_b);
+    assert_eq!((first.pending, first.conflicts), (0, 0));
+    assert_eq!((follower.pending, follower.conflicts), (0, 0));
+    assert!(cloud_sync::list_conflicts(&device_b).unwrap().is_empty());
+    pull_all(&device_b);
+
+    let entity_id = format!("{}|{}", task.id, work_date);
+    let remote = cloud.state.lock().unwrap();
+    assert_eq!(remote.occurrences.len(), 1);
+    assert_eq!(remote.occurrences[&entity_id]["version"], 1);
+    assert_eq!(
+        remote
+            .time_entries
+            .values()
+            .filter(|entry| matches!(entry["state"].as_str(), Some("running" | "paused")))
+            .count(),
+        1
+    );
+    drop(remote);
+    let local_occurrence: (String, i64) = device_b
+        .open()
+        .unwrap()
+        .query_row(
+            "SELECT status,version FROM task_occurrences WHERE task_id=?1 AND occurrence_date=?2",
+            rusqlite::params![task.id, work_date],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(local_occurrence, ("open".to_string(), 1));
+    let active_b = today_entries(&device_b)
+        .entries
+        .into_iter()
+        .find(|entry| matches!(entry.state.as_str(), "running" | "paused"))
+        .unwrap();
+    assert_eq!(active_b.id, timer_a.active_entry.id);
+    assert_ne!(active_b.id, timer_b.active_entry.id);
+}
+
+#[test]
+fn missing_remote_occurrence_conflict_auto_rebases_and_pushes_final_local_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::initialize_at(
+        directory
+            .path()
+            .join("missing-occurrence-auto-rebase.sqlite3"),
+    )
+    .unwrap();
+    let cloud = PlanningCloudServer::start();
+    let workspace_id = Uuid::now_v7().to_string();
+    configure_isolated_planning_device(
+        &database,
+        &cloud.base_url,
+        &workspace_id,
+        "missing-occurrence-user",
+    );
+    let subject = subjects::list_subjects(&database).unwrap().remove(0);
+    let task = create_task(&database, &subject.id, "历史缺失周期轮次");
+    cloud.seed(&database, &subject, &task);
+    let work_date = crate::work_calendar::current_work_date(
+        &database.open().unwrap(),
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .unwrap();
+    let entity_id = format!("{}|{}", task.id, work_date);
+    let operation_id = Uuid::now_v7().to_string();
+    let local_workspace_id: String = database
+        .open()
+        .unwrap()
+        .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    let device_id: String = database
+        .open()
+        .unwrap()
+        .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    database.open().unwrap().execute(
+        "INSERT INTO task_occurrences(workspace_id,task_id,occurrence_date,origin,status,completed_at,created_at,updated_at,version) VALUES(?1,?2,?3,'scheduled','open',NULL,1,3,3)",
+        rusqlite::params![local_workspace_id,task.id,work_date],
+    ).unwrap();
+    let payload = json!({
+        "task_id":task.id,
+        "occurrence_date":work_date,
+        "origin":"scheduled",
+        "status":"open",
+        "completed_at":null,
+        "created_at":1,
+        "updated_at":3,
+        "version":3
+    });
+    database.open().unwrap().execute(
+        "INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,base_version,payload_json,payload_version,state,attempt_count,created_at) VALUES(?1,?2,?3,'task_set_completed','task_occurrence',?4,2,?5,3,'pending',0,1)",
+        rusqlite::params![operation_id,workspace_id,device_id,entity_id,payload.to_string()],
+    ).unwrap();
+
+    let pushed = push_all(&database);
+    assert_eq!((pushed.pending, pushed.conflicts), (0, 0));
+    assert!(cloud_sync::list_conflicts(&database).unwrap().is_empty());
+    let remote = cloud.state.lock().unwrap();
+    assert_eq!(remote.occurrences[&entity_id]["status"], "open");
+    assert_eq!(remote.occurrences[&entity_id]["version"], 1);
+    drop(remote);
+    assert_eq!(
+        database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT version FROM task_occurrences WHERE task_id=?1 AND occurrence_date=?2",
+                rusqlite::params![task.id, work_date],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
 }
 
 #[test]

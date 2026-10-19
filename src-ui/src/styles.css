@@ -2016,6 +2016,12 @@ pre {
 }
 .reminder-meta .meta-picker:hover { color: var(--text); }
 .reminder-meta .meta-picker.filled { color: var(--accent); }
+.reminder-meta .actual-time-picker { display: inline-flex; align-items: center; gap: 4px; border: 0; padding: 0; color: #78877f; background: transparent; font: inherit; line-height: 1; white-space: nowrap; }
+.reminder-meta .actual-time-picker > svg { flex: none; }
+.reminder-meta button.actual-time-picker:hover { color: var(--text); }
+.reminder-meta .actual-time-picker.filled,
+.reminder-meta .actual-time-picker.active { color: var(--accent); }
+.reminder-meta .actual-time-picker.summary { cursor: default; }
 .meta-picker > input {
   position: absolute;
   inset: 0;
@@ -2120,7 +2126,9 @@ pre {
 .quick-estimate-row.child .quick-estimate-task { padding-left: 18px; }
 .quick-estimate-row.group { grid-template-columns: 1fr; min-height: 48px; background: var(--panel-2); }
 .quick-estimate-task { min-width: 0; min-height: 32px; display: flex; align-items: center; align-content: center; flex-wrap: wrap; gap: 5px; }
-.quick-estimate-task strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.quick-estimate-task-title { min-width: 0; max-width: 100%; display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+.quick-estimate-task-title > svg { flex: none; }
+.quick-estimate-task-title strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .quick-estimate-task small { flex-basis: 100%; color: var(--muted); }
 .quick-estimate-suggestion, .quick-estimate-clear { min-height: 32px; padding: 0 8px; border: 1px solid var(--line); border-radius: 7px; color: var(--text-soft); background: var(--panel-2); cursor: pointer; white-space: nowrap; }
 .quick-estimate-suggestion { grid-column: 2; color: var(--accent); }
@@ -2130,10 +2138,15 @@ pre {
 .quick-estimate-editor { display: grid; grid-template-columns: 30px 82px 30px minmax(72px, 1fr); align-items: center; gap: 6px; }
 .quick-estimate-editor > button { width: 30px; height: 32px; display: inline-flex; align-items: center; justify-content: center; padding: 0; border: 1px solid var(--line); border-radius: 7px; color: var(--text-soft); background: var(--panel-2); cursor: pointer; }
 .quick-estimate-editor > button:hover { border-color: var(--accent); color: var(--accent); }
+.quick-estimate-minute-dropdown { width: 100%; }
 .quick-estimate-editor label { height: 32px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: var(--panel-2); }
 .quick-estimate-editor label:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 16%, transparent); }
 .quick-estimate-editor input { width: 100%; min-width: 0; height: 30px; padding: 0 4px 0 8px; border: 0; color: var(--text); background: transparent; outline: none; }
 .quick-estimate-editor label > span { padding-right: 7px; font-size: 11px; }
+.quick-estimate-preset-popper .el-dropdown-menu { min-width: 148px; padding: 5px; background: var(--popover-bg); }
+.quick-estimate-preset-popper .el-dropdown-menu__item { min-height: 32px; border-radius: 5px; color: var(--text-soft); font-size: 11px; }
+.quick-estimate-preset-popper .el-dropdown-menu__item:not(.is-disabled):focus,
+.quick-estimate-preset-popper .el-dropdown-menu__item:not(.is-disabled):hover { color: var(--text); background: var(--surface-hover); }
 .quick-estimate-hours { overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .quick-estimate-input-wrap .error { overflow: hidden; color: #d66d3a; font-size: 11px; line-height: 15px; text-overflow: ellipsis; white-space: nowrap; }
 .quick-estimate-empty { padding: 32px 12px; text-align: center; color: var(--muted); }

@@ -90,6 +90,8 @@ end $$;
 \ir 20261018o_timegenie_optional_pre_restore_snapshot.sql
 \ir 20261018p_timegenie_restore_unassigned_state.sql
 \ir 20261018p_timegenie_restore_unassigned_state.sql
+\ir 20261019_timegenie_timer_recurring_occurrence.sql
+\ir 20261019_timegenie_timer_recurring_occurrence.sql
 
 do $$
 begin
@@ -2492,7 +2494,7 @@ end $$;
 -- transaction. Retries reuse the exact result and conflicts leave no partial
 -- task or timer behind.
 do $$
-declare start_millis bigint; switch_millis bigint; start_payload jsonb; switch_payload jsonb; stale_payload jsonb; first_result jsonb; retry_result jsonb;
+declare start_millis bigint; switch_millis bigint; start_payload jsonb; invalid_occurrence_payload jsonb; switch_payload jsonb; stale_payload jsonb; first_result jsonb; retry_result jsonb;
 begin
   start_millis:=floor(extract(epoch from clock_timestamp())*1000)::bigint;
   switch_millis:=start_millis+60000;
@@ -2502,7 +2504,11 @@ begin
       'title','原子转换一级事项','status','open','planned_date',timegenie.workspace_work_date('20000000-0000-0000-0000-000000000002',to_timestamp(start_millis::double precision/1000)),
       'planned_time',null,'estimate_minutes',null,'note',null,'project_name',null,'solution_name',null,'source_type','timer_quick_create',
       'source_ref',null,'sort_order',10,'completed_at',null,'created_at',start_millis,'updated_at',start_millis,'version',1,'deleted_at',null
-    ),'expected_parent_version',null,'active_entry',jsonb_build_object(
+    ),'expected_parent_version',null,'occurrence',jsonb_build_object(
+      'task_id','62100000-0000-0000-0000-000000000001',
+      'occurrence_date',timegenie.workspace_work_date('20000000-0000-0000-0000-000000000002',to_timestamp(start_millis::double precision/1000)),
+      'origin','scheduled','status','open','completed_at',null,'created_at',start_millis,'updated_at',start_millis,'version',1
+    ),'active_entry',jsonb_build_object(
       'id','74100000-0000-0000-0000-000000000011','work_date',timegenie.workspace_work_date('20000000-0000-0000-0000-000000000002',to_timestamp(start_millis::double precision/1000)),
       'kind','work','source_type','timer','state','running','default_task_id','62100000-0000-0000-0000-000000000001','label_snapshot','原子转换一级事项',
       'started_at',start_millis,'ended_at',null,'duration_seconds',0,'note',null,'created_at',start_millis,'updated_at',start_millis,'version',1,
@@ -2510,6 +2516,24 @@ begin
       'allocations','[]'::jsonb
     )
   );
+  invalid_occurrence_payload:=jsonb_set(
+    start_payload,
+    '{occurrence,task_id}',
+    to_jsonb('62100000-0000-0000-0000-000000000099'::text)
+  );
+  begin
+    perform timegenie.timer_transition_apply(
+      '20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000003','42000000-0000-0000-0000-000000000010',invalid_occurrence_payload
+    );
+    raise exception 'mismatched timer occurrence was accepted';
+  exception when others then if sqlerrm not like '%timer occurrence identity mismatch%' then raise; end if; end;
+  reset role;
+  if exists(select 1 from timegenie.tasks where id='62100000-0000-0000-0000-000000000001')
+     or exists(select 1 from timegenie.time_entries where id='74100000-0000-0000-0000-000000000011')
+     or exists(select 1 from timegenie.task_occurrences where task_id='62100000-0000-0000-0000-000000000001') then
+    raise exception 'invalid timer occurrence left partial remote data';
+  end if;
+  set role authenticated;
   first_result:=timegenie.timer_transition_apply(
     '20000000-0000-0000-0000-000000000002','30000000-0000-0000-0000-000000000003','42000000-0000-0000-0000-000000000011',start_payload
   );
@@ -2519,6 +2543,8 @@ begin
   reset role;
   if first_result is distinct from retry_result
      or (select count(*) from timegenie.tasks where id='62100000-0000-0000-0000-000000000001')<>1
+     or (select count(*) from timegenie.task_occurrences where task_id='62100000-0000-0000-0000-000000000001')<>1
+     or first_result->'occurrence'->>'status' is distinct from 'open'
      or (select count(*) from timegenie.time_entries where id='74100000-0000-0000-0000-000000000011' and state='running')<>1 then
     raise exception 'timer transition create/start retry was not idempotent';
   end if;

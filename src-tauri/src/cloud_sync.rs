@@ -3259,6 +3259,7 @@ fn push_outbox_locked(
     let state = require_cloud(database)?;
     recover_interrupted_sending_operations(database, &state.workspace_id)?;
     mark_historical_timer_recovery_candidates(database, &state.workspace_id)?;
+    recover_historical_missing_task_occurrences(database, &state.workspace_id)?;
     ensure_current_device_authorized(database).map_err(|error| {
         if error.starts_with("DEVICE_REVOKED:") {
             let _ = mark_auth_blocked(database, "device_revoked");
@@ -3279,6 +3280,7 @@ fn push_outbox_locked(
         }
 
         let mut batch_stopped = false;
+        let mut retry_rebased_occurrence = false;
         for (index, operation) in operations.iter().enumerate() {
             let response = if operation.entity_type == "unassigned_session"
                 && operation.operation_type == "unassigned_session_create"
@@ -3464,6 +3466,9 @@ fn push_outbox_locked(
                             adopt_shared_unassigned_rpc_result(database, session)?;
                         }
                     }
+                    if operation.entity_type == "timer_transition" {
+                        adopt_timer_transition_occurrence_result(database, operation, &value)?;
+                    }
                     if operation.entity_type == "report_template" {
                         adopt_authoritative_report_template_result(database, operation, &value)?;
                     }
@@ -3551,6 +3556,16 @@ fn push_outbox_locked(
                         "云端工作空间已回滚，本机旧世代修改尚未处理",
                     )?;
                     batch_stopped = true;
+                    break;
+                }
+                Err(error)
+                    if operation.entity_type == "task_occurrence"
+                        && is_missing_task_occurrence_conflict(&error) =>
+                {
+                    rebase_missing_task_occurrence(database, &state.workspace_id, operation)?;
+                    release_unprocessed_claims(database, &operations[index + 1..])?;
+                    batch_stopped = true;
+                    retry_rebased_occurrence = true;
                     break;
                 }
                 Err(error) if is_conflict_error(&error) => {
@@ -3657,6 +3672,9 @@ fn push_outbox_locked(
                     break;
                 }
             }
+        }
+        if retry_rebased_occurrence {
+            continue;
         }
         if batch_stopped || !drain_queue {
             break;
@@ -4204,6 +4222,73 @@ fn adopt_authoritative_report_template_result(
             entity_type: "report_templates".to_string(),
             source_entity_type: "report_templates".to_string(),
             entity_id: template_id.to_string(),
+            change_seq: 0,
+            deleted: false,
+            data: Some(authoritative.clone()),
+        },
+    )?;
+    transaction
+        .execute(
+            "UPDATE app_metadata SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='global_revision'",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn adopt_timer_transition_occurrence_result(
+    database: &Database,
+    operation: &OutboxOperation,
+    value: &Value,
+) -> Result<(), String> {
+    let Some(authoritative) = value.get("occurrence").filter(|row| !row.is_null()) else {
+        return Ok(());
+    };
+    let expected = operation
+        .payload
+        .get("occurrence")
+        .filter(|row| !row.is_null())
+        .ok_or_else(|| "SYNC_ERROR: 计时转换返回了未请求的周期轮次".to_string())?;
+    let task_id = authoritative
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "SYNC_ERROR: 权威周期轮次缺少事项 ID".to_string())?;
+    let occurrence_date = authoritative
+        .get("occurrence_date")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "SYNC_ERROR: 权威周期轮次缺少日期".to_string())?;
+    if expected.get("task_id").and_then(Value::as_str) != Some(task_id)
+        || expected.get("occurrence_date").and_then(Value::as_str) != Some(occurrence_date)
+    {
+        return Err("SYNC_ERROR: 权威周期轮次与计时转换目标不一致".to_string());
+    }
+    let incoming_version = authoritative
+        .get("version")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "SYNC_ERROR: 权威周期轮次缺少版本".to_string())?;
+    let local_workspace_id = local_cache_workspace_id(database)?;
+    let mut connection = database.open()?;
+    let current_version: Option<i64> = connection
+        .query_row(
+            "SELECT version FROM task_occurrences WHERE workspace_id=?1 AND task_id=?2 AND occurrence_date=?3",
+            params![local_workspace_id, task_id, occurrence_date],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if current_version.is_some_and(|version| version > incoming_version) {
+        return Ok(());
+    }
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    apply_incremental_entity(
+        &transaction,
+        &local_workspace_id,
+        &IncrementalEntity {
+            entity_type: "task_occurrences".to_string(),
+            source_entity_type: "task_occurrences".to_string(),
+            entity_id: format!("{task_id}|{occurrence_date}"),
             change_seq: 0,
             deleted: false,
             data: Some(authoritative.clone()),
@@ -4923,6 +5008,9 @@ fn resolve_loaded_conflict(
                 == "task_daily_estimate"
                 && latest_local.payload.get("deleted").and_then(Value::as_bool) == Some(true)
                 && cloud_version.is_none();
+            if cloud_version.is_none() && latest_local.entity_type == "task_occurrence" {
+                return rebase_missing_task_occurrence(database, &state.workspace_id, conflict);
+            }
             if cloud_version.is_none()
                 && conflict.base_version.is_some()
                 && !local_delete_of_absent_daily_estimate
@@ -4974,6 +5062,156 @@ fn resolve_loaded_conflict(
         _ => return validate_conflict_strategy(strategy),
     }
     Ok(())
+}
+
+fn is_missing_task_occurrence_conflict(error: &str) -> bool {
+    error.contains("SYNC_CONFLICT")
+        && error.contains("expected version")
+        && (error.contains("current version <NULL>") || error.contains("current version null"))
+}
+
+fn recover_historical_missing_task_occurrences(
+    database: &Database,
+    workspace_id: &str,
+) -> Result<usize, String> {
+    let connection = database.open()?;
+    let mut statement = connection
+        .prepare(
+            "SELECT operation_id,workspace_epoch,operation_type,entity_type,entity_id,base_version,payload_version,coalesced_count,depends_on_operation_id,payload_json
+             FROM sync_outbox
+             WHERE workspace_id=?1 AND entity_type='task_occurrence' AND state='conflict'
+               AND error_json LIKE '%SYNC_CONFLICT%' AND error_json LIKE '%expected version%'
+               AND (error_json LIKE '%current version <NULL>%' OR error_json LIKE '%current version null%')
+             ORDER BY created_at,rowid",
+        )
+        .map_err(|error| error.to_string())?;
+    let operations = statement
+        .query_map([workspace_id], |row| {
+            let payload: String = row.get(9)?;
+            Ok(OutboxOperation {
+                operation_id: row.get(0)?,
+                workspace_epoch: row.get(1)?,
+                operation_type: row.get(2)?,
+                entity_type: row.get(3)?,
+                entity_id: row.get(4)?,
+                base_version: row.get(5)?,
+                payload_version: row.get(6)?,
+                coalesced_count: row.get(7)?,
+                depends_on_operation_id: row.get(8)?,
+                payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    drop(connection);
+    let mut recovered = 0;
+    let mut entities = HashSet::new();
+    for operation in operations {
+        let Some(entity_id) = operation.entity_id.as_deref() else {
+            continue;
+        };
+        if entities.insert(entity_id.to_string()) {
+            rebase_missing_task_occurrence(database, workspace_id, &operation)?;
+            recovered += 1;
+        }
+    }
+    Ok(recovered)
+}
+
+fn rebase_missing_task_occurrence(
+    database: &Database,
+    workspace_id: &str,
+    operation: &OutboxOperation,
+) -> Result<(), String> {
+    if operation.entity_type != "task_occurrence" {
+        return Err("VALIDATION_ERROR: 只有周期事项轮次可以从缺失云端实体重基".to_string());
+    }
+    let entity_id = operation
+        .entity_id
+        .as_deref()
+        .ok_or_else(|| "VALIDATION_ERROR: 周期事项轮次同步缺少实体 ID".to_string())?;
+    let (task_id, occurrence_date) = entity_id
+        .split_once('|')
+        .ok_or_else(|| "VALIDATION_ERROR: 周期事项轮次同步实体 ID 无效".to_string())?;
+    let latest = latest_outbox_entity_operation(database, workspace_id, operation)?;
+    let mut payload = latest.payload.clone();
+    if payload.get("task_id").and_then(Value::as_str) != Some(task_id)
+        || payload.get("occurrence_date").and_then(Value::as_str) != Some(occurrence_date)
+    {
+        return Err("VALIDATION_ERROR: 周期事项轮次载荷身份不一致".to_string());
+    }
+    let now = now_millis();
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("version".to_string(), json!(1));
+        if object.contains_key("updated_at") {
+            object.insert("updated_at".to_string(), json!(now));
+        }
+    }
+    let recovery_context = json!({
+        "message": "云端缺少周期事项轮次，已将本机最终状态重基为创建",
+        "previousBaseVersion": operation.base_version,
+        "localFinalVersion": latest.payload_version
+    });
+    let mut connection = database.open()?;
+    let local_workspace_id = local_cache_workspace_id(database)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE sync_outbox SET operation_type=?1,base_version=NULL,payload_json=?2,payload_version=1,
+             coalesced_count=1,state='pending',attempt_count=0,last_attempt_at=NULL,error_json=NULL,
+             recovery_kind='rebased_missing_occurrence',recovery_context_json=?3,recovery_updated_at=?4
+             WHERE workspace_id=?5 AND operation_id=?6",
+            params![
+                latest.operation_type,
+                payload.to_string(),
+                recovery_context.to_string(),
+                now,
+                workspace_id,
+                operation.operation_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    let mut statement = transaction
+        .prepare(
+            "SELECT operation_id FROM sync_outbox WHERE workspace_id=?1 AND entity_type='task_occurrence'
+             AND entity_id=?2 AND operation_id<>?3
+             AND rowid>=(SELECT rowid FROM sync_outbox WHERE operation_id=?3)",
+        )
+        .map_err(|error| error.to_string())?;
+    let following = statement
+        .query_map(
+            params![workspace_id, entity_id, operation.operation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    for following_id in following {
+        transaction
+            .execute(
+                "UPDATE sync_outbox SET depends_on_operation_id=?1 WHERE depends_on_operation_id=?2",
+                params![operation.operation_id, following_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM sync_outbox WHERE operation_id=?1",
+                [&following_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction
+        .execute(
+            "UPDATE task_occurrences SET version=1,updated_at=?1 WHERE workspace_id=?2 AND task_id=?3 AND occurrence_date=?4",
+            params![now, local_workspace_id, task_id, occurrence_date],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 fn rollback_actual_adjustment_batch_local_images(
@@ -11277,6 +11515,166 @@ mod tests {
         assert_eq!(conflicts[0].entity_type, "task");
         assert_eq!(conflicts[0].base_version, Some(1));
         assert_eq!(conflicts[0].local_payload, json!({}));
+    }
+
+    #[test]
+    fn missing_task_occurrence_conflict_rebases_latest_local_state_as_create() {
+        let (_directory, database, _cloud_workspace_id, workspace_id, subject_id) =
+            cloud_database_for_incremental_test("missing-task-occurrence-rebase.sqlite3");
+        let task_id = Uuid::now_v7().to_string();
+        let entity_id = format!("{task_id}|2026-10-19");
+        let conflict_id = Uuid::now_v7().to_string();
+        let following_id = Uuid::now_v7().to_string();
+        let connection = database.open().unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        connection.execute(
+            "INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version) VALUES(?1,(SELECT id FROM workspaces LIMIT 1),?2,'周期冲突','open','manual',10,1,1,1)",
+            params![task_id, subject_id],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO task_occurrences(workspace_id,task_id,occurrence_date,origin,status,created_at,updated_at,version) VALUES((SELECT id FROM workspaces LIMIT 1),?1,'2026-10-19','scheduled','open',1,3,3)",
+            [&task_id],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,base_version,payload_json,payload_version,state,attempt_count,created_at,error_json) VALUES(?1,?2,?3,'task_set_completed','task_occurrence',?4,1,?5,2,'conflict',1,1,?6)",
+            params![
+                conflict_id,
+                workspace_id,
+                device_id,
+                entity_id,
+                json!({"task_id":task_id,"occurrence_date":"2026-10-19","origin":"scheduled","status":"done","completed_at":2,"created_at":1,"updated_at":2,"version":2}).to_string(),
+                json!({"message":"CLOUD_REQUEST_FAILED: SYNC_CONFLICT: expected version 1, current version <NULL>"}).to_string()
+            ],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,base_version,payload_json,payload_version,state,attempt_count,created_at) VALUES(?1,?2,?3,'task_set_completed','task_occurrence',?4,2,?5,3,'pending',0,2)",
+            params![
+                following_id,
+                workspace_id,
+                device_id,
+                entity_id,
+                json!({"task_id":task_id,"occurrence_date":"2026-10-19","origin":"scheduled","status":"open","completed_at":null,"created_at":1,"updated_at":3,"version":3}).to_string()
+            ],
+        ).unwrap();
+        drop(connection);
+
+        assert_eq!(
+            recover_historical_missing_task_occurrences(&database, &workspace_id).unwrap(),
+            1
+        );
+        let connection = database.open().unwrap();
+        let row: (Option<i64>, i64, String, String, i64) = connection.query_row(
+            "SELECT base_version,payload_version,payload_json,state,attempt_count FROM sync_outbox WHERE operation_id=?1",
+            [&conflict_id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).unwrap();
+        assert_eq!(row.0, None);
+        assert_eq!(row.1, 1);
+        assert_eq!(row.3, "pending");
+        assert_eq!(row.4, 0);
+        let payload: Value = serde_json::from_str(&row.2).unwrap();
+        assert_eq!(payload["status"], "open");
+        assert_eq!(payload["version"], 1);
+        assert_eq!(connection.query_row("SELECT version FROM task_occurrences WHERE task_id=?1 AND occurrence_date='2026-10-19'",[&task_id],|row|row.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_outbox WHERE operation_id=?1",
+                    [&following_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn missing_entity_rebase_remains_restricted_to_task_occurrences() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("missing-task-rebase-guard.sqlite3"))
+                .unwrap();
+        let workspace_id: String = database
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let operation = OutboxOperation {
+            operation_id: Uuid::now_v7().to_string(),
+            workspace_epoch: 1,
+            operation_type: "task_update".to_string(),
+            entity_type: "task".to_string(),
+            entity_id: Some(Uuid::now_v7().to_string()),
+            base_version: Some(2),
+            payload_version: Some(3),
+            coalesced_count: 1,
+            depends_on_operation_id: None,
+            payload: json!({"version":3}),
+        };
+        assert!(
+            rebase_missing_task_occurrence(&database, &workspace_id, &operation)
+                .unwrap_err()
+                .contains("只有周期事项轮次")
+        );
+    }
+
+    #[test]
+    fn timer_transition_adopts_authoritative_occurrence_without_reverting_newer_local_state() {
+        let (_directory, database, workspace_id, local_workspace_id, subject_id) =
+            cloud_database_for_incremental_test(
+                "timer-transition-authoritative-occurrence.sqlite3",
+            );
+        let task_id = Uuid::now_v7().to_string();
+        let connection = database.open().unwrap();
+        connection.execute(
+            "INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version) VALUES(?1,?2,?3,'周期权威轮次','open','manual',10,1,1,1)",
+            params![task_id,local_workspace_id,subject_id],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO task_occurrences(workspace_id,task_id,occurrence_date,origin,status,created_at,updated_at,version) VALUES(?1,?2,'2026-10-19','manual','open',1,1,1)",
+            params![local_workspace_id,task_id],
+        ).unwrap();
+        drop(connection);
+        let operation = OutboxOperation {
+            operation_id: Uuid::now_v7().to_string(),
+            workspace_epoch: 1,
+            operation_type: "timer_transition_apply".to_string(),
+            entity_type: "timer_transition".to_string(),
+            entity_id: Some(Uuid::now_v7().to_string()),
+            base_version: None,
+            payload_version: None,
+            coalesced_count: 1,
+            depends_on_operation_id: None,
+            payload: json!({
+                "occurrence": {"task_id":task_id,"occurrence_date":"2026-10-19","version":1}
+            }),
+        };
+        adopt_timer_transition_occurrence_result(&database,&operation,&json!({
+            "occurrence": {"task_id":task_id,"occurrence_date":"2026-10-19","origin":"scheduled","status":"open","completed_at":null,"created_at":10,"updated_at":10,"version":1}
+        })).unwrap();
+        let row: (String,i64,i64) = database.open().unwrap().query_row(
+            "SELECT origin,created_at,version FROM task_occurrences WHERE task_id=?1 AND occurrence_date='2026-10-19'",
+            [&task_id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(row, ("scheduled".to_string(), 1, 1));
+
+        database.open().unwrap().execute(
+            "UPDATE task_occurrences SET status='done',completed_at=20,updated_at=20,version=2 WHERE task_id=?1",
+            [&task_id],
+        ).unwrap();
+        adopt_timer_transition_occurrence_result(&database,&operation,&json!({
+            "occurrence": {"task_id":task_id,"occurrence_date":"2026-10-19","origin":"scheduled","status":"open","completed_at":null,"created_at":10,"updated_at":10,"version":1}
+        })).unwrap();
+        let row: (String,i64) = database.open().unwrap().query_row(
+            "SELECT status,version FROM task_occurrences WHERE task_id=?1 AND occurrence_date='2026-10-19'",
+            [&task_id],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(row, ("done".to_string(), 2));
+        assert!(!workspace_id.is_empty());
     }
 
     #[test]

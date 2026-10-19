@@ -9,7 +9,7 @@ import { isActivePlanTask } from "../services/completedTaskHistoryCore";
 import { contextMenuPosition, taskSubtreeIds, todayEstimateDraft } from "../services/planTaskInteractionCore";
 import { createTaskTreeSortable } from "../services/taskTreeSortable";
 import { getSubjectWorkSchedule, type SubjectWorkScheduleDay } from "../services/tauri";
-import type { ActualAdjustmentBatchRequest, ActualAdjustmentBatchResult, ActualAdjustmentSnapshotRecord } from "../services/tauri";
+import type { ActualAdjustmentBatchRequest, ActualAdjustmentBatchResult, ActualAdjustmentSnapshotRecord, ActualAdjustmentSnapshotTaskRecord } from "../services/tauri";
 import { adjustQuickEstimateMinutes, allocatedMinutes, capacitySummary, changedEstimateDrafts, formatQuickEstimateHours, parseQuickDuration, parseQuickEstimateMinutes, quickEstimateRows, scheduleCapacity, weekdayIndexForDate, type QuickEstimateDraft } from "../services/quickPlanEstimateCore";
 import { actualAdjustmentSummary, eligibleActualAdjustmentParents, parentTargetTotal, parseActualMinutes, type ActualAdjustmentDraft, type ActualAdjustmentNewTaskDraft } from "../services/quickActualAdjustmentCore";
 import { analyzeQuickPlanDraft, buildQuickPlanBatchRequest, createQuickPlanBaseline, createQuickPlanDraft, reconcileQuickPlanText, serializeQuickPlanLines, type QuickPlanBaselineTask, type QuickPlanBatchRequest, type QuickPlanDraftLine } from "../services/quickPlanTextCore";
@@ -20,6 +20,7 @@ const props = defineProps<{
   subjectName: string;
   selectedId: string;
   runningTaskId?: string;
+  runningTaskMinutes?: number;
   formatMinutes: (minutes: number) => string;
   todayDate: string;
   timezone: string;
@@ -78,6 +79,12 @@ const quickEstimateCapacityText = ref("");
 const quickEstimateCapacityMinutes = ref(0);
 const quickEstimateDoneFocus = ref(false);
 const quickEstimateConfirmingClose = ref(false);
+const quickEstimatePresets = [
+  { minutes: 30, label: "30 分钟" },
+  { minutes: 60, label: "1 小时" },
+  { minutes: 90, label: "1 小时 30 分钟" },
+  { minutes: 120, label: "2 小时" },
+];
 const actualAdjustmentOpen = ref(false);
 const actualAdjustmentSaving = ref(false);
 const actualAdjustmentSnapshot = ref<ActualAdjustmentSnapshotRecord>();
@@ -88,6 +95,14 @@ const actualAdjustmentNote = ref("");
 const actualAdjustmentClientRequestId = ref("");
 const actualAdjustmentBatchId = ref("");
 const actualAdjustmentSubjectId = ref("");
+const inlineActualTaskId = ref("");
+const inlineActualTask = ref<ActualAdjustmentSnapshotTaskRecord>();
+const inlineActualWorkDate = ref("");
+const inlineActualTargetText = ref("");
+const inlineActualNote = ref("");
+const inlineActualError = ref("");
+const inlineActualLoading = ref(false);
+const inlineActualSaving = ref(false);
 const quickPlanOpen = ref(false);
 const quickPlanSaving = ref(false);
 const quickPlanMode = ref<"edit" | "summary">("edit");
@@ -130,6 +145,9 @@ const quickEstimateDirty = computed(() => changedEstimateDrafts(quickEstimateDra
 const actualAdjustmentSummaryValue = computed(() => actualAdjustmentSummary(actualAdjustmentDrafts.value, actualAdjustmentNewTasks.value));
 const actualAdjustmentDirty = computed(() => actualAdjustmentSummaryValue.value.changes.length > 0 || actualAdjustmentNewTasks.value.length > 0);
 const actualAdjustmentParents = computed(() => eligibleActualAdjustmentParents(actualAdjustmentSnapshot.value?.tasks ?? []));
+const inlineActualBaseline = computed(() => inlineActualTask.value?.directMinutes ?? 0);
+const inlineActualParsed = computed(() => parseActualMinutes(inlineActualTargetText.value));
+const inlineActualDelta = computed(() => inlineActualParsed.value.ok ? inlineActualParsed.value.minutes - inlineActualBaseline.value : 0);
 const quickPlanSummary = computed(() => {
   const summary = analyzeQuickPlanDraft(quickPlanBaseline.value, quickPlanLines.value);
   return { ...summary, errors: [...quickPlanPasteErrors.value, ...summary.errors] };
@@ -823,6 +841,100 @@ function mountSortable() {
   treeSortable.mount();
 }
 
+async function openInlineActualAdjustment(task: Task) {
+  if (hasChildren(task.id) || inlineActualLoading.value) return;
+  inlineActualTaskId.value = task.id;
+  inlineActualTask.value = undefined;
+  inlineActualWorkDate.value = "";
+  inlineActualTargetText.value = String(task.directMinutes);
+  inlineActualNote.value = "";
+  inlineActualError.value = "";
+  inlineActualLoading.value = true;
+  try {
+    const snapshot = await props.loadActualSnapshot();
+    if (inlineActualTaskId.value !== task.id) return;
+    const snapshotTask = snapshot.tasks.find((item) => item.id === task.id && item.isLeaf);
+    if (!snapshotTask) throw new Error("事项今日用时已变化，请刷新后重试");
+    inlineActualTask.value = snapshotTask;
+    inlineActualWorkDate.value = snapshot.workDate;
+    inlineActualTargetText.value = String(snapshotTask.directMinutes);
+  } catch (error) {
+    inlineActualError.value = typeof error === "string" ? error : error instanceof Error ? error.message : "今日用时加载失败";
+  } finally {
+    inlineActualLoading.value = false;
+  }
+}
+
+function resetInlineActualAdjustment() {
+  inlineActualTaskId.value = "";
+  inlineActualTask.value = undefined;
+  inlineActualWorkDate.value = "";
+  inlineActualTargetText.value = "";
+  inlineActualNote.value = "";
+  inlineActualError.value = "";
+}
+
+function inlineActualDirty() {
+  return Boolean(inlineActualTask.value && inlineActualParsed.value.ok && inlineActualDelta.value !== 0);
+}
+
+async function setInlineActualAdjustmentVisible(task: Task, visible: boolean) {
+  if (visible) {
+    await openInlineActualAdjustment(task);
+    return;
+  }
+  if (inlineActualSaving.value || inlineActualLoading.value) return;
+  if (inlineActualDirty()) {
+    try {
+      await ElMessageBox.confirm("今日实际还有未保存修改，确定放弃吗？", "放弃今日实际调整", { confirmButtonText: "放弃", cancelButtonText: "继续编辑", type: "warning" });
+    } catch { return; }
+  }
+  resetInlineActualAdjustment();
+}
+
+async function saveInlineActualAdjustment() {
+  const task = inlineActualTask.value;
+  const parsed = inlineActualParsed.value;
+  if (!task || !inlineActualWorkDate.value || !parsed.ok || !task.adjustmentFingerprint) {
+    inlineActualError.value = parsed.ok ? "事项实际基线已失效，请刷新后重试" : parsed.message;
+    return;
+  }
+  if (parsed.minutes === task.directMinutes) {
+    resetInlineActualAdjustment();
+    return;
+  }
+  inlineActualSaving.value = true;
+  inlineActualError.value = "";
+  try {
+    await props.saveActualBatch({
+      subjectId: task.subjectId,
+      workDate: inlineActualWorkDate.value,
+      clientRequestId: crypto.randomUUID(),
+      batchId: crypto.randomUUID(),
+      note: inlineActualNote.value.trim() || undefined,
+      items: [{
+        taskId: task.id,
+        expectedTaskVersion: task.version,
+        baselineMinutes: task.directMinutes,
+        targetMinutes: parsed.minutes,
+        deltaMinutes: parsed.minutes - task.directMinutes,
+        adjustmentFingerprint: task.adjustmentFingerprint,
+      }],
+      newTasks: [],
+    });
+    resetInlineActualAdjustment();
+    ElMessage.success("今日实际已调整");
+  } catch (error) {
+    inlineActualError.value = typeof error === "string" ? error : error instanceof Error ? error.message : "今日实际调整失败";
+  } finally {
+    inlineActualSaving.value = false;
+  }
+}
+
+function activeSegmentMinutes(taskId: string) {
+  return props.runningTaskId === taskId ? Math.max(0, props.runningTaskMinutes ?? 0) : 0;
+}
+
 async function rebuildSortableList() {
   treeSortable.destroy();
   listRenderVersion.value += 1;
@@ -925,6 +1037,42 @@ onBeforeUnmount(() => {
                   @keydown.esc.prevent="closeTodayEstimateEditor"
                 />
               </span>
+              <span v-if="hasChildren(row.task.id)" class="meta-picker actual-time-picker summary" :class="{ filled: row.task.actual > 0 }" title="子事项今日用时合计">
+                <Clock3 :size="12" />今日用时 {{ formatMinutes(row.task.actual) }} · 合计
+              </span>
+              <el-popover
+                v-else
+                :visible="inlineActualTaskId === row.task.id"
+                placement="bottom"
+                :width="340"
+                trigger="click"
+                @update:visible="setInlineActualAdjustmentVisible(row.task, $event)"
+              >
+                <template #reference>
+                  <button class="meta-picker actual-time-picker" :class="{ filled: row.task.directMinutes > 0, active: runningTaskId === row.task.id }" type="button" :aria-label="`调整${row.task.title}今日用时`" @click.stop>
+                    <Clock3 :size="12" />今日用时 {{ formatMinutes(row.task.directMinutes) }}
+                  </button>
+                </template>
+                <div v-if="inlineActualTaskId === row.task.id" class="actual-adjustment-inline">
+                  <strong>{{ row.task.title }} · 今日实际</strong>
+                  <div v-if="inlineActualLoading" class="actual-adjustment-inline-summary"><span>正在加载最新用时…</span></div>
+                  <template v-else>
+                    <div class="actual-adjustment-inline-summary">
+                      <span>当前已确认 <b>{{ formatMinutes(inlineActualBaseline) }}</b></span>
+                      <span v-if="activeSegmentMinutes(row.task.id)">当前本段 <b>{{ formatMinutes(activeSegmentMinutes(row.task.id)) }}</b>，尚未计入</span>
+                    </div>
+                    <label><span>目标分钟</span><input v-model="inlineActualTargetText" inputmode="numeric" aria-label="目标实际分钟" /></label>
+                    <div class="actual-adjustment-inline-delta">本次变化 <strong>{{ inlineActualDelta >= 0 ? '+' : '' }}{{ inlineActualDelta }} 分钟</strong></div>
+                    <label><span>备注（可选）</span><input v-model="inlineActualNote" placeholder="例如：按工作记录核对" /></label>
+                    <small v-if="!inlineActualParsed.ok" class="error">{{ inlineActualParsed.message }}</small>
+                    <small v-else-if="inlineActualError" class="error">{{ inlineActualError }}</small>
+                    <div class="actual-adjustment-inline-actions">
+                      <button class="secondary-button compact" type="button" :disabled="inlineActualSaving" @click="resetInlineActualAdjustment">取消</button>
+                      <button class="primary-button compact" type="button" :disabled="inlineActualSaving || !inlineActualTask || !inlineActualParsed.ok || inlineActualDelta === 0" @click="saveInlineActualAdjustment">{{ inlineActualSaving ? '保存中...' : '确认调整' }}</button>
+                    </div>
+                  </template>
+                </div>
+              </el-popover>
               <el-tooltip
                 :content="row.task.note?.trim() || '暂无备注，点击添加'"
                 effect="dark"
@@ -1118,7 +1266,7 @@ onBeforeUnmount(() => {
       v-model="quickEstimateOpen"
       class="recurrence-dialog quick-estimate-dialog"
       title="分配今日预计"
-      width="min(820px, 95vw)"
+      width="min(960px, 95vw)"
       append-to-body
       align-center
       modal-class="quick-estimate-overlay"
@@ -1141,8 +1289,10 @@ onBeforeUnmount(() => {
       <div v-if="quickRows.length" class="quick-estimate-list">
         <div v-for="row in quickRows" :key="row.task.id" class="quick-estimate-row" :class="{ group: !row.allocatable, child: row.task.parentId }">
           <div class="quick-estimate-task">
-            <CornerDownRight v-if="row.task.parentId" :size="14" />
-            <strong>{{ row.task.title || '未命名事项' }}</strong>
+            <span class="quick-estimate-task-title" :title="row.task.title || '未命名事项'">
+              <CornerDownRight v-if="row.task.parentId" :size="14" />
+              <strong>{{ row.task.title || '未命名事项' }}</strong>
+            </span>
             <small v-if="!row.allocatable">作为分组，不参与合计<span v-if="row.task.todayEstimate"> · 已有 {{ formatMinutes(row.task.todayEstimate) }} 未修改</span></small>
             <small v-else-if="row.task.recurrence">重复事项 · 保存后同步更新每次预计</small>
           </div>
@@ -1151,19 +1301,26 @@ onBeforeUnmount(() => {
             <div class="quick-estimate-input-wrap">
               <div class="quick-estimate-editor">
                 <button type="button" title="减少 15 分钟" aria-label="减少 15 分钟" @click="adjustQuickMinutes(row.task.id, -15)"><Minus :size="14" /></button>
-                <label>
-                  <input
-                    :data-quick-estimate-input="row.task.id"
-                    :value="quickDraft(row.task.id)?.text"
-                    inputmode="numeric"
-                    placeholder="分钟"
-                    aria-label="预计分钟数"
-                    @input="inputQuickDraft(row.task.id, ($event.target as HTMLInputElement).value)"
-                    @blur="updateQuickDraft(row.task.id, ($event.target as HTMLInputElement).value)"
-                    @keydown="handleQuickKey($event, row.task.id)"
-                  />
-                  <span>分钟</span>
-                </label>
+                <el-dropdown class="quick-estimate-minute-dropdown" trigger="click" placement="bottom-start" popper-class="quick-estimate-preset-popper" @command="(minutes: number) => setQuickMinutes(row.task.id, minutes)">
+                  <label>
+                    <input
+                      :data-quick-estimate-input="row.task.id"
+                      :value="quickDraft(row.task.id)?.text"
+                      inputmode="numeric"
+                      placeholder="分钟"
+                      aria-label="预计分钟数，可点击选择常用时长"
+                      @input="inputQuickDraft(row.task.id, ($event.target as HTMLInputElement).value)"
+                      @blur="updateQuickDraft(row.task.id, ($event.target as HTMLInputElement).value)"
+                      @keydown="handleQuickKey($event, row.task.id)"
+                    />
+                    <span>分钟</span>
+                  </label>
+                  <template #dropdown>
+                    <el-dropdown-menu>
+                      <el-dropdown-item v-for="preset in quickEstimatePresets" :key="preset.minutes" :command="preset.minutes">{{ preset.label }}</el-dropdown-item>
+                    </el-dropdown-menu>
+                  </template>
+                </el-dropdown>
                 <button type="button" title="增加 15 分钟" aria-label="增加 15 分钟" @click="adjustQuickMinutes(row.task.id, 15)"><Plus :size="14" /></button>
                 <span class="quick-estimate-hours">{{ quickDraftHours(row.task.id) }}</span>
               </div>

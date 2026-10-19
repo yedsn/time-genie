@@ -3142,6 +3142,131 @@ mod tests {
         crate::supabase::storage_mode(database).unwrap()
     }
 
+    #[test]
+    fn recurring_timer_then_complete_and_reopen_keeps_a_continuous_occurrence_chain() {
+        let database = database();
+        let state = configure_cloud_mode(&database);
+        let recurring_task = create_leaf_task(&database, "周期计时链");
+        let other_task = create_leaf_task(&database, "普通切换目标");
+        let work_date =
+            crate::work_calendar::current_work_date(&database.open().unwrap(), now_millis())
+                .unwrap();
+        crate::recurring::save_rule(
+            &database,
+            crate::recurring::RecurrenceSaveRequest {
+                task_id: recurring_task.id.clone(),
+                task_expected_version: recurring_task.version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: work_date.clone(),
+                rule_expected_version: None,
+            },
+        )
+        .unwrap();
+        let recurring_task_version: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT version FROM tasks WHERE id=?1",
+                [&recurring_task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let first_transition_id = Uuid::now_v7().to_string();
+        let started = crate::time_tracking::transition_timer_for_cloud_test(
+            &database,
+            crate::time_tracking::TimerTransitionRequest {
+                client_request_id: first_transition_id.clone(),
+                current_entry_id: None,
+                current_entry_expected_version: None,
+                task_id: Some(recurring_task.id.clone()),
+                reopen_completed_task_version: None,
+                new_task: None,
+                note: None,
+            },
+            &state,
+        )
+        .unwrap();
+        set_task_status_with_cloud_operation(
+            &database,
+            TaskStatusRequest {
+                id: recurring_task.id.clone(),
+                expected_version: recurring_task_version,
+                done: true,
+                occurrence_date: Some(work_date.clone()),
+                occurrence_expected_version: Some(1),
+            },
+            Some((&state, "task_set_completed")),
+        )
+        .unwrap();
+        set_task_status_with_cloud_operation(
+            &database,
+            TaskStatusRequest {
+                id: recurring_task.id.clone(),
+                expected_version: recurring_task_version,
+                done: false,
+                occurrence_date: Some(work_date.clone()),
+                occurrence_expected_version: Some(2),
+            },
+            Some((&state, "task_set_completed")),
+        )
+        .unwrap();
+        let second_transition_id = Uuid::now_v7().to_string();
+        crate::time_tracking::transition_timer_for_cloud_test(
+            &database,
+            crate::time_tracking::TimerTransitionRequest {
+                client_request_id: second_transition_id.clone(),
+                current_entry_id: Some(started.active_entry.id),
+                current_entry_expected_version: Some(started.active_entry.version),
+                task_id: Some(other_task.id),
+                reopen_completed_task_version: None,
+                new_task: None,
+                note: None,
+            },
+            &state,
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let transition_payload: Value = serde_json::from_str(
+            &connection
+                .query_row(
+                    "SELECT payload_json FROM sync_outbox WHERE operation_id=?1",
+                    [&first_transition_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(transition_payload["occurrence"]["version"], 1);
+        let occurrence_rows = connection
+            .prepare(
+                "SELECT base_version,payload_version,payload_json FROM sync_outbox
+                 WHERE entity_type='task_occurrence' AND entity_id=?1 ORDER BY created_at,rowid",
+            )
+            .unwrap()
+            .query_map([format!("{}|{}", recurring_task.id, work_date)], |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(occurrence_rows.len(), 2);
+        assert_eq!(occurrence_rows[0].0, Some(1));
+        assert_eq!(occurrence_rows[0].1, Some(2));
+        assert_eq!(occurrence_rows[1].0, Some(2));
+        assert_eq!(occurrence_rows[1].1, Some(3));
+        assert_eq!(
+            serde_json::from_str::<Value>(&occurrence_rows[1].2).unwrap()["status"],
+            "open"
+        );
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM sync_outbox WHERE operation_id=?1 AND entity_type='timer_transition'",[second_transition_id],|row|row.get::<_,i64>(0)).unwrap(),1);
+    }
+
     fn create_leaf_task(database: &Database, title: &str) -> TaskDto {
         let subject_id: String = database
             .open()
