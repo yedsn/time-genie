@@ -51,11 +51,15 @@ impl ProtectionGroup {
 #[derive(Clone, Copy, Debug)]
 pub struct ProtectedEntity {
     pub table: &'static str,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub sync_entity: Option<&'static str>,
     pub group: ProtectionGroup,
     pub stable_order: &'static str,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub import_order: u16,
+    #[allow(dead_code)]
     pub label_field: Option<&'static str>,
+    #[allow(dead_code)]
     pub log_fields: &'static [&'static str],
 }
 
@@ -326,6 +330,7 @@ pub const PROTECTED_ENTITIES: &[ProtectedEntity] = &[
     },
 ];
 
+#[cfg(test)]
 pub const EXCLUDED_TABLES: &[&str] = &[
     "devices",
     "tracking_leases",

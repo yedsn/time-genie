@@ -756,7 +756,7 @@ function rowContextTask() {
 function openRowContextMenu(event: MouseEvent, task: PanelTask) {
   event.preventDefault();
   event.stopPropagation();
-  const position = contextMenuPosition(event.clientX, event.clientY, 190, 164, window.innerWidth, window.innerHeight);
+  const position = contextMenuPosition(event.clientX, event.clientY, 190, 198, window.innerWidth, window.innerHeight);
   rowContextTaskId.value = task.id;
   rowContextMenuLeft.value = position.left;
   rowContextMenuTop.value = position.top;
@@ -795,10 +795,11 @@ async function duplicateCurrentRow(task: PanelTask) {
   }
 }
 
-function runRowContextCommand(command: "create" | "before" | "after" | "duplicate") {
+function runRowContextCommand(command: "create" | "before" | "after" | "duplicate" | "delete") {
   const task = rowContextTask();
   if (!task) { closeRowContextMenu(); return; }
   if (command === "duplicate") { void duplicateCurrentRow(task); return; }
+  if (command === "delete") { closeRowContextMenu(); void deleteTask(task); return; }
   if (command === "create") { openNewTask(); return; }
   openRelativeTask(task, command);
 }
@@ -1036,7 +1037,7 @@ function formatTime(timestamp: number) {
       <div v-if="!panelInitialLoading && rows.length" ref="rowsRef" class="timer-task-sortable-rows" :class="{ moving }">
         <div v-for="row in rows" :key="row.task.id" class="timer-task-row" :data-timer-task-id="row.task.id" :data-depth="row.depth" :class="[{ parent: row.hasChildren, child: row.depth > 0, recent: recentTaskId === row.task.id, active: store.runningEntry?.defaultTask === row.task.id, completed: row.task.completedToday }, `state-${actionFor(row.task, row.hasChildren).mode}`]">
           <div class="timer-task-name-cell" :style="{ '--task-depth': String(row.depth) }">
-            <button class="timer-task-drag-handle" type="button" :disabled="Boolean(query.trim())" :class="{ active: rowContextTaskId === row.task.id }" :title="query.trim() ? '清空搜索后调整顺序和层级' : '拖动排序；右键可复制事项或插入行'" :aria-label="`${row.task.title}拖动排序，右键打开行菜单`" @pointerdown="prepareSubtreeDrag(row.task.id)" @contextmenu="openRowContextMenu($event, row.task)"><GripVertical :size="14" /></button>
+            <button class="timer-task-drag-handle" type="button" :disabled="Boolean(query.trim())" :class="{ active: rowContextTaskId === row.task.id }" :title="query.trim() ? '清空搜索后调整顺序和层级' : '拖动排序；右键可复制、插入或删除事项'" :aria-label="`${row.task.title}拖动排序，右键打开行菜单`" @pointerdown="prepareSubtreeDrag(row.task.id)" @contextmenu="openRowContextMenu($event, row.task)"><GripVertical :size="14" /></button>
             <CornerDownRight v-if="row.depth" :size="14" />
             <input data-timer-task-field="title" :value="draftFor(row.task).title" :aria-label="`事项名称：${row.task.title}`" @input="updateDraft(row.task, 'title', ($event.target as HTMLInputElement).value)" @blur="saveField(row.task, 'title')" @keydown.enter.prevent="($event.target as HTMLInputElement).blur()" />
             <small v-if="row.hasChildren">{{ row.task.parentId ? '子组' : '父事项' }}<template v-if="row.totalTodayEstimate > 0"> · {{ formatMinutes(row.totalTodayEstimate) }} 预计</template></small>
@@ -1109,6 +1110,8 @@ function formatTime(timestamp: number) {
       <span class="plan-task-context-divider"></span>
       <button type="button" role="menuitem" @click="runRowContextCommand('before')">在上方插入行</button>
       <button type="button" role="menuitem" @click="runRowContextCommand('after')">在下方插入行</button>
+      <span class="plan-task-context-divider"></span>
+      <button class="danger" type="button" role="menuitem" @click="runRowContextCommand('delete')">删除事项</button>
     </div>
   </Teleport>
 

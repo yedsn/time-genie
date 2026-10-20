@@ -827,7 +827,7 @@ function saveRecurrence() {
   recurrenceDialogOpen.value = false;
 }
 
-async function confirmDelete(task: Task) {
+async function confirmDelete(task: Task): Promise<boolean> {
   const childCount = props.tasks.filter((item) => item.parentId === task.id).length;
   const suffix = childCount ? `，并同时删除 ${childCount} 个子项` : "";
   try {
@@ -839,7 +839,10 @@ async function confirmDelete(task: Task) {
       confirmButtonClass: "work-confirm-danger"
     });
     emit("delete", task.id);
-  } catch {}
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function openTodayImport() {
@@ -972,7 +975,7 @@ function openTodayImportContextMenu(event: MouseEvent, task: Task) {
   event.preventDefault();
   event.stopPropagation();
   closeContextMenu();
-  const position = contextMenuPosition(event.clientX, event.clientY, 190, 130, window.innerWidth, window.innerHeight);
+  const position = contextMenuPosition(event.clientX, event.clientY, 190, 178, window.innerWidth, window.innerHeight);
   todayImportContextTaskId.value = task.id;
   todayImportContextMenuLeft.value = position.left;
   todayImportContextMenuTop.value = position.top;
@@ -998,10 +1001,26 @@ async function duplicateTodayImportRow(task: Task) {
   }
 }
 
-function runTodayImportContextCommand(command: "before" | "after" | "duplicate") {
+async function deleteTodayImportRow(task: Task) {
+  closeTodayImportContextMenu();
+  if (!await confirmDelete(task)) return;
+  todayImportSelection.value = todayImportSelection.value.filter((taskId) => taskId !== task.id);
+  const estimates = { ...todayImportEstimates.value };
+  const titleErrors = { ...todayImportTitleErrors.value };
+  const taskTitles = { ...todayImportTaskTitles.value };
+  delete estimates[task.id];
+  delete titleErrors[task.id];
+  delete taskTitles[task.id];
+  todayImportEstimates.value = estimates;
+  todayImportTitleErrors.value = titleErrors;
+  todayImportTaskTitles.value = taskTitles;
+}
+
+function runTodayImportContextCommand(command: "before" | "after" | "duplicate" | "delete") {
   const task = todayImportContextTask();
   if (!task) { closeTodayImportContextMenu(); return; }
   if (command === "duplicate") { void duplicateTodayImportRow(task); return; }
+  if (command === "delete") { void deleteTodayImportRow(task); return; }
   void openTodayImportRelativeCreate(task, command);
 }
 
@@ -1490,7 +1509,7 @@ onBeforeUnmount(() => {
         <div class="today-import-list-head" aria-hidden="true"><span>事项</span><span>今日实际</span><span>今日预计</span><span>操作</span></div>
         <div ref="todayImportRowsRef" class="today-import-sortable-rows" :class="{ moving: todayImportMoving }">
         <div v-for="row in todayImportRows" :key="row.task.id" class="today-import-row" :data-today-import-task-id="row.task.id" :data-depth="row.depth" :class="{ group: !row.allocatable, child: row.depth > 0, selected: isTodayImportSelected(row.task.id) }" :style="{ '--task-depth': String(row.depth) }">
-          <button class="today-import-drag-handle" type="button" :disabled="Boolean(todayImportQuery.trim())" :class="{ active: todayImportContextTaskId === row.task.id }" :title="todayImportQuery.trim() ? '清空搜索后调整顺序和层级' : '拖动排序；右键可复制事项或插入行'" :aria-label="`${row.task.title}拖动排序，右键打开行菜单`" @pointerdown="todayImportSortable.prepareSubtree(row.task.id)" @contextmenu="openTodayImportContextMenu($event, row.task)"><GripVertical :size="14" /></button>
+          <button class="today-import-drag-handle" type="button" :disabled="Boolean(todayImportQuery.trim())" :class="{ active: todayImportContextTaskId === row.task.id }" :title="todayImportQuery.trim() ? '清空搜索后调整顺序和层级' : '拖动排序；右键可复制、插入或删除事项'" :aria-label="`${row.task.title}拖动排序，右键打开行菜单`" @pointerdown="todayImportSortable.prepareSubtree(row.task.id)" @contextmenu="openTodayImportContextMenu($event, row.task)"><GripVertical :size="14" /></button>
           <template v-if="row.allocatable">
             <input class="today-import-check" type="checkbox" :checked="isTodayImportSelected(row.task.id)" :disabled="todayPlannedIds.has(row.task.id)" :aria-label="`${row.task.title}加入今日`" @change="updateTodayImportSelection(row.task.id, ($event.target as HTMLInputElement).checked)" />
           </template>
@@ -1698,6 +1717,8 @@ onBeforeUnmount(() => {
         <span class="plan-task-context-divider"></span>
         <button type="button" role="menuitem" @click="runTodayImportContextCommand('before')">在上方插入行</button>
         <button type="button" role="menuitem" @click="runTodayImportContextCommand('after')">在下方插入行</button>
+        <span class="plan-task-context-divider"></span>
+        <button class="danger" type="button" role="menuitem" @click="runTodayImportContextCommand('delete')">删除事项</button>
       </div>
       <div v-if="contextMenuOpen" class="plan-task-context-menu" role="menu" :style="{ left: `${contextMenuLeft}px`, top: `${contextMenuTop}px` }" @pointerdown.stop>
         <button type="button" role="menuitem" @click="runContextCommand('duplicate')">复制事项</button>
@@ -1707,7 +1728,7 @@ onBeforeUnmount(() => {
         <button type="button" role="menuitem" :disabled="Boolean(contextTask()?.parentId || contextTask()?.recurrence || contextTask()?.directMinutes)" @click="runContextCommand('child')">新建子事项</button>
         <span class="plan-task-context-divider"></span>
         <button type="button" role="menuitem" @click="runContextCommand('note')">编辑备注</button>
-        <button class="danger" type="button" role="menuitem" @click="runContextCommand('delete')">删除</button>
+        <button class="danger" type="button" role="menuitem" @click="runContextCommand('delete')">删除事项</button>
       </div>
     </Teleport>
   </div>

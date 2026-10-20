@@ -327,7 +327,7 @@ async function main() {
   await existingChildRow.locator('.timer-task-drag-handle').click({ button: "right" });
   const executeRowMenu = page.locator('.task-row-context-menu:visible');
   const executeMenuItems = await executeRowMenu.getByRole("menuitem").allTextContents();
-  if (executeMenuItems.join("|") !== "复制事项|新增事项|在上方插入行|在下方插入行") throw new Error("执行弹框右键菜单顺序或文案不正确");
+  if (executeMenuItems.join("|") !== "复制事项|新增事项|在上方插入行|在下方插入行|删除事项") throw new Error("执行弹框右键菜单顺序或文案不正确");
   await executeRowMenu.getByRole("menuitem", { name: "新增事项" }).click();
   await dialog.locator('input[aria-label="新事项名称"]').fill("执行右键新增事项");
   await dialog.locator('.timer-task-row.new-task button', { hasText: "保存" }).click();
@@ -424,7 +424,7 @@ async function main() {
   await unassignedChildRow.locator('.timer-task-drag-handle').click({ button: "right" });
   const unassignedRowMenu = unassignedPage.locator('.task-row-context-menu:visible');
   const unassignedMenuItems = await unassignedRowMenu.getByRole("menuitem").allTextContents();
-  if (unassignedMenuItems.join("|") !== "复制事项|新增事项|在上方插入行|在下方插入行") throw new Error("未归属弹框右键菜单顺序或文案不正确");
+  if (unassignedMenuItems.join("|") !== "复制事项|新增事项|在上方插入行|在下方插入行|删除事项") throw new Error("未归属弹框右键菜单顺序或文案不正确");
   await unassignedRowMenu.getByRole("menuitem", { name: "新增事项" }).click();
   await unassignedDialog.locator('input[aria-label="新事项名称"]').fill("未归属右键新增事项");
   await unassignedDialog.locator('.timer-task-row.new-task button', { hasText: "保存" }).click();

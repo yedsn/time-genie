@@ -261,22 +261,6 @@ pub(crate) fn write_day_plan_in_transaction(
     })
 }
 
-pub(crate) fn current_day_plan_version(
-    connection: &rusqlite::Connection,
-    workspace_id: &str,
-    task_id: &str,
-    work_date: &str,
-) -> Result<Option<i64>, String> {
-    connection
-        .query_row(
-            "SELECT version FROM task_day_plans WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3",
-            params![workspace_id, task_id, work_date],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())
-}
-
 pub(crate) fn ensure_included_in_transaction(
     transaction: &Transaction<'_>,
     workspace_id: &str,

@@ -1227,6 +1227,7 @@ fn rewind_for_ready_deferred_entities(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn pull(
     database: &Database,
     request: CloudSyncPullRequest,
@@ -6137,15 +6138,6 @@ pub fn reset_local_cache_from_cloud(database: &Database) -> Result<CloudSyncStat
 /// differs from the ordinary cache reset: the local state still contains the
 /// previous epoch immediately after the restore RPC succeeds, so the server
 /// epoch supplied by the restore result is authoritative for this one download.
-pub fn rebuild_local_cache_after_workspace_restore(
-    database: &Database,
-    restored_epoch: i64,
-    reset_change_seq: i64,
-) -> Result<CloudSyncStatus, String> {
-    let _operation_guard = cloud_sync_operation_guard();
-    rebuild_local_cache_after_workspace_restore_locked(database, restored_epoch, reset_change_seq)
-}
-
 pub(crate) fn rebuild_local_cache_after_workspace_restore_locked(
     database: &Database,
     restored_epoch: i64,
@@ -7255,6 +7247,7 @@ fn local_revision(database: &Database) -> Result<i64, String> {
         .map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 fn apply_snapshot(
     database: &Database,
     snapshot: &Value,
@@ -7272,6 +7265,7 @@ fn apply_snapshot(
     )
 }
 
+#[cfg(test)]
 fn apply_snapshot_with_options(
     database: &Database,
     snapshot: &Value,
