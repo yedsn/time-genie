@@ -166,14 +166,35 @@ const mode = computed(() => props.mode ?? "active");
 const scopedDisplayTasks = computed(() => (props.displayTasks ?? []).filter((task) => task.subjectId === props.subjectId));
 const displayedTasks = computed(() => {
   if (!props.displayTasks) return props.tasks;
-  const snapshotById = new Map(scopedDisplayTasks.value.map((task) => [task.id, task]));
-  const displayedIds = new Set(snapshotById.keys());
-  if (temporaryTaskId.value) displayedIds.add(temporaryTaskId.value);
-  const ordered = props.tasks
-    .filter((task) => displayedIds.has(task.id))
-    .map((task) => snapshotById.get(task.id) ?? task);
-  const orderedIds = new Set(ordered.map((task) => task.id));
-  return [...ordered, ...scopedDisplayTasks.value.filter((task) => !orderedIds.has(task.id))];
+  const taskById = new Map(props.tasks.map((task) => [task.id, task]));
+  const snapshotIds = new Set(scopedDisplayTasks.value.map((task) => task.id));
+  const ordered = [...scopedDisplayTasks.value];
+  if (!temporaryTaskId.value || snapshotIds.has(temporaryTaskId.value)) return ordered;
+  const temporaryTask = taskById.get(temporaryTaskId.value);
+  if (!temporaryTask) return ordered;
+  const sourceIndex = props.tasks.findIndex((task) => task.id === temporaryTask.id);
+  let previousSnapshotIndex = -1;
+  for (let index = sourceIndex - 1; index >= 0; index -= 1) {
+    if (snapshotIds.has(props.tasks[index].id)) {
+      previousSnapshotIndex = index;
+      break;
+    }
+  }
+  const relativeNextSnapshotIndex = props.tasks
+    .slice(sourceIndex + 1)
+    .findIndex((task) => snapshotIds.has(task.id));
+  if (previousSnapshotIndex >= 0) {
+    const previousId = props.tasks[previousSnapshotIndex].id;
+    const insertAt = ordered.findIndex((task) => task.id === previousId) + 1;
+    ordered.splice(insertAt, 0, temporaryTask);
+  } else if (relativeNextSnapshotIndex >= 0) {
+    const nextId = props.tasks[sourceIndex + 1 + relativeNextSnapshotIndex].id;
+    const insertAt = ordered.findIndex((task) => task.id === nextId);
+    ordered.splice(insertAt, 0, temporaryTask);
+  } else {
+    ordered.push(temporaryTask);
+  }
+  return ordered;
 });
 const flatRows = computed(() => displayedTasks.value.map((task) => ({ task, depth: getDepth(task) })));
 const pendingRows = computed(() => mode.value === "today"

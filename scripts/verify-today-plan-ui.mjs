@@ -69,9 +69,10 @@ function mockInitScript() {
     "subject-a": [
       record("parent", { title: "项目", selectable: false, isLeaf: false, canAcceptChildren: true, todayMember: false, todayContext: true, dayPlanVersion: 1, sortOrder: 10 }),
       record("child", { title: "写今日计划", parentId: "parent", pathLabel: "项目 / 写今日计划", todayMember: true, todayContext: false, dayPlanVersion: 1, todayEstimateMinutes: 30, directMinutes: 20, totalMinutes: 20, sortOrder: 20 }),
+      record("done-today", { title: "今天已完成的子项", parentId: "parent", pathLabel: "项目 / 今天已完成的子项", status: "done", executionState: "done", completedToday: true, version: 2, todayMember: true, todayContext: false, dayPlanVersion: 1, directMinutes: 45, totalMinutes: 45, sortOrder: 25 }),
       record("no-estimate", { title: "无预计事项", parentId: "parent", pathLabel: "项目 / 无预计事项", todayMember: true, todayContext: false, dayPlanVersion: 1, sortOrder: 30 }),
       record("recurring", { title: "每日复盘", status: "done", executionState: "done", completedToday: true, todayMember: true, todayContext: false, dayPlanVersion: 1, sortOrder: 35, recurrence: { id: "rule-recurring", taskId: "recurring", frequency: "daily", effectiveStart: "2026-10-19", summary: "每天", version: 1 }, occurrenceDate: "2026-10-19", occurrenceOrigin: "scheduled", occurrenceVersion: 1 }),
-      record("done-today", { title: "今天已完成的成员", status: "done", executionState: "done", completedToday: true, version: 2, todayMember: true, todayContext: false, dayPlanVersion: 1, directMinutes: 45, totalMinutes: 45, sortOrder: 40 }),
+      record("plain-done", { title: "已完成普通事项", status: "done", executionState: "done", completedToday: true, version: 2, todayMember: true, todayContext: false, dayPlanVersion: 1, sortOrder: 50 }),
     ],
     "subject-b": [
       record("personal", { subjectId: "subject-b", title: "阅读", projectName: "个人", todayMember: true, todayContext: false, dayPlanVersion: 1, sortOrder: 10 }),
@@ -375,14 +376,16 @@ async function mainSharedPlanEditor() {
   await page.locator(".nav-list button", { hasText: "待办" }).click();
   await page.locator(".pending-reminder-row").first().waitFor({ state: "visible" });
 
-  if (await page.locator(".pending-reminder-row").count() !== 5) throw new Error("今日计划行数量异常");
+  if (await page.locator(".pending-reminder-row").count() !== 6) throw new Error("今日计划行数量异常");
+  const initialTodayOrder = await page.locator(".pending-reminder-row").evaluateAll((rows) => rows.map((row) => row.dataset.taskId));
+  if (initialTodayOrder.join("|") !== "recurring|parent|child|done-today|no-estimate|plain-done") throw new Error("已完成事项未保持原始顺序: " + initialTodayOrder.join("|"));
   const snapshotCallsBeforeRefresh = (await calls()).dayPlanSnapshot;
   await page.evaluate(() => window.__TODAY_PLAN_TEST__.delayNextSnapshot(450));
   await page.getByRole("tab", { name: /今日/ }).click();
   await page.getByRole("tab", { name: /今日/ }).click();
   await page.waitForTimeout(120);
   if (await page.locator(".today-plan-skeleton").count() !== 0) throw new Error("今日计划后台刷新仍用骨架替换已有列表");
-  if (await page.locator(".pending-reminder-row").count() !== 5) throw new Error("今日计划后台刷新未保持已有列表稳定");
+  if (await page.locator(".pending-reminder-row").count() !== 6) throw new Error("今日计划后台刷新未保持已有列表稳定");
   if (await page.locator(".today-plan-loading-line, .today-plan-refresh-label, .today-plan-refreshing, .today-plan-list-refreshing").count() !== 0) throw new Error("今日计划刷新仍显示横条、提示或旧列表弱化效果");
   if (await page.getByText("正在更新", { exact: true }).count() !== 0 || await page.getByText("正在整理今日计划", { exact: true }).count() !== 0) throw new Error("今日计划仍显示额外加载提示");
   await page.screenshot({ path: path.join(evidenceDir, "08-paper-today-refreshing.png"), fullPage: true });
@@ -411,7 +414,7 @@ async function mainSharedPlanEditor() {
   const listBounds = await page.locator(".reminder-list").boundingBox();
   const firstRecurringBounds = await firstTodayRow.boundingBox();
   if (!listBounds || !firstRecurringBounds || firstRecurringBounds.x - listBounds.x < 7 || listBounds.x + listBounds.width - firstRecurringBounds.x - firstRecurringBounds.width < 7) throw new Error("已完成首个重复事项卡片缺少左右外边距");
-  if (await page.locator(".pending-reminder-row .drag-handle").count() !== 5) throw new Error("今日页未复用进行中的拖动入口");
+  if (await page.locator(".pending-reminder-row .drag-handle").count() !== 6) throw new Error("今日页未复用进行中的拖动入口");
   if (await page.locator(".plan-placeholder-row").count() !== 1) throw new Error("今日页缺少与进行中一致的底部新增行");
   if (await page.getByRole("button", { name: "新增今日事项" }).count() !== 0) throw new Error("仍显示独立的新增今日事项按钮");
   if (await page.getByRole("button", { name: "管理完整计划" }).count() !== 0) throw new Error("仍显示管理完整计划按钮");
@@ -424,7 +427,7 @@ async function mainSharedPlanEditor() {
   const contextRow = page.locator('.pending-reminder-row[data-task-id="parent"]');
   if (await contextRow.locator(".task-timer-action").count() !== 0) throw new Error("上下文父事项不应可执行");
   if (await contextRow.locator(".check-button").count() !== 1 || !await contextRow.locator(".check-button").isDisabled()) throw new Error("今日页父事项应保留禁用勾选框");
-  if (await page.locator(".pending-reminder-row .check-button").count() !== 5) throw new Error("今日页事项勾选框未保持统一对齐");
+  if (await page.locator(".pending-reminder-row .check-button").count() !== 6) throw new Error("今日页事项勾选框未保持统一对齐");
   if (await page.locator(".actual-time-picker").count() === 0) throw new Error("今日页应继续显示今日用时");
   const todayParentCheckBox = await contextRow.locator(".check-button").boundingBox();
   const todayRecurringCheckBox = await page.locator('.pending-reminder-row[data-task-id="recurring"] .check-button').boundingBox();
@@ -451,7 +454,7 @@ async function mainSharedPlanEditor() {
   const todayQuickPlanText = await page.locator(".quick-plan-dialog .cm-content").innerText();
   if (!todayQuickPlanText.includes("写今日计划") || !todayQuickPlanText.includes("无预计事项")) throw new Error("编辑今日计划未包含今日事项");
   if (todayQuickPlanText.includes("长期待办") || todayQuickPlanText.includes("预计自动加入事项")) throw new Error("编辑今日计划混入了非今日事项");
-  if (todayQuickPlanText.includes("每日复盘") || todayQuickPlanText.includes("今天已完成的成员")) throw new Error("编辑今日计划不应混入已完成今日事项");
+  if (todayQuickPlanText.includes("每日复盘") || todayQuickPlanText.includes("今天已完成的子项") || todayQuickPlanText.includes("已完成普通事项")) throw new Error("编辑今日计划不应混入已完成今日事项");
   await page.locator(".quick-plan-dialog button", { hasText: "取消" }).click();
 
   await page.getByRole("button", { name: "配置今日事项" }).click();

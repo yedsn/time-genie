@@ -3,7 +3,7 @@
 ## 1. 已完成事项分页数据能力
 
 - [x] 1.1 为普通事项 DTO 和前端事项类型增加可选完成时间字段，确保本地任务查询与云端同步映射保持兼容；运行 `cargo test --manifest-path src-tauri/Cargo.toml tasks:: --lib` 与 `npm run typecheck`
-- [x] 1.2 增加按主体查询普通已完成事项的分页命令与前端服务接口，默认每页 20 条，按 `completed_at DESC, id DESC` 返回记录、总数和页码信息；补充后端分页、稳定排序和主体隔离测试并运行相关 Rust 测试
+- [x] 1.2 增加按主体查询普通已完成事项的分页命令与前端服务接口，默认每页 20 条，按事项树原有的深度优先顺序排列，每级使用 `sort_order, created_at, id` 保持计划顺序，并返回记录、总数和页码信息；补充后端分页、稳定排序和主体隔离测试并运行相关 Rust 测试
 - [x] 1.3 确保已完成分页只读取 `tasks.status = 'done'`，不读取或统计 `task_occurrences` 的每日完成轮次；增加重复事项轮次排除测试并运行相关 Rust 测试
 - [x] 1.4 将主工作台事项加载改为只加载进行中树，验证 `includeCompleted: false` 下父子层级、累计用时、事项选择和今日视图不回归；运行 `npm run typecheck` 及事项列表相关 Rust 测试
 
@@ -23,6 +23,6 @@
 
 ## 4. 集成验收
 
-- [x] 4.1 使用实际应用验证多个主体的默认标签、标签切换、普通事项完成、完成时间倒序、20 条分页、恢复、编辑、删除、空页回退及重复事项轮次排除
+- [x] 4.1 使用实际应用验证多个主体的默认标签、标签切换、普通事项完成、完成后保持原事项顺序、20 条分页、恢复、编辑、删除、空页回退及重复事项轮次排除
 - [x] 4.2 构造大量普通已完成事项，确认停留在进行中标签时不请求完成明细，打开已完成标签后仅加载当前主体当前页，并比较页面长度和响应性能无随全部历史线性增长
 - [x] 4.3 运行 `npm run typecheck`、`npm run build`、前端新增测试、`npm run test:work-data-refresh`、相关 Rust 测试、`git diff --check` 与 `openspec validate split-active-completed-task-tabs --strict`，确认变更无回归

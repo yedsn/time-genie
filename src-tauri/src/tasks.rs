@@ -522,12 +522,31 @@ pub fn list_completed_task_page(
     };
     let mut statement = connection
         .prepare(
-            "SELECT id, subject_id, parent_id, title, status, planned_date,
-                    estimate_minutes, note, project_name, solution_name, sort_order, completed_at, version
-             FROM tasks
-             WHERE workspace_id = ?1 AND subject_id = ?2
-               AND status = 'done' AND deleted_at IS NULL
-             ORDER BY completed_at DESC, id DESC
+            "WITH RECURSIVE completed_tree(id, path) AS (
+               SELECT t.id,
+                      printf('%+011d', t.sort_order + 1000000000) || '|' ||
+                      printf('%020d', t.created_at) || '|' || t.id
+               FROM tasks t
+               WHERE t.workspace_id = ?1 AND t.subject_id = ?2 AND t.deleted_at IS NULL
+                 AND (t.parent_id IS NULL OR NOT EXISTS (
+                   SELECT 1 FROM tasks p
+                   WHERE p.id = t.parent_id AND p.workspace_id = t.workspace_id AND p.deleted_at IS NULL
+                 ))
+               UNION ALL
+               SELECT child.id,
+                      parent.path || '/' || printf('%+011d', child.sort_order + 1000000000) || '|' ||
+                      printf('%020d', child.created_at) || '|' || child.id
+               FROM tasks child
+               JOIN completed_tree parent ON child.parent_id = parent.id
+               WHERE child.workspace_id = ?1 AND child.subject_id = ?2 AND child.deleted_at IS NULL
+             )
+             SELECT t.id, t.subject_id, t.parent_id, t.title, t.status, t.planned_date,
+                    t.estimate_minutes, t.note, t.project_name, t.solution_name, t.sort_order,
+                    t.completed_at, t.version
+             FROM completed_tree tree
+             JOIN tasks t ON t.id = tree.id
+             WHERE t.status = 'done'
+             ORDER BY tree.path
              LIMIT ?3 OFFSET ?4",
         )
         .map_err(|error| error.to_string())?;
@@ -4759,7 +4778,7 @@ mod tests {
                     params![completed_at, task.id],
                 )
                 .unwrap();
-            expected.push((task.id, completed_at));
+            expected.push((task.id, task.sort_order));
         }
         let other_task = create_test_task(&database, &other_subject_id, None, "其他主体已完成");
         database
@@ -4770,7 +4789,7 @@ mod tests {
                 [&other_task.id],
             )
             .unwrap();
-        expected.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| right.0.cmp(&left.0)));
+        expected.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
 
         let first = list_completed_task_page(
             &database,
@@ -4904,6 +4923,53 @@ mod tests {
             )
             .unwrap();
         assert_eq!(recurring_status, "open");
+    }
+
+    #[test]
+    fn completed_task_page_preserves_original_tree_order() {
+        let database = database();
+        let connection = database.open().unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+
+        let parent_a = create_test_task(&database, &subject_id, None, "父项 A");
+        let child_a = create_test_task(&database, &subject_id, Some(parent_a.id.clone()), "子项 A");
+        let parent_b = create_test_task(&database, &subject_id, None, "父项 B");
+        let child_b = create_test_task(&database, &subject_id, Some(parent_b.id.clone()), "子项 B");
+        for (index, task) in [&child_b, &parent_b, &child_a, &parent_a]
+            .into_iter()
+            .enumerate()
+        {
+            database
+                .open()
+                .unwrap()
+                .execute(
+                    "UPDATE tasks SET status = 'done', completed_at = ?1 WHERE id = ?2",
+                    params![1000 + index as i64, task.id],
+                )
+                .unwrap();
+        }
+
+        let result = list_completed_task_page(
+            &database,
+            CompletedTaskPageRequest {
+                subject_id,
+                page: Some(1),
+                page_size: Some(20),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result
+                .tasks
+                .iter()
+                .map(|task| task.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["父项 A", "子项 A", "父项 B", "子项 B"]
+        );
     }
 
     #[test]
