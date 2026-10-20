@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { AlertCircle, Check, CheckCircle2, CornerDownRight, GripVertical, IndentDecrease, IndentIncrease, ListTodo, LoaderCircle, MessageSquareText, MoreHorizontal, Play, Plus, Search, Trash2 } from "lucide-vue-next";
 import { useWorkdayStore, type Task } from "../store";
@@ -13,7 +13,7 @@ import {
   type ExecutionPanelMode,
   type ExecutionPanelTaskRow,
 } from "../services/executionTaskPanelCore";
-import { taskSubtreeIds } from "../services/planTaskInteractionCore";
+import { contextMenuPosition, taskSubtreeIds } from "../services/planTaskInteractionCore";
 import { createTaskTreeSortable } from "../services/taskTreeSortable";
 import { parseActualMinutes } from "../services/quickActualAdjustmentCore";
 import { readRememberedPanelSubjectId, rememberPanelSubjectId } from "../services/executionPanelSubjectPreference";
@@ -66,7 +66,11 @@ const allocationOpenedSessionId = ref("");
 const allocationOpenedSessionVersion = ref(0);
 const allocationOpenedEntryVersion = ref(0);
 const allocationBaseline = ref("");
-const newTask = reactive({ open: false, parentId: "", title: "", saving: false, error: "" });
+const newTask = reactive({ open: false, parentId: "", targetId: "", placement: "after" as "before" | "after", title: "", saving: false, error: "" });
+const rowContextMenuOpen = ref(false);
+const rowContextTaskId = ref("");
+const rowContextMenuLeft = ref(0);
+const rowContextMenuTop = ref(0);
 const todayPickerOpen = ref(false);
 const todayPickerQuery = ref("");
 const todayPickerSelected = ref<string[]>([]);
@@ -178,7 +182,8 @@ const allocationPeriodLabel = computed(() => {
 });
 
 watch([() => props.modelValue, () => props.mode, () => props.entryId], async ([open]) => {
-  if (!open) return;
+  if (!open) { closeRowContextMenu(); return; }
+  closeRowContextMenu();
   returnFocusElement.value = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
   subjectId.value = resolveTimerDialogSubject({
     subjects: store.subjects,
@@ -252,7 +257,18 @@ watch([() => props.modelValue, rows, query], async ([open]) => {
   treeSortable.mount();
 }, { flush: "post" });
 
-onBeforeUnmount(treeSortable.destroy);
+onMounted(() => {
+  document.addEventListener("pointerdown", closeRowContextMenuForPointer);
+  document.addEventListener("keydown", closeRowContextMenuForKey);
+  window.addEventListener("scroll", closeRowContextMenu, true);
+});
+
+onBeforeUnmount(() => {
+  treeSortable.destroy();
+  document.removeEventListener("pointerdown", closeRowContextMenuForPointer);
+  document.removeEventListener("keydown", closeRowContextMenuForKey);
+  window.removeEventListener("scroll", closeRowContextMenu, true);
+});
 
 function prepareSubtreeDrag(taskId: string) {
   treeSortable.prepareSubtree(taskId);
@@ -634,8 +650,21 @@ async function selectSubject(nextSubjectId: string) {
 }
 
 function openNewTask(parentId = "") {
+  closeRowContextMenu();
   newTask.open = true;
   newTask.parentId = parentId;
+  newTask.targetId = "";
+  newTask.placement = "after";
+  newTask.title = "";
+  newTask.error = "";
+}
+
+function openRelativeTask(task: PanelTask, placement: "before" | "after") {
+  closeRowContextMenu();
+  newTask.open = true;
+  newTask.parentId = task.parentId ?? "";
+  newTask.targetId = task.id;
+  newTask.placement = placement;
   newTask.title = "";
   newTask.error = "";
 }
@@ -643,6 +672,8 @@ function openNewTask(parentId = "") {
 function resetNewTask() {
   newTask.open = false;
   newTask.parentId = "";
+  newTask.targetId = "";
+  newTask.placement = "after";
   newTask.title = "";
   newTask.saving = false;
   newTask.error = "";
@@ -654,7 +685,7 @@ async function createNewTask(startAfterCreate = false) {
   newTask.saving = true;
   newTask.error = "";
   try {
-    if (startAfterCreate && props.mode === "execute") {
+    if (startAfterCreate && props.mode === "execute" && !newTask.targetId) {
       const parent = newTask.parentId ? store.tasks.find((task) => task.id === newTask.parentId) : undefined;
       const result = await store.transitionTimer({
         newTask: {
@@ -670,12 +701,17 @@ async function createNewTask(startAfterCreate = false) {
       emit("update:modelValue", false);
       return;
     }
-    const tempId = store.addTaskSelectionDraft(title, subjectId.value, newTask.parentId || undefined);
-    if (!tempId) throw new Error("新事项创建失败");
-    const tempTask = store.tasks.find((task) => task.id === tempId);
-    if (!tempTask) throw new Error("新事项创建失败");
-    const taskId = await store.saveTask(tempId);
-    if (!taskId) throw new Error("新事项保存失败");
+    const taskId = newTask.targetId
+      ? await store.createTaskRelative(newTask.targetId, newTask.placement, title)
+      : await (async () => {
+        const tempId = store.addTaskSelectionDraft(title, subjectId.value, newTask.parentId || undefined);
+        if (!tempId) throw new Error("新事项创建失败");
+        const tempTask = store.tasks.find((task) => task.id === tempId);
+        if (!tempTask) throw new Error("新事项创建失败");
+        const savedTaskId = await store.saveTask(tempId);
+        if (!savedTaskId) throw new Error("新事项保存失败");
+        return savedTaskId;
+      })();
     if (props.mode === "execute") {
       try {
         await store.addTasksToToday([taskId]);
@@ -700,6 +736,60 @@ async function createNewTask(startAfterCreate = false) {
   } finally {
     newTask.saving = false;
   }
+}
+
+function rowContextTask() {
+  return panelTasks.value.find((task) => task.id === rowContextTaskId.value);
+}
+
+function openRowContextMenu(event: MouseEvent, task: PanelTask) {
+  event.preventDefault();
+  event.stopPropagation();
+  const position = contextMenuPosition(event.clientX, event.clientY, 190, 164, window.innerWidth, window.innerHeight);
+  rowContextTaskId.value = task.id;
+  rowContextMenuLeft.value = position.left;
+  rowContextMenuTop.value = position.top;
+  rowContextMenuOpen.value = true;
+}
+
+function closeRowContextMenu() {
+  rowContextMenuOpen.value = false;
+  rowContextTaskId.value = "";
+}
+
+function closeRowContextMenuForPointer(event: PointerEvent) {
+  if (!(event.target as HTMLElement).closest(".task-row-context-menu")) closeRowContextMenu();
+}
+
+function closeRowContextMenuForKey(event: KeyboardEvent) {
+  if (event.key === "Escape") closeRowContextMenu();
+}
+
+async function duplicateCurrentRow(task: PanelTask) {
+  closeRowContextMenu();
+  try {
+    const taskId = await store.duplicateSingleTask(task.id);
+    if (!taskId) throw new Error("事项复制失败");
+    if (props.mode === "execute") {
+      await store.addTasksToToday([taskId]);
+      await store.loadTodayPlan(subjectId.value);
+    } else {
+      await store.loadExecutionSnapshot(subjectId.value);
+    }
+    recentTaskId.value = taskId;
+    window.setTimeout(() => { if (recentTaskId.value === taskId) recentTaskId.value = ""; }, 1_200);
+    ElMessage.success("已复制事项");
+  } catch (error) {
+    ElMessage.error(errorText(error, "事项复制失败"));
+  }
+}
+
+function runRowContextCommand(command: "create" | "before" | "after" | "duplicate") {
+  const task = rowContextTask();
+  if (!task) { closeRowContextMenu(); return; }
+  if (command === "duplicate") { void duplicateCurrentRow(task); return; }
+  if (command === "create") { openNewTask(); return; }
+  openRelativeTask(task, command);
 }
 
 function moreDraftFor(task: Task) {
@@ -927,7 +1017,7 @@ function formatTime(timestamp: number) {
       <div v-else-if="newTask.open" class="timer-task-row new-task" :class="{ child: newTask.parentId }">
         <div class="timer-task-name-cell"><CornerDownRight v-if="newTask.parentId" :size="14" /><input v-model="newTask.title" placeholder="新事项名称" aria-label="新事项名称" @keydown.enter="createNewTask(false)" /></div>
         <span class="timer-task-estimate-cell readonly empty">—</span>
-        <span class="timer-task-actual-cell">新事项</span>
+        <span class="timer-task-actual-cell">{{ newTask.targetId ? (newTask.placement === 'before' ? '插入上方' : '插入下方') : '新事项' }}</span>
         <div class="timer-task-actions"><button class="secondary-button compact" type="button" :disabled="newTask.saving" @click="resetNewTask">取消</button><button class="secondary-button compact" type="button" :disabled="newTask.saving" @click="createNewTask(false)">保存</button><button v-if="presentation.showTimerActions" class="primary-button compact" type="button" :disabled="newTask.saving" @click="createNewTask(true)"><LoaderCircle v-if="newTask.saving" :size="13" class="spin" /><Play v-else :size="13" fill="currentColor" />开始</button></div>
         <small v-if="newTask.error" class="timer-task-row-error">{{ newTask.error }}</small>
       </div>
@@ -935,7 +1025,7 @@ function formatTime(timestamp: number) {
       <div v-if="!panelInitialLoading && rows.length" ref="rowsRef" class="timer-task-sortable-rows" :class="{ moving }">
         <div v-for="row in rows" :key="row.task.id" class="timer-task-row" :data-timer-task-id="row.task.id" :data-depth="row.depth" :class="[{ parent: row.hasChildren, child: row.depth > 0, recent: recentTaskId === row.task.id, active: store.runningEntry?.defaultTask === row.task.id, completed: row.task.completedToday }, `state-${actionFor(row.task, row.hasChildren).mode}`]">
           <div class="timer-task-name-cell" :style="{ '--task-depth': String(row.depth) }">
-            <button class="timer-task-drag-handle" type="button" :disabled="Boolean(query.trim())" :title="query.trim() ? '清空搜索后调整顺序和层级' : (subtreeIds(row.task.id).size > 1 ? `拖动整组（共 ${subtreeIds(row.task.id).size} 项）` : '拖动排序')" :aria-label="`${row.task.title}拖动排序`" @pointerdown="prepareSubtreeDrag(row.task.id)"><GripVertical :size="14" /></button>
+            <button class="timer-task-drag-handle" type="button" :disabled="Boolean(query.trim())" :class="{ active: rowContextTaskId === row.task.id }" :title="query.trim() ? '清空搜索后调整顺序和层级' : '拖动排序；右键可复制事项或插入行'" :aria-label="`${row.task.title}拖动排序，右键打开行菜单`" @pointerdown="prepareSubtreeDrag(row.task.id)" @contextmenu="openRowContextMenu($event, row.task)"><GripVertical :size="14" /></button>
             <CornerDownRight v-if="row.depth" :size="14" />
             <input data-timer-task-field="title" :value="draftFor(row.task).title" :aria-label="`事项名称：${row.task.title}`" @input="updateDraft(row.task, 'title', ($event.target as HTMLInputElement).value)" @blur="saveField(row.task, 'title')" @keydown.enter.prevent="($event.target as HTMLInputElement).blur()" />
             <small v-if="row.hasChildren">{{ row.task.parentId ? '子组' : '父事项' }}<template v-if="row.totalTodayEstimate > 0"> · {{ formatMinutes(row.totalTodayEstimate) }} 预计</template></small>
@@ -985,7 +1075,6 @@ function formatTime(timestamp: number) {
               <template #reference><button class="icon-button subtle" type="button" :aria-label="`${row.task.title}更多操作`" title="更多操作"><MoreHorizontal :size="15" /></button></template>
               <div class="timer-task-more-popover"><strong>{{ row.task.title }}</strong><label><span>整体预计</span><div><input v-model="moreDraftFor(row.task).estimate" inputmode="numeric" /><small>分钟</small></div></label><label><span>预计开始</span><input v-model="moreDraftFor(row.task).planDate" type="date" /></label><label v-if="!row.hasChildren && store.tasks.some((task) => task.id === row.task.id)"><span>重复设置</span><select v-model="moreDraftFor(row.task).recurrence"><option value="none">不重复</option><option value="daily">每天</option><option value="weekdays">工作日</option><option value="weekly">每周</option></select></label><label v-if="!row.hasChildren && store.tasks.some((task) => task.id === row.task.id) && moreDraftFor(row.task).recurrence !== 'none'"><span>生效日期</span><input v-model="moreDraftFor(row.task).recurrenceStart" type="date" /></label><div v-if="!row.hasChildren && store.tasks.some((task) => task.id === row.task.id) && moreDraftFor(row.task).recurrence === 'weekly'" class="timer-task-weekdays"><span>重复星期</span><div><label v-for="(label, index) in weekdayLabels" :key="label"><input v-model="moreDraftFor(row.task).recurrenceWeekdays" type="checkbox" :value="index" />{{ label }}</label></div></div><small v-if="row.task.completedToday && !store.tasks.some((task) => task.id === row.task.id)">继续事项后可修改重复设置</small><div class="timer-task-more-actions"><button v-if="row.task.status !== 'done'" class="secondary-button compact" type="button" @click="completeTask(row.task)"><CheckCircle2 :size="13" />完成</button><button class="danger-button compact" type="button" @click="deleteTask(row.task)"><Trash2 :size="13" />删除</button><span></span><button class="primary-button compact" type="button" @click="saveMore(row.task)">保存设置</button></div></div>
             </el-popover>
-            <button v-if="row.depth === 0" class="secondary-button compact timer-task-add-child" type="button" :disabled="Boolean(row.task.recurrence)" :title="row.task.recurrence ? '重复事项新增子项前必须先关闭重复' : '新增子项'" @click="openNewTask(row.task.id)"><Plus :size="13" />子项</button>
           </div>
         </div>
       </div>
@@ -1002,5 +1091,15 @@ function formatTime(timestamp: number) {
     <div class="today-plan-candidates"><label v-for="task in todayPickerCandidates" :key="task.id"><input v-model="todayPickerSelected" type="checkbox" :value="task.id" /><span><strong>{{ task.title }}</strong><small>{{ task.pathLabel }}</small></span></label><p v-if="!todayPickerCandidates.length">没有可加入的进行中事项</p></div>
     <template #footer><button class="secondary-button" type="button" @click="todayPickerOpen = false">取消</button><button class="primary-button" type="button" :disabled="!todayPickerSelected.length" @click="confirmAddExistingTodayTasks">加入今日（{{ todayPickerSelected.length }}）</button></template>
   </el-dialog>
+
+  <Teleport to="body">
+    <div v-if="rowContextMenuOpen" class="plan-task-context-menu task-row-context-menu" role="menu" :style="{ left: `${rowContextMenuLeft}px`, top: `${rowContextMenuTop}px` }" @pointerdown.stop>
+      <button type="button" role="menuitem" @click="runRowContextCommand('duplicate')">复制事项</button>
+      <button type="button" role="menuitem" @click="runRowContextCommand('create')">新增事项</button>
+      <span class="plan-task-context-divider"></span>
+      <button type="button" role="menuitem" @click="runRowContextCommand('before')">在上方插入行</button>
+      <button type="button" role="menuitem" @click="runRowContextCommand('after')">在下方插入行</button>
+    </div>
+  </Teleport>
 
 </template>

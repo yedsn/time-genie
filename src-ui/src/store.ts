@@ -1167,6 +1167,19 @@ export const useWorkdayStore = defineStore("workday", () => {
     return task.id;
   }
 
+  async function createTaskRelative(targetId: string, placement: "before" | "after", title: string) {
+    const normalizedTitle = title.trim();
+    if (!normalizedTitle) throw new Error("事项名称不能为空");
+    const taskId = addTaskRelative(targetId, placement);
+    if (!taskId) throw new Error("目标事项已不存在");
+    const task = tasks.find((item) => item.id === taskId);
+    if (!task) throw new Error("事项创建失败");
+    task.title = normalizedTitle;
+    const savedTaskId = await saveTask(taskId);
+    if (!savedTaskId) throw new Error("事项保存失败");
+    return savedTaskId;
+  }
+
   async function deleteTask(taskId: string) {
     const deletedTask = tasks.find((task) => task.id === taskId);
     if (deletedTask?.version) await deleteTaskSubtree(deletedTask.id, deletedTask.version);
@@ -1273,6 +1286,24 @@ export const useWorkdayStore = defineStore("workday", () => {
     await loadTodayOverview();
     selectedTaskId.value = result.rootId;
     return result.rootId;
+  }
+
+  async function duplicateSingleTask(taskId: string) {
+    const ordered = buildVisibleTaskList(tasks);
+    const source = ordered.find((task) => task.id === taskId);
+    if (!source || source.version <= 0) return;
+    const draftId = addTaskRelative(source.id, "after");
+    if (!draftId) return;
+    const draft = tasks.find((task) => task.id === draftId);
+    if (!draft) return;
+    draft.title = source.title;
+    draft.project = source.project;
+    draft.planDate = source.planDate;
+    draft.estimate = source.estimate;
+    draft.note = source.note;
+    const savedTaskId = await saveTask(draftId);
+    if (!savedTaskId) throw new Error("事项复制失败");
+    return savedTaskId;
   }
 
   function moveTask(taskId: string, targetId: string, placement: "before" | "after" | "inside", parentId?: string) {
@@ -2059,7 +2090,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     now, todayMinutes, allocatedMinutes, pendingMinutes, doneCount, todayCompletionDoneCount, todayCompletionTotalCount, todayCompletionPercent, unassignedSeconds, unassignedStartedAt,
     unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen, unassignedWorkDate, unassignedSessionId, unassignedVersion,
     unassignedCurrentSession,
-    workspaceLoaded, workspaceLoading, executionSnapshots, executionSnapshotLoading, loadExecutionSnapshot, saveExecutionTaskTitle, saveExecutionTaskNote, saveExecutionTaskDetails, deleteExecutionTask, loadWorkspaceData, loadTodayPlan, setTodayPlanMembership, addTasksToToday, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addTaskSelectionDraft, addChildTask, addTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTodayImport, saveTaskPlanBatch, loadActualAdjustmentSnapshot, saveActualAdjustmentBatch, removeActualAdjustment, duplicateTask, deleteTask, moveTask, reorderTask, movePlanTask,
+    workspaceLoaded, workspaceLoading, executionSnapshots, executionSnapshotLoading, loadExecutionSnapshot, saveExecutionTaskTitle, saveExecutionTaskNote, saveExecutionTaskDetails, deleteExecutionTask, loadWorkspaceData, loadTodayPlan, setTodayPlanMembership, addTasksToToday, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addTaskSelectionDraft, addChildTask, addTaskRelative, createTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTodayImport, saveTaskPlanBatch, loadActualAdjustmentSnapshot, saveActualAdjustmentBatch, removeActualAdjustment, duplicateTask, duplicateSingleTask, deleteTask, moveTask, reorderTask, movePlanTask,
     indentTask, outdentTask, moveExecutionTask, startTimer, transitionTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, loadReportTemplates, createReportTemplate, updateReportTemplate, duplicateReportTemplate, setDefaultReportTemplate, deleteReportTemplate, reorderReportTemplates, getReportTemplatePlaceholders, publicReportText, previewObsidianReport, writeObsidianReport,
     beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, dismissUnassignedResolution, resolveUnassignedTime
   };

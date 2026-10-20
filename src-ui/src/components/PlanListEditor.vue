@@ -28,6 +28,8 @@ const props = defineProps<{
   timezone: string;
   saveTodayImport: (request: { taskIds: string[]; estimates: Array<{ taskId: string; expectedTaskVersion: number; expectedDailyEstimateVersion?: number; estimateMinutes?: number }> }) => Promise<void>;
   createTask: (title: string, parentId?: string) => Promise<string>;
+  createRelativeTask: (targetId: string, placement: "before" | "after", title: string) => Promise<string>;
+  duplicateSingleTask: (taskId: string) => Promise<string | undefined>;
   saveTask: (taskId: string) => Promise<string | false>;
   savePlanBatch: (request: QuickPlanBatchRequest) => Promise<{ createdCount: number; updatedCount: number; deletedCount: number; todayPlanChangedCount: number; createdItems: Array<{ lineKey: string; taskId: string }> }>;
   loadActualSnapshot: () => Promise<ActualAdjustmentSnapshotRecord>;
@@ -71,6 +73,8 @@ const todayImportTaskTitles = ref<Record<string, string>>({});
 const todayImportTitleErrors = ref<Record<string, string>>({});
 const todayImportTitleSavingId = ref("");
 const todayImportCreateParentId = ref("");
+const todayImportCreateTargetId = ref("");
+const todayImportCreatePlacement = ref<"before" | "after">("after");
 const todayImportCreateTitle = ref("");
 const todayImportCreateOpen = ref(false);
 const todayImportCreateSaving = ref(false);
@@ -104,6 +108,10 @@ const contextMenuOpen = ref(false);
 const contextTaskId = ref("");
 const contextMenuLeft = ref(0);
 const contextMenuTop = ref(0);
+const todayImportContextMenuOpen = ref(false);
+const todayImportContextTaskId = ref("");
+const todayImportContextMenuLeft = ref(0);
+const todayImportContextMenuTop = ref(0);
 const actualAdjustmentOpen = ref(false);
 const actualAdjustmentSaving = ref(false);
 const actualAdjustmentSnapshot = ref<ActualAdjustmentSnapshotRecord>();
@@ -495,11 +503,17 @@ function runContextCommand(command: "before" | "after" | "child" | "note" | "dup
 }
 
 function closeContextMenuForPointer(event: PointerEvent) {
-  if (!(event.target as HTMLElement).closest(".plan-task-context-menu")) closeContextMenu();
+  if (!(event.target as HTMLElement).closest(".plan-task-context-menu")) {
+    closeContextMenu();
+    closeTodayImportContextMenu();
+  }
 }
 
 function closeContextMenuForKey(event: KeyboardEvent) {
-  if (event.key === "Escape") closeContextMenu();
+  if (event.key === "Escape") {
+    closeContextMenu();
+    closeTodayImportContextMenu();
+  }
 }
 
 function normalizeEstimate(value: number | undefined) {
@@ -826,6 +840,20 @@ async function openTodayImportCreate(parentId = "") {
     return;
   }
   todayImportCreateParentId.value = parentId;
+  todayImportCreateTargetId.value = "";
+  todayImportCreateTitle.value = "";
+  todayImportCreateError.value = "";
+  todayImportCreateOpen.value = true;
+  todayImportQuery.value = "";
+  await nextTick();
+  todayImportCreateInputRef.value?.focus();
+}
+
+async function openTodayImportRelativeCreate(task: Task, placement: "before" | "after") {
+  closeTodayImportContextMenu();
+  todayImportCreateParentId.value = task.parentId ?? "";
+  todayImportCreateTargetId.value = task.id;
+  todayImportCreatePlacement.value = placement;
   todayImportCreateTitle.value = "";
   todayImportCreateError.value = "";
   todayImportCreateOpen.value = true;
@@ -838,6 +866,7 @@ function closeTodayImportCreate() {
   if (todayImportCreateSaving.value) return;
   todayImportCreateOpen.value = false;
   todayImportCreateParentId.value = "";
+  todayImportCreateTargetId.value = "";
   todayImportCreateTitle.value = "";
   todayImportCreateError.value = "";
 }
@@ -850,7 +879,9 @@ async function createTodayImportTask() {
   todayImportCreateError.value = "";
   const parentId = todayImportCreateParentId.value;
   try {
-    const taskId = await props.createTask(title, parentId || undefined);
+    const taskId = todayImportCreateTargetId.value
+      ? await props.createRelativeTask(todayImportCreateTargetId.value, todayImportCreatePlacement.value, title)
+      : await props.createTask(title, parentId || undefined);
     todayImportSelection.value = [...new Set([...todayImportSelection.value.filter((id) => id !== parentId), taskId])];
     todayImportEstimates.value = { ...todayImportEstimates.value, [taskId]: "" };
     todayImportTaskTitles.value = { ...todayImportTaskTitles.value, [taskId]: title };
@@ -862,6 +893,47 @@ async function createTodayImportTask() {
   } finally {
     todayImportCreateSaving.value = false;
   }
+}
+
+function todayImportContextTask() {
+  return activeImportTasks.value.find((task) => task.id === todayImportContextTaskId.value);
+}
+
+function openTodayImportContextMenu(event: MouseEvent, task: Task) {
+  event.preventDefault();
+  event.stopPropagation();
+  closeContextMenu();
+  const position = contextMenuPosition(event.clientX, event.clientY, 190, 130, window.innerWidth, window.innerHeight);
+  todayImportContextTaskId.value = task.id;
+  todayImportContextMenuLeft.value = position.left;
+  todayImportContextMenuTop.value = position.top;
+  todayImportContextMenuOpen.value = true;
+}
+
+function closeTodayImportContextMenu() {
+  todayImportContextMenuOpen.value = false;
+  todayImportContextTaskId.value = "";
+}
+
+async function duplicateTodayImportRow(task: Task) {
+  closeTodayImportContextMenu();
+  try {
+    const taskId = await props.duplicateSingleTask(task.id);
+    if (!taskId) throw new Error("事项复制失败");
+    todayImportSelection.value = [...new Set([...todayImportSelection.value, taskId])];
+    todayImportEstimates.value = { ...todayImportEstimates.value, [taskId]: "" };
+    todayImportTaskTitles.value = { ...todayImportTaskTitles.value, [taskId]: task.title };
+    ElMessage.success("已复制事项");
+  } catch (error) {
+    ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "事项复制失败");
+  }
+}
+
+function runTodayImportContextCommand(command: "before" | "after" | "duplicate") {
+  const task = todayImportContextTask();
+  if (!task) { closeTodayImportContextMenu(); return; }
+  if (command === "duplicate") { void duplicateTodayImportRow(task); return; }
+  void openTodayImportRelativeCreate(task, command);
 }
 
 function todayImportSubtreeIds(taskId: string) {
@@ -1093,10 +1165,11 @@ onMounted(() => {
   document.addEventListener("pointerdown", closeContextMenuForPointer);
   document.addEventListener("keydown", closeContextMenuForKey);
   window.addEventListener("scroll", closeContextMenu, true);
+  window.addEventListener("scroll", closeTodayImportContextMenu, true);
 });
 
 watch([todayImportOpen, todayImportRows, todayImportQuery], async ([open]) => {
-  if (!open) { todayImportSortable.destroy(); return; }
+  if (!open) { todayImportSortable.destroy(); closeTodayImportContextMenu(); return; }
   await nextTick();
   todayImportSortable.mount();
 }, { flush: "post" });
@@ -1107,6 +1180,7 @@ onBeforeUnmount(() => {
   document.removeEventListener("pointerdown", closeContextMenuForPointer);
   document.removeEventListener("keydown", closeContextMenuForKey);
   window.removeEventListener("scroll", closeContextMenu, true);
+  window.removeEventListener("scroll", closeTodayImportContextMenu, true);
   if (levelChangedTimer) window.clearTimeout(levelChangedTimer);
 });
 </script>
@@ -1344,7 +1418,7 @@ onBeforeUnmount(() => {
         <div class="today-import-list-head" aria-hidden="true"><span>事项</span><span>今日实际</span><span>今日预计</span><span>操作</span></div>
         <div ref="todayImportRowsRef" class="today-import-sortable-rows" :class="{ moving: todayImportMoving }">
         <div v-for="row in todayImportRows" :key="row.task.id" class="today-import-row" :data-today-import-task-id="row.task.id" :data-depth="row.depth" :class="{ group: !row.allocatable, child: row.depth > 0, selected: isTodayImportSelected(row.task.id) }" :style="{ '--task-depth': String(row.depth) }">
-          <button class="today-import-drag-handle" type="button" :disabled="Boolean(todayImportQuery.trim())" :title="todayImportQuery.trim() ? '清空搜索后调整顺序和层级' : (todayImportSubtreeIds(row.task.id).size > 1 ? `拖动整组（共 ${todayImportSubtreeIds(row.task.id).size} 项）` : '拖动排序')" :aria-label="`${row.task.title}拖动排序`" @pointerdown="todayImportSortable.prepareSubtree(row.task.id)"><GripVertical :size="14" /></button>
+          <button class="today-import-drag-handle" type="button" :disabled="Boolean(todayImportQuery.trim())" :class="{ active: todayImportContextTaskId === row.task.id }" :title="todayImportQuery.trim() ? '清空搜索后调整顺序和层级' : '拖动排序；右键可复制事项或插入行'" :aria-label="`${row.task.title}拖动排序，右键打开行菜单`" @pointerdown="todayImportSortable.prepareSubtree(row.task.id)" @contextmenu="openTodayImportContextMenu($event, row.task)"><GripVertical :size="14" /></button>
           <template v-if="row.allocatable">
             <input class="today-import-check" type="checkbox" :checked="isTodayImportSelected(row.task.id)" :disabled="todayPlannedIds.has(row.task.id)" :aria-label="`${row.task.title}加入今日`" @change="updateTodayImportSelection(row.task.id, ($event.target as HTMLInputElement).checked)" />
           </template>
@@ -1402,9 +1476,7 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <span v-else class="today-import-estimate-empty">—</span>
-          <div class="today-import-actions">
-            <button v-if="row.depth === 0" class="secondary-button compact timer-task-add-child" type="button" :disabled="Boolean(row.task.recurrence)" :title="row.task.recurrence ? '重复事项新增子项前必须先关闭重复' : '新增子项'" :aria-label="`${row.task.title}新增子项`" @click="openTodayImportCreate(row.task.id)"><Plus :size="13" />子项</button>
-          </div>
+          <div class="today-import-actions"></div>
           <small v-if="todayImportErrors[row.task.id]" class="today-import-error">{{ todayImportErrors[row.task.id] }}</small>
         </div>
         </div>
@@ -1549,6 +1621,12 @@ onBeforeUnmount(() => {
     </el-dialog>
 
     <Teleport to="body">
+      <div v-if="todayImportContextMenuOpen" class="plan-task-context-menu task-row-context-menu" role="menu" :style="{ left: `${todayImportContextMenuLeft}px`, top: `${todayImportContextMenuTop}px` }" @pointerdown.stop>
+        <button type="button" role="menuitem" @click="runTodayImportContextCommand('duplicate')">复制事项</button>
+        <span class="plan-task-context-divider"></span>
+        <button type="button" role="menuitem" @click="runTodayImportContextCommand('before')">在上方插入行</button>
+        <button type="button" role="menuitem" @click="runTodayImportContextCommand('after')">在下方插入行</button>
+      </div>
       <div v-if="contextMenuOpen" class="plan-task-context-menu" role="menu" :style="{ left: `${contextMenuLeft}px`, top: `${contextMenuTop}px` }" @pointerdown.stop>
         <button type="button" role="menuitem" @click="runContextCommand('before')">在上方新增</button>
         <button type="button" role="menuitem" @click="runContextCommand('after')">在下方新增</button>

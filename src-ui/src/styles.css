@@ -1642,6 +1642,7 @@ pre {
 .today-import-row.group { min-height: 48px; background: var(--panel-2); }
 .today-import-drag-handle { width: 22px; height: 30px; display: grid; place-items: center; border: 0; padding: 0; color: var(--muted); background: transparent; cursor: grab; }
 .today-import-drag-handle:disabled { opacity: .35; cursor: not-allowed; }
+.today-import-drag-handle.active, .timer-task-drag-handle.active { color: var(--accent); background: var(--surface-soft); border-radius: 6px; }
 .today-import-sortable-rows[data-drop-depth="0"] .sortable-ghost { box-shadow: inset 0 3px 0 var(--accent); }
 .today-import-sortable-rows[data-drop-depth="1"] .sortable-ghost { box-shadow: inset 54px 3px 0 var(--accent); }
 .today-import-sortable-rows.drop-invalid .sortable-ghost { border-color: var(--danger); box-shadow: inset 0 0 0 1px var(--danger); }
@@ -2449,7 +2450,7 @@ pre {
 .timer-task-primary-action.running { color: var(--green); }
 .timer-task-primary-action.paused { color: var(--amber); }
 .timer-task-primary-action:disabled { cursor: default; opacity: .74; }
-.timer-task-add-child { min-width: 62px; }
+.task-row-context-menu { width: 190px; }
 .timer-task-row-error { grid-column: 1 / -1; margin-top: -3px; font-size: 10px; }
 .timer-task-empty { min-height: 220px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; padding: 30px; color: var(--muted); text-align: center; }
 .timer-task-empty strong { color: var(--text); }

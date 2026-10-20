@@ -253,6 +253,24 @@ function mockInitScript() {
           activeTasks.push(row);
           return { ...row };
         }
+        case "task_create_positioned": {
+          created += 1;
+          const id = "created-" + created;
+          calls.create.push({ id, ...args.request });
+          const row = record(id, {
+            subjectId: args.request.subjectId,
+            parentId: args.request.parentId,
+            title: args.request.title,
+            projectName: args.request.projectName ?? "工作",
+            plannedDate: args.request.plannedDate,
+            estimateMinutes: args.request.estimateMinutes,
+            note: args.request.note,
+            pathLabel: args.request.parentId ? `项目 / ${args.request.title}` : args.request.title,
+            sortOrder: 90 + created,
+          });
+          activeTasks.push(row);
+          return { ...row };
+        }
         case "actual_adjustment_snapshot":
           return {
             subjectId: args.request.subjectId,
@@ -453,14 +471,23 @@ async function mainSharedPlanEditor() {
   const createdRootRow = todayImport.locator(`[data-today-import-task-id="${createdRootId}"]`);
   await createdRootRow.waitFor({ state: "visible" });
   if (!await createdRootRow.locator('.today-import-check').isChecked()) throw new Error("配置弹框新增事项后未自动选中");
-  await createdRootRow.getByRole("button", { name: /新增子项/ }).click();
+  if (await todayImport.locator('.timer-task-add-child').count()) throw new Error("配置今日事项仍显示逐行新增子项按钮");
+  const existingChildRow = todayImport.locator('[data-today-import-task-id="child"]');
+  await existingChildRow.locator('.today-import-drag-handle').click({ button: "right" });
+  const rowMenu = page.locator('.task-row-context-menu:visible');
+  const menuItems = await rowMenu.getByRole("menuitem").allTextContents();
+  if (menuItems.join("|") !== "复制事项|在上方插入行|在下方插入行") throw new Error("配置今日事项右键菜单顺序或文案不正确");
+  await rowMenu.getByRole("menuitem", { name: "在下方插入行" }).click();
   await todayImport.getByRole("textbox", { name: "新增事项名称" }).fill("配置弹框新增子项");
   await todayImport.locator('.today-import-create-bar button', { hasText: "新增" }).click();
-  await page.waitForFunction((parentId) => window.__TODAY_PLAN_TEST__.calls.create.some((call) => call.title === "配置弹框新增子项" && call.parentId === parentId), createdRootId);
+  await page.waitForFunction(() => window.__TODAY_PLAN_TEST__.calls.create.some((call) => call.title === "配置弹框新增子项" && call.parentId === "parent"));
   const createdChild = (await calls()).create.find((call) => call.title === "配置弹框新增子项");
   const createdChildRow = todayImport.locator(`[data-today-import-task-id="${createdChild.id}"]`);
   await createdChildRow.waitFor({ state: "visible" });
   if (await createdChildRow.getAttribute("data-depth") !== "1") throw new Error("配置弹框新增子项未形成二级层级");
+  await createdChildRow.locator('.today-import-drag-handle').click({ button: "right" });
+  await page.locator('.task-row-context-menu:visible').getByRole("menuitem", { name: "复制事项" }).click();
+  await page.waitForFunction((taskId) => window.__TODAY_PLAN_TEST__.calls.create.some((call) => call.previousSiblingId === taskId && call.parentId === "parent"), createdChild.id);
   const createdTitleInput = createdChildRow.getByRole("textbox", { name: /编辑事项名称/ });
   await createdTitleInput.fill("配置弹框子项改名");
   await createdTitleInput.blur();
