@@ -2011,7 +2011,7 @@ fn apply_incremental_entity(
         "time_entries" => apply_incremental_time_entry(transaction, workspace_id, data),
         "actual_time_adjustments" => transaction.execute(
             "INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,note,source_type,batch_id,created_at,updated_at,version,created_by_device_id,updated_by_device_id,deleted_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'quick_actual_adjustment',?10,?11,?12,?13,?14,?15,?16)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'quick_actual_adjustment',?10,?11,?12,?13,(SELECT id FROM devices WHERE id=?14 AND workspace_id=?2),(SELECT id FROM devices WHERE id=?15 AND workspace_id=?2),?16)
              ON CONFLICT(id) DO UPDATE SET subject_id=excluded.subject_id,task_id=excluded.task_id,work_date=excluded.work_date,delta_minutes=excluded.delta_minutes,baseline_minutes=excluded.baseline_minutes,target_minutes=excluded.target_minutes,note=excluded.note,batch_id=excluded.batch_id,updated_at=excluded.updated_at,version=excluded.version,updated_by_device_id=excluded.updated_by_device_id,deleted_at=excluded.deleted_at",
             params![text(data,"id"),workspace_id,text(data,"subject_id"),text(data,"task_id"),text(data,"work_date"),integer(data,"delta_minutes"),integer(data,"baseline_minutes"),integer(data,"target_minutes"),optional_text(data,"note"),text(data,"batch_id"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version"),optional_text(data,"created_by_device_id"),optional_text(data,"updated_by_device_id"),optional_millis(data,"deleted_at")],
         ),
@@ -8121,7 +8121,7 @@ fn replace_snapshot_table(
         }
         "actual_time_adjustments" => {
             replace_simple_rows(transaction, table, workspace_id, rows, |tx, row, ws| {
-                tx.execute("INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,note,source_type,batch_id,created_at,updated_at,version,created_by_device_id,updated_by_device_id,deleted_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'quick_actual_adjustment',?10,?11,?12,?13,?14,?15,?16)", params![text(row,"id"),ws,text(row,"subject_id"),text(row,"task_id"),text(row,"work_date"),integer(row,"delta_minutes"),integer(row,"baseline_minutes"),integer(row,"target_minutes"),optional_text(row,"note"),text(row,"batch_id"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version"),optional_text(row,"created_by_device_id"),optional_text(row,"updated_by_device_id"),optional_millis(row,"deleted_at")])
+                tx.execute("INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,note,source_type,batch_id,created_at,updated_at,version,created_by_device_id,updated_by_device_id,deleted_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'quick_actual_adjustment',?10,?11,?12,?13,(SELECT id FROM devices WHERE id=?14 AND workspace_id=?2),(SELECT id FROM devices WHERE id=?15 AND workspace_id=?2),?16)", params![text(row,"id"),ws,text(row,"subject_id"),text(row,"task_id"),text(row,"work_date"),integer(row,"delta_minutes"),integer(row,"baseline_minutes"),integer(row,"target_minutes"),optional_text(row,"note"),text(row,"batch_id"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version"),optional_text(row,"created_by_device_id"),optional_text(row,"updated_by_device_id"),optional_millis(row,"deleted_at")])
             })?
         }
         "unassigned_sessions" => {
@@ -14090,12 +14090,13 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_import_restores_actual_time_adjustments() {
+    fn snapshot_import_restores_actual_time_adjustments_with_unknown_device_ids() {
         let (_directory, database, cloud_workspace_id, _local_workspace_id, subject_id) =
             cloud_database_for_incremental_test("cloud-snapshot-restores-adjustments.sqlite3");
         let task_id = Uuid::now_v7().to_string();
         let adjustment_id = Uuid::now_v7().to_string();
         let batch_id = Uuid::now_v7().to_string();
+        let missing_device_id = Uuid::now_v7().to_string();
         let now = now_millis();
         let snapshot = json!({
             "subjects": [{"id": subject_id, "name": "默认", "sort_order": 10, "created_at": now, "updated_at": now, "version": 1, "deleted_at": null}],
@@ -14105,22 +14106,80 @@ mod tests {
                 "work_date": "2026-10-20", "delta_minutes": 15, "baseline_minutes": 0,
                 "target_minutes": 15, "note": null, "source_type": "quick_actual_adjustment",
                 "batch_id": batch_id, "created_at": now, "updated_at": now, "version": 1,
-                "created_by_device_id": null, "updated_by_device_id": null, "deleted_at": null
+                "created_by_device_id": missing_device_id, "updated_by_device_id": missing_device_id, "deleted_at": null
             }]
         });
 
         apply_snapshot(&database, &snapshot, None, Some(&cloud_workspace_id), None).unwrap();
 
-        let saved: i64 = database
+        let saved: (i64, Option<String>, Option<String>) = database
             .open()
             .unwrap()
             .query_row(
-                "SELECT target_minutes FROM actual_time_adjustments WHERE id=?1 AND deleted_at IS NULL",
+                "SELECT target_minutes,created_by_device_id,updated_by_device_id FROM actual_time_adjustments WHERE id=?1 AND deleted_at IS NULL",
                 [&adjustment_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(saved, 15);
+        assert_eq!(saved, (15, None, None));
+    }
+
+    #[test]
+    fn incremental_actual_adjustment_ignores_unknown_device_ids() {
+        let (_directory, database, _cloud_workspace_id, local_workspace_id, subject_id) =
+            cloud_database_for_incremental_test("cloud-incremental-adjustment-device.sqlite3");
+        let task_id = Uuid::now_v7().to_string();
+        let adjustment_id = Uuid::now_v7().to_string();
+        let missing_device_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        let mut connection = database.open().unwrap();
+        connection
+            .execute(
+                "INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version)
+                 VALUES(?1,?2,?3,'增量实际用时','open','manual',10,?4,?4,1)",
+                params![task_id, local_workspace_id, subject_id, now],
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        apply_incremental_entity(
+            &transaction,
+            &local_workspace_id,
+            &IncrementalEntity {
+                entity_type: "actual_time_adjustments".to_string(),
+                source_entity_type: "actual_time_adjustments".to_string(),
+                entity_id: adjustment_id.clone(),
+                change_seq: 1,
+                deleted: false,
+                data: Some(json!({
+                    "id": adjustment_id,
+                    "subject_id": subject_id,
+                    "task_id": task_id,
+                    "work_date": "2026-10-20",
+                    "delta_minutes": 15,
+                    "baseline_minutes": 0,
+                    "target_minutes": 15,
+                    "note": null,
+                    "batch_id": Uuid::now_v7().to_string(),
+                    "created_at": now,
+                    "updated_at": now,
+                    "version": 1,
+                    "created_by_device_id": missing_device_id,
+                    "updated_by_device_id": missing_device_id,
+                    "deleted_at": null
+                })),
+            },
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+
+        let saved: (i64, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT target_minutes,created_by_device_id,updated_by_device_id FROM actual_time_adjustments WHERE id=?1",
+                [&adjustment_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(saved, (15, None, None));
     }
 
     #[test]
