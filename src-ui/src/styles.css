@@ -2097,7 +2097,6 @@ pre {
 .completed-history-head h2 { overflow: hidden; margin: 0 0 2px; color: var(--text); font-size: 16px; text-overflow: ellipsis; white-space: nowrap; }
 .completed-history-head span { color: var(--muted); font-size: 11px; }
 .completed-history-list { min-height: 0; overflow: auto; padding: 6px 8px; transition: opacity 140ms ease; }
-.completed-history-list.refreshing { opacity: 0.56; pointer-events: none; }
 .completed-history-row { min-width: 0; min-height: 61px; display: grid; grid-template-columns: 30px minmax(0, 1fr) 30px; align-items: center; gap: 9px; border-bottom: 1px solid var(--line-soft); padding: 7px 4px; }
 .completed-history-row:last-child { border-bottom: 0; }
 .completed-history-row:hover { background: var(--surface-subtle); }

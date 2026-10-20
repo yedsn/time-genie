@@ -64,7 +64,8 @@ export type ExecutionPanelTask = {
 };
 
 /**
- * 执行模式的候选范围只允许当前主体的未完成今日成员及其父级上下文。
+ * 执行模式的候选范围只允许当前主体的今日成员及其父级上下文；
+ * 当天已完成成员继续显示，点击“继续”时由计时转换恢复完成状态。
  * 非执行模式（历史归属、未归属时间分配）继续沿用调用方给出的既有范围，不做缩窄。
  */
 export function executionPanelSourceTasks<T extends ExecutionPanelTask>(
@@ -74,8 +75,7 @@ export function executionPanelSourceTasks<T extends ExecutionPanelTask>(
 ): T[] {
   if (mode !== "execute") return [...tasks];
   return tasks.filter((task) => task.subjectId === subjectId
-    && (Boolean(task.todayMember) || Boolean(task.todayContext))
-    && (Boolean(task.todayContext) || task.status !== "done"));
+    && (Boolean(task.todayMember) || Boolean(task.todayContext)));
 }
 
 export type ExecutionPanelCurrentStatus = {
@@ -128,7 +128,7 @@ function stableTree<T extends ExecutionPanelTask>(tasks: readonly T[], subjectId
   const subjectTasks = tasks.filter((task) => task.subjectId === subjectId);
   const byId = new Map(subjectTasks.map((task) => [task.id, task]));
   const included = new Set(subjectTasks
-    .filter((task) => task.status === "open" || task.completedToday || task.pinned)
+    .filter((task) => task.status === "open" || task.completedToday || task.todayMember || task.pinned)
     .map((task) => task.id));
   for (const taskId of [...included]) {
     let parentId = byId.get(taskId)?.parentId;

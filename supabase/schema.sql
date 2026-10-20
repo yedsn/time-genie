@@ -1993,7 +1993,8 @@ as $$
 declare
   cached jsonb; request_value jsonb; item jsonb; draft jsonb; created_wrapper jsonb;
   task_image jsonb; adjustment_image jsonb; current_task timegenie.tasks;
-  current_fingerprint text; current_actual bigint; result_value jsonb;
+  current_actual bigint; effective_delta integer; result_value jsonb;
+  applied_adjustments jsonb := '[]'::jsonb; discarded_adjustment_ids jsonb := '[]'::jsonb;
   expected_adjustment_count integer := 0; matching_count integer;
 begin
   if not timegenie.is_workspace_owner(p_workspace_id) then raise exception 'AUTH_REQUIRED'; end if;
@@ -2049,14 +2050,6 @@ begin
        or (item->>'targetMinutes')::integer - (item->>'baselineMinutes')::integer <> (item->>'deltaMinutes')::integer then
       raise exception 'VALIDATION_ERROR: actual adjustment minutes are inconsistent';
     end if;
-    current_fingerprint := timegenie.actual_adjustment_fingerprint(p_workspace_id,current_task.id,(p_payload->>'workDate')::date);
-    if current_fingerprint is distinct from item->>'adjustmentFingerprint' then
-      raise exception 'ADJUSTMENT_BASELINE_CONFLICT: actual adjustment baseline changed';
-    end if;
-    select coalesce(sum(a.minutes),0) + coalesce((select sum(existing.delta_minutes) from timegenie.actual_time_adjustments existing where existing.workspace_id=p_workspace_id and existing.task_id=current_task.id and existing.work_date=(p_payload->>'workDate')::date and existing.deleted_at is null),0)
-    into current_actual from timegenie.time_allocations a join timegenie.time_entries e on e.id=a.entry_id
-    where a.workspace_id=p_workspace_id and a.task_id=current_task.id and e.work_date=(p_payload->>'workDate')::date and e.deleted_at is null;
-    if current_actual + (item->>'deltaMinutes')::integer < 0 then raise exception 'VALIDATION_ERROR: final actual minutes cannot be negative'; end if;
     if (item->>'deltaMinutes')::integer <> 0 then
       expected_adjustment_count := expected_adjustment_count + 1;
       select count(*) into matching_count
@@ -2170,13 +2163,35 @@ begin
       and (adjustment_image->>'baseline_minutes')::integer = 0
       and (adjustment_image->>'target_minutes')::integer = (expected->>'targetMinutes')::integer;
     if matching_count <> 1 then raise exception 'VALIDATION_ERROR: actual adjustment image does not match request'; end if;
+    item := null;
+    select value into item
+    from jsonb_array_elements(coalesce(p_payload->'items','[]'::jsonb)) value
+    where value->>'taskId'=adjustment_image->>'task_id';
+    if item is not null then
+      select coalesce(sum(a.minutes),0) + coalesce((select sum(existing.delta_minutes) from timegenie.actual_time_adjustments existing where existing.workspace_id=p_workspace_id and existing.task_id=(adjustment_image->>'task_id')::uuid and existing.work_date=(p_payload->>'workDate')::date and existing.deleted_at is null),0)
+      into current_actual from timegenie.time_allocations a join timegenie.time_entries e on e.id=a.entry_id
+      where a.workspace_id=p_workspace_id and a.task_id=(adjustment_image->>'task_id')::uuid and e.work_date=(p_payload->>'workDate')::date and e.deleted_at is null;
+      effective_delta := (item->>'targetMinutes')::integer - current_actual;
+      if effective_delta = 0 then
+        discarded_adjustment_ids := discarded_adjustment_ids || jsonb_build_array(adjustment_image->>'id');
+        continue;
+      end if;
+      adjustment_image := adjustment_image || jsonb_build_object(
+        'delta_minutes',effective_delta,
+        'baseline_minutes',current_actual,
+        'target_minutes',(item->>'targetMinutes')::integer
+      );
+    end if;
     insert into timegenie.actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,note,source_type,batch_id,created_at,updated_at,version,created_by_device_id,updated_by_device_id,deleted_at)
     values((adjustment_image->>'id')::uuid,p_workspace_id,(adjustment_image->>'subject_id')::uuid,(adjustment_image->>'task_id')::uuid,(adjustment_image->>'work_date')::date,(adjustment_image->>'delta_minutes')::integer,(adjustment_image->>'baseline_minutes')::integer,(adjustment_image->>'target_minutes')::integer,nullif(adjustment_image->>'note',''),'quick_actual_adjustment',(adjustment_image->>'batch_id')::uuid,to_timestamp((adjustment_image->>'created_at')::double precision/1000),to_timestamp((adjustment_image->>'updated_at')::double precision/1000),1,p_device_id,p_device_id,null);
+    applied_adjustments := applied_adjustments || jsonb_build_array(adjustment_image);
   end loop;
   result_value := jsonb_build_object(
     'batchId',p_payload->>'batchId',
     'createdTaskCount',jsonb_array_length(coalesce(p_payload->'createdTasks','[]'::jsonb)),
-    'createdAdjustmentCount',jsonb_array_length(coalesce(p_payload->'adjustments','[]'::jsonb))
+    'createdAdjustmentCount',jsonb_array_length(applied_adjustments),
+    'adjustments',applied_adjustments,
+    'discardedAdjustmentIds',discarded_adjustment_ids
   );
   perform timegenie.record_processed_operation(p_workspace_id,p_operation_id,p_device_id,'actual_adjustment_batch_apply',request_value,result_value);
   return result_value;
@@ -3749,3 +3764,9 @@ notify pgrst, 'reload schema';
 -- Timer transitions atomically materialize recurring occurrences. Keep this
 -- after the legacy timer-transition patch so upgrades finish on this version.
 \ir 20261019_timegenie_timer_recurring_occurrence.sql
+
+-- Actual-time edits are target-based and rebase against the latest cloud value.
+\ir 20261020_timegenie_actual_adjustment_target_rebase.sql
+
+-- Expose actual-time adjustments in full snapshots for upgrade deployments.
+\ir 20261020b_timegenie_actual_adjustment_snapshot.sql

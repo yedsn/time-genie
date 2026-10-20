@@ -36,6 +36,8 @@ const optionalPreRestoreSnapshotPatchFile = path.join(repoRoot, "supabase", "202
 const restoreUnassignedStatePatchFile = path.join(repoRoot, "supabase", "20261018p_timegenie_restore_unassigned_state.sql");
 const timerFactConvergencePatchFile = path.join(repoRoot, "supabase", "20261018f_timegenie_timer_fact_convergence.sql");
 const actualAdjustmentBatchPatchFile = path.join(repoRoot, "supabase", "20261015_timegenie_actual_adjustment_batch.sql");
+const actualAdjustmentTargetRebasePatchFile = path.join(repoRoot, "supabase", "20261020_timegenie_actual_adjustment_target_rebase.sql");
+const actualAdjustmentSnapshotPatchFile = path.join(repoRoot, "supabase", "20261020b_timegenie_actual_adjustment_snapshot.sql");
 const namedTemplateBootstrapFixFile = path.join(repoRoot, "supabase", "20261016_timegenie_named_template_bootstrap_fix.sql");
 const timerTransitionPatchFile = path.join(repoRoot, "supabase", "20261016b_timegenie_timer_transition.sql");
 const timerRecurringOccurrencePatchFile = path.join(repoRoot, "supabase", "20261019_timegenie_timer_recurring_occurrence.sql");
@@ -122,6 +124,8 @@ function verifyStaticSchemaInvariants() {
   const restoreUnassignedStatePatch = fs.readFileSync(restoreUnassignedStatePatchFile, "utf8");
   const timerFactConvergencePatch = fs.readFileSync(timerFactConvergencePatchFile, "utf8");
   const actualAdjustmentBatchPatch = fs.readFileSync(actualAdjustmentBatchPatchFile, "utf8");
+  const actualAdjustmentTargetRebasePatch = fs.readFileSync(actualAdjustmentTargetRebasePatchFile, "utf8");
+  const actualAdjustmentSnapshotPatch = fs.readFileSync(actualAdjustmentSnapshotPatchFile, "utf8");
   const namedTemplateBootstrapFix = fs.readFileSync(namedTemplateBootstrapFixFile, "utf8");
   const timerTransitionPatch = fs.readFileSync(timerTransitionPatchFile, "utf8");
   const timerRecurringOccurrencePatch = fs.readFileSync(timerRecurringOccurrencePatchFile, "utf8");
@@ -439,6 +443,9 @@ function verifyStaticSchemaInvariants() {
   if ((schemaIntegrationTest.match(/\\ir 20261015_timegenie_actual_adjustment_batch\.sql/g) ?? []).length < 2) {
     throw new Error("The schema integration test must prove the actual adjustment batch patch is idempotent.");
   }
+  if ((schemaIntegrationTest.match(/\\ir 20261020_timegenie_actual_adjustment_target_rebase\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the actual adjustment target-rebase patch is idempotent.");
+  }
   if ((schemaIntegrationTest.match(/\\ir 20261016_timegenie_named_template_bootstrap_fix\.sql/g) ?? []).length < 2) {
     throw new Error("The schema integration test must prove the named-template bootstrap fix is idempotent.");
   }
@@ -456,24 +463,45 @@ function verifyStaticSchemaInvariants() {
   if (!schema.includes("\\ir 20261016_timegenie_named_template_bootstrap_fix.sql")) {
     throw new Error("The source schema must finish with the named-template bootstrap fix.");
   }
+  if (!schema.includes("create or replace function timegenie.actual_adjustment_fingerprint")
+      || !actualAdjustmentBatchPatch.includes("create or replace function timegenie.actual_adjustment_fingerprint")) {
+    throw new Error("The schema and original actual adjustment patch must retain the adjustment fingerprint helper.");
+  }
   for (const expected of [
-    "create or replace function timegenie.actual_adjustment_fingerprint",
     "create or replace function timegenie.actual_adjustment_batch_apply",
-    "ADJUSTMENT_BASELINE_CONFLICT",
-    "final actual minutes cannot be negative",
+    "effective_delta := (item->>'targetMinutes')::integer - current_actual",
+    "discardedAdjustmentIds",
+    "'adjustments',applied_adjustments",
     "existing task adjustment image does not match request",
     "new task adjustment image does not match draft",
     "grant execute on function timegenie.actual_adjustment_batch_apply(uuid,uuid,uuid,jsonb) to authenticated",
   ]) {
     const compactExpected = expected.replaceAll(" ", "").toLowerCase();
     if (!schema.replaceAll(" ", "").toLowerCase().includes(compactExpected)
-        || !actualAdjustmentBatchPatch.replaceAll(" ", "").toLowerCase().includes(compactExpected)) {
-      throw new Error(`The schema and actual adjustment batch patch must include: ${expected}`);
+        || !actualAdjustmentTargetRebasePatch.replaceAll(" ", "").toLowerCase().includes(compactExpected)) {
+      throw new Error(`The schema and actual adjustment target-rebase patch must include: ${expected}`);
+    }
+  }
+  if (!schema.includes("\\ir 20261020_timegenie_actual_adjustment_target_rebase.sql")) {
+    throw new Error("The source schema must finish with the actual adjustment target-rebase patch.");
+  }
+  if (!schema.includes("\\ir 20261020b_timegenie_actual_adjustment_snapshot.sql")) {
+    throw new Error("The source schema must include the actual-adjustment snapshot patch.");
+  }
+  for (const expected of [
+    "cloud_snapshot_get_pre_actual_adjustments",
+    "'actual_time_adjustments',coalesce((select jsonb_agg(to_jsonb(row_value) order by work_date,task_id,id)",
+    "cloud_incremental_entity_get_pre_actual_adjustments",
+    "migration_import_snapshot_pre_actual_adjustments",
+    "source_entity_type','actual_time_adjustments'",
+  ]) {
+    if (!actualAdjustmentSnapshotPatch.includes(expected)) {
+      throw new Error(`The actual-adjustment snapshot patch must include: ${expected}`);
     }
   }
   if (!schemaIntegrationTest.includes("failed actual adjustment batch left partial remote data")
-      || !schemaIntegrationTest.includes("stale actual adjustment batch left partial remote data")) {
-    throw new Error("The schema integration test must prove failed actual adjustment batches leave no partial remote data.");
+      || !schemaIntegrationTest.includes("stale adjustment target was not rebased")) {
+    throw new Error("The schema integration test must prove failed batches stay atomic and stale baselines rebase to the requested target.");
   }
   const authorityTickStart = timerSyncAuthorityPatch.indexOf("create or replace function timegenie.unassigned_tick");
   const authorityTickEnd = timerSyncAuthorityPatch.indexOf("end $$;", authorityTickStart);

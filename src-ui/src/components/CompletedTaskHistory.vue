@@ -99,7 +99,7 @@ async function confirmDelete(task: Task) {
       <strong>还没有已完成事项</strong>
       <span>普通事项完成后会出现在这里，重复事项的每日轮次不会进入历史。</span>
     </div>
-    <div v-else class="completed-history-list" :class="{ refreshing: loading }">
+    <div v-else class="completed-history-list">
       <article v-for="task in tasks" :key="task.id" class="completed-history-row">
         <button class="completed-history-reopen" type="button" title="恢复为进行中" @click="emit('reopen', task)">
           <RotateCcw :size="16" />

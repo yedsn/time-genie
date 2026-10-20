@@ -115,6 +115,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "task_day_plans",
         sql: include_str!("../migrations/0020_task_day_plans.sql"),
     },
+    Migration {
+        version: 21,
+        name: "actual_adjustment_conflict_classification",
+        sql: include_str!("../migrations/0021_actual_adjustment_conflict_classification.sql"),
+    },
+    Migration {
+        version: 22,
+        name: "retry_actual_adjustment_target_conflicts",
+        sql: include_str!("../migrations/0022_retry_actual_adjustment_target_conflicts.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -615,8 +625,63 @@ mod tests {
         let workspace_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migration_count, 20);
+        assert_eq!(migration_count, 22);
         assert_eq!(workspace_count, 1);
+    }
+
+    #[test]
+    fn actual_adjustment_target_migration_retries_old_baseline_conflicts() {
+        let directory = tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("actual-adjustment-conflict-upgrade.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                   version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        for migration in &MIGRATIONS[..20] {
+            let transaction = connection.transaction().unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version,name,applied_at) VALUES (?1,?2,1)",
+                    params![migration.version, migration.name],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,payload_json,state,attempt_count,created_at,last_attempt_at,error_json)
+                 VALUES('adjustment-op','workspace','device','actual_adjustment_batch_apply','actual_adjustment_batch','batch','{}','pending',7,100,200,?1)",
+                [serde_json::json!({ "message": "CLOUD_REQUEST_FAILED: ADJUSTMENT_BASELINE_CONFLICT: actual adjustment baseline changed" }).to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        Database::initialize_at(path.clone()).unwrap();
+        let connection = Connection::open(path).unwrap();
+        let state: String = connection
+            .query_row(
+                "SELECT state FROM sync_outbox WHERE operation_id='adjustment-op'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "pending");
+        let error_json: Option<String> = connection
+            .query_row(
+                "SELECT error_json FROM sync_outbox WHERE operation_id='adjustment-op'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(error_json.is_none());
     }
 
     #[test]

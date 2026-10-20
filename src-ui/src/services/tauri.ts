@@ -1592,6 +1592,10 @@ export async function refreshCloudSync(): Promise<void> {
   await invoke("cloud_sync_refresh");
 }
 
+export async function catchUpCloudSync(): Promise<void> {
+  await invoke("cloud_sync_catch_up");
+}
+
 export async function saveCloudSync(): Promise<CloudSyncPushResult> {
   return await invoke("cloud_sync_save");
 }

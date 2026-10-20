@@ -1235,6 +1235,46 @@ pub fn pull(
     pull_locked(database, request)
 }
 
+fn catch_up_incremental(database: &Database) -> Result<CloudSyncPullResult, String> {
+    let _operation_guard = cloud_sync_operation_guard();
+    let state = storage_mode(database)?;
+    if state.mode != "cloud" || !state.online {
+        return Ok(CloudSyncPullResult {
+            changes: Vec::new(),
+            last_change_seq: state.last_change_seq,
+            has_more: false,
+            domains: Vec::new(),
+        });
+    }
+    let mut last_change_seq = state.last_change_seq;
+    let mut changes = Vec::new();
+    let mut domains = HashSet::new();
+    loop {
+        let pulled = pull_locked(
+            database,
+            CloudSyncPullRequest {
+                after_change_seq: Some(last_change_seq),
+                limit: Some(500),
+            },
+        )?;
+        let previous_seq = last_change_seq;
+        last_change_seq = pulled.last_change_seq.max(last_change_seq);
+        changes.extend(pulled.changes);
+        domains.extend(pulled.domains);
+        if !pulled.has_more || last_change_seq <= previous_seq {
+            break;
+        }
+    }
+    let mut domains = domains.into_iter().collect::<Vec<_>>();
+    domains.sort();
+    Ok(CloudSyncPullResult {
+        changes,
+        last_change_seq,
+        has_more: false,
+        domains,
+    })
+}
+
 fn pull_locked(
     database: &Database,
     request: CloudSyncPullRequest,
@@ -3519,6 +3559,9 @@ fn push_outbox_locked(
                     if operation.entity_type == "timer_transition" {
                         adopt_timer_transition_occurrence_result(database, operation, &value)?;
                     }
+                    if operation.entity_type == "actual_adjustment_batch" {
+                        adopt_actual_adjustment_batch_result(database, operation, &value)?;
+                    }
                     if operation.entity_type == "report_template" {
                         adopt_authoritative_report_template_result(database, operation, &value)?;
                     }
@@ -5323,6 +5366,86 @@ fn rollback_actual_adjustment_batch_local_images(
     transaction.commit().map_err(|error| error.to_string())
 }
 
+fn adopt_actual_adjustment_batch_result(
+    database: &Database,
+    operation: &OutboxOperation,
+    value: &Value,
+) -> Result<(), String> {
+    let authoritative = value
+        .get("adjustments")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let discarded = value
+        .get("discardedAdjustmentIds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect::<HashSet<_>>();
+    if authoritative.is_empty() && discarded.is_empty() {
+        return Ok(());
+    }
+    let optimistic_ids = operation
+        .payload
+        .get("adjustments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|adjustment| adjustment.get("id"))
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect::<HashSet<_>>();
+    let mut connection = database.open()?;
+    let local_workspace_id: String = connection
+        .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    for id in discarded {
+        if optimistic_ids.contains(&id) {
+            transaction
+                .execute("DELETE FROM actual_time_adjustments WHERE id=?1", [id])
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    for adjustment in authoritative {
+        let id = text(&adjustment, "id");
+        if id.is_empty() || !optimistic_ids.contains(&id) {
+            continue;
+        }
+        transaction
+            .execute(
+                "UPDATE actual_time_adjustments
+                 SET delta_minutes=?1,baseline_minutes=?2,target_minutes=?3,note=?4,
+                     updated_at=?5,version=?6,updated_by_device_id=?7,deleted_at=?8
+                 WHERE workspace_id=?9 AND id=?10",
+                params![
+                    integer(&adjustment, "delta_minutes"),
+                    integer(&adjustment, "baseline_minutes"),
+                    integer(&adjustment, "target_minutes"),
+                    optional_text(&adjustment, "note"),
+                    millis(&adjustment, "updated_at"),
+                    integer(&adjustment, "version"),
+                    optional_text(&adjustment, "updated_by_device_id"),
+                    optional_millis(&adjustment, "deleted_at"),
+                    local_workspace_id,
+                    id,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction
+        .execute(
+            "UPDATE app_metadata SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='global_revision'",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
 fn incremental_entity_type_for_outbox(entity_type: &str) -> Option<&'static str> {
     match entity_type {
         "subject" => Some("subjects"),
@@ -7083,7 +7206,9 @@ fn mark_epoch_blocked(
 }
 
 fn is_conflict_error(error: &str) -> bool {
-    error.contains("SYNC_CONFLICT") || error.contains("VERSION_CONFLICT")
+    error.contains("SYNC_CONFLICT")
+        || error.contains("VERSION_CONFLICT")
+        || error.contains("ADJUSTMENT_BASELINE_CONFLICT")
 }
 
 fn is_workspace_epoch_stale_error(error: &str) -> bool {
@@ -7280,6 +7405,17 @@ fn apply_snapshot_with_policy(
                 )
                 .map_err(|error| error.to_string())?;
         }
+    }
+    if sync_workspace_id.is_some()
+        && !matches!(
+            snapshot.get("actual_time_adjustments"),
+            Some(Value::Array(_))
+        )
+    {
+        return Err(
+            "CLOUD_SCHEMA_OUTDATED: 云端快照缺少今日实际用时数据。请先部署 supabase/20261020b_timegenie_actual_adjustment_snapshot.sql，已取消本次覆盖。"
+                .to_string(),
+        );
     }
     let integration_secret_refs = integration_secret_refs(&transaction, &local_workspace_id)?;
     let local_tracking_overlay = if preserve_local_tracking {
@@ -8272,6 +8408,16 @@ pub fn cloud_sync_refresh(_database: tauri::State<'_, Database>) -> Result<(), S
 }
 
 #[tauri::command]
+pub async fn cloud_sync_catch_up(
+    database: tauri::State<'_, Database>,
+) -> Result<CloudSyncPullResult, String> {
+    let database = database.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || catch_up_incremental(&database))
+        .await
+        .map_err(|error| format!("SYNC_WORKER_ERROR: 云端刷新任务异常: {error}"))?
+}
+
+#[tauri::command]
 pub async fn cloud_sync_save(
     database: tauri::State<'_, Database>,
     app: AppHandle,
@@ -8544,6 +8690,19 @@ mod tests {
         let local_url = realtime_url("http://127.0.0.1:54321", "local-key").unwrap();
         assert_eq!(local_url.scheme(), "ws");
         assert_eq!(local_url.host_str(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn actual_adjustment_baseline_error_is_a_sync_conflict() {
+        assert!(is_conflict_error(
+            "CLOUD_REQUEST_FAILED: ADJUSTMENT_BASELINE_CONFLICT: actual adjustment baseline changed"
+        ));
+        assert!(is_conflict_error(
+            "CLOUD_REQUEST_FAILED: VERSION_CONFLICT: actual adjustment task version changed"
+        ));
+        assert!(!is_conflict_error(
+            "CLOUD_REQUEST_FAILED: network request timed out"
+        ));
     }
 
     fn incremental_entity(
@@ -11526,7 +11685,8 @@ mod tests {
                         "updated_at": now,
                         "version": 2,
                         "deleted_at": null
-                    }]
+                    }],
+                    "actual_time_adjustments": []
                 }),
                 None,
                 Some(&workspace_id),
@@ -12258,6 +12418,89 @@ mod tests {
                 .query_row(
                     "SELECT COUNT(*) FROM actual_adjustment_batches WHERE client_request_id=?1",
                     [operation_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn actual_adjustment_batch_success_adopts_rebased_cloud_delta() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("actual-adjustment-batch-adopt-rebase.sqlite3"),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let task_id = Uuid::now_v7().to_string();
+        let adjustment_id = Uuid::now_v7().to_string();
+        let discarded_id = Uuid::now_v7().to_string();
+        let batch_id = Uuid::now_v7().to_string();
+        connection.execute("INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version) VALUES(?1,?2,?3,'重算目标','open','manual',10,1,1,1)",params![task_id,workspace_id,subject_id]).unwrap();
+        for (id, delta, baseline, target) in [
+            (&adjustment_id, 15_i64, 60_i64, 75_i64),
+            (&discarded_id, 5_i64, 75_i64, 80_i64),
+        ] {
+            connection.execute("INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,batch_id,created_at,updated_at,version) VALUES(?1,?2,?3,?4,'2026-10-20',?5,?6,?7,?8,1,1,1)",params![id,workspace_id,subject_id,task_id,delta,baseline,target,batch_id]).unwrap();
+        }
+        drop(connection);
+        let operation = OutboxOperation {
+            operation_id: Uuid::now_v7().to_string(),
+            workspace_epoch: 1,
+            operation_type: "actual_adjustment_batch_apply".to_string(),
+            entity_type: "actual_adjustment_batch".to_string(),
+            entity_id: Some(batch_id.clone()),
+            base_version: None,
+            payload_version: None,
+            coalesced_count: 1,
+            depends_on_operation_id: None,
+            payload: json!({
+                "adjustments": [{"id": adjustment_id}, {"id": discarded_id}]
+            }),
+        };
+        adopt_actual_adjustment_batch_result(
+            &database,
+            &operation,
+            &json!({
+                "adjustments": [{
+                    "id": adjustment_id,
+                    "delta_minutes": -20,
+                    "baseline_minutes": 75,
+                    "target_minutes": 55,
+                    "note": null,
+                    "updated_at": 20,
+                    "version": 1,
+                    "updated_by_device_id": device_id,
+                    "deleted_at": null
+                }],
+                "discardedAdjustmentIds": [discarded_id]
+            }),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let adopted: (i64,i64,i64) = connection.query_row(
+            "SELECT delta_minutes,baseline_minutes,target_minutes FROM actual_time_adjustments WHERE id=?1",
+            [&adjustment_id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(adopted, (-20, 75, 55));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM actual_time_adjustments WHERE id=?1",
+                    [discarded_id],
                     |row| row.get::<_, i64>(0)
                 )
                 .unwrap(),
@@ -13701,7 +13944,8 @@ mod tests {
 
         let now = now_millis();
         let snapshot = json!({
-            "subjects": [{"id": subject_id, "name": "云端主体", "sort_order": 10, "created_at": now, "updated_at": now, "version": 7, "deleted_at": null}]
+            "subjects": [{"id": subject_id, "name": "云端主体", "sort_order": 10, "created_at": now, "updated_at": now, "version": 7, "deleted_at": null}],
+            "actual_time_adjustments": []
         });
         apply_snapshot(
             &database,
@@ -13805,6 +14049,84 @@ mod tests {
             )
             .unwrap();
         assert_eq!(counts, (1, 2, 1, 1));
+    }
+
+    #[test]
+    fn cloud_snapshot_without_actual_adjustments_does_not_clear_local_rows() {
+        let (_directory, database, cloud_workspace_id, local_workspace_id, subject_id) =
+            cloud_database_for_incremental_test("cloud-snapshot-missing-adjustments.sqlite3");
+        let task_id = Uuid::now_v7().to_string();
+        let adjustment_id = Uuid::now_v7().to_string();
+        let batch_id = Uuid::now_v7().to_string();
+        let connection = database.open().unwrap();
+        connection
+            .execute(
+                "INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version) VALUES(?1,?2,?3,'今日用时保护','open','manual',10,1,1,1)",
+                params![task_id, local_workspace_id, subject_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,batch_id,created_at,updated_at,version) VALUES(?1,?2,?3,?4,'2026-10-20',15,0,15,?5,1,1,1)",
+                params![adjustment_id, local_workspace_id, subject_id, task_id, batch_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = apply_snapshot(
+            &database,
+            &json!({"subjects": []}),
+            None,
+            Some(&cloud_workspace_id),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.starts_with("CLOUD_SCHEMA_OUTDATED:"));
+        let saved: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT target_minutes FROM actual_time_adjustments WHERE id=?1 AND deleted_at IS NULL",
+                [&adjustment_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved, 15);
+    }
+
+    #[test]
+    fn snapshot_import_restores_actual_time_adjustments() {
+        let (_directory, database, cloud_workspace_id, _local_workspace_id, subject_id) =
+            cloud_database_for_incremental_test("cloud-snapshot-restores-adjustments.sqlite3");
+        let task_id = Uuid::now_v7().to_string();
+        let adjustment_id = Uuid::now_v7().to_string();
+        let batch_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        let snapshot = json!({
+            "subjects": [{"id": subject_id, "name": "默认", "sort_order": 10, "created_at": now, "updated_at": now, "version": 1, "deleted_at": null}],
+            "tasks": [{"id": task_id, "subject_id": subject_id, "parent_id": null, "title": "今日用时", "status": "open", "source_type": "manual", "sort_order": 10, "created_at": now, "updated_at": now, "version": 1}],
+            "actual_time_adjustments": [{
+                "id": adjustment_id, "subject_id": subject_id, "task_id": task_id,
+                "work_date": "2026-10-20", "delta_minutes": 15, "baseline_minutes": 0,
+                "target_minutes": 15, "note": null, "source_type": "quick_actual_adjustment",
+                "batch_id": batch_id, "created_at": now, "updated_at": now, "version": 1,
+                "created_by_device_id": null, "updated_by_device_id": null, "deleted_at": null
+            }]
+        });
+
+        apply_snapshot(&database, &snapshot, None, Some(&cloud_workspace_id), None).unwrap();
+
+        let saved: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT target_minutes FROM actual_time_adjustments WHERE id=?1 AND deleted_at IS NULL",
+                [&adjustment_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved, 15);
     }
 
     #[test]
@@ -13918,7 +14240,8 @@ mod tests {
             "subjects": [{"id": subject_id.clone(), "name": "默认", "sort_order": 10, "created_at": now, "updated_at": now, "version": 1, "deleted_at": null}],
             "tasks": [{"id": task.id.clone(), "subject_id": subject_id.clone(), "parent_id": null, "title": task.title.clone(), "status": "open", "source_type": "manual", "sort_order": 10, "created_at": now, "updated_at": now, "version": task.version}],
             "time_entries": [],
-            "time_segments": []
+            "time_segments": [],
+            "actual_time_adjustments": []
         });
         apply_snapshot(&database, &snapshot, None, None, None).unwrap();
 
@@ -13977,7 +14300,8 @@ mod tests {
             "subjects": [{"id": subject_id.clone(), "name": "默认", "sort_order": 10, "created_at": now, "updated_at": now, "version": 1, "deleted_at": null}],
             "tasks": [{"id": task.id.clone(), "subject_id": subject_id.clone(), "parent_id": null, "title": task.title.clone(), "status": "open", "source_type": "manual", "sort_order": 10, "created_at": now, "updated_at": now, "version": task.version}],
             "time_entries": [],
-            "time_segments": []
+            "time_segments": [],
+            "actual_time_adjustments": []
         });
         apply_snapshot_with_options(
             &database,
@@ -14161,7 +14485,8 @@ mod tests {
                 "generated_entry_id":null,"resolved_at":resolved_at,"created_at":resolved_at-60_000,
                 "updated_at":resolved_at,"version":2
             }],
-            "unassigned_segments": []
+            "unassigned_segments": [],
+            "actual_time_adjustments": []
         });
         apply_snapshot(
             &database,

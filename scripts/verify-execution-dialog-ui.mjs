@@ -80,7 +80,7 @@ function mockInitScript() {
     version: 1,
   });
 
-  const calls = { update: [], dayPlanSet: [], dayPlanBatch: [], transition: [], create: [], completed: [], move: [], actualAdjustment: [] };
+  const calls = { update: [], dayPlanSet: [], dayPlanBatch: [], transition: [], create: [], completed: [], move: [], actualAdjustment: [], cloudCatchUp: 0 };
   let failDayPlanBatchOnce = false;
   let created = 0;
 
@@ -246,6 +246,9 @@ function mockInitScript() {
         case "storage_mode_get":
         case "cloud_sync_status":
           return { mode: "local", workspaceId: "workspace", deviceId: "device", online: true, syncState: "synced", pendingOperations: 0, conflictCount: 0, lastChangeSeq: 0, authBlocked: false };
+        case "cloud_sync_catch_up":
+          calls.cloudCatchUp += 1;
+          return { changes: [], lastChangeSeq: 0, hasMore: false, domains: [] };
         case "cloud_session_get":
           return { signedIn: false };
         case "get_app_version":
@@ -278,13 +281,18 @@ async function main() {
   const rows = dialog.locator(".timer-task-row:not(.new-task)");
   await rows.first().waitFor({ state: "visible" });
 
-  // 1. 只展示未完成今日成员与父级上下文：长期待办、已完成普通事项、当天已完成成员都不进入候选
+  // 1. 展示今日成员（含当天已完成）与父级上下文：长期待办、非今日的已完成普通事项不进入候选
   const rowTitles = await rows.locator('input[data-timer-task-field="title"]').evaluateAll((inputs) => inputs.map((input) => input.getAttribute("aria-label")));
-  if (rowTitles.length !== 2) throw new Error("执行弹框候选未收敛到今日计划：" + JSON.stringify(rowTitles));
+  const initialRowCount = rowTitles.length;
+  if (rowTitles.length !== 3) throw new Error("执行弹框候选未收敛到今日计划：" + JSON.stringify(rowTitles));
   if (!rowTitles.includes("事项名称：写今日计划")) throw new Error("今日未完成成员未出现在执行弹框");
   if (rowTitles.some((label) => label.includes("跨日继续的长期待办"))) throw new Error("未加入今日的进行中事项混入了执行候选");
   if (rowTitles.some((label) => label.includes("已完成普通事项"))) throw new Error("已完成普通事项混入了执行候选");
-  if (rowTitles.some((label) => label.includes("今天已完成的成员"))) throw new Error("当天已完成成员不应进入执行候选");
+  if (!rowTitles.includes("事项名称：今天已完成的成员")) throw new Error("当天已完成成员未出现在执行弹框");
+  const completedRow = dialog.locator('.timer-task-row[data-timer-task-id="done-today"]');
+  if (!(await completedRow.innerText()).includes("今天已完成")) throw new Error("当天已完成成员缺少完成态提示");
+  if ((await completedRow.locator(".timer-task-primary-action").innerText()).trim() !== "继续") throw new Error("当天已完成成员没有继续执行入口");
+  if (!(await dialog.locator(".timer-task-dialog-summary").innerText()).includes("1 个今天已完成")) throw new Error("执行弹框汇总未区分今天已完成事项");
   if (await rows.filter({ has: page.locator('input[aria-label="事项名称：项目"]') }).locator(".timer-task-primary-action").count() !== 0) throw new Error("父级上下文可执行");
 
   // 2. 跨日继续计时的当前事项只显示状态，不进入候选
@@ -309,7 +317,7 @@ async function main() {
   const picker = page.locator(".el-dialog", { hasText: "从进行中加入今日" });
   await picker.locator("label", { hasText: "跨日继续的长期待办" }).locator("input").check();
   await picker.locator("button", { hasText: "加入今日" }).click();
-  await page.waitForFunction(() => document.querySelectorAll(".timer-task-dialog .timer-task-row:not(.new-task)").length === 3);
+  await page.waitForFunction((expected) => document.querySelectorAll(".timer-task-dialog .timer-task-row:not(.new-task)").length === expected, initialRowCount + 1);
   if (!await dialog.isVisible()) throw new Error("加入今日后执行弹框不应关闭");
 
   // 5. 执行弹框通过拖动柄右键菜单同层插入、复制当前行，并可点击实际用时调整。
@@ -337,6 +345,7 @@ async function main() {
   await executeActualPopover.getByRole("textbox", { name: "目标实际分钟" }).fill("15");
   await executeActualPopover.getByRole("button", { name: "确认调整" }).click();
   await page.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.actualAdjustment.some((call) => call.items?.some((item) => item.taskId === "child" && item.targetMinutes === 15)));
+  if ((await calls()).cloudCatchUp < 2) throw new Error("执行弹框实际调整未在打开和保存前追平云端增量");
 
   // 6. 今日成员写入失败时保留弹框并提示，不得对未成为今日成员的事项开始计时
   await page.evaluate(() => window.__EXECUTION_DIALOG_TEST__.failNextDayPlanBatch());
@@ -370,7 +379,19 @@ async function main() {
   if (await empty.locator("button", { hasText: "从进行中加入" }).count() !== 1) throw new Error("空状态缺少从进行中加入入口");
   if (await dialog.locator(".timer-task-row:not(.new-task)").count() !== 0) throw new Error("空计划主体不应展示其他主体事项");
 
-  // 9. 回到工作主体后验证执行弹框拖动写入正式事项顺序。
+  // 9. 回到工作主体后验证当天已完成事项可从执行弹框继续，计时转换携带恢复版本。
+  await dialog.locator(".timer-task-subject-tabs button", { hasText: "工作" }).click();
+  const completedTaskRow = dialog.locator('.timer-task-row[data-timer-task-id="done-today"]');
+  const continueButton = completedTaskRow.locator(".timer-task-primary-action", { hasText: "继续" });
+  await continueButton.click();
+  await page.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.transition.some((call) => call.taskId === "done-today"));
+  const continueCall = (await calls()).transition.find((call) => call.taskId === "done-today");
+  if (continueCall?.reopenCompletedTaskVersion !== 2) throw new Error("继续已完成事项未携带恢复版本：" + JSON.stringify(continueCall));
+  await dialog.waitFor({ state: "hidden" });
+
+  // 9.1 重新打开执行弹框，验证拖动写入正式事项顺序。
+  await page.locator(".global-timer-main").click();
+  await dialog.waitFor({ state: "visible" });
   await dialog.locator(".timer-task-subject-tabs button", { hasText: "工作" }).click();
   const backlogRow = dialog.locator('.timer-task-row[data-timer-task-id="backlog"]');
   const childRow = dialog.locator('.timer-task-row[data-timer-task-id="child"]');
@@ -379,7 +400,7 @@ async function main() {
   await backlogRow.locator(".timer-task-drag-handle").dragTo(childRow, { targetPosition: { x: 150, y: 5 } });
   await page.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.move.length > 0);
   const moveCall = (await calls()).move.at(-1);
-  if (moveCall.id !== "backlog" || moveCall.previousSiblingId !== "parent" || moveCall.parentId) throw new Error("执行弹框拖动结果异常：" + JSON.stringify(moveCall));
+  if (moveCall.id !== "backlog" || moveCall.parentId || (!moveCall.previousSiblingId && !moveCall.nextSiblingId)) throw new Error("执行弹框拖动结果异常：" + JSON.stringify(moveCall));
 
   // 10. 未归属时间分配复用同一套事项配置：新增一级/子项，并可独立调整实际用时。
   const unassignedPage = await context.newPage();

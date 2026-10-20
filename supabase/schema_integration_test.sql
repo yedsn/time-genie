@@ -92,6 +92,10 @@ end $$;
 \ir 20261018p_timegenie_restore_unassigned_state.sql
 \ir 20261019_timegenie_timer_recurring_occurrence.sql
 \ir 20261019_timegenie_timer_recurring_occurrence.sql
+\ir 20261020_timegenie_actual_adjustment_target_rebase.sql
+\ir 20261020_timegenie_actual_adjustment_target_rebase.sql
+\ir 20261020b_timegenie_actual_adjustment_snapshot.sql
+\ir 20261020b_timegenie_actual_adjustment_snapshot.sql
 
 do $$
 begin
@@ -2779,10 +2783,9 @@ begin
   end if;
   set role authenticated;
 
-  -- The first successful batch changed the adjustment fingerprint, so a new
-  -- operation carrying the old empty fingerprint must be rejected atomically.
-  begin
-    perform timegenie.actual_adjustment_batch_apply(
+  -- A stale local baseline still carries the user's target. Rebase its fixed
+  -- delta against the current cloud actual instead of creating a conflict.
+  first_result:=timegenie.actual_adjustment_batch_apply(
       '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000002','40000000-0000-0000-0000-000000000197',
       jsonb_build_object('subjectId','51000000-0000-0000-0000-000000000095','workDate','2026-10-15','clientRequestId','40000000-0000-0000-0000-000000000197','batchId','41000000-0000-0000-0000-000000000197',
         'items',jsonb_build_array(jsonb_build_object('taskId','61000000-0000-0000-0000-000000000095','expectedTaskVersion',1,'baselineMinutes',60,'targetMinutes',55,'deltaMinutes',-5,'adjustmentFingerprint',empty_fingerprint)),
@@ -2790,17 +2793,17 @@ begin
         'adjustments',jsonb_build_array(jsonb_build_object('id','81000000-0000-0000-0000-000000000098','subject_id','51000000-0000-0000-0000-000000000095','task_id','61000000-0000-0000-0000-000000000095','work_date','2026-10-15','delta_minutes',-5,'baseline_minutes',60,'target_minutes',55,'note',null,'source_type','quick_actual_adjustment','batch_id','41000000-0000-0000-0000-000000000197','created_at',1791997900000,'updated_at',1791997900000,'version',1,'deleted_at',null))
       )
     );
-    raise exception 'stale adjustment fingerprint was accepted';
-  exception when others then if sqlerrm not like '%ADJUSTMENT_BASELINE_CONFLICT%' then raise; end if; end;
   reset role;
-  if exists(select 1 from timegenie.actual_time_adjustments where id='81000000-0000-0000-0000-000000000098')
-     or exists(select 1 from timegenie.processed_operations where operation_id='40000000-0000-0000-0000-000000000197') then
-    raise exception 'stale actual adjustment batch left partial remote data';
+  if not exists(select 1 from timegenie.actual_time_adjustments where id='81000000-0000-0000-0000-000000000098' and baseline_minutes=75 and delta_minutes=-20 and target_minutes=55)
+     or (select coalesce(sum(a.minutes),0) from timegenie.time_allocations a join timegenie.time_entries e on e.id=a.entry_id where a.task_id='61000000-0000-0000-0000-000000000095' and e.work_date='2026-10-15' and e.deleted_at is null)
+        +(select coalesce(sum(delta_minutes),0) from timegenie.actual_time_adjustments where task_id='61000000-0000-0000-0000-000000000095' and work_date='2026-10-15' and deleted_at is null)<>55
+     or (first_result->'adjustments'->0->>'delta_minutes')::integer<>-20 then
+    raise exception 'stale adjustment target was not rebased: %',first_result;
   end if;
   set role authenticated;
 
-  -- Ordinary time added after the snapshot is allowed because only the
-  -- adjustment-set fingerprint protects the fixed delta.
+  -- Ordinary time added after the snapshot is folded into the latest target,
+  -- so the final actual still equals the user's requested minutes.
   reset role;
   insert into timegenie.time_entries(id,workspace_id,work_date,kind,source_type,state,label_snapshot,started_at,ended_at,duration_seconds,created_at,updated_at,version)
   values('71000000-0000-0000-0000-000000000097','20000000-0000-0000-0000-000000000001','2026-10-16','work','manual','ended','普通计时增长',to_timestamp(1792080000),to_timestamp(1792083600),3600,to_timestamp(1792080000),to_timestamp(1792083600),1);
@@ -2817,8 +2820,8 @@ begin
   );
   reset role;
   if (select coalesce(sum(a.minutes),0) from timegenie.time_allocations a join timegenie.time_entries e on e.id=a.entry_id where a.task_id='61000000-0000-0000-0000-000000000095' and e.work_date='2026-10-16' and e.deleted_at is null)
-       +(select coalesce(sum(delta_minutes),0) from timegenie.actual_time_adjustments where task_id='61000000-0000-0000-0000-000000000095' and work_date='2026-10-16' and deleted_at is null)<>80 then
-    raise exception 'ordinary timing growth incorrectly conflicted with fixed actual adjustment delta';
+       +(select coalesce(sum(delta_minutes),0) from timegenie.actual_time_adjustments where task_id='61000000-0000-0000-0000-000000000095' and work_date='2026-10-16' and deleted_at is null)<>75 then
+    raise exception 'ordinary timing growth did not preserve the requested actual target';
   end if;
   update timegenie.actual_time_adjustments set deleted_at=to_timestamp(1792083600.123),updated_at=to_timestamp(1792083600.123),version=2
   where id='81000000-0000-0000-0000-000000000099';
@@ -2848,8 +2851,11 @@ begin
   if (select count(*) from timegenie.cloud_operation_logs where workspace_id='20000000-0000-0000-0000-000000000001' and operation_id='40000000-0000-0000-0000-000000000195')<>1 then
     raise exception 'idempotent batch produced duplicate operation history';
   end if;
-  if exists(select 1 from timegenie.cloud_operation_logs where operation_id in('40000000-0000-0000-0000-000000000196','40000000-0000-0000-0000-000000000197')) then
+  if exists(select 1 from timegenie.cloud_operation_logs where operation_id='40000000-0000-0000-0000-000000000196') then
     raise exception 'failed operation was recorded as successful history';
+  end if;
+  if not exists(select 1 from timegenie.cloud_operation_logs where operation_id='40000000-0000-0000-0000-000000000197') then
+    raise exception 'rebased actual adjustment was not recorded as successful history';
   end if;
   before_task_count:=(select count(*) from timegenie.tasks where workspace_id='20000000-0000-0000-0000-000000000001');
   before_change_count:=(select count(*) from timegenie.workspace_changes where workspace_id='20000000-0000-0000-0000-000000000001');
@@ -3464,6 +3470,30 @@ do $$ begin
   if not exists(select 1 from timegenie.workspace_changes where workspace_id='20000000-0000-0000-0000-000000000001' and entity_type='workspace_reset' and entity_version=3) then raise exception 'workspace reset event missing'; end if;
   if not exists(select 1 from timegenie.cloud_operation_logs where workspace_id='20000000-0000-0000-0000-000000000001' and operation_id='4f000000-0000-0000-0000-000000000004' and source='restore') then raise exception 'restore operation history missing'; end if;
 end $$;
+
+select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+select set_config('request.headers','{"x-timegenie-workspace-epoch":"3"}',true);
+do $$
+declare target_task uuid; target_subject uuid; snapshot jsonb; adjustment_id uuid := '4f000000-0000-0000-0000-000000000099';
+begin
+  select id, subject_id into target_task, target_subject from timegenie.tasks
+  where workspace_id='20000000-0000-0000-0000-000000000001' and deleted_at is null order by id limit 1;
+  if target_task is null then raise exception 'actual adjustment snapshot test has no task'; end if;
+  insert into timegenie.actual_time_adjustments(
+    id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,source_type,batch_id,created_at,updated_at,version
+  ) values(
+    adjustment_id,'20000000-0000-0000-0000-000000000001',target_subject,target_task,'2026-10-21',15,0,15,'quick_actual_adjustment',gen_random_uuid(),now(),now(),1
+  ) on conflict(id) do nothing;
+  snapshot:=timegenie.cloud_snapshot_get('20000000-0000-0000-0000-000000000001');
+  if not (snapshot ? 'actual_time_adjustments') then raise exception 'cloud snapshot omitted actual_time_adjustments'; end if;
+  if not exists(select 1 from jsonb_array_elements(snapshot->'actual_time_adjustments') value where value->>'id'=adjustment_id::text and (value->>'target_minutes')::integer=15) then
+    raise exception 'cloud snapshot did not retain the saved actual time adjustment';
+  end if;
+  if timegenie.cloud_incremental_entity_get('20000000-0000-0000-0000-000000000001','actual_time_adjustments',adjustment_id::text)->'data' is null then
+    raise exception 'incremental entity get reported an existing actual time adjustment as deleted';
+  end if;
+end $$;
+reset role;
 
 select 'Supabase schema integration tests passed' as result;
 

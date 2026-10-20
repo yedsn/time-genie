@@ -129,6 +129,8 @@ const panelTasks = computed<PanelTask[]>(() => {
   return snapshot.value?.tasks.map(snapshotTaskToPanelTask) ?? store.tasks.map((task) => ({ ...task, totalMinutes: task.actual, completedToday: false }));
 });
 const rows = computed(() => executionPanelRows<PanelTask>(panelTasks.value, subjectId.value, query.value));
+const openLeafCount = computed(() => rows.value.filter((row) => !row.hasChildren && !row.task.completedToday).length);
+const completedLeafCount = computed(() => rows.value.filter((row) => !row.hasChildren && row.task.completedToday).length);
 const currentStatus = computed(() => executionPanelCurrentStatus({
   taskId: store.runningEntry?.defaultTask,
   taskTitle: activeTask.value?.title,
@@ -441,12 +443,21 @@ async function resolveAllocationDisposition(disposition: "break" | "discard") {
   }
 }
 
-function openActualAdjustment(task: PanelTask, hasChildren: boolean) {
+async function openActualAdjustment(task: PanelTask, hasChildren: boolean) {
   if (hasChildren || !presentation.value.actualEditable) return;
   actualTaskId.value = task.id;
   actualTargetText.value = String(task.directMinutes);
   actualNote.value = "";
   actualError.value = "";
+  try {
+    const latestSnapshot = await store.loadActualAdjustmentSnapshot(subjectId.value);
+    if (actualTaskId.value !== task.id) return;
+    const latestTask = latestSnapshot?.tasks.find((item) => item.id === task.id && item.isLeaf);
+    if (!latestTask) throw new Error("事项实际基线已失效，请刷新后重试");
+    actualTargetText.value = String(latestTask.directMinutes);
+  } catch (error) {
+    actualError.value = errorText(error, "今日实际加载失败");
+  }
 }
 
 function closeActualAdjustment() {
@@ -462,7 +473,7 @@ function actualAdjustmentDirty() {
 }
 
 async function setActualAdjustmentVisible(task: PanelTask, visible: boolean) {
-  if (visible) { openActualAdjustment(task, false); return; }
+  if (visible) { await openActualAdjustment(task, false); return; }
   if (actualSaving.value) return;
   if (actualAdjustmentDirty()) {
     try {
@@ -475,6 +486,9 @@ async function setActualAdjustmentVisible(task: PanelTask, visible: boolean) {
 async function saveActualAdjustment() {
   const task = actualTask.value;
   const parsed = actualParsed.value;
+  actualSaving.value = true;
+  actualError.value = "";
+  try {
   const actualSnapshot = await store.loadActualAdjustmentSnapshot(subjectId.value);
   const actualSnapshotTask = actualSnapshot?.tasks.find((item) => item.id === task?.id && item.isLeaf);
   if (!task || !actualSnapshot || !actualSnapshotTask || !parsed.ok || !actualSnapshotTask.adjustmentFingerprint) {
@@ -482,9 +496,6 @@ async function saveActualAdjustment() {
     return;
   }
   if (parsed.minutes === actualSnapshotTask.directMinutes) { closeActualAdjustment(); return; }
-  actualSaving.value = true;
-  actualError.value = "";
-  try {
     await store.saveActualAdjustmentBatch({
       subjectId: actualSnapshotTask.subjectId,
       workDate: actualSnapshot.workDate,
@@ -601,7 +612,7 @@ async function flushTask(task: PanelTask) {
 async function startOrSwitch(task: PanelTask, hasChildren: boolean) {
   const action = actionFor(task, hasChildren);
   if (!action.actionable || timerBusyTaskId.value) return;
-    if (action.mode === "allocate") { allocateRemaining(task.id, task.title); return; }
+  if (action.mode === "allocate") { allocateRemaining(task.id, task.title); return; }
   timerBusyTaskId.value = task.id;
   let focusActionAfterFailure = false;
   try {
@@ -997,7 +1008,7 @@ function formatTime(timestamp: number) {
 
     <div class="timer-task-dialog-summary">
       <span><strong>{{ currentSubject?.name ?? '当前主体' }}</strong></span>
-      <span>{{ rows.filter((row) => !row.hasChildren).length }} 个可执行事项</span>
+      <span>{{ openLeafCount }} 个可执行事项<template v-if="completedLeafCount"> · {{ completedLeafCount }} 个今天已完成</template></span>
       <span v-if="props.mode === 'entry-allocation'">{{ allocationPeriodLabel }} · 共 {{ allocationRequiredMinutes }} 分钟 · 已分配 {{ allocationTotalMinutes }} · {{ allocationRemainingMinutes >= 0 ? `待分配 ${allocationRemainingMinutes}` : `超出 ${Math.abs(allocationRemainingMinutes)}` }} 分钟</span>
       <span v-else-if="props.mode === 'execute'">名称和备注会自动保存 · 今日预计请在待办页调整</span>
     </div>
@@ -1080,7 +1091,7 @@ function formatTime(timestamp: number) {
       </div>
       <small v-if="query.trim()" class="timer-task-search-drag-hint">搜索状态下不能拖动；清空搜索后可调整顺序和层级。</small>
 
-      <div v-if="!panelInitialLoading && !rows.length && !newTask.open" class="timer-task-empty"><AlertCircle :size="22" /><strong>{{ query ? '没有匹配事项' : '当前主体暂无可执行事项' }}</strong><span>{{ query ? '换个关键词，或清空搜索查看全部事项。' : (props.mode === 'execute' ? '可以新建今日事项，或从进行中加入今日计划。' : '可以直接在这里新建事项。') }}</span><div v-if="!query"><button class="primary-button compact" type="button" @click="openNewTask()"><Plus :size="14" />新增事项</button><button v-if="props.mode === 'execute'" class="secondary-button compact" type="button" @click="todayPickerOpen = true">从进行中加入</button></div></div>
+      <div v-if="!panelInitialLoading && !rows.length && !newTask.open" class="timer-task-empty"><AlertCircle :size="22" /><strong>{{ query ? '没有匹配事项' : (props.mode === 'execute' ? '今日还没有事项' : '当前主体暂无可执行事项') }}</strong><span>{{ query ? '换个关键词，或清空搜索查看全部事项。' : (props.mode === 'execute' ? '可以新建今日事项，或从进行中加入今日计划。' : '可以直接在这里新建事项。') }}</span><div v-if="!query"><button class="primary-button compact" type="button" @click="openNewTask()"><Plus :size="14" />新增事项</button><button v-if="props.mode === 'execute'" class="secondary-button compact" type="button" @click="todayPickerOpen = true">从进行中加入</button></div></div>
     </div>
 
     <template #footer><div class="timer-task-dialog-footer"><button class="secondary-button compact" type="button" @click="goPlan"><ListTodo :size="14" />前往待办页</button><span class="timer-task-allocation-error">{{ allocationError }}</span><template v-if="presentation.showAllocation"><button class="secondary-button compact" type="button" :disabled="allocationSaving || !selectedAllocations.length" @click="clearAllocationDrafts">清空</button><button v-if="presentation.showBreakDiscard" class="secondary-button compact" type="button" :disabled="allocationSaving" @click="resolveAllocationDisposition('break')">记为休息</button><button v-if="presentation.showBreakDiscard" class="danger-button compact" type="button" :disabled="allocationSaving" @click="resolveAllocationDisposition('discard')">丢弃</button><button class="primary-button" type="button" :disabled="allocationSaving" @click="saveAllocationDrafts">{{ allocationSaving ? '保存中...' : presentation.primaryLabel }}</button></template><button v-else class="secondary-button" type="button" :disabled="closing" @click="closeDialog">关闭</button></div></template>

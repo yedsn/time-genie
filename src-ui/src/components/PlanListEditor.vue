@@ -123,6 +123,7 @@ const actualAdjustmentClientRequestId = ref("");
 const actualAdjustmentBatchId = ref("");
 const actualAdjustmentSubjectId = ref("");
 const inlineActualTaskId = ref("");
+const inlineActualSurface = ref<"list" | "today-import" | "">("");
 const inlineActualTask = ref<ActualAdjustmentSnapshotTaskRecord>();
 const inlineActualWorkDate = ref("");
 const inlineActualTargetText = ref("");
@@ -698,9 +699,29 @@ async function saveActualAdjustment() {
   if (Object.keys(actualAdjustmentErrors.value).length) return;
   const summary = actualAdjustmentSummaryValue.value;
   if (!summary.changes.length && !actualAdjustmentNewTasks.value.length) { actualAdjustmentOpen.value = false; return; }
+  const targetMinutesByTask = new Map(actualAdjustmentDrafts.value.map((draft) => [draft.taskId, draft.targetMinutes]));
+  try {
+    const latestSnapshot = await props.loadActualSnapshot();
+    const latestTaskById = new Map(latestSnapshot.tasks.filter((task) => task.isLeaf).map((task) => [task.id, task]));
+    for (const draft of actualAdjustmentDrafts.value) {
+      const latestTask = latestTaskById.get(draft.taskId);
+      if (!latestTask) continue;
+      draft.baselineMinutes = latestTask.directMinutes;
+      draft.expectedTaskVersion = latestTask.version;
+      draft.adjustmentFingerprint = latestTask.adjustmentFingerprint;
+      draft.targetMinutes = targetMinutesByTask.get(draft.taskId) ?? draft.targetMinutes;
+      draft.text = String(draft.targetMinutes);
+    }
+    actualAdjustmentSnapshot.value = latestSnapshot;
+  } catch (error) {
+    ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "无法刷新最新实际时间，请稍后重试");
+    return;
+  }
+  const latestSummary = actualAdjustmentSummaryValue.value;
+  if (!latestSummary.changes.length && !actualAdjustmentNewTasks.value.length) { actualAdjustmentOpen.value = false; return; }
   const escapeHtml = (value: string) => value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character] ?? character);
   const taskById = new Map((actualAdjustmentSnapshot.value.tasks ?? []).map((task) => [task.id, task]));
-  const existingRows = summary.changes.map((item) => {
+  const existingRows = latestSummary.changes.map((item) => {
     const task = taskById.get(item.taskId);
     const delta = item.deltaMinutes >= 0 ? `+${item.deltaMinutes}` : String(item.deltaMinutes);
     return `<li><strong>实际调整</strong> · ${escapeHtml(task?.title ?? "未知事项")}：${item.baselineMinutes} → ${item.targetMinutes} 分钟（${delta}）</li>`;
@@ -711,11 +732,11 @@ async function saveActualAdjustment() {
     const adjustment = draft.targetMinutes > 0 ? `初始调整 +${draft.targetMinutes} 分钟` : "仅新增事项，无实际调整";
     return `<li><strong>新增事项</strong> · ${escapeHtml(draft.title.trim())}（${position}）：目标 ${draft.targetMinutes} 分钟，${adjustment}</li>`;
   });
-  const message = `<p>新增 ${summary.newTaskCount} 个事项，保存 ${summary.adjustmentCount} 条实际调整；增加 ${summary.addedMinutes} 分钟，减少 ${summary.reducedMinutes} 分钟，净变化 ${summary.netMinutes >= 0 ? "+" : ""}${summary.netMinutes} 分钟。</p><ul class="actual-adjustment-confirm-list">${[...newRows, ...existingRows].join("")}</ul>`;
+  const message = `<p>新增 ${latestSummary.newTaskCount} 个事项，保存 ${latestSummary.adjustmentCount} 条实际调整；增加 ${latestSummary.addedMinutes} 分钟，减少 ${latestSummary.reducedMinutes} 分钟，净变化 ${latestSummary.netMinutes >= 0 ? "+" : ""}${latestSummary.netMinutes} 分钟。</p><ul class="actual-adjustment-confirm-list">${[...newRows, ...existingRows].join("")}</ul>`;
   try { await ElMessageBox.confirm(message, "确认今日实际变化", { confirmButtonText: "保存", cancelButtonText: "继续调整", type: "info", dangerouslyUseHTMLString: true }); } catch { return; }
   actualAdjustmentSaving.value = true;
   try {
-    await props.saveActualBatch({ subjectId: actualAdjustmentSubjectId.value, workDate: actualAdjustmentSnapshot.value.workDate, clientRequestId: actualAdjustmentClientRequestId.value, batchId: actualAdjustmentBatchId.value, note: actualAdjustmentNote.value.trim() || undefined, items: summary.changes, newTasks: actualAdjustmentNewTasks.value.map((draft) => ({ clientTaskId: draft.clientTaskId, title: draft.title.trim(), parentId: draft.parentId, expectedParentVersion: draft.expectedParentVersion, targetMinutes: draft.targetMinutes })) });
+    await props.saveActualBatch({ subjectId: actualAdjustmentSubjectId.value, workDate: actualAdjustmentSnapshot.value.workDate, clientRequestId: actualAdjustmentClientRequestId.value, batchId: actualAdjustmentBatchId.value, note: actualAdjustmentNote.value.trim() || undefined, items: latestSummary.changes, newTasks: actualAdjustmentNewTasks.value.map((draft) => ({ clientTaskId: draft.clientTaskId, title: draft.title.trim(), parentId: draft.parentId, expectedParentVersion: draft.expectedParentVersion, targetMinutes: draft.targetMinutes })) });
     actualAdjustmentOpen.value = false; ElMessage.success("今日实际已调整");
   } catch (error) { ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "今日实际保存失败，草稿已保留"); }
   finally { actualAdjustmentSaving.value = false; }
@@ -1057,9 +1078,10 @@ function mountSortable() {
   treeSortable.mount();
 }
 
-async function openInlineActualAdjustment(task: Task) {
+async function openInlineActualAdjustment(task: Task, surface: "list" | "today-import") {
   if (hasChildren(task.id) || inlineActualLoading.value) return;
   inlineActualTaskId.value = task.id;
+  inlineActualSurface.value = surface;
   inlineActualTask.value = undefined;
   inlineActualWorkDate.value = "";
   inlineActualTargetText.value = String(task.directMinutes);
@@ -1068,7 +1090,7 @@ async function openInlineActualAdjustment(task: Task) {
   inlineActualLoading.value = true;
   try {
     const snapshot = await props.loadActualSnapshot();
-    if (inlineActualTaskId.value !== task.id) return;
+    if (inlineActualTaskId.value !== task.id || inlineActualSurface.value !== surface) return;
     const snapshotTask = snapshot.tasks.find((item) => item.id === task.id && item.isLeaf);
     if (!snapshotTask) throw new Error("事项今日用时已变化，请刷新后重试");
     inlineActualTask.value = snapshotTask;
@@ -1083,6 +1105,7 @@ async function openInlineActualAdjustment(task: Task) {
 
 function resetInlineActualAdjustment() {
   inlineActualTaskId.value = "";
+  inlineActualSurface.value = "";
   inlineActualTask.value = undefined;
   inlineActualWorkDate.value = "";
   inlineActualTargetText.value = "";
@@ -1094,11 +1117,12 @@ function inlineActualDirty() {
   return Boolean(inlineActualTask.value && inlineActualParsed.value.ok && inlineActualDelta.value !== 0);
 }
 
-async function setInlineActualAdjustmentVisible(task: Task, visible: boolean) {
+async function setInlineActualAdjustmentVisible(task: Task, visible: boolean, surface: "list" | "today-import") {
   if (visible) {
-    await openInlineActualAdjustment(task);
+    await openInlineActualAdjustment(task, surface);
     return;
   }
+  if (inlineActualTaskId.value !== task.id || inlineActualSurface.value !== surface) return;
   if (inlineActualSaving.value || inlineActualLoading.value) return;
   if (inlineActualDirty()) {
     try {
@@ -1109,22 +1133,25 @@ async function setInlineActualAdjustmentVisible(task: Task, visible: boolean) {
 }
 
 async function saveInlineActualAdjustment() {
-  const task = inlineActualTask.value;
   const parsed = inlineActualParsed.value;
-  if (!task || !inlineActualWorkDate.value || !parsed.ok || !task.adjustmentFingerprint) {
+  const taskId = inlineActualTaskId.value;
+  if (!taskId || !parsed.ok) {
     inlineActualError.value = parsed.ok ? "事项实际基线已失效，请刷新后重试" : parsed.message;
-    return;
-  }
-  if (parsed.minutes === task.directMinutes) {
-    resetInlineActualAdjustment();
     return;
   }
   inlineActualSaving.value = true;
   inlineActualError.value = "";
   try {
+    const snapshot = await props.loadActualSnapshot();
+    const task = snapshot.tasks.find((item) => item.id === taskId && item.isLeaf);
+    if (!task?.adjustmentFingerprint) throw new Error("事项实际基线已失效，请刷新后重试");
+    if (parsed.minutes === task.directMinutes) {
+      resetInlineActualAdjustment();
+      return;
+    }
     await props.saveActualBatch({
       subjectId: task.subjectId,
-      workDate: inlineActualWorkDate.value,
+      workDate: snapshot.workDate,
       clientRequestId: crypto.randomUUID(),
       batchId: crypto.randomUUID(),
       note: inlineActualNote.value.trim() || undefined,
@@ -1285,18 +1312,18 @@ onBeforeUnmount(() => {
               </span>
               <el-popover
                 v-else-if="mode === 'today'"
-                :visible="inlineActualTaskId === row.task.id"
+                :visible="inlineActualSurface === 'list' && inlineActualTaskId === row.task.id"
                 placement="bottom"
                 :width="340"
                 trigger="click"
-                @update:visible="setInlineActualAdjustmentVisible(row.task, $event)"
+                @update:visible="setInlineActualAdjustmentVisible(row.task, $event, 'list')"
               >
                 <template #reference>
                   <button class="meta-picker actual-time-picker" :class="{ filled: row.task.directMinutes > 0, active: runningTaskId === row.task.id }" type="button" :aria-label="`调整${row.task.title}今日用时`" @click.stop>
                     <Clock3 :size="12" />今日用时 {{ formatMinutes(row.task.directMinutes) }}
                   </button>
                 </template>
-                <div v-if="inlineActualTaskId === row.task.id" class="actual-adjustment-inline">
+                <div v-if="inlineActualSurface === 'list' && inlineActualTaskId === row.task.id" class="actual-adjustment-inline">
                   <strong>{{ row.task.title }} · 今日实际</strong>
                   <div v-if="inlineActualLoading" class="actual-adjustment-inline-summary"><span>正在加载最新用时…</span></div>
                   <template v-else>
@@ -1437,9 +1464,9 @@ onBeforeUnmount(() => {
             <small v-else-if="todayImportTitleErrors[row.task.id]" class="today-import-title-error">{{ todayImportTitleErrors[row.task.id] }}</small>
           </div>
           <div class="today-import-actual">
-            <el-popover v-if="row.allocatable" :visible="inlineActualTaskId === row.task.id" placement="bottom" :width="340" trigger="click" @update:visible="setInlineActualAdjustmentVisible(row.task, $event)">
+            <el-popover v-if="row.allocatable" :visible="inlineActualSurface === 'today-import' && inlineActualTaskId === row.task.id" placement="bottom" :width="340" trigger="click" @update:visible="setInlineActualAdjustmentVisible(row.task, $event, 'today-import')">
               <template #reference><button type="button" :aria-label="`调整${row.task.title}今日实际`">{{ formatMinutes(row.task.directMinutes) }}</button></template>
-              <div v-if="inlineActualTaskId === row.task.id" class="actual-adjustment-inline">
+              <div v-if="inlineActualSurface === 'today-import' && inlineActualTaskId === row.task.id" class="actual-adjustment-inline">
                 <strong>{{ row.task.title }} · 今日实际</strong>
                 <div v-if="inlineActualLoading" class="actual-adjustment-inline-summary"><span>正在加载最新用时…</span></div>
                 <template v-else>

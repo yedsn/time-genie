@@ -60,6 +60,7 @@ import {
   applyTaskPlanBatch,
   getActualAdjustmentSnapshot,
   applyActualAdjustmentBatch,
+  catchUpCloudSync,
   setRecurringTaskEstimate,
   startTimerRecord,
   transitionTimerRecord,
@@ -219,6 +220,18 @@ const defaultStatusColors: StatusColors = {
   done: "#34c584"
 };
 
+function replaceArrayIfChanged<T>(target: T[], next: T[]) {
+  if (JSON.stringify(target) === JSON.stringify(next)) return false;
+  target.splice(0, target.length, ...next);
+  return true;
+}
+
+function replaceRefIfChanged<T>(target: { value: T }, next: T) {
+  if (JSON.stringify(target.value) === JSON.stringify(next)) return false;
+  target.value = next;
+  return true;
+}
+
 export const useWorkdayStore = defineStore("workday", () => {
   const activePage = ref("today");
   const subjects = reactive<Subject[]>(initialSubjects.map((subject) => ({ ...subject })));
@@ -229,7 +242,9 @@ export const useWorkdayStore = defineStore("workday", () => {
   const todayPlanLoading = ref(false);
   const todayPlanSubjectId = ref("");
   const todayPlanError = ref("");
+  const todayPlanLoadedKey = ref("");
   let todayPlanRequestSeq = 0;
+  const todayPlanRequests = new Map<string, Promise<TaskDayPlanSnapshotRecord>>();
   const statusColors = reactive<StatusColors>({ ...defaultStatusColors });
   const entries = reactive<TimeEntry[]>([]);
   const timeHistoryGroups = reactive<TimeEntryHistoryDay[]>([]);
@@ -416,7 +431,7 @@ export const useWorkdayStore = defineStore("workday", () => {
         listTodayTasks(undefined, todayDate),
       ]);
       if (requestSeq !== workspaceRequestSeq) return true;
-      subjects.splice(0, subjects.length, ...subjectRecords.map((subject) => ({
+      replaceArrayIfChanged(subjects, subjectRecords.map((subject) => ({
         id: subject.id,
         name: subject.name,
         version: subject.version,
@@ -441,8 +456,9 @@ export const useWorkdayStore = defineStore("workday", () => {
         if (previousIndex >= 0) mergedTasks.splice(previousIndex, 0, draft);
         else mergedTasks.push(draft);
       }
-      tasks.splice(0, tasks.length, ...mergedTasks);
-      todayTasks.splice(0, todayTasks.length, ...todayTaskResult.tasks.map(toUiTask));
+      replaceArrayIfChanged(tasks, mergedTasks);
+      const loadedTodayTasks = todayTaskResult.tasks.map(toUiTask);
+      replaceArrayIfChanged(todayTasks, loadedTodayTasks);
       const fallbackSubjectId = subjects[0]?.id ?? "";
       if (!subjects.some((subject) => subject.id === selectedSubjectId.value)) selectedSubjectId.value = fallbackSubjectId;
       if (todayOverviewSubjectId.value && !subjects.some((subject) => subject.id === todayOverviewSubjectId.value)) todayOverviewSubjectId.value = "";
@@ -598,7 +614,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       } else {
         timerStateMissingRefreshes = transientMissingStateResult(Boolean(previousActiveEntry), activeStateStillPresent, timerStateMissingRefreshes).missingRefreshes;
       }
-      entries.splice(0, entries.length, ...nextEntries);
+      replaceArrayIfChanged(entries, nextEntries);
       if (timerStopConfirmationEntryId.value && !entries.some((entry) => entry.id === timerStopConfirmationEntryId.value)) {
         timerStopConfirmationEntryId.value = "";
       }
@@ -626,7 +642,7 @@ export const useWorkdayStore = defineStore("workday", () => {
         historyDays: 30,
         trendDays: 14,
       });
-      if (requestSeq === todayOverviewRequestSeq) todayOverview.value = result;
+      if (requestSeq === todayOverviewRequestSeq) replaceRefIfChanged(todayOverview, result);
     } catch (error) {
       console.error("加载今日概览失败", error);
     } finally {
@@ -642,7 +658,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   async function loadReports() {
     try {
       const result = await listReports();
-      reports.value = result.reports.map(toUiReport);
+      replaceRefIfChanged(reports, result.reports.map(toUiReport));
     } catch (error) {
       console.error("加载报告失败", error);
     }
@@ -696,7 +712,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       timeHistoryTotalDays.value = result.totalDays;
       timeHistoryTotalPages.value = result.totalPages;
       timeHistoryRevision.value = result.revision;
-      timeHistoryGroups.splice(0, timeHistoryGroups.length, ...result.groups.map((group) => ({
+      replaceArrayIfChanged(timeHistoryGroups, result.groups.map((group) => ({
         ...group,
         entries: group.entries.map(toUiTimeEntry),
       })));
@@ -861,7 +877,7 @@ export const useWorkdayStore = defineStore("workday", () => {
         completedTasksPage.value,
         completedTasksRequestSeq,
       )) return false;
-      completedTasks.splice(0, completedTasks.length, ...result.tasks.map(toUiTask));
+      replaceArrayIfChanged(completedTasks, result.tasks.map(toUiTask));
       completedTasksPage.value = result.page;
       completedTasksTotal.value = result.total;
       completedTasksTotalPages.value = result.totalPages;
@@ -871,7 +887,6 @@ export const useWorkdayStore = defineStore("workday", () => {
       return true;
     } catch (error) {
       if (sequence !== completedTasksRequestSeq) return false;
-      completedTasks.splice(0);
       completedTasksError.value = error instanceof Error ? error.message : String(error);
       return false;
     } finally {
@@ -894,21 +909,29 @@ export const useWorkdayStore = defineStore("workday", () => {
     if (!subjectId) return undefined;
     const workDate = await ensureWorkspaceCalendar();
     const requestedSubjectId = subjectId;
+    const requestKey = `${requestedSubjectId}|${workDate}`;
     const token = beginTodayPlanRequest(todayPlanRequestSeq, requestedSubjectId, workDate);
     todayPlanRequestSeq = token.sequence;
     todayPlanSubjectId.value = requestedSubjectId;
-    todayPlanLoading.value = true;
+    todayPlanLoading.value = todayPlanLoadedKey.value !== requestKey;
     todayPlanError.value = "";
+    let request = todayPlanRequests.get(requestKey);
+    const ownsRequest = !request;
+    if (!request) {
+      request = getTaskDayPlanSnapshot(requestedSubjectId, workDate);
+      todayPlanRequests.set(requestKey, request);
+    }
     try {
-      const snapshot: TaskDayPlanSnapshotRecord = await getTaskDayPlanSnapshot(requestedSubjectId, workDate);
+      const snapshot = await request;
       const stillCurrent = isCurrentTodayPlanRequest(token, todayPlanRequestSeq, workspaceToday.value);
       const outcome = resolveTodayPlanOutcome(
         { tasks: [...todayPlanTasks], subjectId: todayPlanSubjectId.value },
         stillCurrent ? { ok: true, token, tasks: snapshot.tasks.map(toUiTask) } : { ok: false },
       );
       if (stillCurrent) {
-        todayPlanTasks.splice(0, todayPlanTasks.length, ...outcome.tasks);
+        replaceArrayIfChanged(todayPlanTasks, outcome.tasks);
         todayPlanSubjectId.value = requestedSubjectId;
+        todayPlanLoadedKey.value = requestKey;
       }
       return snapshot;
     } catch (error) {
@@ -917,6 +940,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       }
       throw error;
     } finally {
+      if (ownsRequest && todayPlanRequests.get(requestKey) === request) todayPlanRequests.delete(requestKey);
       if (isCurrentTodayPlanRequest(token, todayPlanRequestSeq, workspaceToday.value)) todayPlanLoading.value = false;
     }
   }
@@ -1669,6 +1693,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function loadActualAdjustmentSnapshot(subjectId = selectedSubjectId.value) {
+    await catchUpCloudSync();
     const workDate = await ensureWorkspaceCalendar();
     return await getActualAdjustmentSnapshot(subjectId, workDate);
   }
@@ -1679,7 +1704,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     executionSnapshotLoading[subjectId] = true;
     try {
       const snapshot = await getActualAdjustmentSnapshot(subjectId, workDate);
-      executionSnapshots[subjectId] = snapshot;
+      if (JSON.stringify(executionSnapshots[subjectId]) !== JSON.stringify(snapshot)) executionSnapshots[subjectId] = snapshot;
       return snapshot;
     } finally {
       executionSnapshotLoading[subjectId] = false;
@@ -1729,7 +1754,7 @@ export const useWorkdayStore = defineStore("workday", () => {
 
   async function saveActualAdjustmentBatch(request: ActualAdjustmentBatchRequest) {
     const result = await applyActualAdjustmentBatch(request);
-    await Promise.all([loadWorkspaceData(), loadTimeData(), loadTodayOverview(), loadTimeHistory(timeHistoryPage.value)]);
+    await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(request.subjectId), loadTimeData(), loadTodayOverview(), loadTimeHistory(timeHistoryPage.value)]);
     return result;
   }
 

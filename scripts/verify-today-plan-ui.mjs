@@ -84,7 +84,7 @@ function mockInitScript() {
   moveToFront(activeTasks, "recurring");
   moveToFront(planRows["subject-a"], "recurring");
 
-  const calls = { dayPlanSet: [], dayPlanBatch: [], estimateSet: [], update: [], completed: [], create: [], move: [], actualAdjustment: [] };
+  const calls = { dayPlanSet: [], dayPlanBatch: [], dayPlanSnapshot: 0, estimateSet: [], update: [], completed: [], create: [], move: [], actualAdjustment: [], cloudCatchUp: 0 };
   let failDayPlanBatchOnce = false;
   let failSnapshotFor = "";
   let snapshotDelayMs = 0;
@@ -140,6 +140,7 @@ function mockInitScript() {
         case "task_list_completed_page":
           return { tasks: [], page: 1, pageSize: 20, total: 0, totalPages: 0 };
         case "task_day_plan_snapshot":
+          calls.dayPlanSnapshot += 1;
           if (snapshotDelayMs) {
             const delay = snapshotDelayMs;
             snapshotDelayMs = 0;
@@ -342,6 +343,9 @@ function mockInitScript() {
         case "storage_mode_get":
         case "cloud_sync_status":
           return { mode: "local", workspaceId: "workspace", deviceId: "device", online: true, syncState: "synced", pendingOperations: 0, conflictCount: 0, lastChangeSeq: 0, authBlocked: false };
+        case "cloud_sync_catch_up":
+          calls.cloudCatchUp += 1;
+          return { changes: [], lastChangeSeq: 0, hasMore: false, domains: [] };
         case "cloud_session_get":
           return { signedIn: false };
         case "get_app_version":
@@ -372,15 +376,18 @@ async function mainSharedPlanEditor() {
   await page.locator(".pending-reminder-row").first().waitFor({ state: "visible" });
 
   if (await page.locator(".pending-reminder-row").count() !== 5) throw new Error("今日计划行数量异常");
+  const snapshotCallsBeforeRefresh = (await calls()).dayPlanSnapshot;
   await page.evaluate(() => window.__TODAY_PLAN_TEST__.delayNextSnapshot(450));
   await page.getByRole("tab", { name: /今日/ }).click();
-  await page.locator(".today-plan-skeleton").waitFor({ state: "visible" });
-  if (await page.locator(".today-plan-skeleton-row").count() !== 4) throw new Error("今日计划刷新未展示统一骨架");
-  if (await page.locator(".pending-reminder-row").count() !== 0) throw new Error("今日计划刷新时骨架与旧事项同时显示");
+  await page.getByRole("tab", { name: /今日/ }).click();
+  await page.waitForTimeout(120);
+  if (await page.locator(".today-plan-skeleton").count() !== 0) throw new Error("今日计划后台刷新仍用骨架替换已有列表");
+  if (await page.locator(".pending-reminder-row").count() !== 5) throw new Error("今日计划后台刷新未保持已有列表稳定");
   if (await page.locator(".today-plan-loading-line, .today-plan-refresh-label, .today-plan-refreshing, .today-plan-list-refreshing").count() !== 0) throw new Error("今日计划刷新仍显示横条、提示或旧列表弱化效果");
   if (await page.getByText("正在更新", { exact: true }).count() !== 0 || await page.getByText("正在整理今日计划", { exact: true }).count() !== 0) throw new Error("今日计划仍显示额外加载提示");
   await page.screenshot({ path: path.join(evidenceDir, "08-paper-today-refreshing.png"), fullPage: true });
-  await page.locator(".today-plan-skeleton").waitFor({ state: "hidden" });
+  await page.waitForTimeout(450);
+  if ((await calls()).dayPlanSnapshot !== snapshotCallsBeforeRefresh + 1) throw new Error("同一主体和日期的重复今日计划请求未合并");
 
   await page.evaluate(() => window.__TODAY_PLAN_TEST__.delayNextSnapshot(450));
   await page.locator('.subject-select-button[title="个人"]').click();
@@ -497,10 +504,14 @@ async function mainSharedPlanEditor() {
   await createdTitleInput.blur();
   await page.waitForFunction((taskId) => window.__TODAY_PLAN_TEST__.calls.update.some((call) => call.id === taskId && call.title === "配置弹框子项改名"), createdChild.id);
   await todayImport.getByRole("button", { name: "调整写今日计划今日实际" }).click();
-  const actualPopover = page.locator('.el-popper:visible .actual-adjustment-inline').filter({ hasText: "写今日计划 · 今日实际" }).last();
+  const actualPopover = page.locator('.el-popper:visible .actual-adjustment-inline').filter({ hasText: "写今日计划 · 今日实际" });
+  await actualPopover.first().waitFor({ state: "visible" });
+  const actualPopoverCount = await actualPopover.count();
+  if (actualPopoverCount !== 1) throw new Error(`配置今日事项点击今日实际时重复打开了调整浮层：${actualPopoverCount}`);
   await actualPopover.getByRole("textbox", { name: "目标实际分钟" }).fill("35");
   await actualPopover.getByRole("button", { name: "确认调整" }).click();
   await page.waitForFunction(() => window.__TODAY_PLAN_TEST__.calls.actualAdjustment.some((call) => call.items?.some((item) => item.taskId === "child" && item.targetMinutes === 35)));
+  if ((await calls()).cloudCatchUp < 2) throw new Error("今日实际调整未在打开和保存前追平云端增量");
   const importBacklogRow = todayImport.locator('.today-import-row[data-today-import-task-id="backlog"]');
   const importLongTitleRow = todayImport.locator('.today-import-row[data-today-import-task-id="long-title"]');
   if (await importBacklogRow.locator(".today-import-drag-handle").count() !== 1) throw new Error("配置今日事项缺少拖动排序入口");
