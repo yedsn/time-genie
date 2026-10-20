@@ -178,8 +178,8 @@ const flatRows = computed(() => displayedTasks.value.map((task) => ({ task, dept
 const pendingRows = computed(() => mode.value === "today"
   ? flatRows.value
   : flatRows.value.filter((row) => isActivePlanTask({ status: row.task.status, recurring: Boolean(row.task.recurrence) })));
-const todayInitialLoading = computed(() => mode.value === "today" && Boolean(props.loading) && pendingRows.value.length === 0);
-const todayRefreshing = computed(() => mode.value === "today" && Boolean(props.loading) && pendingRows.value.length > 0);
+const todayLoading = computed(() => mode.value === "today" && Boolean(props.loading));
+const visiblePendingRows = computed(() => todayLoading.value ? [] : pendingRows.value);
 const todayPlannedIds = computed(() => new Set(scopedDisplayTasks.value.filter((task) => task.todayMember).map((task) => task.id)));
 const knownTodayMemberIds = computed(() => new Set([
   ...todayPlannedIds.value,
@@ -1186,19 +1186,17 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div ref="listRef" class="plan-reminder-editor" :class="{ 'today-plan-mode': mode === 'today', 'today-plan-loading': mode === 'today' && loading, 'today-plan-initial-loading': todayInitialLoading, 'today-plan-refreshing': todayRefreshing }" :aria-busy="mode === 'today' && loading">
+  <div ref="listRef" class="plan-reminder-editor" :class="{ 'today-plan-mode': mode === 'today', 'today-plan-loading': todayLoading }" :aria-busy="todayLoading">
     <div class="plan-editor-head">
       <div>
         <h2>{{ mode === 'today' ? subjectName + ' · 今日计划' : subjectName }}</h2>
         <span class="plan-editor-caption">
-          <template v-if="todayInitialLoading">正在整理今日计划</template>
-          <template v-else>{{ pendingRows.filter((row) => isTodayMember(row.task)).length }} 项待办 · 点击文字直接编辑</template>
-          <small v-if="todayRefreshing" class="today-plan-refresh-label">正在更新</small>
+          {{ pendingRows.filter((row) => isTodayMember(row.task)).length }} 项待办 · 点击文字直接编辑
         </span>
       </div>
       <div v-if="mode === 'today'" class="plan-today-metrics" aria-label="今日计划时长统计">
-        <span><small>今日预计</small><strong>{{ todayInitialLoading ? '—' : formatMinutes(todayEstimatedTotalMinutes) }}</strong></span>
-        <span><small>今日实际</small><strong>{{ todayInitialLoading ? '—' : formatMinutes(todayActualTotalMinutes) }}</strong></span>
+        <span><small>今日预计</small><strong>{{ formatMinutes(todayEstimatedTotalMinutes) }}</strong></span>
+        <span><small>今日实际</small><strong>{{ formatMinutes(todayActualTotalMinutes) }}</strong></span>
       </div>
       <div class="plan-head-actions">
         <button v-if="mode === 'today'" class="secondary-button quick-estimate-entry" type="button" title="选择今日事项并填写今日预计" @click="openTodayImport"><ListPlus :size="14" />配置今日事项</button>
@@ -1206,20 +1204,19 @@ onBeforeUnmount(() => {
         <button v-if="mode === 'active'" class="icon-button subtle" type="button" title="同步到 SeaTable" aria-label="同步到 SeaTable" @click="emit('syncSeaTable')"><DatabaseZap :size="15" /></button>
         <button v-if="mode === 'active'" class="icon-button subtle plan-import-button" type="button" title="从昨日 Obsidian 日报导入计划" aria-label="导入计划" @click="emit('importPlan')"><FileInput :size="15" /></button>
       </div>
-      <div v-if="mode === 'today' && loading" class="today-plan-loading-line" aria-hidden="true"><span></span></div>
     </div>
 
     <div v-if="mode === 'today' && error && !loading" class="today-plan-error" role="status">今日计划刷新失败，仍显示上一次成功结果：{{ error }}</div>
-    <div class="visually-hidden" role="status" aria-live="polite">{{ mode === 'today' && loading ? (todayInitialLoading ? '正在加载今日计划' : '正在更新今日计划') : '' }}</div>
-    <div :key="listRenderVersion" ref="rowsRef" class="reminder-list" :class="{ 'is-sorting': isSorting, 'today-plan-list-refreshing': todayRefreshing }">
-      <div v-if="todayInitialLoading" class="today-plan-skeleton" aria-hidden="true">
+    <div class="visually-hidden" role="status" aria-live="polite">{{ todayLoading ? '正在加载今日计划' : '' }}</div>
+    <div :key="listRenderVersion" ref="rowsRef" class="reminder-list" :class="{ 'is-sorting': isSorting }">
+      <div v-if="todayLoading" class="today-plan-skeleton" aria-hidden="true">
         <div v-for="index in 4" :key="index" class="today-plan-skeleton-row" :class="{ child: index === 2 || index === 3 }">
           <i class="today-plan-skeleton-grip"></i>
           <i class="today-plan-skeleton-check"></i>
           <span><i class="today-plan-skeleton-title"></i><i class="today-plan-skeleton-meta"></i></span>
         </div>
       </div>
-      <template v-for="(row, rowIndex) in pendingRows" :key="row.task.id">
+      <template v-for="(row, rowIndex) in visiblePendingRows" :key="row.task.id">
         <div
           class="reminder-row pending-reminder-row"
           :class="[
@@ -1373,7 +1370,7 @@ onBeforeUnmount(() => {
           <span class="placeholder-input child-placeholder-input" aria-hidden="true"></span>
         </button>
       </template>
-      <button v-if="!todayInitialLoading" class="reminder-placeholder-row plan-placeholder-row" type="button" aria-label="新建待办" title="新建待办" @click="addTask">
+      <button v-if="!todayLoading" class="reminder-placeholder-row plan-placeholder-row" type="button" aria-label="新建待办" title="新建待办" @click="addTask">
         <span class="drag-handle-spacer" aria-hidden="true"></span>
         <span class="placeholder-plus" aria-hidden="true"><Plus :size="18" /></span>
         <span class="placeholder-input" aria-hidden="true"></span>

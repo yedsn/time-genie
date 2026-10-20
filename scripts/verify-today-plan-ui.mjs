@@ -372,21 +372,19 @@ async function mainSharedPlanEditor() {
   await page.locator(".pending-reminder-row").first().waitFor({ state: "visible" });
 
   if (await page.locator(".pending-reminder-row").count() !== 5) throw new Error("今日计划行数量异常");
-  const stableEditorBounds = await page.locator(".plan-reminder-editor").boundingBox();
   await page.evaluate(() => window.__TODAY_PLAN_TEST__.delayNextSnapshot(450));
   await page.getByRole("tab", { name: /今日/ }).click();
-  await page.locator(".today-plan-refreshing").waitFor({ state: "visible" });
-  if (await page.locator(".pending-reminder-row").count() !== 5) throw new Error("今日计划刷新时不应清空已有事项");
-  if (await page.locator(".today-plan-loading-line").count() !== 1 || !await page.getByText("正在更新", { exact: true }).isVisible()) throw new Error("今日计划刷新缺少轻量更新反馈");
-  if (await page.locator(".today-plan-skeleton").count() !== 0) throw new Error("已有数据刷新时不应展示首次加载骨架");
-  const refreshingEditorBounds = await page.locator(".plan-reminder-editor").boundingBox();
-  if (!stableEditorBounds || !refreshingEditorBounds || Math.abs(refreshingEditorBounds.height - stableEditorBounds.height) > 1) throw new Error("今日计划刷新导致编辑器布局跳动");
+  await page.locator(".today-plan-skeleton").waitFor({ state: "visible" });
+  if (await page.locator(".today-plan-skeleton-row").count() !== 4) throw new Error("今日计划刷新未展示统一骨架");
+  if (await page.locator(".pending-reminder-row").count() !== 0) throw new Error("今日计划刷新时骨架与旧事项同时显示");
+  if (await page.locator(".today-plan-loading-line, .today-plan-refresh-label, .today-plan-refreshing, .today-plan-list-refreshing").count() !== 0) throw new Error("今日计划刷新仍显示横条、提示或旧列表弱化效果");
+  if (await page.getByText("正在更新", { exact: true }).count() !== 0 || await page.getByText("正在整理今日计划", { exact: true }).count() !== 0) throw new Error("今日计划仍显示额外加载提示");
   await page.screenshot({ path: path.join(evidenceDir, "08-paper-today-refreshing.png"), fullPage: true });
-  await page.locator(".today-plan-refreshing").waitFor({ state: "hidden" });
+  await page.locator(".today-plan-skeleton").waitFor({ state: "hidden" });
 
   await page.evaluate(() => window.__TODAY_PLAN_TEST__.delayNextSnapshot(450));
   await page.locator('.subject-select-button[title="个人"]').click();
-  await page.locator(".today-plan-initial-loading").waitFor({ state: "visible" });
+  await page.locator(".today-plan-skeleton").waitFor({ state: "visible" });
   if (await page.locator(".today-plan-skeleton-row").count() !== 4) throw new Error("首次加载今日计划未展示稳定事项骨架");
   if (await page.locator(".pending-reminder-row").count() !== 0) throw new Error("切换主体首次加载时不应短暂显示旧主体事项");
   const initialLoadingListBounds = await page.locator(".reminder-list").boundingBox();
