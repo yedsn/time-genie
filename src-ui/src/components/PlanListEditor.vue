@@ -1628,12 +1628,13 @@ onBeforeUnmount(() => {
         <button type="button" role="menuitem" @click="runTodayImportContextCommand('after')">在下方插入行</button>
       </div>
       <div v-if="contextMenuOpen" class="plan-task-context-menu" role="menu" :style="{ left: `${contextMenuLeft}px`, top: `${contextMenuTop}px` }" @pointerdown.stop>
+        <button type="button" role="menuitem" @click="runContextCommand('duplicate')">复制事项</button>
+        <span class="plan-task-context-divider"></span>
         <button type="button" role="menuitem" @click="runContextCommand('before')">在上方新增</button>
         <button type="button" role="menuitem" @click="runContextCommand('after')">在下方新增</button>
         <button type="button" role="menuitem" :disabled="Boolean(contextTask()?.parentId || contextTask()?.recurrence || contextTask()?.directMinutes)" @click="runContextCommand('child')">新建子事项</button>
         <span class="plan-task-context-divider"></span>
         <button type="button" role="menuitem" @click="runContextCommand('note')">编辑备注</button>
-        <button type="button" role="menuitem" @click="runContextCommand('duplicate')">复制</button>
         <button class="danger" type="button" role="menuitem" @click="runContextCommand('delete')">删除</button>
       </div>
     </Teleport>

@@ -433,6 +433,12 @@ async function mainSharedPlanEditor() {
   if (!todayParentDragBox || !todayChildDragBox || Math.abs(todayChildDragBox.x - todayParentDragBox.x - 17) > 1) throw new Error("今日页二级事项拖动柄未随整行缩进");
   if (!todayParentCheckBox || !todayChildCheckBox || Math.abs(todayChildCheckBox.x - todayParentCheckBox.x - 17) > 1) throw new Error("今日页二级事项勾选框未随整行缩进");
   if (await contextRow.locator('.drag-handle').evaluate((element) => getComputedStyle(element).opacity) !== "1") throw new Error("待办页拖动柄应常显");
+  await contextRow.dispatchEvent("contextmenu", { clientX: 240, clientY: 240 });
+  const todayListContextMenu = page.locator('.plan-task-context-menu:visible').filter({ has: page.locator('button', { hasText: "编辑备注" }) });
+  await todayListContextMenu.waitFor({ state: "visible" });
+  const todayListMenuItems = await todayListContextMenu.getByRole("menuitem").allTextContents();
+  if (todayListMenuItems.join("|") !== "复制事项|在上方新增|在下方新增|新建子事项|编辑备注|删除") throw new Error(`今日待办右键菜单顺序或复制文案不正确：${todayListMenuItems.join("|")}`);
+  await page.keyboard.press("Escape");
   await page.screenshot({ path: path.join(evidenceDir, "01-paper-wide.png"), fullPage: true });
 
   await page.getByRole("button", { name: "编辑今日计划" }).click();
@@ -550,6 +556,12 @@ async function mainSharedPlanEditor() {
   if (await page.getByRole("button", { name: "分配今日预计" }).count() !== 0) throw new Error("分配今日预计不应出现在进行中页");
   if (await page.locator(".actual-time-picker").count() !== 0) throw new Error("进行中页不应显示今日用时");
   const activeParentRow = page.locator('.pending-reminder-row[data-task-id="parent"]');
+  await activeParentRow.dispatchEvent("contextmenu", { clientX: 240, clientY: 240 });
+  const activeListContextMenu = page.locator('.plan-task-context-menu:visible').filter({ has: page.locator('button', { hasText: "编辑备注" }) });
+  await activeListContextMenu.waitFor({ state: "visible" });
+  const activeListMenuItems = await activeListContextMenu.getByRole("menuitem").allTextContents();
+  if (activeListMenuItems.join("|") !== "复制事项|在上方新增|在下方新增|新建子事项|编辑备注|删除") throw new Error("进行中待办右键菜单顺序或复制文案不正确");
+  await page.keyboard.press("Escape");
   if (!await activeParentRow.locator(".check-button").isDisabled()) throw new Error("进行中父事项勾选框应为禁用状态");
   const completedBeforeDisabledClick = (await calls()).completed.length;
   await activeParentRow.locator(".check-button").click({ force: true });

@@ -7,9 +7,10 @@ const store = await readFile(new URL("../src-ui/src/store.ts", import.meta.url),
 const sortableCoordinator = await readFile(new URL("../src-ui/src/services/taskTreeSortable.ts", import.meta.url), "utf8");
 const executionPanel = await readFile(new URL("../src-ui/src/components/TimerTaskDialog.vue", import.meta.url), "utf8");
 
-for (const text of ["在上方新增", "在下方新增", "新建子事项", "编辑备注", "复制", "删除"]) {
+for (const text of ["复制事项", "在上方新增", "在下方新增", "新建子事项", "编辑备注", "删除"]) {
   assert.ok(editor.includes(text), `missing context menu command: ${text}`);
 }
+assert.ok(editor.indexOf(">复制事项</button>") < editor.indexOf(">在上方新增</button>"));
 assert.ok(editor.includes('@contextmenu="openContextMenu($event, row.task)"'));
 assert.ok(editor.includes('target.closest("input, textarea")'));
 assert.ok(editor.includes('document.addEventListener("pointerdown"'));
