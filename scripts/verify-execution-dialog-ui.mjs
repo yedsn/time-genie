@@ -290,7 +290,8 @@ async function main() {
   if (rowTitles.some((label) => label.includes("已完成普通事项"))) throw new Error("已完成普通事项混入了执行候选");
   if (!rowTitles.includes("事项名称：今天已完成的成员")) throw new Error("当天已完成成员未出现在执行弹框");
   const completedRow = dialog.locator('.timer-task-row[data-timer-task-id="done-today"]');
-  if (!(await completedRow.innerText()).includes("今天已完成")) throw new Error("当天已完成成员缺少完成态提示");
+  if (await completedRow.locator(".timer-task-name-cell > small").count() !== 0) throw new Error("当天已完成成员仍显示额外完成态文字");
+  if (!await completedRow.evaluate((element) => element.classList.contains("completed"))) throw new Error("当天已完成成员缺少灰色完成态样式");
   if ((await completedRow.locator(".timer-task-primary-action").innerText()).trim() !== "继续") throw new Error("当天已完成成员没有继续执行入口");
   if (!(await dialog.locator(".timer-task-dialog-summary").innerText()).includes("1 个今天已完成")) throw new Error("执行弹框汇总未区分今天已完成事项");
   if (await rows.filter({ has: page.locator('input[aria-label="事项名称：项目"]') }).locator(".timer-task-primary-action").count() !== 0) throw new Error("父级上下文可执行");

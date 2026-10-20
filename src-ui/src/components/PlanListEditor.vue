@@ -16,6 +16,7 @@ import { analyzeQuickPlanDraft, buildQuickPlanBatchRequest, createQuickPlanBasel
 const props = defineProps<{
   tasks: Task[];
   displayTasks?: Task[];
+  todayStatusTasks?: Task[];
   todayMemberIds?: string[];
   mode?: "active" | "today";
   subjectId: string;
@@ -164,8 +165,30 @@ const quickPlanMarkdownToolbars = [
 
 const mode = computed(() => props.mode ?? "active");
 const scopedDisplayTasks = computed(() => (props.displayTasks ?? []).filter((task) => task.subjectId === props.subjectId));
+const todayStatusById = computed(() => new Map(
+  (props.todayStatusTasks ?? [])
+    .filter((task) => task.subjectId === props.subjectId)
+    .map((task) => [task.id, task]),
+));
 const displayedTasks = computed(() => {
-  if (!props.displayTasks) return props.tasks;
+  if (!props.displayTasks) {
+    if (!props.todayStatusTasks) return props.tasks;
+    return props.tasks.map((task) => {
+      const todayTask = todayStatusById.value.get(task.id);
+      if (!todayTask) return task;
+      return {
+        ...task,
+        status: todayTask.status,
+        executionState: todayTask.executionState,
+        completedAt: todayTask.completedAt,
+        todayMember: todayTask.todayMember,
+        recurrence: todayTask.recurrence ?? task.recurrence,
+        occurrenceDate: todayTask.occurrenceDate,
+        occurrenceOrigin: todayTask.occurrenceOrigin,
+        occurrenceVersion: todayTask.occurrenceVersion,
+      };
+    });
+  }
   const taskById = new Map(props.tasks.map((task) => [task.id, task]));
   const snapshotIds = new Set(scopedDisplayTasks.value.map((task) => task.id));
   const ordered = [...scopedDisplayTasks.value];
@@ -315,6 +338,10 @@ function taskToggleTitle(task: Task) {
   if (!isTodayMember(task)) return "上下文父事项不能直接完成";
   if (task.recurrence) return task.status === "done" ? "恢复今天这一轮" : "完成今天这一轮";
   return task.status === "done" ? "恢复为进行中" : "标记为完成";
+}
+
+function isTaskCompleted(task: Task) {
+  return task.status === "done";
 }
 
 function syncEditableTask(task: Task) {
@@ -1272,7 +1299,7 @@ onBeforeUnmount(() => {
               child: row.depth > 0,
               selected: row.task.id === selectedId,
               context: mode === 'today' && !isTodayMember(row.task),
-              completed: mode === 'today' && row.task.status === 'done',
+              completed: isTaskCompleted(row.task),
               'level-changed': row.task.id === levelChangedId,
               'task-group-start': isTaskGroupStart(rowIndex),
               'task-group-single': row.depth === 0 && !isTaskGroupStart(rowIndex),
@@ -1286,8 +1313,8 @@ onBeforeUnmount(() => {
           @contextmenu="openContextMenu($event, row.task)"
         >
           <button class="drag-handle" :title="getSubtreeIds(row.task.id).size > 1 ? `拖动整组（共 ${getSubtreeIds(row.task.id).size} 项）` : '拖动排序'" @pointerdown="prepareSubtreeDrag(row.task.id)"><GripVertical :size="14" /></button>
-          <button class="check-button" :class="{ completed: row.task.status === 'done' }" :disabled="!canToggleTask(row.task)" :title="taskToggleTitle(row.task)" @click.stop="emit('toggle', row.task, $event)">
-            <CheckCircle2 v-if="row.task.status === 'done'" :size="18" />
+          <button class="check-button" :class="{ completed: isTaskCompleted(row.task) }" :disabled="!canToggleTask(row.task)" :title="taskToggleTitle(row.task)" @click.stop="emit('toggle', row.task, $event)">
+            <CheckCircle2 v-if="isTaskCompleted(row.task)" :size="18" />
             <Circle v-else :size="18" />
           </button>
           <div class="reminder-main">

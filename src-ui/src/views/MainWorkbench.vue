@@ -1690,6 +1690,7 @@ async function handleCompletedTaskDelete(task: Task) {
         <PlanListEditor
           v-if="store.planTaskTab === 'active'"
           :tasks="store.selectedSubjectTasks"
+          :today-status-tasks="store.todayPlanTasks"
           :today-member-ids="store.todayPlanTasks.filter((task) => task.todayMember).map((task) => task.id)"
           :subject-id="store.selectedSubjectId"
           :subject-name="store.selectedSubject?.name ?? '待办'"

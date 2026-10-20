@@ -1930,6 +1930,15 @@ pre {
 .reminder-row:hover { background: var(--surface-soft); }
 .reminder-row.context { color: var(--muted); background: var(--surface-inset); }
 .reminder-row.context .reminder-main > input { color: var(--text-soft); }
+.pending-reminder-row.completed .reminder-main > input { color: #89968f; }
+.pending-reminder-row.completed .reminder-meta,
+.pending-reminder-row.completed .reminder-meta .meta-picker,
+.pending-reminder-row.completed .reminder-meta .meta-picker.filled,
+.pending-reminder-row.completed .reminder-meta .task-level-label,
+.pending-reminder-row.completed .reminder-meta .actual-time-picker,
+.pending-reminder-row.completed .reminder-meta .actual-time-picker.filled { color: #69766f; }
+.pending-reminder-row.completed .reminder-inline-controls { opacity: 0.62; }
+.pending-reminder-row.completed .check-button { color: #7e8c85; background: color-mix(in srgb, var(--panel-2) 82%, transparent); }
 .check-button-spacer { width: 28px; height: 28px; }
 .reminder-row .check-button:disabled { color: color-mix(in srgb, var(--text-soft) 42%, transparent); border-color: color-mix(in srgb, var(--line) 70%, transparent); background: var(--surface-inset); cursor: default; }
 .reminder-row .check-button:disabled:hover { background: var(--surface-inset); }

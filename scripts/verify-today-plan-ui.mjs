@@ -411,6 +411,10 @@ async function mainSharedPlanEditor() {
   if (!firstRecurringTitleBox || !firstRegularRootTitleBox || Math.abs(firstRecurringTitleBox.x - firstRegularRootTitleBox.x) > 1) throw new Error("首个重复事项标题未与其他一级事项对齐");
   const firstRecurringStyle = await firstTodayRow.evaluate((element) => ({ borderRadius: getComputedStyle(element).borderRadius, marginBottom: getComputedStyle(element).marginBottom }));
   if (firstRecurringStyle.borderRadius !== "7px" || firstRecurringStyle.marginBottom !== "6px") throw new Error("首个重复事项未形成完整独立卡片");
+  const completedTitleColor = await firstTodayRow.locator(':scope > .reminder-main > input').evaluate((element) => getComputedStyle(element).color);
+  const openTitleColor = await page.locator('.pending-reminder-row[data-task-id="child"] > .reminder-main > input').evaluate((element) => getComputedStyle(element).color);
+  if (completedTitleColor === openTitleColor) throw new Error("今日已完成事项未显示为灰色");
+  if ((await firstTodayRow.innerText()).includes("今日已完成")) throw new Error("今日已完成事项仍显示额外完成态文字");
   const listBounds = await page.locator(".reminder-list").boundingBox();
   const firstRecurringBounds = await firstTodayRow.boundingBox();
   if (!listBounds || !firstRecurringBounds || firstRecurringBounds.x - listBounds.x < 7 || listBounds.x + listBounds.width - firstRecurringBounds.x - firstRecurringBounds.width < 7) throw new Error("已完成首个重复事项卡片缺少左右外边距");
@@ -568,6 +572,11 @@ async function mainSharedPlanEditor() {
   if (await page.getByRole("button", { name: "分配今日预计" }).count() !== 0) throw new Error("分配今日预计不应出现在进行中页");
   if (await page.locator(".actual-time-picker").count() !== 0) throw new Error("进行中页不应显示今日用时");
   const activeParentRow = page.locator('.pending-reminder-row[data-task-id="parent"]');
+  const activeRecurringRow = page.locator('.pending-reminder-row[data-task-id="recurring"]');
+  if (!await activeRecurringRow.evaluate((element) => element.classList.contains("completed"))) throw new Error("进行中页的今日已完成重复事项未显示完成态");
+  const activeRecurringTitleColor = await activeRecurringRow.locator(':scope > .reminder-main > input').evaluate((element) => getComputedStyle(element).color);
+  const activeOpenTitleColor = await page.locator('.pending-reminder-row[data-task-id="estimate-auto"] > .reminder-main > input').evaluate((element) => getComputedStyle(element).color);
+  if (activeRecurringTitleColor === activeOpenTitleColor) throw new Error("进行中页的今日已完成重复事项未变灰");
   await activeParentRow.dispatchEvent("contextmenu", { clientX: 240, clientY: 240 });
   const activeListContextMenu = page.locator('.plan-task-context-menu:visible').filter({ has: page.locator('button', { hasText: "编辑备注" }) });
   await activeListContextMenu.waitFor({ state: "visible" });

@@ -1040,7 +1040,6 @@ function formatTime(timestamp: number) {
             <CornerDownRight v-if="row.depth" :size="14" />
             <input data-timer-task-field="title" :value="draftFor(row.task).title" :aria-label="`事项名称：${row.task.title}`" @input="updateDraft(row.task, 'title', ($event.target as HTMLInputElement).value)" @blur="saveField(row.task, 'title')" @keydown.enter.prevent="($event.target as HTMLInputElement).blur()" />
             <small v-if="row.hasChildren">{{ row.task.parentId ? '子组' : '父事项' }}<template v-if="row.totalTodayEstimate > 0"> · {{ formatMinutes(row.totalTodayEstimate) }} 预计</template></small>
-            <small v-else-if="row.task.completedToday">今天已完成</small>
             <small v-else-if="draftFor(row.task).saving.title">保存中...</small>
             <small v-else-if="draftFor(row.task).errors.title" class="error">{{ draftFor(row.task).errors.title }}</small>
             <small v-else-if="draftFor(row.task).saved.title">已保存</small>
