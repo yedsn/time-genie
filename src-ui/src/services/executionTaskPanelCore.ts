@@ -33,7 +33,7 @@ export function executionPanelPresentation(mode: ExecutionPanelMode): ExecutionP
     title: "执行事项",
     showTimerActions: false,
     showActual: true,
-    actualEditable: false,
+    actualEditable: mode === "unassigned-allocation",
     showAllocation: true,
     showBreakDiscard: true,
     primaryLabel: mode === "unassigned-allocation" ? "确认分配" : "保存归属",

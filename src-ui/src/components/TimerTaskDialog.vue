@@ -223,7 +223,7 @@ const treeSortable = createTaskTreeSortable({
   rowSelector: ".timer-task-row[data-timer-task-id]",
   handleSelector: ".timer-task-drag-handle",
   taskIdAttribute: "data-timer-task-id",
-  disabled: () => props.mode === "execute" || Boolean(query.value.trim()),
+  disabled: () => Boolean(query.value.trim()),
   subtreeIds,
   parentId: (taskId) => rows.value.find((row) => row.task.id === taskId)?.task.parentId,
   onStart: () => { moving.value = true; },
@@ -234,7 +234,8 @@ const treeSortable = createTaskTreeSortable({
       await store.moveExecutionTask(task.id, task.version, task.subjectId, intent.parentId, intent.previousSiblingId, intent.nextSiblingId);
     } catch (error) {
       ElMessage.warning(errorText(error, "事项移动失败"));
-      await store.loadExecutionSnapshot(subjectId.value);
+      if (props.mode === "execute") await store.loadTodayPlan(subjectId.value);
+      else await store.loadExecutionSnapshot(subjectId.value);
     }
   },
   onInvalid: () => { ElMessage.warning("该落点会产生三级事项，请选择一级或同级位置"); },
@@ -246,7 +247,7 @@ const treeSortable = createTaskTreeSortable({
 });
 
 watch([() => props.modelValue, rows, query], async ([open]) => {
-  if (!open || props.mode === "execute") { treeSortable.destroy(); return; }
+  if (!open) { treeSortable.destroy(); return; }
   await nextTick();
   treeSortable.mount();
 }, { flush: "post" });
@@ -258,7 +259,6 @@ function prepareSubtreeDrag(taskId: string) {
 }
 
 async function keyboardMove(task: PanelTask, direction: "indent" | "outdent") {
-  if (props.mode === "execute") return;
   try {
     const ordered = rows.value.map((row) => row.task);
     if (direction === "indent") {
@@ -459,31 +459,34 @@ async function setActualAdjustmentVisible(task: PanelTask, visible: boolean) {
 async function saveActualAdjustment() {
   const task = actualTask.value;
   const parsed = actualParsed.value;
-  if (!task || !snapshot.value || !parsed.ok || !task.adjustmentFingerprint) {
+  const actualSnapshot = await store.loadActualAdjustmentSnapshot(subjectId.value);
+  const actualSnapshotTask = actualSnapshot?.tasks.find((item) => item.id === task?.id && item.isLeaf);
+  if (!task || !actualSnapshot || !actualSnapshotTask || !parsed.ok || !actualSnapshotTask.adjustmentFingerprint) {
     actualError.value = parsed.ok ? "事项实际基线已失效，请刷新后重试" : parsed.message;
     return;
   }
-  if (parsed.minutes === task.directMinutes) { closeActualAdjustment(); return; }
+  if (parsed.minutes === actualSnapshotTask.directMinutes) { closeActualAdjustment(); return; }
   actualSaving.value = true;
   actualError.value = "";
   try {
     await store.saveActualAdjustmentBatch({
-      subjectId: task.subjectId,
-      workDate: snapshot.value.workDate,
+      subjectId: actualSnapshotTask.subjectId,
+      workDate: actualSnapshot.workDate,
       clientRequestId: crypto.randomUUID(),
       batchId: crypto.randomUUID(),
       note: actualNote.value.trim() || undefined,
       items: [{
-        taskId: task.id,
-        expectedTaskVersion: task.version,
-        baselineMinutes: task.directMinutes,
+        taskId: actualSnapshotTask.id,
+        expectedTaskVersion: actualSnapshotTask.version,
+        baselineMinutes: actualSnapshotTask.directMinutes,
         targetMinutes: parsed.minutes,
-        deltaMinutes: parsed.minutes - task.directMinutes,
-        adjustmentFingerprint: task.adjustmentFingerprint,
+        deltaMinutes: parsed.minutes - actualSnapshotTask.directMinutes,
+        adjustmentFingerprint: actualSnapshotTask.adjustmentFingerprint,
       }],
       newTasks: [],
     });
-    await store.loadExecutionSnapshot(subjectId.value);
+    if (props.mode === "execute") await store.loadTodayPlan(subjectId.value);
+    else await store.loadExecutionSnapshot(subjectId.value);
     actualTaskId.value = "";
     ElMessage.success("今日实际已调整");
   } catch (error) {
@@ -900,7 +903,6 @@ function formatTime(timestamp: number) {
       </div>
       <label class="timer-task-search"><Search :size="15" /><input ref="searchRef" v-model="query" placeholder="搜索当前主体事项" aria-label="搜索执行事项" /></label>
       <button v-if="props.mode === 'execute'" class="secondary-button compact" type="button" @click="todayPickerOpen = true"><ListTodo :size="14" />从进行中加入</button>
-      <button class="secondary-button compact" type="button" @click="openNewTask()"><Plus :size="14" />新增事项</button>
     </div>
 
     <div class="timer-task-dialog-summary">
@@ -916,6 +918,7 @@ function formatTime(timestamp: number) {
     <div v-if="presentation.showAllocation && selectedAllocations.length" class="timer-task-allocation-selection" aria-label="当前已选时间分配">
       <span v-for="item in selectedAllocations" :key="item.taskId"><strong>{{ item.title }}</strong><template v-if="item.minutes > 0">{{ item.minutes }} 分钟</template><template v-if="item.minutes > 0 && item.completeTask"> · </template><template v-if="item.completeTask">完成</template><button type="button" :aria-label="`移除${item.title}的分配与完成选择`" @click="clearAllocationDraft(item.taskId)">×</button></span>
     </div>
+    <div class="timer-task-table-tools"><button class="secondary-button compact" type="button" @click="openNewTask()"><Plus :size="14" />新增事项</button></div>
 
     <div class="timer-task-list" :class="{ allocation: presentation.showAllocation }" aria-live="polite" :aria-busy="store.workspaceLoading || store.executionSnapshotLoading[subjectId]">
       <div class="timer-task-list-head" aria-hidden="true"><span>事项</span><span>今日预计</span><span>{{ presentation.showAllocation ? '已确认实际' : '已确认实际' }}</span><span>{{ presentation.showAllocation ? '本次分配' : '操作' }}</span></div>
@@ -932,7 +935,7 @@ function formatTime(timestamp: number) {
       <div v-if="!panelInitialLoading && rows.length" ref="rowsRef" class="timer-task-sortable-rows" :class="{ moving }">
         <div v-for="row in rows" :key="row.task.id" class="timer-task-row" :data-timer-task-id="row.task.id" :data-depth="row.depth" :class="[{ parent: row.hasChildren, child: row.depth > 0, recent: recentTaskId === row.task.id, active: store.runningEntry?.defaultTask === row.task.id, completed: row.task.completedToday }, `state-${actionFor(row.task, row.hasChildren).mode}`]">
           <div class="timer-task-name-cell" :style="{ '--task-depth': String(row.depth) }">
-            <button v-if="props.mode !== 'execute'" class="timer-task-drag-handle" type="button" :disabled="Boolean(query.trim())" :title="query.trim() ? '清空搜索后调整顺序和层级' : (subtreeIds(row.task.id).size > 1 ? `拖动整组（共 ${subtreeIds(row.task.id).size} 项）` : '拖动排序')" :aria-label="`${row.task.title}拖动排序`" @pointerdown="prepareSubtreeDrag(row.task.id)"><GripVertical :size="14" /></button>
+            <button class="timer-task-drag-handle" type="button" :disabled="Boolean(query.trim())" :title="query.trim() ? '清空搜索后调整顺序和层级' : (subtreeIds(row.task.id).size > 1 ? `拖动整组（共 ${subtreeIds(row.task.id).size} 项）` : '拖动排序')" :aria-label="`${row.task.title}拖动排序`" @pointerdown="prepareSubtreeDrag(row.task.id)"><GripVertical :size="14" /></button>
             <CornerDownRight v-if="row.depth" :size="14" />
             <input data-timer-task-field="title" :value="draftFor(row.task).title" :aria-label="`事项名称：${row.task.title}`" @input="updateDraft(row.task, 'title', ($event.target as HTMLInputElement).value)" @blur="saveField(row.task, 'title')" @keydown.enter.prevent="($event.target as HTMLInputElement).blur()" />
             <small v-if="row.hasChildren">{{ row.task.parentId ? '子组' : '父事项' }}<template v-if="row.totalTodayEstimate > 0"> · {{ formatMinutes(row.totalTodayEstimate) }} 预计</template></small>
@@ -967,14 +970,13 @@ function formatTime(timestamp: number) {
           </div>
 
           <div class="timer-task-actions">
-            <button v-if="props.mode !== 'execute' && !row.task.parentId" class="icon-button subtle" type="button" title="缩进为上一个一级事项的子项" :aria-label="`${row.task.title}增加层级`" @click="keyboardMove(row.task, 'indent')"><IndentIncrease :size="14" /></button>
-            <button v-else-if="props.mode !== 'execute'" class="icon-button subtle" type="button" title="移到一级" :aria-label="`${row.task.title}减少层级`" @click="keyboardMove(row.task, 'outdent')"><IndentDecrease :size="14" /></button>
+            <button v-if="!row.task.parentId" class="icon-button subtle" type="button" title="缩进为上一个一级事项的子项" :aria-label="`${row.task.title}增加层级`" @click="keyboardMove(row.task, 'indent')"><IndentIncrease :size="14" /></button>
+            <button v-else class="icon-button subtle" type="button" title="移到一级" :aria-label="`${row.task.title}减少层级`" @click="keyboardMove(row.task, 'outdent')"><IndentDecrease :size="14" /></button>
             <el-popover :visible="noteTaskId === row.task.id" placement="bottom" :width="300" trigger="click" @update:visible="noteTaskId = $event ? row.task.id : ''">
               <template #reference><button class="icon-button subtle" type="button" :class="{ filled: Boolean(draftFor(row.task).note.trim()) }" :title="draftFor(row.task).note.trim() ? '编辑备注' : '添加备注'" :aria-label="`${row.task.title}备注`"><MessageSquareText :size="14" /></button></template>
               <div class="timer-task-note-popover"><strong>{{ row.task.title }} · 备注</strong><textarea data-timer-task-field="note" :value="draftFor(row.task).note" rows="4" @input="updateDraft(row.task, 'note', ($event.target as HTMLTextAreaElement).value)"></textarea><small v-if="draftFor(row.task).errors.note" class="error">{{ draftFor(row.task).errors.note }}</small><div><button class="secondary-button compact" type="button" @click="noteTaskId = ''">关闭</button><button class="primary-button compact" type="button" :disabled="Boolean(draftFor(row.task).saving.note)" @click="saveField(row.task, 'note').then((ok) => { if (ok) noteTaskId = '' })"><Check :size="13" />保存</button></div></div>
             </el-popover>
 
-            <button v-if="row.hasChildren" class="secondary-button compact timer-task-add-child" type="button" @click="openNewTask(row.task.id)"><Plus :size="13" />子项</button>
             <label v-if="presentation.showAllocation && !row.hasChildren" class="timer-task-allocation-input"><input v-model.number="allocationDraft(row.task.id, row.task.title).minutes" min="0" :max="allocationRequiredMinutes" type="number" :aria-label="`${row.task.title}本次分配分钟`" /><span>分</span></label>
             <label v-if="presentation.showAllocation && !row.hasChildren" class="timer-task-complete-toggle" title="保存归属时同时完成事项；无需为该事项分配时间"><input v-model="allocationDraft(row.task.id, row.task.title).completeTask" type="checkbox" /><span>完成</span></label>
             <button v-if="!row.hasChildren" class="timer-task-primary-action" :class="actionFor(row.task, false).mode" type="button" :disabled="!actionFor(row.task, false).actionable || Boolean(timerBusyTaskId)" :aria-label="actionFor(row.task, false).ariaLabel" @click="startOrSwitch(row.task, false)"><LoaderCircle v-if="timerBusyTaskId === row.task.id" :size="13" class="spin" /><Play v-else-if="presentation.showTimerActions && actionFor(row.task, false).actionable" :size="13" fill="currentColor" />{{ actionFor(row.task, false).label }}</button>
@@ -983,10 +985,11 @@ function formatTime(timestamp: number) {
               <template #reference><button class="icon-button subtle" type="button" :aria-label="`${row.task.title}更多操作`" title="更多操作"><MoreHorizontal :size="15" /></button></template>
               <div class="timer-task-more-popover"><strong>{{ row.task.title }}</strong><label><span>整体预计</span><div><input v-model="moreDraftFor(row.task).estimate" inputmode="numeric" /><small>分钟</small></div></label><label><span>预计开始</span><input v-model="moreDraftFor(row.task).planDate" type="date" /></label><label v-if="!row.hasChildren && store.tasks.some((task) => task.id === row.task.id)"><span>重复设置</span><select v-model="moreDraftFor(row.task).recurrence"><option value="none">不重复</option><option value="daily">每天</option><option value="weekdays">工作日</option><option value="weekly">每周</option></select></label><label v-if="!row.hasChildren && store.tasks.some((task) => task.id === row.task.id) && moreDraftFor(row.task).recurrence !== 'none'"><span>生效日期</span><input v-model="moreDraftFor(row.task).recurrenceStart" type="date" /></label><div v-if="!row.hasChildren && store.tasks.some((task) => task.id === row.task.id) && moreDraftFor(row.task).recurrence === 'weekly'" class="timer-task-weekdays"><span>重复星期</span><div><label v-for="(label, index) in weekdayLabels" :key="label"><input v-model="moreDraftFor(row.task).recurrenceWeekdays" type="checkbox" :value="index" />{{ label }}</label></div></div><small v-if="row.task.completedToday && !store.tasks.some((task) => task.id === row.task.id)">继续事项后可修改重复设置</small><div class="timer-task-more-actions"><button v-if="row.task.status !== 'done'" class="secondary-button compact" type="button" @click="completeTask(row.task)"><CheckCircle2 :size="13" />完成</button><button class="danger-button compact" type="button" @click="deleteTask(row.task)"><Trash2 :size="13" />删除</button><span></span><button class="primary-button compact" type="button" @click="saveMore(row.task)">保存设置</button></div></div>
             </el-popover>
+            <button v-if="row.depth === 0" class="secondary-button compact timer-task-add-child" type="button" :disabled="Boolean(row.task.recurrence)" :title="row.task.recurrence ? '重复事项新增子项前必须先关闭重复' : '新增子项'" @click="openNewTask(row.task.id)"><Plus :size="13" />子项</button>
           </div>
         </div>
       </div>
-      <small v-if="props.mode !== 'execute' && query.trim()" class="timer-task-search-drag-hint">搜索状态下不能拖动；清空搜索后可调整顺序和层级。</small>
+      <small v-if="query.trim()" class="timer-task-search-drag-hint">搜索状态下不能拖动；清空搜索后可调整顺序和层级。</small>
 
       <div v-if="!panelInitialLoading && !rows.length && !newTask.open" class="timer-task-empty"><AlertCircle :size="22" /><strong>{{ query ? '没有匹配事项' : '当前主体暂无可执行事项' }}</strong><span>{{ query ? '换个关键词，或清空搜索查看全部事项。' : (props.mode === 'execute' ? '可以新建今日事项，或从进行中加入今日计划。' : '可以直接在这里新建事项。') }}</span><div v-if="!query"><button class="primary-button compact" type="button" @click="openNewTask()"><Plus :size="14" />新增事项</button><button v-if="props.mode === 'execute'" class="secondary-button compact" type="button" @click="todayPickerOpen = true">从进行中加入</button></div></div>
     </div>

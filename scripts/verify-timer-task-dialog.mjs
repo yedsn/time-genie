@@ -57,6 +57,7 @@ const tracking = readFileSync("src-ui/src/components/TimeTrackingWorkspace.vue",
 const today = readFileSync("src-ui/src/components/TodayOverviewWorkspace.vue", "utf8");
 const workbench = readFileSync("src-ui/src/views/MainWorkbench.vue", "utf8");
 const plan = readFileSync("src-ui/src/components/PlanListEditor.vue", "utf8");
+const unassignedIndicator = readFileSync("src-ui/src/components/UnassignedTimeIndicator.vue", "utf8");
 const reports = readFileSync("src-ui/src/components/ReportWorkspace.vue", "utf8");
 const storeSource = readFileSync("src-ui/src/store.ts", "utf8");
 const styles = readFileSync("src-ui/src/styles.css", "utf8");
@@ -84,8 +85,17 @@ assert.ok(dialog.includes("{ summary: row.hasChildren, empty: row.totalTodayEsti
 assert.match(dialog, /executionPanelAction/);
 assert.match(dialog, /executionPanelRows/);
 assert.match(dialog, /presentation.title/);
+assert.match(dialog, /v-if="!row.hasChildren && presentation.actualEditable"/);
+assert.ok(dialog.includes('const actualSnapshot = await store.loadActualAdjustmentSnapshot(subjectId.value)'));
+assert.ok(dialog.includes('v-if="row.depth === 0" class="secondary-button compact timer-task-add-child"'));
+assert.ok(dialog.includes("row.task.recurrence ? '重复事项新增子项前必须先关闭重复' : '新增子项'"));
+assert.ok(dialog.includes('@click="openNewTask(row.task.id)"'));
+assert.ok(dialog.includes('@click="openNewTask()"'));
 assert.match(dialog, /Sortable/);
 assert.match(dialog, /timer-task-drag-handle/);
+assert.doesNotMatch(dialog, /v-if="props.mode !== 'execute'" class="timer-task-drag-handle"/);
+assert.doesNotMatch(dialog, /disabled: () => props.mode === "execute"/);
+assert.ok(dialog.includes('if (props.mode === "execute") await store.loadTodayPlan(subjectId.value)'));
 assert.match(dialog, /taskSubtreeIds/);
 assert.match(dialog, /query.value.trim()/);
 assert.match(dialog, /store\.moveExecutionTask/);
@@ -106,7 +116,7 @@ assert.match(dialog, /filter\(\(allocation\) => allocation\.minutes > 0 \|\| all
 assert.match(dialog, /filter\(\(item\) => item\.minutes > 0 \|\| item\.completeTask\)/);
 assert.match(dialog, /clearAllocationDraft\(item\.taskId\)/);
 assert.doesNotMatch(dialog, /分配保存前只读/);
-assert.match(styles, /timer-task-list\.allocation[^}]*--timer-task-actions-width: 312px/);
+assert.match(styles, /timer-task-list\.allocation[^}]*--timer-task-actions-width: 390px/);
 assert.doesNotMatch(styles, /timer-task-complete-toggle\.empty/);
 assert.match(storeSource, /minutes <= 0 && !item\.completeTask/);
 assert.match(storeSource, /!allocationMinutes && !allocation\.completeTask/);
@@ -125,6 +135,9 @@ assert.match(today, /store\.runningEntry \? '切换执行事项' : '开始执行
 assert.match(workbench, /onOpenTimerTaskSelection\(\(\) => openTimerTaskDialog\(\)\)/);
 assert.match(workbench, /executionPanelMode/);
 assert.match(workbench, /mode: "unassigned-allocation"/);
+assert.match(unassignedIndicator, /v-if="!store\.unassignedDialogOpen"/);
+assert.doesNotMatch(unassignedIndicator, /!store\.runningEntry/);
+assert.match(unassignedIndicator, /store\.promptUnassignedResolution\(true\)/);
 assert.match(workbench, /@open-entry-allocation="openEntryAllocation"/);
 assert.doesNotMatch(workbench, /<UnassignedTimeDialog/);
 assert.match(workbench, /label: "待办"/);
@@ -134,7 +147,8 @@ assert.doesNotMatch(plan, /TimerTaskDialog|timer-task-dialog/);
 
 assert.ok(dialog.includes('<button v-if="!row.hasChildren" class="timer-task-primary-action"'));
 assert.ok(dialog.includes('<template v-if="row.totalTodayEstimate > 0">'));
-assert.ok(styles.includes(".timer-task-actions { min-width: 0; display: flex; flex-wrap: wrap;"));
+assert.ok(styles.includes(".timer-task-actions { min-width: 0; display: flex; flex-wrap: nowrap;"));
+assert.ok(dialog.includes('class="timer-task-table-tools"'), "新增事项入口应位于表格左上方");
 assert.ok(dialog.includes("timer-task-allocation-overview"));
 assert.ok(dialog.includes("props.mode === 'unassigned-allocation'"));
 assert.ok(dialog.indexOf('class="timer-task-allocation-overview"') < dialog.indexOf('class="timer-task-dialog-toolbar"'));

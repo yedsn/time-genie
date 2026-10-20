@@ -14,12 +14,14 @@ assert.equal(execute.title, "执行事项");
 assert.equal(execute.showTimerActions, true);
 assert.equal(execute.actualEditable, true);
 assert.equal(execute.showAllocation, false);
-for (const mode of ["unassigned-allocation", "entry-allocation"]) {
-  const presentation = executionPanelPresentation(mode);
-  assert.equal(presentation.showTimerActions, false);
-  assert.equal(presentation.actualEditable, false);
-  assert.equal(presentation.showAllocation, true);
-}
+const unassigned = executionPanelPresentation("unassigned-allocation");
+assert.equal(unassigned.showTimerActions, false);
+assert.equal(unassigned.actualEditable, true);
+assert.equal(unassigned.showAllocation, true);
+const entryAllocation = executionPanelPresentation("entry-allocation");
+assert.equal(entryAllocation.showTimerActions, false);
+assert.equal(entryAllocation.actualEditable, false);
+assert.equal(entryAllocation.showAllocation, true);
 assert.equal(executionPanelPresentation("unassigned-allocation").showBreakDiscard, true);
 assert.equal(executionPanelPresentation("entry-allocation").showBreakDiscard, true);
 

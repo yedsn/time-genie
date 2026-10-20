@@ -1486,6 +1486,16 @@ async function handleTaskNoteSave(taskId: string, note: string) {
   }
 }
 
+async function createTaskFromTodayImport(title: string, parentId?: string) {
+  const draftId = parentId
+    ? store.addChildTask(parentId, title)
+    : store.addTask(title, store.selectedSubjectId);
+  if (!draftId) throw new Error(parentId ? "该一级事项暂时不能新增子项" : "事项新增失败");
+  const savedTaskId = await store.saveTask(draftId);
+  if (!savedTaskId) throw new Error("事项新增失败");
+  return savedTaskId;
+}
+
 async function handleTodayPlanRemove(taskId: string) {
   try {
     await store.setTodayPlanMembership(taskId, "excluded");
@@ -1624,7 +1634,7 @@ async function handleCompletedTaskDelete(task: Task) {
       <section v-else-if="store.activePage === 'plan'" class="plan-edit-layout">
         <div class="plan-task-tabs" role="tablist" aria-label="事项状态">
           <button type="button" role="tab" :aria-selected="store.planTaskTab === 'today'" :class="{ active: store.planTaskTab === 'today' }" @click="store.selectPlanTaskTab('today')">
-            <span>今日</span><strong>{{ store.todayPlanTasks.filter((task) => task.todayMember).length }}</strong>
+            <span>今日</span><strong>{{ store.todayPlanTasks.filter((task) => task.subjectId === store.selectedSubjectId && task.todayMember).length }}</strong>
           </button>
           <button type="button" role="tab" :aria-selected="store.planTaskTab === 'active'" :class="{ active: store.planTaskTab === 'active' }" @click="store.selectPlanTaskTab('active')">
             <span>进行中</span><strong>{{ store.selectedSubjectTasks.length }}</strong>
@@ -1648,10 +1658,13 @@ async function handleCompletedTaskDelete(task: Task) {
           :format-minutes="formatMinutes"
           :today-date="store.workspaceToday"
           :timezone="store.workspaceTimezone"
-          :save-estimate-batch="store.saveTaskEstimateBatch"
+          :save-today-import="store.saveTodayImport"
+          :create-task="createTaskFromTodayImport"
+          :save-task="store.saveTask"
           :save-plan-batch="store.saveTaskPlanBatch"
           :load-actual-snapshot="store.loadActualAdjustmentSnapshot"
           :save-actual-batch="store.saveActualAdjustmentBatch"
+          :move-task="store.movePlanTask"
           @select="store.selectedTaskId = $event"
           @add="store.addTask('', store.selectedSubjectId)"
           @add-child="store.addChildTask"
@@ -1684,10 +1697,13 @@ async function handleCompletedTaskDelete(task: Task) {
           :format-minutes="formatMinutes"
           :today-date="store.workspaceToday"
           :timezone="store.workspaceTimezone"
-          :save-estimate-batch="store.saveTaskEstimateBatch"
+          :save-today-import="store.saveTodayImport"
+          :create-task="createTaskFromTodayImport"
+          :save-task="store.saveTask"
           :save-plan-batch="store.saveTaskPlanBatch"
           :load-actual-snapshot="store.loadActualAdjustmentSnapshot"
           :save-actual-batch="store.saveActualAdjustmentBatch"
+          :move-task="store.movePlanTask"
           @select="store.selectedTaskId = $event"
           @add="store.addTask('', store.selectedSubjectId)"
           @add-child="store.addChildTask"

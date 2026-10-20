@@ -1083,17 +1083,24 @@ export type TaskPlanBatchRequest = {
   baselineTasks: Array<{ taskId: string; expectedVersion: number }>;
   finalItems: Array<{ lineKey: string; taskId?: string; title: string; parentLineKey?: string }>;
   confirmedDeleteTaskIds: string[];
+  todayPlanChange?: {
+    workDate: string;
+    includeLineKeys: string[];
+    excludeItems: Array<{ taskId: string; expectedVersion?: number }>;
+  };
 };
 
 export type TaskPlanBatchResult = {
   createdCount: number;
   updatedCount: number;
   deletedCount: number;
+  todayPlanChangedCount: number;
+  createdItems: Array<{ lineKey: string; taskId: string }>;
 };
 
 export async function applyTaskPlanBatch(request: TaskPlanBatchRequest): Promise<TaskPlanBatchResult> {
   const result = await invoke<TaskPlanBatchResult>("task_plan_batch_apply", { request });
-  if (result.createdCount || result.updatedCount || result.deletedCount) {
+  if (result.createdCount || result.updatedCount || result.deletedCount || result.todayPlanChangedCount) {
     await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-plan-batch-apply");
   }
   return result;

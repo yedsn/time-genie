@@ -80,7 +80,7 @@ function mockInitScript() {
     version: 1,
   });
 
-  const calls = { update: [], dayPlanSet: [], dayPlanBatch: [], transition: [], create: [], completed: [] };
+  const calls = { update: [], dayPlanSet: [], dayPlanBatch: [], transition: [], create: [], completed: [], move: [], actualAdjustment: [] };
   let failDayPlanBatchOnce = false;
   let created = 0;
 
@@ -157,14 +157,58 @@ function mockInitScript() {
           }
           return { ...(row ?? {}) };
         }
+        case "task_move": {
+          calls.move.push({ ...args.request });
+          const applyMove = (rows) => {
+            const index = rows.findIndex((row) => row.id === args.request.id);
+            if (index < 0) return undefined;
+            const [moving] = rows.splice(index, 1);
+            moving.parentId = args.request.parentId;
+            moving.version += 1;
+            const anchorId = args.request.nextSiblingId ?? args.request.previousSiblingId;
+            const anchorIndex = anchorId ? rows.findIndex((row) => row.id === anchorId) : -1;
+            const insertAt = anchorIndex < 0 ? rows.length : args.request.nextSiblingId ? anchorIndex : anchorIndex + 1;
+            rows.splice(insertAt, 0, moving);
+            return moving;
+          };
+          const moved = applyMove(activeTasks);
+          applyMove(planRows["subject-a"]);
+          return { ...(moved ?? {}) };
+        }
         case "task_create":
         case "task_create_quick": {
           created += 1;
           const id = "created-" + created;
           calls.create.push({ id, ...args.request });
-          const row = record(id, { subjectId: args.request.subjectId, title: args.request.title, sortOrder: 90 + created });
+          const row = record(id, { subjectId: args.request.subjectId, parentId: args.request.parentId, title: args.request.title, pathLabel: args.request.parentId ? `子项 / ${args.request.title}` : args.request.title, sortOrder: 90 + created });
           activeTasks.push(row);
           return { ...row };
+        }
+        case "actual_adjustment_snapshot":
+          return {
+            subjectId: args.request.subjectId,
+            workDate: args.request.workDate,
+            tasks: activeTasks
+              .filter((task) => task.subjectId === args.request.subjectId && task.status === "open")
+              .map((task) => ({
+                ...task,
+                isLeaf: !activeTasks.some((candidate) => candidate.parentId === task.id),
+                canAcceptChildren: !task.recurrence,
+                totalMinutes: activeTasks.filter((candidate) => candidate.parentId === task.id).reduce((sum, child) => sum + child.directMinutes, task.directMinutes),
+              })),
+            adjustments: [],
+          };
+        case "actual_adjustment_batch_apply": {
+          calls.actualAdjustment.push({ ...args.request });
+          for (const item of args.request.items ?? []) {
+            const active = activeTasks.find((task) => task.id === item.taskId);
+            if (active) { active.directMinutes = item.targetMinutes; active.totalMinutes = item.targetMinutes; }
+            for (const rows of Object.values(planRows)) {
+              const row = rows.find((task) => task.id === item.taskId);
+              if (row) { row.directMinutes = item.targetMinutes; row.totalMinutes = item.targetMinutes; }
+            }
+          }
+          return { batchId: args.request.batchId, createdAdjustmentCount: (args.request.items ?? []).length, createdTaskCount: 0, createdTasks: [], adjustments: [] };
         }
         case "timer_transition": {
           calls.transition.push({ ...args.request });
@@ -183,8 +227,8 @@ function mockInitScript() {
           return { page: 1, pageSize: 7, totalDays: 0, totalPages: 0, groups: [], revision: 1 };
         case "timer_get_state":
           return runningEntry();
-        case "unassigned_get_state":
-          return { current: undefined };
+        case "unassigned_get_state_snapshot":
+          return { current: { sessionId: "unassigned-1", workDate, state: "awaiting_resolution", firstStartedAt: Date.now() - 1_800_000, lastEndedAt: Date.now(), elapsedSeconds: 1_800, requiredMinutes: 30, thresholdSeconds: 300, mustResolve: true, version: 1 } };
         case "today_work_overview_get":
           return { scope: { subjectName: "全部主体", todayDate: workDate }, summary: { actualMinutes: 0, estimatedMinutes: 0, completedCount: 0, activeCount: 0, notStartedCount: 0, unassignedMinutes: 0, completionRate: 0 }, days: [], timeline: [], tasks: [], revision: 1 };
         case "report_list":
@@ -213,11 +257,10 @@ async function main() {
   await waitForServer();
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  await context.addInitScript(mockInitScript);
   const page = await context.newPage();
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
-  await page.addInitScript(mockInitScript);
-
   const calls = () => page.evaluate(() => window.__EXECUTION_DIALOG_TEST__.calls);
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await page.locator(".global-timer-main").click();
@@ -261,9 +304,22 @@ async function main() {
   await page.waitForFunction(() => document.querySelectorAll(".timer-task-dialog .timer-task-row:not(.new-task)").length === 3);
   if (!await dialog.isVisible()) throw new Error("加入今日后执行弹框不应关闭");
 
-  // 5. 今日成员写入失败时保留弹框并提示，不得对未成为今日成员的事项开始计时
+  // 5. 执行弹框支持一级事项新增子项，并可点击实际用时调整。
+  const joinedBacklogRow = dialog.locator('.timer-task-row[data-timer-task-id="backlog"]');
+  if (await joinedBacklogRow.locator('.timer-task-add-child').count() !== 1) throw new Error("执行弹框一级叶子事项缺少新增子项入口");
+  await joinedBacklogRow.locator('.timer-task-add-child').click();
+  await dialog.locator('input[aria-label="新事项名称"]').fill("执行弹框新增子项");
+  await dialog.locator('.timer-task-row.new-task button', { hasText: "保存" }).click();
+  await page.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.create.some((call) => call.title === "执行弹框新增子项" && call.parentId === "backlog"));
+  await dialog.getByRole("button", { name: "调整写今日计划（弹框改名）今日实际" }).click();
+  const executeActualPopover = page.locator('.el-popper:visible .actual-adjustment-inline').filter({ hasText: "写今日计划（弹框改名） · 今日实际" }).last();
+  await executeActualPopover.getByRole("textbox", { name: "目标实际分钟" }).fill("15");
+  await executeActualPopover.getByRole("button", { name: "确认调整" }).click();
+  await page.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.actualAdjustment.some((call) => call.items?.some((item) => item.taskId === "child" && item.targetMinutes === 15)));
+
+  // 6. 今日成员写入失败时保留弹框并提示，不得对未成为今日成员的事项开始计时
   await page.evaluate(() => window.__EXECUTION_DIALOG_TEST__.failNextDayPlanBatch());
-  await dialog.locator("button", { hasText: "新增事项" }).click();
+  await dialog.locator(".timer-task-table-tools button", { hasText: "新增事项" }).click();
   const newTaskTitle = dialog.locator('input[aria-label="新事项名称"]');
   await newTaskTitle.fill("加入会失败的新事项");
   await dialog.locator(".timer-task-row.new-task button", { hasText: "保存" }).click();
@@ -274,7 +330,7 @@ async function main() {
   if ((await calls()).transition.length !== 0) throw new Error("加入今日失败后不应开始计时");
   await dialog.locator(".timer-task-row.new-task button", { hasText: "取消" }).click();
 
-  // 6. 新建并开始走原子计时转换请求，成功后关闭弹框
+  // 7. 新建并开始走原子计时转换请求，成功后关闭弹框
   await dialog.locator("button", { hasText: "新增事项" }).click();
   await dialog.locator('input[aria-label="新事项名称"]').fill("新建并开始的事项");
   await dialog.locator(".timer-task-row.new-task button", { hasText: "开始" }).click();
@@ -283,7 +339,7 @@ async function main() {
   if (!transitionCall.newTask || transitionCall.newTask.subjectId !== "subject-a") throw new Error("新建并开始没有携带主体信息");
   await dialog.waitFor({ state: "hidden" });
 
-  // 7. 空今日计划的主体：空状态保留两条补充入口
+  // 8. 空今日计划的主体：空状态保留两条补充入口
   await page.locator(".global-timer-main").click();
   await dialog.waitFor({ state: "visible" });
   await dialog.locator(".timer-task-subject-tabs button", { hasText: "个人" }).click();
@@ -292,6 +348,43 @@ async function main() {
   if (await empty.locator("button", { hasText: "新增事项" }).count() !== 1) throw new Error("空状态缺少新增今日事项入口");
   if (await empty.locator("button", { hasText: "从进行中加入" }).count() !== 1) throw new Error("空状态缺少从进行中加入入口");
   if (await dialog.locator(".timer-task-row:not(.new-task)").count() !== 0) throw new Error("空计划主体不应展示其他主体事项");
+
+  // 9. 回到工作主体后验证执行弹框拖动写入正式事项顺序。
+  await dialog.locator(".timer-task-subject-tabs button", { hasText: "工作" }).click();
+  const backlogRow = dialog.locator('.timer-task-row[data-timer-task-id="backlog"]');
+  const childRow = dialog.locator('.timer-task-row[data-timer-task-id="child"]');
+  await backlogRow.waitFor({ state: "visible" });
+  if (await backlogRow.locator(".timer-task-drag-handle").count() !== 1) throw new Error("执行弹框缺少拖动排序入口");
+  await backlogRow.locator(".timer-task-drag-handle").dragTo(childRow, { targetPosition: { x: 150, y: 5 } });
+  await page.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.move.length > 0);
+  const moveCall = (await calls()).move.at(-1);
+  if (moveCall.id !== "backlog" || moveCall.previousSiblingId !== "parent" || moveCall.parentId) throw new Error("执行弹框拖动结果异常：" + JSON.stringify(moveCall));
+
+  // 10. 未归属时间分配复用同一套事项配置：新增一级/子项，并可独立调整实际用时。
+  const unassignedPage = await context.newPage();
+  unassignedPage.on("pageerror", (error) => pageErrors.push(error.message));
+  await unassignedPage.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const unassignedCalls = () => unassignedPage.evaluate(() => window.__EXECUTION_DIALOG_TEST__.calls);
+  const unassignedDialog = unassignedPage.locator('.timer-task-dialog');
+  await unassignedPage.waitForFunction(() => document.querySelector('.unassigned-time-indicator time')?.textContent !== "00:00");
+  await unassignedPage.locator('.unassigned-time-indicator').click();
+  await unassignedDialog.waitFor({ state: "visible" });
+  await unassignedDialog.locator('.timer-task-allocation-overview').waitFor({ state: "visible" });
+  await unassignedDialog.locator('.timer-task-table-tools button', { hasText: "新增事项" }).click();
+  await unassignedDialog.locator('input[aria-label="新事项名称"]').fill("未归属弹框新增事项");
+  await unassignedDialog.locator('.timer-task-row.new-task button', { hasText: "保存" }).click();
+  await unassignedPage.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.create.some((call) => call.title === "未归属弹框新增事项" && !call.parentId));
+  const unassignedRoot = (await unassignedCalls()).create.find((call) => call.title === "未归属弹框新增事项");
+  const unassignedRootRow = unassignedDialog.locator(`[data-timer-task-id="${unassignedRoot.id}"]`);
+  await unassignedRootRow.locator('.timer-task-add-child').click();
+  await unassignedDialog.locator('input[aria-label="新事项名称"]').fill("未归属弹框新增子项");
+  await unassignedDialog.locator('.timer-task-row.new-task button', { hasText: "保存" }).click();
+  await unassignedPage.waitForFunction((parentId) => window.__EXECUTION_DIALOG_TEST__.calls.create.some((call) => call.title === "未归属弹框新增子项" && call.parentId === parentId), unassignedRoot.id);
+  await unassignedDialog.getByRole("button", { name: "调整写今日计划今日实际" }).click();
+  const unassignedActualPopover = unassignedPage.locator('.el-popper:visible .actual-adjustment-inline').filter({ hasText: "写今日计划 · 今日实际" }).last();
+  await unassignedActualPopover.getByRole("textbox", { name: "目标实际分钟" }).fill("25");
+  await unassignedActualPopover.getByRole("button", { name: "确认调整" }).click();
+  await unassignedPage.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.actualAdjustment.some((call) => call.items?.some((item) => item.taskId === "child" && item.targetMinutes === 25)));
 
   if (pageErrors.length) throw new Error("页面错误: " + pageErrors.join("；"));
   await browser.close();

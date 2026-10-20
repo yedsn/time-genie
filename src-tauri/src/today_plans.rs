@@ -648,8 +648,10 @@ mod tests {
     #[test]
     fn explicit_exclusion_overrides_recurring_rule_for_only_one_date() {
         let database = database();
-        let first = "2026-10-19";
-        let second = "2026-10-20";
+        let first = chrono::Local::now().date_naive();
+        let second = first + chrono::Duration::days(1);
+        let first = first.format("%Y-%m-%d").to_string();
+        let second = second.format("%Y-%m-%d").to_string();
         let task = create_task(&database, "每日重复", None);
         crate::recurring::save_rule(
             &database,
@@ -658,18 +660,18 @@ mod tests {
                 task_expected_version: task.version,
                 frequency: "daily".to_string(),
                 weekdays_mask: None,
-                effective_start: first.to_string(),
+                effective_start: first.clone(),
                 rule_expected_version: None,
             },
         )
         .unwrap();
-        plan_set(&database, &task.id, first, EXCLUDED, None).unwrap();
+        plan_set(&database, &task.id, &first, EXCLUDED, None).unwrap();
 
         let first_result = snapshot(
             &database,
             TaskDayPlanSnapshotRequest {
                 subject_id: subject_id(&database),
-                work_date: first.to_string(),
+                work_date: first.clone(),
             },
         )
         .unwrap();
@@ -678,7 +680,7 @@ mod tests {
             &database,
             TaskDayPlanSnapshotRequest {
                 subject_id: subject_id(&database),
-                work_date: second.to_string(),
+                work_date: second,
             },
         )
         .unwrap();

@@ -151,6 +151,22 @@ pub struct TaskPlanBatchApplyRequest {
     pub baseline_tasks: Vec<TaskPlanBatchBaselineItem>,
     pub final_items: Vec<TaskPlanBatchFinalItem>,
     pub confirmed_delete_task_ids: Vec<String>,
+    pub today_plan_change: Option<TaskPlanBatchTodayPlanChange>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskPlanBatchTodayPlanChange {
+    pub work_date: String,
+    pub include_line_keys: Vec<String>,
+    pub exclude_items: Vec<TaskPlanBatchTodayPlanExcludeItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskPlanBatchTodayPlanExcludeItem {
+    pub task_id: String,
+    pub expected_version: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -159,6 +175,15 @@ pub struct TaskPlanBatchApplyResult {
     pub created_count: usize,
     pub updated_count: usize,
     pub deleted_count: usize,
+    pub today_plan_changed_count: usize,
+    pub created_items: Vec<TaskPlanBatchCreatedItem>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskPlanBatchCreatedItem {
+    pub line_key: String,
+    pub task_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1865,6 +1890,27 @@ fn apply_task_plan_batch_with_cloud_operation(
     if confirmed_delete.len() != request.confirmed_delete_task_ids.len() {
         return Err("VALIDATION_ERROR: 删除确认事项不能重复".to_string());
     }
+    let mut today_plan_changed_count = 0;
+    let mut created_task_operation_ids = HashMap::<String, String>::new();
+    if let Some(change) = request.today_plan_change.as_ref() {
+        validate_date(&change.work_date)?;
+        let include_seen: HashSet<&str> = change
+            .include_line_keys
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if include_seen.len() != change.include_line_keys.len() {
+            return Err("VALIDATION_ERROR: 今日计划新增行不能重复".to_string());
+        }
+        let exclude_seen: HashSet<&str> = change
+            .exclude_items
+            .iter()
+            .map(|item| item.task_id.as_str())
+            .collect();
+        if exclude_seen.len() != change.exclude_items.len() {
+            return Err("VALIDATION_ERROR: 移出今日事项不能重复".to_string());
+        }
+    }
 
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
@@ -1943,6 +1989,7 @@ fn apply_task_plan_batch_with_cloud_operation(
     }
     let mut line_to_task = HashMap::<String, String>::new();
     let mut created_ids = Vec::new();
+    let mut created_items = Vec::new();
     let now = now_millis();
     let mut created_count = 0;
     for item in &request.final_items {
@@ -1968,6 +2015,10 @@ fn apply_task_plan_batch_with_cloud_operation(
             .map_err(|error| error.to_string())?;
         line_to_task.insert(item.line_key.clone(), id.clone());
         created_ids.push(id);
+        created_items.push(TaskPlanBatchCreatedItem {
+            line_key: item.line_key.clone(),
+            task_id: line_to_task[&item.line_key].clone(),
+        });
         created_count += 1;
     }
 
@@ -2016,6 +2067,71 @@ fn apply_task_plan_batch_with_cloud_operation(
         }
     }
 
+    if let Some(change) = request.today_plan_change.as_ref() {
+        let include_line_keys: HashSet<&str> = change
+            .include_line_keys
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for line_key in &include_line_keys {
+            let Some(task_id) = line_to_task.get(*line_key) else {
+                return Err("VALIDATION_ERROR: 今日计划新增行不存在".to_string());
+            };
+            let dependency_operation_id = if created_ids.contains(task_id) {
+                if let Some((state, operation_type)) = cloud_state {
+                    let operation_id = crate::cloud_sync::enqueue_entity_in_transaction(
+                        &transaction,
+                        state,
+                        operation_type,
+                        "task",
+                        Some(task_id),
+                        None,
+                        None,
+                    )?;
+                    if let Some(operation_id) = operation_id {
+                        created_task_operation_ids.insert(task_id.clone(), operation_id.clone());
+                        Some(operation_id)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            crate::today_plans::write_day_plan_in_transaction(
+                &transaction,
+                &workspace_id,
+                task_id,
+                &change.work_date,
+                crate::today_plans::INCLUDED,
+                None,
+                now,
+                cloud_state.map(|value| value.0),
+                dependency_operation_id.as_deref(),
+            )?;
+            today_plan_changed_count += 1;
+        }
+        for item in &change.exclude_items {
+            if !current.contains_key(&item.task_id) {
+                return Err("VERSION_CONFLICT: 移出今日事项已不存在".to_string());
+            }
+            crate::today_plans::write_day_plan_in_transaction(
+                &transaction,
+                &workspace_id,
+                &item.task_id,
+                &change.work_date,
+                crate::today_plans::EXCLUDED,
+                item.expected_version,
+                now,
+                cloud_state.map(|value| value.0),
+                None,
+            )?;
+            today_plan_changed_count += 1;
+        }
+    }
+
     let actual_deleted: HashSet<String> = current
         .keys()
         .filter(|id| !task_seen.contains(id.as_str()))
@@ -2038,17 +2154,26 @@ fn apply_task_plan_batch_with_cloud_operation(
             params![now, task_id, workspace_id, version],
         ).map_err(|error| error.to_string())?;
     }
-    if created_count == 0 && changed_count == 0 && actual_deleted.is_empty() {
+    let today_plan_changed = request.today_plan_change.as_ref().is_some_and(|change| {
+        !change.include_line_keys.is_empty() || !change.exclude_items.is_empty()
+    });
+    if created_count == 0 && changed_count == 0 && actual_deleted.is_empty() && !today_plan_changed
+    {
         transaction.commit().map_err(|error| error.to_string())?;
         return Ok(TaskPlanBatchApplyResult {
             created_count,
             updated_count: changed_count,
             deleted_count: 0,
+            today_plan_changed_count,
+            created_items,
         });
     }
     bump_revision(&transaction)?;
     if let Some((state, operation_type)) = cloud_state {
         for id in &created_ids {
+            if created_task_operation_ids.contains_key(id) {
+                continue;
+            }
             crate::cloud_sync::enqueue_entity_in_transaction(
                 &transaction,
                 state,
@@ -2097,6 +2222,8 @@ fn apply_task_plan_batch_with_cloud_operation(
         created_count,
         updated_count: changed_count,
         deleted_count: actual_deleted.len(),
+        today_plan_changed_count,
+        created_items,
     })
 }
 
@@ -5387,6 +5514,7 @@ mod tests {
                 baseline_tasks,
                 final_items,
                 confirmed_delete_task_ids: vec![deleted.id.clone()],
+                today_plan_change: None,
             },
             None,
         )
@@ -5409,6 +5537,121 @@ mod tests {
             )
             .unwrap();
         assert!(deleted_at.is_some());
+    }
+
+    #[test]
+    fn scoped_today_plan_batch_adds_and_excludes_without_deleting_tasks() {
+        let database = database();
+        let subject_id: String = database
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let existing = create_test_task(&database, &subject_id, None, "今日已有");
+        let hidden = create_test_task(&database, &subject_id, None, "长期事项");
+        let work_date = "2026-10-20";
+        let workspace_id: String = database
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let mut connection = database.open().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let plan = crate::today_plans::write_day_plan_in_transaction(
+            &transaction,
+            &workspace_id,
+            &existing.id,
+            work_date,
+            crate::today_plans::INCLUDED,
+            None,
+            now_millis(),
+            None,
+            None,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let all = list_tasks(
+            &database,
+            TaskListRequest {
+                subject_id: Some(subject_id.clone()),
+                include_completed: Some(false),
+                planned_date: None,
+                today_date: None,
+                today_only: Some(false),
+                daily_estimate_date: None,
+                query: None,
+            },
+        )
+        .unwrap()
+        .tasks;
+        let result = apply_task_plan_batch_with_cloud_operation(
+            &database,
+            TaskPlanBatchApplyRequest {
+                subject_id,
+                baseline_tasks: all
+                    .iter()
+                    .map(|task| TaskPlanBatchBaselineItem {
+                        task_id: task.id.clone(),
+                        expected_version: task.version,
+                    })
+                    .collect(),
+                final_items: all
+                    .iter()
+                    .map(|task| TaskPlanBatchFinalItem {
+                        line_key: format!("task:{}", task.id),
+                        task_id: Some(task.id.clone()),
+                        title: task.title.clone(),
+                        parent_line_key: None,
+                    })
+                    .chain(std::iter::once(TaskPlanBatchFinalItem {
+                        line_key: "today-new".to_string(),
+                        task_id: None,
+                        title: "今日新增".to_string(),
+                        parent_line_key: None,
+                    }))
+                    .collect(),
+                confirmed_delete_task_ids: vec![],
+                today_plan_change: Some(TaskPlanBatchTodayPlanChange {
+                    work_date: work_date.to_string(),
+                    include_line_keys: vec!["today-new".to_string()],
+                    exclude_items: vec![TaskPlanBatchTodayPlanExcludeItem {
+                        task_id: existing.id.clone(),
+                        expected_version: Some(plan.plan.version),
+                    }],
+                }),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.created_count, 1);
+        assert_eq!(result.deleted_count, 0);
+        assert_eq!(result.today_plan_changed_count, 2);
+        let created_id = &result.created_items[0].task_id;
+        let connection = database.open().unwrap();
+        let existing_state: String = connection
+            .query_row(
+                "SELECT state FROM task_day_plans WHERE task_id=?1 AND work_date=?2",
+                params![existing.id, work_date],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let created_state: String = connection
+            .query_row(
+                "SELECT state FROM task_day_plans WHERE task_id=?1 AND work_date=?2",
+                params![created_id, work_date],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(existing_state, crate::today_plans::EXCLUDED);
+        assert_eq!(created_state, crate::today_plans::INCLUDED);
+        let remaining: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id IN (?1,?2) AND deleted_at IS NULL",
+                params![existing.id, hidden.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 2);
     }
 
     #[test]
@@ -5459,6 +5702,7 @@ mod tests {
                 })
                 .collect(),
             confirmed_delete_task_ids,
+            today_plan_change: None,
         };
         let mismatch =
             apply_task_plan_batch_with_cloud_operation(&database, make_request(vec![]), None)
@@ -5480,6 +5724,7 @@ mod tests {
                 }],
                 final_items: vec![],
                 confirmed_delete_task_ids: vec![first.id],
+                today_plan_change: None,
             },
             None,
         )
@@ -5545,6 +5790,7 @@ mod tests {
                     .collect(),
                 final_items,
                 confirmed_delete_task_ids: vec![deleted.id.clone()],
+                today_plan_change: None,
             },
             Some((&state, "task_plan_batch_apply")),
         )

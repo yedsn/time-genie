@@ -1141,15 +1141,12 @@ fn run_sync_coordinator_round(
     };
     let mut domains = domains.into_iter().collect::<Vec<_>>();
     domains.sort();
+    let retry_after = next_outbox_retry_delay(database)?;
     Ok(SyncCoordinatorRoundResult {
         domains,
         last_change_seq,
         source: source.to_string(),
-        retry_after: if push.pending > 0 {
-            next_outbox_retry_delay(database)?
-        } else {
-            None
-        },
+        retry_after,
     })
 }
 #[cfg(test)]
@@ -1625,7 +1622,9 @@ fn queue_next_shared_unassigned_candidate(
     let candidate: Option<String> = connection
         .query_row(
             "SELECT id FROM unassigned_sessions
-             WHERE predecessor_session_id=?1 AND state IN ('collecting','awaiting_resolution')
+             WHERE predecessor_session_id=?1
+               AND state IN ('collecting','awaiting_resolution')
+               AND shared_source='cloud' AND migration_state='candidate'
              ORDER BY created_at LIMIT 1",
             [&predecessor_session_id],
             |row| row.get(0),
@@ -1654,9 +1653,18 @@ fn queue_next_shared_unassigned_candidate(
             None,
             None,
         )?;
-        flush_if_online(database)?;
+        wake_after_confirmed_cloud_enqueue(database);
     }
     Ok(())
+}
+
+fn wake_after_confirmed_cloud_enqueue(database: &Database) {
+    signal_cloud_sync(SYNC_SIGNAL_LOCAL_DIRTY, None);
+    if let Some(app) = CLOUD_SYNC_APP_HANDLE.get() {
+        if let Ok(status) = sync_status(database) {
+            let _ = app.emit("cloud-sync-state-changed", &status);
+        }
+    }
 }
 
 fn ensure_next_shared_unassigned_session(
@@ -5999,7 +6007,7 @@ pub fn reset_local_cache_from_cloud(database: &Database) -> Result<CloudSyncStat
         false,
         true,
     )?;
-    sync_status(database)
+    finish_cache_rebuild_sync_locked(database, "重置本地数据")
 }
 
 /// Rebuilds the restoring device from a newly committed workspace epoch. This
@@ -6067,7 +6075,7 @@ pub(crate) fn rebuild_local_cache_after_workspace_restore_locked(
         false,
         true,
     )?;
-    sync_status(database)
+    finish_cache_rebuild_sync_locked(database, "云端恢复后的本地重建")
 }
 
 pub fn discard_old_epoch_changes_and_redownload(
@@ -6122,7 +6130,46 @@ pub fn discard_old_epoch_changes_and_redownload(
         false,
         true,
     )?;
-    sync_status(database)
+    finish_cache_rebuild_sync_locked(database, "放弃旧世代修改后的本地重建")
+}
+
+fn finish_cache_rebuild_sync_locked(
+    database: &Database,
+    operation_label: &str,
+) -> Result<CloudSyncStatus, String> {
+    finish_cache_rebuild_sync_with(database, operation_label, |database| {
+        push_outbox_locked(database, true, true)
+    })
+}
+
+fn finish_cache_rebuild_sync_with(
+    database: &Database,
+    operation_label: &str,
+    push: impl FnOnce(&Database) -> Result<CloudSyncPushResult, String>,
+) -> Result<CloudSyncStatus, String> {
+    let before = sync_status(database)?;
+    if before.pending_operations == 0 && before.conflict_count == 0 {
+        return Ok(before);
+    }
+
+    let result = push(database).map_err(|error| {
+        format!(
+            "CACHE_REBUILD_SYNC_FAILED: {operation_label}已完成，但随后产生的共享状态未能同步：{error}"
+        )
+    })?;
+    let status = sync_status(database)?;
+    if result.conflicts > 0 || status.conflict_count > 0 {
+        return Err(format!(
+            "CACHE_REBUILD_SYNC_CONFLICT: {operation_label}已完成，但随后产生的共享状态遇到同步冲突"
+        ));
+    }
+    if result.pending > 0 || status.pending_operations > 0 {
+        return Err(format!(
+            "CACHE_REBUILD_SYNC_PENDING: {operation_label}已完成，但仍有 {} 项共享状态等待同步",
+            result.pending.max(status.pending_operations)
+        ));
+    }
+    Ok(status)
 }
 
 pub fn acquire_lease(database: &Database) -> Result<Value, String> {
@@ -10100,6 +10147,11 @@ mod tests {
 
     #[test]
     fn remote_resolution_starts_next_shared_session_at_server_boundary_when_idle() {
+        let _guard = CLOUD_SYNC_TEST_STATE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
         let (_directory, database, cloud_workspace_id, _local_workspace_id, _subject_id) =
             cloud_database_for_incremental_test("incremental-unassigned-resolved-idle.sqlite3");
         let device_id = storage_mode(&database).unwrap().device_id;
@@ -10140,6 +10192,23 @@ mod tests {
             )
             .unwrap();
         assert_eq!(predecessor, old.session_id);
+        let queued: (String, i64) = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT state,attempt_count FROM sync_outbox
+                 WHERE operation_type='unassigned_session_create' AND entity_id=?1",
+                [&next.session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(queued, ("pending".to_string(), 0));
+        assert!(next_outbox_retry_delay(&database).unwrap().is_some());
+        assert_ne!(
+            CLOUD_SYNC_SIGNALS.load(Ordering::Acquire) & SYNC_SIGNAL_LOCAL_DIRTY,
+            0
+        );
+        CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
     }
 
     #[test]
@@ -10477,8 +10546,14 @@ mod tests {
             &[entity.clone()],
         )
         .unwrap();
-        apply_incremental_entities(&database, &cloud_workspace_id, &device_id, 25, &[entity])
-            .unwrap();
+        apply_incremental_entities(
+            &database,
+            &cloud_workspace_id,
+            &device_id,
+            25,
+            &[entity.clone()],
+        )
+        .unwrap();
 
         let connection = database.open().unwrap();
         let next: (i64, i64) = connection
@@ -10490,6 +10565,45 @@ mod tests {
             )
             .unwrap();
         assert_eq!(next, (1, resolved_at));
+
+        let candidate_id: String = connection
+            .query_row(
+                "SELECT id FROM unassigned_sessions
+                 WHERE predecessor_session_id=?1 AND state IN ('collecting','awaiting_resolution')",
+                [&old.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE unassigned_sessions SET migration_state='adopted' WHERE id=?1",
+                [&candidate_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM sync_outbox WHERE entity_type='unassigned_session' AND entity_id=?1",
+                [&candidate_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        apply_incremental_entities(&database, &cloud_workspace_id, &device_id, 26, &[entity])
+            .unwrap();
+        let repeated_outbox: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox
+                 WHERE entity_type='unassigned_session' AND entity_id=?1",
+                [&candidate_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            repeated_outbox, 0,
+            "已被云端采用的下一段未归属会话不能因重复终态通知再次入队"
+        );
     }
 
     #[test]
@@ -11439,6 +11553,53 @@ mod tests {
             );
             assert_eq!(subject_name, "云端名称");
         }
+    }
+
+    #[test]
+    fn cache_rebuild_waits_for_followup_outbox_before_reporting_success() {
+        let (_directory, database, workspace_id) =
+            cloud_database_with_outbox_state("cache-rebuild-followup.sqlite3", "pending");
+        let status = finish_cache_rebuild_sync_with(&database, "重置本地数据", |database| {
+            database
+                .open()?
+                .execute(
+                    "DELETE FROM sync_outbox WHERE workspace_id=?1",
+                    [&workspace_id],
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(CloudSyncPushResult {
+                pushed: 1,
+                pending: 0,
+                conflicts: 0,
+            })
+        })
+        .unwrap();
+
+        assert_eq!(status.pending_operations, 0);
+        assert_eq!(status.conflict_count, 0);
+    }
+
+    #[test]
+    fn cache_rebuild_reports_followup_sync_failure_without_dropping_outbox() {
+        let (_directory, database, workspace_id) =
+            cloud_database_with_outbox_state("cache-rebuild-followup-failure.sqlite3", "pending");
+        let error = finish_cache_rebuild_sync_with(&database, "重置本地数据", |_| {
+            Err("NETWORK_ERROR: 测试网络中断".to_string())
+        })
+        .unwrap_err();
+
+        assert!(error.starts_with("CACHE_REBUILD_SYNC_FAILED:"));
+        assert!(error.contains("重置本地数据已完成"));
+        let remaining: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1",
+                [&workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 1);
     }
 
     fn cloud_database_with_outbox_state(

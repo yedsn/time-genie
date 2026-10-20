@@ -1572,7 +1572,12 @@ export const useWorkdayStore = defineStore("workday", () => {
       snapshot.tasks.splice(0, snapshot.tasks.length, ...remaining.slice(0, insertIndex), ...movingBlock, ...remaining.slice(insertIndex));
     }
     replaceTask(moved);
-    return await loadExecutionSnapshot(subjectId);
+    const [, todaySnapshot, executionSnapshot] = await Promise.all([
+      loadWorkspaceData(),
+      loadTodayPlan(subjectId),
+      loadExecutionSnapshot(subjectId),
+    ]);
+    return executionSnapshot ?? todaySnapshot;
   }
 
   async function saveTaskNote(taskId: string, note: string) {
@@ -1609,6 +1614,21 @@ export const useWorkdayStore = defineStore("workday", () => {
     const todayDate = await ensureWorkspaceCalendar();
     await setTaskDailyEstimateBatch(selectedSubjectId.value, todayDate, items);
     await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(selectedSubjectId.value), loadTodayOverview()]);
+  }
+
+  async function saveTodayImport(request: {
+    taskIds: string[];
+    estimates: Array<{
+      taskId: string;
+      expectedTaskVersion: number;
+      expectedDailyEstimateVersion?: number;
+      estimateMinutes?: number;
+    }>;
+  }) {
+    const estimateMemberIds = new Set(request.estimates.filter((item) => item.estimateMinutes !== undefined).map((item) => item.taskId));
+    if (request.estimates.length) await saveTaskEstimateBatch(request.estimates);
+    const membershipOnlyIds = request.taskIds.filter((taskId) => !estimateMemberIds.has(taskId));
+    if (membershipOnlyIds.length) await addTasksToToday(membershipOnlyIds);
   }
 
   async function saveTaskPlanBatch(request: QuickPlanBatchRequest) {
@@ -2039,7 +2059,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     now, todayMinutes, allocatedMinutes, pendingMinutes, doneCount, todayCompletionDoneCount, todayCompletionTotalCount, todayCompletionPercent, unassignedSeconds, unassignedStartedAt,
     unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen, unassignedWorkDate, unassignedSessionId, unassignedVersion,
     unassignedCurrentSession,
-    workspaceLoaded, workspaceLoading, executionSnapshots, executionSnapshotLoading, loadExecutionSnapshot, saveExecutionTaskTitle, saveExecutionTaskNote, saveExecutionTaskDetails, deleteExecutionTask, loadWorkspaceData, loadTodayPlan, setTodayPlanMembership, addTasksToToday, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addTaskSelectionDraft, addChildTask, addTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTaskPlanBatch, loadActualAdjustmentSnapshot, saveActualAdjustmentBatch, removeActualAdjustment, duplicateTask, deleteTask, moveTask, reorderTask, movePlanTask,
+    workspaceLoaded, workspaceLoading, executionSnapshots, executionSnapshotLoading, loadExecutionSnapshot, saveExecutionTaskTitle, saveExecutionTaskNote, saveExecutionTaskDetails, deleteExecutionTask, loadWorkspaceData, loadTodayPlan, setTodayPlanMembership, addTasksToToday, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addTaskSelectionDraft, addChildTask, addTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTodayImport, saveTaskPlanBatch, loadActualAdjustmentSnapshot, saveActualAdjustmentBatch, removeActualAdjustment, duplicateTask, deleteTask, moveTask, reorderTask, movePlanTask,
     indentTask, outdentTask, moveExecutionTask, startTimer, transitionTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, loadReportTemplates, createReportTemplate, updateReportTemplate, duplicateReportTemplate, setDefaultReportTemplate, deleteReportTemplate, reorderReportTemplates, getReportTemplatePlaceholders, publicReportText, previewObsidianReport, writeObsidianReport,
     beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, dismissUnassignedResolution, resolveUnassignedTime
   };

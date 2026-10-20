@@ -200,8 +200,9 @@ async function main() {
   if (await page.evaluate(() => window.__TASK_STATUS_TEST__.todayPlanRequests) < 1) throw new Error("进入待办页未加载今日计划快照");
   if (await page.locator(".pending-reminder-row").count() !== 3) throw new Error("今日标签成员数量异常");
   if (await page.locator(".pending-reminder-row .drag-handle").count() !== 3) throw new Error("今日标签应复用进行中的拖动排序入口");
-  if (await page.getByRole("button", { name: "分配今日预计" }).count() !== 1) throw new Error("今日标签缺少分配今日预计入口");
-  if (await page.getByRole("button", { name: "快速编辑计划" }).count() !== 1) throw new Error("今日标签缺少快速编辑计划入口");
+  if (await page.getByRole("button", { name: "配置今日事项" }).count() !== 1) throw new Error("今日标签缺少配置今日事项入口");
+  if (await page.getByRole("button", { name: "分配今日预计" }).count() !== 0) throw new Error("今日标签仍显示旧的分配今日预计入口");
+  if (await page.getByRole("button", { name: "编辑今日计划" }).count() !== 1) throw new Error("今日标签缺少编辑今日计划入口");
   if (await page.getByRole("button", { name: "新增今日事项" }).count() !== 0) throw new Error("今日标签不应保留独立新增按钮");
   const todayContextRow = page.locator(".pending-reminder-row.context").first();
   if (await todayContextRow.locator(".task-timer-action").count() !== 0) throw new Error("父级上下文不应可执行");
@@ -209,8 +210,8 @@ async function main() {
   await page.getByRole("tab", { name: /进行中/ }).click();
   await page.locator(".pending-reminder-row").first().waitFor({ state: "visible" });
   if (await page.locator(".pending-reminder-row").count() !== 3) throw new Error("进行中列表未保留重复事项当日完成轮次");
-  if (await page.getByRole("button", { name: "分配今日预计" }).count() !== 0) throw new Error("进行中标签不应显示分配今日预计入口");
-  if (await page.getByRole("button", { name: "快速编辑计划" }).count() !== 1) throw new Error("进行中标签缺少快速编辑计划入口");
+  if (await page.getByRole("button", { name: "配置今日事项" }).count() !== 0) throw new Error("进行中标签不应显示配置今日事项入口");
+  if (await page.getByRole("button", { name: "编辑全部计划" }).count() !== 1) throw new Error("进行中标签缺少编辑全部计划入口");
 
   await page.getByRole("tab", { name: /已完成/ }).click();
   await page.locator(".completed-history-row").first().waitFor({ state: "visible" });

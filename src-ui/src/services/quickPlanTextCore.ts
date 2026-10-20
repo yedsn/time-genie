@@ -60,6 +60,11 @@ export type QuickPlanBatchRequest = {
   baselineTasks: Array<{ taskId: string; expectedVersion: number }>;
   finalItems: Array<{ lineKey: string; taskId?: string; title: string; parentLineKey?: string }>;
   confirmedDeleteTaskIds: string[];
+  todayPlanChange?: {
+    workDate: string;
+    includeLineKeys: string[];
+    excludeItems: Array<{ taskId: string; expectedVersion?: number }>;
+  };
 };
 
 export function createQuickPlanBaseline(tasks: readonly QuickPlanTask[]): QuickPlanBaselineTask[] {
@@ -259,4 +264,49 @@ export function buildQuickPlanBatchRequest(
     finalItems: summary.finalItems.map(({ lineKey, taskId, title, parentLineKey }) => ({ lineKey, taskId, title, parentLineKey })),
     confirmedDeleteTaskIds: summary.deleted.flatMap((item) => item.taskId ? [item.taskId] : []),
   };
+}
+
+export function mergeScopedQuickPlanDraft(
+  fullDraft: readonly QuickPlanDraftLine[],
+  fullBaseline: readonly QuickPlanBaselineTask[],
+  scopedBaseline: readonly QuickPlanBaselineTask[],
+  scopedSummary: QuickPlanChangeSummary,
+) {
+  const finalScopedIds = new Set(scopedSummary.finalItems.flatMap((item) => item.taskId ? [item.taskId] : []));
+  const finalScopedRootIds = new Set(scopedSummary.finalItems.filter((item) => item.taskId && item.depth === 0).map((item) => item.taskId!));
+  const fullById = new Map(fullBaseline.map((task) => [task.taskId, task]));
+  const attachedExtras = new Map<string, QuickPlanDraftLine[]>();
+  for (const line of fullDraft) {
+    if (!line.taskId || finalScopedIds.has(line.taskId)) continue;
+    const parentId = fullById.get(line.taskId)?.parentTaskId;
+    if (!parentId || !finalScopedRootIds.has(parentId)) continue;
+    const extras = attachedExtras.get(parentId) ?? [];
+    extras.push({ ...line, depth: 1 });
+    attachedExtras.set(parentId, extras);
+  }
+  const movedIds = new Set([
+    ...finalScopedIds,
+    ...[...attachedExtras.values()].flatMap((lines) => lines.flatMap((line) => line.taskId ? [line.taskId] : [])),
+  ]);
+  const anchorIndexes = fullDraft.flatMap((line, index) => line.taskId && movedIds.has(line.taskId) ? [index] : []);
+  const insertAt = anchorIndexes.length ? Math.min(...anchorIndexes) : fullDraft.length;
+  const remaining = fullDraft.filter((line) => !line.taskId || !movedIds.has(line.taskId));
+  const normalized = scopedSummary.finalItems.map((item) => ({
+    lineKey: item.lineKey,
+    taskId: item.taskId,
+    expectedVersion: item.taskId ? scopedBaseline.find((task) => task.taskId === item.taskId)?.expectedVersion : undefined,
+    text: item.title,
+    depth: item.depth,
+  }));
+  const scopedBlock: QuickPlanDraftLine[] = [];
+  let currentRootTaskId: string | undefined;
+  for (let index = 0; index < normalized.length; index += 1) {
+    const line = normalized[index];
+    scopedBlock.push(line);
+    if (line.depth === 0) currentRootTaskId = line.taskId;
+    const next = normalized[index + 1];
+    if ((!next || next.depth === 0) && currentRootTaskId) scopedBlock.push(...(attachedExtras.get(currentRootTaskId) ?? []));
+  }
+  const boundedInsertAt = Math.min(insertAt, remaining.length);
+  return [...remaining.slice(0, boundedInsertAt), ...scopedBlock, ...remaining.slice(boundedInsertAt)];
 }

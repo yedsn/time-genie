@@ -112,18 +112,11 @@ function timelineLabel(item: TodayWorkOverviewTimelineItemRecord) {
   return item.taskTitle || "工作";
 }
 
-function timelineStateLabel(item: TodayWorkOverviewTimelineItemRecord) {
-  if (item.itemType === "actual_adjustment") return "实际调整";
-  if (item.state === "running" || item.state === "collecting") return "进行中";
-  if (item.state === "paused") return "已暂停";
-  return item.itemType === "unassigned" ? "待处理" : "已结束";
-}
-
 function timelineTypeLabel(item: TodayWorkOverviewTimelineItemRecord) {
-  if (item.itemType === "break") return "休息";
-  if (item.itemType === "unassigned") return "未归属";
-  if (item.itemType === "actual_adjustment") return "调整";
-  return "工作";
+  if (item.itemType === "break") return "休息记录";
+  if (item.itemType === "unassigned") return "未归属记录";
+  if (item.itemType === "actual_adjustment") return "实际调整";
+  return "工作记录";
 }
 
 function timelinePeriod(item: TodayWorkOverviewTimelineItemRecord) {
@@ -206,21 +199,18 @@ function taskTitle(task: TodayWorkOverviewTaskRecord) {
         <template v-if="timelineItems.length">
           <div class="today-timeline">
             <div class="today-timeline-scale">
-              <span class="timeline-scale-label">时间记录</span>
+              <div class="timeline-table-head"><span>时间</span><span>事项</span><span>类型</span><span>用时</span></div>
               <div class="timeline-scale-track"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
             </div>
             <div v-for="item in timelineItems" :key="item.id" class="today-timeline-row" :class="timelineClass(item)">
-              <div class="timeline-copy">
-                <div class="timeline-title-row">
-                  <span class="timeline-kind">{{ timelineTypeLabel(item) }}</span>
+              <div class="timeline-record">
+                <time>{{ timelinePeriod(item) }}</time>
+                <div class="timeline-task-cell">
                   <strong :title="timelineLabel(item)">{{ timelineLabel(item) }}</strong>
-                  <span class="timeline-state">{{ timelineStateLabel(item) }}</span>
+                  <span v-if="allSubjectScope" :title="item.subjectName || '全局'">{{ item.subjectName || '全局' }}</span>
                 </div>
-                <small class="timeline-meta">
-                  <time>{{ timelinePeriod(item) }}</time>
-                  <span class="timeline-duration">{{ timelineDurationLabel(item) }}</span>
-                  <span v-if="allSubjectScope" class="timeline-subject" :title="item.subjectName || '全局'">{{ item.subjectName || '全局' }}</span>
-                </small>
+                <span class="timeline-type">{{ timelineTypeLabel(item) }}</span>
+                <b class="timeline-duration">{{ timelineDurationLabel(item) }}</b>
               </div>
               <div class="timeline-track" aria-hidden="true"><i :style="timelineStyle(item)"></i></div>
             </div>

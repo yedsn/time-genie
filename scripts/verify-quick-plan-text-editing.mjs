@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { analyzeQuickPlanDraft, buildQuickPlanBatchRequest, createQuickPlanBaseline, createQuickPlanDraft, parseQuickPlanText, reconcileQuickPlanText, removeQuickPlanSubtree, serializeQuickPlanLines } from "../.tmp-quick-plan-text-editing-test/quickPlanTextCore.js";
+import { analyzeQuickPlanDraft, buildQuickPlanBatchRequest, createQuickPlanBaseline, createQuickPlanDraft, mergeScopedQuickPlanDraft, parseQuickPlanText, reconcileQuickPlanText, removeQuickPlanSubtree, serializeQuickPlanLines } from "../.tmp-quick-plan-text-editing-test/quickPlanTextCore.js";
 
 const tasks = [
   { id: "root-a", title: "重复标题", version: 1 },
@@ -66,5 +66,25 @@ const request = buildQuickPlanBatchRequest("subject-1", baseline, summary);
 assert.equal(request.baselineTasks.length, 3);
 assert.deepEqual(request.confirmedDeleteTaskIds, ["child-a"]);
 assert.equal(request.finalItems.some((item) => item.lineKey === "new:1"), true);
+
+const fullTasks = [
+  { id: "context", title: "父项", version: 1 },
+  { id: "today-child", parentId: "context", title: "今日子项", version: 1 },
+  { id: "hidden-child", parentId: "context", title: "长期子项", version: 1 },
+  { id: "hidden-root", title: "长期根事项", version: 1 },
+];
+const scopedTasks = fullTasks.filter((task) => task.id === "context" || task.id === "today-child");
+const scopedBaseline = createQuickPlanBaseline(scopedTasks);
+const scopedDraft = createQuickPlanDraft(scopedTasks);
+scopedDraft[1].text = "今日子项已改名";
+scopedDraft.push({ lineKey: "today:new", text: "今日新增", depth: 0 });
+const scopedSummary = analyzeQuickPlanDraft(scopedBaseline, scopedDraft);
+const mergedDraft = mergeScopedQuickPlanDraft(createQuickPlanDraft(fullTasks), createQuickPlanBaseline(fullTasks), scopedBaseline, scopedSummary);
+assert.deepEqual(mergedDraft.map((line) => line.taskId ?? line.lineKey), ["context", "today-child", "hidden-child", "today:new", "hidden-root"]);
+assert.equal(mergedDraft.find((line) => line.taskId === "today-child").text, "今日子项已改名");
+assert.equal(mergedDraft.find((line) => line.taskId === "hidden-child").depth, 1);
+const mergedSummary = analyzeQuickPlanDraft(createQuickPlanBaseline(fullTasks), mergedDraft);
+assert.deepEqual(mergedSummary.deleted, []);
+assert.equal(mergedSummary.added.some((item) => item.lineKey === "today:new"), true);
 
 console.log("quick plan text editing checks passed");
