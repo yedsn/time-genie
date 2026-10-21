@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { AlertCircle, Check, CheckCircle2, CornerDownRight, GripVertical, IndentDecrease, IndentIncrease, ListTodo, LoaderCircle, MessageSquareText, MoreHorizontal, Play, Plus, Search, Trash2 } from "lucide-vue-next";
+import { AlertCircle, Check, CheckCircle2, Circle, CornerDownRight, GripVertical, IndentDecrease, IndentIncrease, ListTodo, LoaderCircle, MessageSquareText, MoreHorizontal, Play, Plus, Search, Trash2 } from "lucide-vue-next";
 import { useWorkdayStore, type Task } from "../store";
 import type { ActualAdjustmentSnapshotTaskRecord } from "../services/tauri";
 import {
@@ -1005,7 +1005,7 @@ function formatTime(timestamp: number) {
     class="timer-task-dialog"
     modal-class="timer-task-dialog-overlay"
     :title="presentation.title"
-    width="min(960px, 96vw)"
+    width="min(1040px, 97vw)"
     append-to-body
     destroy-on-close
     :before-close="beforeClose"
@@ -1066,7 +1066,7 @@ function formatTime(timestamp: number) {
       <div v-if="panelInitialLoading" class="timer-task-empty timer-task-loading" role="status"><LoaderCircle :size="22" class="spin" /><strong>正在加载事项…</strong><span>列表准备好后即可编辑或开始执行。</span></div>
 
       <div v-else-if="newTask.open" class="timer-task-row new-task" :class="{ child: newTask.parentId }">
-        <div class="timer-task-name-cell"><CornerDownRight v-if="newTask.parentId" :size="14" /><input v-model="newTask.title" placeholder="新事项名称" aria-label="新事项名称" @keydown.enter="createNewTask(false)" /></div>
+        <div class="timer-task-name-cell"><CornerDownRight v-if="newTask.parentId" :size="14" /><div class="timer-task-name-editor"><input v-model="newTask.title" placeholder="新事项名称" aria-label="新事项名称" @keydown.enter="createNewTask(false)" /></div></div>
         <span class="timer-task-estimate-cell readonly empty">—</span>
         <span class="timer-task-actual-cell">{{ newTask.targetId ? (newTask.placement === 'before' ? '插入上方' : '插入下方') : '新事项' }}</span>
         <div class="timer-task-actions"><button class="secondary-button compact" type="button" :disabled="newTask.saving" @click="resetNewTask">取消</button><button class="secondary-button compact" type="button" :disabled="newTask.saving" @click="createNewTask(false)">保存</button><button v-if="presentation.showTimerActions" class="primary-button compact" type="button" :disabled="newTask.saving" @click="createNewTask(true)"><LoaderCircle v-if="newTask.saving" :size="13" class="spin" /><Play v-else :size="13" fill="currentColor" />开始</button></div>
@@ -1077,12 +1077,18 @@ function formatTime(timestamp: number) {
         <div v-for="row in rows" :key="row.task.id" class="timer-task-row" :data-timer-task-id="row.task.id" :data-depth="row.depth" :class="[{ parent: row.hasChildren, child: row.depth > 0, recent: recentTaskId === row.task.id, active: store.runningEntry?.defaultTask === row.task.id, completed: row.task.completedToday }, `state-${actionFor(row.task, row.hasChildren).mode}`]">
           <div class="timer-task-name-cell" :style="{ '--task-depth': String(row.depth) }">
             <button class="timer-task-drag-handle" type="button" :disabled="Boolean(query.trim())" :class="{ active: rowContextTaskId === row.task.id }" :title="query.trim() ? '清空搜索后调整顺序和层级' : '拖动排序；右键可复制、插入或删除事项'" :aria-label="`${row.task.title}拖动排序，右键打开行菜单`" @pointerdown="prepareSubtreeDrag(row.task.id)" @contextmenu="openRowContextMenu($event, row.task)"><GripVertical :size="14" /></button>
+            <button v-if="presentation.showAllocation" class="timer-task-complete-check" :class="{ completed: !row.hasChildren && allocationDraft(row.task.id, row.task.title).completeTask }" type="button" :disabled="row.hasChildren" :title="row.hasChildren ? '父事项不能直接完成' : '保存归属时同时完成事项'" :aria-label="row.hasChildren ? `${row.task.title}为父事项，不能直接完成` : `${row.task.title}保存归属时完成`" :aria-pressed="row.hasChildren ? undefined : allocationDraft(row.task.id, row.task.title).completeTask" @click="allocationDraft(row.task.id, row.task.title).completeTask = !allocationDraft(row.task.id, row.task.title).completeTask">
+              <CheckCircle2 v-if="!row.hasChildren && allocationDraft(row.task.id, row.task.title).completeTask" :size="18" />
+              <Circle v-else :size="18" />
+            </button>
             <CornerDownRight v-if="row.depth" :size="14" />
-            <input data-timer-task-field="title" :value="draftFor(row.task).title" :aria-label="`事项名称：${row.task.title}`" @input="updateDraft(row.task, 'title', ($event.target as HTMLInputElement).value)" @blur="saveField(row.task, 'title')" @keydown.enter.prevent="($event.target as HTMLInputElement).blur()" />
-            <small v-if="row.hasChildren">{{ row.task.parentId ? '子组' : '父事项' }}<template v-if="row.totalTodayEstimate > 0"> · {{ formatMinutes(row.totalTodayEstimate) }} 预计</template></small>
-            <small v-else-if="draftFor(row.task).saving.title">保存中...</small>
-            <small v-else-if="draftFor(row.task).errors.title" class="error">{{ draftFor(row.task).errors.title }}</small>
-            <small v-else-if="draftFor(row.task).saved.title">已保存</small>
+            <div class="timer-task-name-editor">
+              <input data-timer-task-field="title" :value="draftFor(row.task).title" :aria-label="`事项名称：${row.task.title}`" @input="updateDraft(row.task, 'title', ($event.target as HTMLInputElement).value)" @blur="saveField(row.task, 'title')" @keydown.enter.prevent="($event.target as HTMLInputElement).blur()" />
+              <small v-if="row.hasChildren">{{ row.task.parentId ? '子组' : '父事项' }}<template v-if="row.totalTodayEstimate > 0"> · {{ formatMinutes(row.totalTodayEstimate) }} 预计</template></small>
+              <small v-else-if="draftFor(row.task).saving.title">保存中...</small>
+              <small v-else-if="draftFor(row.task).errors.title" class="error">{{ draftFor(row.task).errors.title }}</small>
+              <small v-else-if="draftFor(row.task).saved.title">已保存</small>
+            </div>
           </div>
 
           <span class="timer-task-estimate-cell readonly" :class="{ summary: row.hasChildren, empty: row.totalTodayEstimate <= 0 }" :aria-label="estimateCellLabel(row)">
@@ -1118,7 +1124,6 @@ function formatTime(timestamp: number) {
             </el-popover>
 
             <label v-if="presentation.showAllocation && !row.hasChildren" class="timer-task-allocation-input"><input v-model.number="allocationDraft(row.task.id, row.task.title).minutes" min="0" :max="allocationRequiredMinutes" type="number" :aria-label="`${row.task.title}本次分配分钟`" /><span>分</span></label>
-            <label v-if="presentation.showAllocation && !row.hasChildren" class="timer-task-complete-toggle" title="保存归属时同时完成事项；无需为该事项分配时间"><input v-model="allocationDraft(row.task.id, row.task.title).completeTask" type="checkbox" /><span>完成</span></label>
             <button v-if="!row.hasChildren" class="timer-task-primary-action" :class="actionFor(row.task, false).mode" type="button" :disabled="!actionFor(row.task, false).actionable || Boolean(timerBusyTaskId)" :aria-label="actionFor(row.task, false).ariaLabel" @click="startOrSwitch(row.task, false)"><LoaderCircle v-if="timerBusyTaskId === row.task.id" :size="13" class="spin" /><Play v-else-if="presentation.showTimerActions && actionFor(row.task, false).actionable" :size="13" fill="currentColor" />{{ actionFor(row.task, false).label }}</button>
 
             <el-popover :visible="moreTaskId === row.task.id" placement="bottom-end" :width="330" trigger="click" @update:visible="moreTaskId = $event ? row.task.id : ''">

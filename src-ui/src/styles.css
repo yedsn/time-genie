@@ -2430,7 +2430,7 @@ pre {
 .timer-task-table-tools { flex: 0 0 auto; display: flex; align-items: center; margin: 0 0 7px 2px; }
 .timer-task-table-tools > button { white-space: nowrap; }
 .timer-task-list { --timer-task-actions-width: 244px; min-height: 0; flex: 1; overflow: auto; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); }
-.timer-task-list.allocation { --timer-task-actions-width: 390px; }
+.timer-task-list.allocation { --timer-task-actions-width: 300px; }
 .timer-task-list-head, .timer-task-row { display: grid; grid-template-columns: minmax(230px, 1fr) 116px 104px var(--timer-task-actions-width); align-items: center; gap: 9px; }
 .timer-task-list-head { position: sticky; top: 0; z-index: 4; min-height: 32px; padding: 0 10px; border-bottom: 1px solid var(--line); color: var(--muted); background: var(--panel-2); font-size: 10px; font-weight: 650; }
 .timer-task-list-head span:nth-child(2) { text-align: center; }
@@ -2442,22 +2442,28 @@ pre {
 .timer-task-row.child .timer-task-name-cell { padding-left: calc(var(--task-depth, 1) * 17px); }
 .timer-task-row.active { border-color: color-mix(in srgb, var(--green) 35%, var(--line)); background: var(--success-surface); }
 .timer-task-row.completed { color: var(--muted); background: color-mix(in srgb, var(--panel-2) 82%, transparent); }
-.timer-task-row.completed .timer-task-name-cell > input { color: var(--muted); }
+.timer-task-row.completed .timer-task-name-editor > input { color: var(--muted); }
 .timer-task-row.recent { animation: level-change-flash 900ms ease-out; }
 .timer-task-row.new-task { background: color-mix(in srgb, var(--accent) 8%, var(--panel)); }
-.timer-task-name-cell { min-width: 0; display: grid; grid-template-columns: auto auto minmax(0, 1fr); align-items: center; gap: 5px; }
-.timer-task-name-cell > input { min-width: 0; width: 100%; height: 30px; border: 1px solid transparent; border-radius: 6px; padding: 0 6px; outline: 0; color: var(--text); background: transparent; font: inherit; font-weight: 600; text-overflow: ellipsis; }
-.timer-task-name-cell > input:hover { border-color: var(--line); background: var(--control-bg); }
-.timer-task-name-cell > input:focus { border-color: var(--accent); background: var(--control-bg); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 14%, transparent); }
-.timer-task-name-cell > small { grid-column: 3; overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.timer-task-name-cell { min-width: 0; display: flex; align-items: center; gap: 5px; }
+.timer-task-name-cell > svg { flex: 0 0 auto; color: var(--muted); }
+.timer-task-name-editor { min-width: 0; flex: 1 1 auto; display: grid; }
+.timer-task-name-editor > input { min-width: 0; width: 100%; height: 30px; border: 1px solid transparent; border-radius: 6px; padding: 0 6px; outline: 0; color: var(--text); background: transparent; font: inherit; font-weight: 600; text-overflow: ellipsis; }
+.timer-task-name-editor > input:hover { border-color: var(--line); background: var(--control-bg); }
+.timer-task-name-editor > input:focus { border-color: var(--accent); background: var(--control-bg); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 14%, transparent); }
+.timer-task-name-editor > small { min-width: 0; overflow: hidden; padding-inline: 6px; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .timer-task-drag-handle { width: 22px; height: 29px; display: grid; place-items: center; border: 0; padding: 0; color: var(--muted); background: transparent; cursor: grab; }
 .timer-task-drag-handle:disabled { opacity: 0.35; cursor: not-allowed; }
+.timer-task-complete-check { width: 28px; height: 28px; flex: 0 0 28px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 7px; padding: 0; color: var(--text-soft); background: var(--surface-soft); }
+.timer-task-complete-check:hover { background: var(--surface-strong); }
+.timer-task-complete-check.completed { color: var(--success-text); background: var(--success-surface); }
+.timer-task-complete-check:disabled { color: color-mix(in srgb, var(--text-soft) 42%, transparent); border-color: color-mix(in srgb, var(--line) 70%, transparent); background: var(--surface-inset); cursor: default; }
 .timer-task-sortable-rows[data-drop-depth="0"] .sortable-ghost { box-shadow: inset 0 3px 0 var(--accent); }
 .timer-task-sortable-rows[data-drop-depth="1"] .sortable-ghost { box-shadow: inset 34px 3px 0 var(--accent); }
 .timer-task-sortable-rows.drop-invalid .sortable-ghost { border-color: var(--danger); box-shadow: inset 0 0 0 1px var(--danger); }
 .timer-task-sortable-rows .sortable-tree-selected { background: color-mix(in srgb, var(--accent) 8%, var(--panel)); }
 .timer-task-search-drag-hint { display: block; padding: 6px 10px; color: var(--muted); font-size: 10px; }
-.timer-task-name-cell > small.error, .timer-task-estimate-cell > small.error, .timer-task-note-popover .error, .timer-task-row-error { color: var(--danger-text); }
+.timer-task-name-editor > small.error, .timer-task-estimate-cell > small.error, .timer-task-note-popover .error, .timer-task-row-error { color: var(--danger-text); }
 .timer-task-estimate-cell { min-width: 0; min-height: 31px; display: grid; align-content: center; justify-items: end; color: var(--text-soft); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
 .timer-task-estimate-cell strong { font-size: 12px; font-weight: 650; }
 .timer-task-estimate-cell small { color: var(--muted); font-size: 9px; }
@@ -2471,8 +2477,6 @@ pre {
 .timer-task-allocation-input { width: 72px; height: 30px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: var(--control-bg); }
 .timer-task-allocation-input input { min-width: 0; width: 100%; border: 0; outline: 0; padding: 0 4px 0 7px; color: var(--text); background: transparent; text-align: right; }
 .timer-task-allocation-input span { padding-right: 6px; font-size: 10px; }
-.timer-task-complete-toggle { width: 48px; flex: 0 0 48px; display: inline-flex; align-items: center; gap: 3px; color: var(--muted); font-size: 9px; white-space: nowrap; }
-.timer-task-complete-toggle input { margin: 0; }
 .timer-task-primary-action { min-width: 68px; height: 30px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--line)); border-radius: 7px; padding: 0 9px; color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--control-bg)); font-size: 11px; font-weight: 650; }
 .timer-task-primary-action.switch { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 32%, var(--line)); background: color-mix(in srgb, var(--amber) 8%, var(--control-bg)); }
 .timer-task-primary-action.running { color: var(--green); }
