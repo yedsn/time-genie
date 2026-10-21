@@ -2485,6 +2485,36 @@ pre {
 .timer-task-dialog-footer { width: 100%; display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
 .timer-task-dialog-footer > :nth-child(2) { margin-right: auto; }
 .timer-task-allocation-error { color: var(--danger-text); font-size: 10px; }
+.timer-today-picker-overlay .el-overlay-dialog { display: flex; align-items: center; justify-content: center; padding: 4vh 0; }
+.timer-today-picker-dialog.el-dialog { --el-dialog-bg-color: var(--panel); --el-text-color-primary: var(--text); height: min(640px, 80vh); max-height: 80vh; display: flex; flex-direction: column; overflow: hidden; margin: 0 auto !important; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); box-shadow: 0 24px 70px rgba(0,0,0,.48); }
+.timer-today-picker-dialog .el-dialog__header { flex: 0 0 auto; margin: 0; padding: 16px 18px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.timer-today-picker-dialog .el-dialog__title { color: var(--text); font-size: 16px; font-weight: 680; }
+.timer-today-picker-dialog .el-dialog__headerbtn { top: 12px; right: 13px; }
+.timer-today-picker-dialog .el-dialog__headerbtn .el-dialog__close { color: var(--muted); }
+.timer-today-picker-dialog .el-dialog__body { min-height: 0; flex: 1; display: flex; flex-direction: column; overflow: hidden; padding: 14px 18px 12px; color: var(--text-soft); background: var(--panel); }
+.timer-today-picker-dialog .el-dialog__footer { flex: 0 0 auto; padding: 0 18px 15px; background: var(--panel); }
+.timer-today-picker-view { min-height: 0; flex: 1; display: flex; flex-direction: column; gap: 10px; overflow: hidden; }
+.timer-today-picker-search { height: 36px; flex: 0 0 auto; display: grid; grid-template-columns: 18px minmax(0, 1fr); align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 8px; padding: 0 10px; color: var(--muted); background: var(--panel-2); }
+.timer-today-picker-search:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent); }
+.timer-today-picker-search input { min-width: 0; height: 34px; border: 0; outline: 0; color: var(--text); background: transparent; }
+.timer-today-picker-summary { flex: 0 0 auto; display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding: 0 2px; }
+.timer-today-picker-summary strong { color: var(--text); font-size: 12px; }
+.timer-today-picker-summary span { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.timer-today-picker-list { min-height: 0; flex: 1; overflow: auto; overscroll-behavior: contain; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); }
+.timer-today-picker-row { min-height: 50px; display: grid; grid-template-columns: 18px minmax(0, 1fr); align-items: center; gap: 10px; padding: 7px 12px; border-bottom: 1px solid var(--line-soft); cursor: pointer; transition: background 120ms ease, border-color 120ms ease; }
+.timer-today-picker-row:last-of-type { border-bottom: 0; }
+.timer-today-picker-row:hover { background: var(--surface-soft); }
+.timer-today-picker-row.selected { background: color-mix(in srgb, var(--accent) 8%, var(--panel)); }
+.timer-today-picker-row > input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+.timer-today-picker-row > span { min-width: 0; display: grid; gap: 2px; }
+.timer-today-picker-row strong, .timer-today-picker-row small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.timer-today-picker-row strong { color: var(--text); font-size: 12px; font-weight: 620; }
+.timer-today-picker-row small { color: var(--muted); font-size: 10px; }
+.timer-today-picker-empty { min-height: 220px; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; padding: 24px; color: var(--muted); text-align: center; }
+.timer-today-picker-empty strong { color: var(--text); }
+.timer-today-picker-empty span { font-size: 11px; }
+.timer-today-picker-footer { width: 100%; display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.timer-today-picker-footer > span { margin-right: auto; color: var(--muted); font-size: 10px; }
 .timer-task-note-popover, .timer-task-more-popover { display: grid; gap: 9px; color: var(--text); }
 .timer-task-note-popover textarea { width: 100%; min-height: 92px; resize: vertical; border: 1px solid var(--line); border-radius: 7px; padding: 8px; outline: 0; color: var(--text); background: var(--control-bg); font: inherit; }
 .timer-task-note-popover textarea:focus { border-color: var(--accent); }

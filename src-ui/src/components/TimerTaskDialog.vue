@@ -79,8 +79,9 @@ const weekdayLabels = ["一", "二", "三", "四", "五", "六", "日"];
 
 const activeTask = computed(() => [...store.todayPlanTasks, ...store.tasks].find((task) => task.id === store.runningEntry?.defaultTask));
 const presentation = computed(() => executionPanelPresentation(props.mode));
+const usesTodayPlan = computed(() => props.mode !== "entry-allocation");
 const snapshot = computed(() => store.executionSnapshots[subjectId.value]);
-const panelInitialLoading = computed(() => props.mode === "execute"
+const panelInitialLoading = computed(() => usesTodayPlan.value
   ? store.todayPlanLoading
   : !snapshot.value && (store.workspaceLoading || store.executionSnapshotLoading[subjectId.value]));
 function snapshotTaskToPanelTask(task: ActualAdjustmentSnapshotTaskRecord): PanelTask {
@@ -121,7 +122,7 @@ function snapshotTaskToPanelTask(task: ActualAdjustmentSnapshotTaskRecord): Pane
   };
 }
 const panelTasks = computed<PanelTask[]>(() => {
-  if (props.mode === "execute") {
+  if (usesTodayPlan.value) {
     const todayPlanPanelTasks = store.todayPlanTasks
       .map((task) => ({ ...task, totalMinutes: task.actual, completedToday: task.status === "done" }));
     return executionPanelSourceTasks(todayPlanPanelTasks, subjectId.value, props.mode);
@@ -207,7 +208,7 @@ watch([() => props.modelValue, () => props.mode, () => props.entryId], async ([o
   allocationOpenedSessionId.value = props.mode === "unassigned-allocation" ? store.unassignedSessionId : "";
   allocationOpenedSessionVersion.value = props.mode === "unassigned-allocation" ? store.unassignedVersion : 0;
   allocationOpenedEntryVersion.value = props.mode === "entry-allocation" ? allocationEntry.value?.version ?? 0 : 0;
-  if (props.mode === "execute") await store.loadTodayPlan(subjectId.value);
+  if (usesTodayPlan.value) await store.loadTodayPlan(subjectId.value);
   else await store.loadExecutionSnapshot(subjectId.value);
 }, { immediate: true });
 
@@ -243,7 +244,7 @@ const treeSortable = createTaskTreeSortable({
       await store.moveExecutionTask(task.id, task.version, task.subjectId, intent.parentId, intent.previousSiblingId, intent.nextSiblingId);
     } catch (error) {
       ElMessage.warning(errorText(error, "事项移动失败"));
-      if (props.mode === "execute") await store.loadTodayPlan(subjectId.value);
+      if (usesTodayPlan.value) await store.loadTodayPlan(subjectId.value);
       else await store.loadExecutionSnapshot(subjectId.value);
     }
   },
@@ -501,7 +502,7 @@ async function saveActualAdjustment() {
     await store.saveActualAdjustmentBatch({
       subjectId: actualSnapshotTask.subjectId,
       workDate: actualSnapshot.workDate,
-      dayInstanceDate: props.mode === "execute" ? store.workspaceToday : undefined,
+      dayInstanceDate: usesTodayPlan.value ? store.workspaceToday : undefined,
       clientRequestId: crypto.randomUUID(),
       batchId: crypto.randomUUID(),
       note: actualNote.value.trim() || undefined,
@@ -515,7 +516,7 @@ async function saveActualAdjustment() {
       }],
       newTasks: [],
     });
-    if (props.mode === "execute") await store.loadTodayPlan(subjectId.value);
+    if (usesTodayPlan.value) await store.loadTodayPlan(subjectId.value);
     else await store.loadExecutionSnapshot(subjectId.value);
     actualTaskId.value = "";
     ElMessage.success("今日实际已调整");
@@ -585,7 +586,7 @@ async function saveField(task: PanelTask, field: TimerDialogDraftField) {
         ? store.tasks.find((item) => item.id === task.dayInstanceSourceTaskId)
         : undefined;
       let applyToFuture = false;
-      if (props.mode === "execute" && source?.recurrence) {
+      if (usesTodayPlan.value && source?.recurrence) {
         const scope = await ElMessageBox.confirm(
           `要把“${task.title}”的修改应用到今后的重复事项吗？`,
           "修改重复事项",
@@ -609,7 +610,7 @@ async function saveField(task: PanelTask, field: TimerDialogDraftField) {
     } catch (error) {
       settleTimerDialogSave(draft, token, { ok: false, message: errorText(error, "保存失败") });
       if (field === "title" && mutatedStoreTitle) {
-        if (props.mode === "execute") await store.loadTodayPlan(task.subjectId);
+        if (usesTodayPlan.value) await store.loadTodayPlan(task.subjectId);
         else await store.loadWorkspaceData();
       }
       if (timerBusyTaskId.value === task.id) await focusTaskControl(task.id, field);
@@ -675,7 +676,7 @@ async function selectSubject(nextSubjectId: string) {
   subjectId.value = nextSubjectId;
   query.value = "";
   resetNewTask();
-  if (props.mode === "execute") await store.loadTodayPlan(nextSubjectId);
+  if (usesTodayPlan.value) await store.loadTodayPlan(nextSubjectId);
   else await store.loadExecutionSnapshot(nextSubjectId);
 }
 
@@ -743,7 +744,7 @@ async function createNewTask(startAfterCreate = false) {
         if (!savedTaskId) throw new Error("新事项保存失败");
         return savedTaskId;
       })();
-    if (props.mode === "execute") {
+    if (usesTodayPlan.value) {
       try {
         await store.addTasksToToday([taskId]);
         await store.loadTodayPlan(subjectId.value);
@@ -801,7 +802,7 @@ async function duplicateCurrentRow(task: PanelTask) {
   try {
     const taskId = await store.duplicateSingleTask(task.id);
     if (!taskId) throw new Error("事项复制失败");
-    if (props.mode === "execute") {
+    if (usesTodayPlan.value) {
       await store.addTasksToToday([taskId]);
       await store.loadTodayPlan(subjectId.value);
     } else {
@@ -850,7 +851,7 @@ async function saveMore(task: PanelTask) {
       || currentNote !== (task.note ?? "")
       || (estimate === undefined ? task.estimate != null : Math.round(estimate) !== task.estimate);
     let applyToFuture = false;
-    if (props.mode === "execute" && source?.recurrence && recurringContentChanged) {
+    if (usesTodayPlan.value && source?.recurrence && recurringContentChanged) {
       const scope = await ElMessageBox.confirm(
         `要把“${task.title}”的设置应用到今后的重复事项吗？`,
         "修改重复事项",
@@ -881,7 +882,7 @@ async function saveMore(task: PanelTask) {
       if (draft.recurrence === "weekly" && !weekdaysMask) throw new Error("每周重复至少选择一天");
       await store.setTaskRecurrence(task.id, { frequency: draft.recurrence, weekdaysMask, effectiveStart: draft.recurrenceStart || store.workspaceToday });
     }
-    if (props.mode === "execute") await store.loadTodayPlan(task.subjectId);
+    if (usesTodayPlan.value) await store.loadTodayPlan(task.subjectId);
     else await store.loadExecutionSnapshot(task.subjectId);
     moreTaskId.value = "";
     ElMessage.success("事项设置已保存");
@@ -907,7 +908,7 @@ async function completeTask(task: Task) {
   if (containsActiveTask(task)) { ElMessage.warning("请先结束或切换当前计时"); return; }
   try {
     await store.commitTaskToggle(task);
-    await Promise.all([store.loadWorkspaceData(), store.loadTodayOverview(), props.mode === "execute" ? store.loadTodayPlan(task.subjectId) : store.loadExecutionSnapshot(task.subjectId)]);
+    await Promise.all([store.loadWorkspaceData(), store.loadTodayOverview(), usesTodayPlan.value ? store.loadTodayPlan(task.subjectId) : store.loadExecutionSnapshot(task.subjectId)]);
     moreTaskId.value = "";
   } catch (error) { ElMessage.error(errorText(error, "完成事项失败")); }
 }
@@ -1042,7 +1043,7 @@ function formatTime(timestamp: number) {
         <button v-for="subject in store.subjects" :key="subject.id" type="button" role="tab" :aria-selected="subjectId === subject.id" :class="{ active: subjectId === subject.id }" @click="selectSubject(subject.id)">{{ subject.name }}</button>
       </div>
       <label class="timer-task-search"><Search :size="15" /><input ref="searchRef" v-model="query" placeholder="搜索当前主体事项" aria-label="搜索执行事项" /></label>
-      <button v-if="props.mode === 'execute'" class="secondary-button compact" type="button" @click="todayPickerOpen = true"><ListTodo :size="14" />从进行中加入</button>
+      <button v-if="usesTodayPlan" class="secondary-button compact" type="button" @click="todayPickerOpen = true"><ListTodo :size="14" />从进行中加入</button>
     </div>
 
     <div class="timer-task-dialog-summary">
@@ -1129,16 +1130,25 @@ function formatTime(timestamp: number) {
       </div>
       <small v-if="query.trim()" class="timer-task-search-drag-hint">搜索状态下不能拖动；清空搜索后可调整顺序和层级。</small>
 
-      <div v-if="!panelInitialLoading && !rows.length && !newTask.open" class="timer-task-empty"><AlertCircle :size="22" /><strong>{{ query ? '没有匹配事项' : (props.mode === 'execute' ? '今日还没有事项' : '当前主体暂无可执行事项') }}</strong><span>{{ query ? '换个关键词，或清空搜索查看全部事项。' : (props.mode === 'execute' ? '可以新建今日事项，或从进行中加入今日计划。' : '可以直接在这里新建事项。') }}</span><div v-if="!query"><button class="primary-button compact" type="button" @click="openNewTask()"><Plus :size="14" />新增事项</button><button v-if="props.mode === 'execute'" class="secondary-button compact" type="button" @click="todayPickerOpen = true">从进行中加入</button></div></div>
+      <div v-if="!panelInitialLoading && !rows.length && !newTask.open" class="timer-task-empty"><AlertCircle :size="22" /><strong>{{ query ? '没有匹配事项' : (usesTodayPlan ? '今日还没有事项' : '当前主体暂无可执行事项') }}</strong><span>{{ query ? '换个关键词，或清空搜索查看全部事项。' : (usesTodayPlan ? '可以新建今日事项，或从进行中加入今日计划。' : '可以直接在这里新建事项。') }}</span><div v-if="!query"><button class="primary-button compact" type="button" @click="openNewTask()"><Plus :size="14" />新增事项</button><button v-if="usesTodayPlan" class="secondary-button compact" type="button" @click="todayPickerOpen = true">从进行中加入</button></div></div>
     </div>
 
     <template #footer><div class="timer-task-dialog-footer"><button class="secondary-button compact" type="button" @click="goPlan"><ListTodo :size="14" />前往待办页</button><span class="timer-task-allocation-error">{{ allocationError }}</span><template v-if="presentation.showAllocation"><button class="secondary-button compact" type="button" :disabled="allocationSaving || !selectedAllocations.length" @click="clearAllocationDrafts">清空</button><button v-if="presentation.showBreakDiscard" class="secondary-button compact" type="button" :disabled="allocationSaving" @click="resolveAllocationDisposition('break')">记为休息</button><button v-if="presentation.showBreakDiscard" class="danger-button compact" type="button" :disabled="allocationSaving" @click="resolveAllocationDisposition('discard')">丢弃</button><button class="primary-button" type="button" :disabled="allocationSaving" @click="saveAllocationDrafts">{{ allocationSaving ? '保存中...' : presentation.primaryLabel }}</button></template><button v-else class="secondary-button" type="button" :disabled="closing" @click="closeDialog">关闭</button></div></template>
   </el-dialog>
 
-  <el-dialog v-model="todayPickerOpen" title="从进行中加入今日" width="min(640px, 92vw)" append-to-body>
-    <input v-model="todayPickerQuery" class="today-plan-search" placeholder="搜索事项或父级路径" />
-    <div class="today-plan-candidates"><label v-for="task in todayPickerCandidates" :key="task.id"><input v-model="todayPickerSelected" type="checkbox" :value="task.id" /><span><strong>{{ task.title }}</strong><small>{{ task.pathLabel }}</small></span></label><p v-if="!todayPickerCandidates.length">没有可加入的进行中事项</p></div>
-    <template #footer><button class="secondary-button" type="button" @click="todayPickerOpen = false">取消</button><button class="primary-button" type="button" :disabled="!todayPickerSelected.length" @click="confirmAddExistingTodayTasks">加入今日（{{ todayPickerSelected.length }}）</button></template>
+  <el-dialog v-model="todayPickerOpen" class="recurrence-dialog timer-today-picker-dialog" modal-class="timer-today-picker-overlay" title="从进行中加入今日" width="min(680px, 94vw)" append-to-body align-center :close-on-click-modal="false">
+    <section class="timer-today-picker-view">
+      <label class="timer-today-picker-search"><Search :size="15" /><input v-model="todayPickerQuery" placeholder="搜索事项或父级路径" aria-label="搜索进行中事项" /></label>
+      <div class="timer-today-picker-summary"><strong>进行中事项</strong><span>选择后加入今日计划，再继续执行或分配时间。</span></div>
+      <div class="timer-today-picker-list">
+        <label v-for="task in todayPickerCandidates" :key="task.id" class="timer-today-picker-row" :class="{ selected: todayPickerSelected.includes(task.id) }">
+          <input v-model="todayPickerSelected" type="checkbox" :value="task.id" :aria-label="`${task.title}加入今日`" />
+          <span><strong>{{ task.title }}</strong><small v-if="task.pathLabel && task.pathLabel !== task.title">{{ task.pathLabel }}</small></span>
+        </label>
+        <div v-if="!todayPickerCandidates.length" class="timer-today-picker-empty"><AlertCircle :size="22" /><strong>{{ todayPickerQuery ? '没有匹配事项' : '没有可加入的进行中事项' }}</strong><span>{{ todayPickerQuery ? '换个关键词试试。' : '当前进行中的事项都已经加入今天。' }}</span></div>
+      </div>
+    </section>
+    <template #footer><div class="timer-today-picker-footer"><span>已选择 {{ todayPickerSelected.length }} 项</span><button class="secondary-button" type="button" @click="todayPickerOpen = false">取消</button><button class="primary-button" type="button" :disabled="!todayPickerSelected.length" @click="confirmAddExistingTodayTasks">加入今日（{{ todayPickerSelected.length }}）</button></div></template>
   </el-dialog>
 
   <Teleport to="body">

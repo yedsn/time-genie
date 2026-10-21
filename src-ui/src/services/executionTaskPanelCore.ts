@@ -64,16 +64,16 @@ export type ExecutionPanelTask = {
 };
 
 /**
- * 执行模式的候选范围只允许当前主体的今日成员及其父级上下文；
+ * 开始执行与未归属时间分配共享今日事项树：只允许当前主体的今日成员及其父级上下文；
  * 当天已完成成员继续显示，点击“继续”时由计时转换恢复完成状态。
- * 非执行模式（历史归属、未归属时间分配）继续沿用调用方给出的既有范围，不做缩窄。
+ * 只有历史时间记录的归属调整沿用调用方给出的完整事项范围。
  */
 export function executionPanelSourceTasks<T extends ExecutionPanelTask>(
   tasks: readonly T[],
   subjectId: string,
   mode: ExecutionPanelMode,
 ): T[] {
-  if (mode !== "execute") return [...tasks];
+  if (mode === "entry-allocation") return [...tasks];
   return tasks.filter((task) => task.subjectId === subjectId
     && (Boolean(task.todayMember) || Boolean(task.todayContext)));
 }

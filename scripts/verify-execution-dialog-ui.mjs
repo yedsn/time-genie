@@ -315,7 +315,28 @@ async function main() {
 
   // 4. 从进行中加入今日：加入后弹框保持打开并立即成为候选
   await dialog.locator("button", { hasText: "从进行中加入" }).click();
-  const picker = page.locator(".el-dialog", { hasText: "从进行中加入今日" });
+  const picker = page.locator(".timer-today-picker-dialog");
+  await picker.waitFor({ state: "visible" });
+  await page.waitForTimeout(350);
+  const executePickerVisual = await picker.evaluate((element) => {
+    const body = element.querySelector(".el-dialog__body");
+    const list = element.querySelector(".timer-today-picker-list");
+    const row = element.querySelector(".timer-today-picker-row");
+    const rect = element.getBoundingClientRect();
+    return {
+      width: rect.width,
+      height: rect.height,
+      background: getComputedStyle(element).backgroundColor,
+      bodyOverflow: body ? getComputedStyle(body).overflow : "",
+      bodyPadding: body ? getComputedStyle(body).padding : "",
+      listOverflow: list ? getComputedStyle(list).overflowY : "",
+      rowHeight: row?.getBoundingClientRect().height ?? 0,
+      opacity: getComputedStyle(element).opacity,
+    };
+  });
+  if (await picker.locator(".today-plan-search, .today-plan-candidates").count()) throw new Error("执行弹框的进行中选择器仍依赖待办页样式");
+  if (executePickerVisual.bodyOverflow !== "hidden" || executePickerVisual.listOverflow !== "auto" || executePickerVisual.rowHeight < 46 || executePickerVisual.opacity !== "1") throw new Error("执行弹框的进行中选择器布局异常：" + JSON.stringify(executePickerVisual));
+  await page.screenshot({ path: path.join(repoRoot, ".tmp-execution-today-picker.png"), fullPage: true });
   await picker.locator("label", { hasText: "跨日继续的长期待办" }).locator("input").check();
   await picker.locator("button", { hasText: "加入今日" }).click();
   await page.waitForFunction((expected) => document.querySelectorAll(".timer-task-dialog .timer-task-row:not(.new-task)").length === expected, initialRowCount + 1);
@@ -413,6 +434,31 @@ async function main() {
   await unassignedPage.locator('.unassigned-time-indicator').click();
   await unassignedDialog.waitFor({ state: "visible" });
   await unassignedDialog.locator('.timer-task-allocation-overview').waitFor({ state: "visible" });
+  await unassignedDialog.locator('button', { hasText: "从进行中加入" }).click();
+  const unassignedPicker = unassignedPage.locator('.timer-today-picker-dialog');
+  await unassignedPicker.waitFor({ state: "visible" });
+  await unassignedPage.waitForTimeout(350);
+  const unassignedPickerVisual = await unassignedPicker.evaluate((element) => {
+    const body = element.querySelector(".el-dialog__body");
+    const list = element.querySelector(".timer-today-picker-list");
+    const row = element.querySelector(".timer-today-picker-row");
+    const rect = element.getBoundingClientRect();
+    return {
+      width: rect.width,
+      height: rect.height,
+      background: getComputedStyle(element).backgroundColor,
+      bodyOverflow: body ? getComputedStyle(body).overflow : "",
+      bodyPadding: body ? getComputedStyle(body).padding : "",
+      listOverflow: list ? getComputedStyle(list).overflowY : "",
+      rowHeight: row?.getBoundingClientRect().height ?? 0,
+      opacity: getComputedStyle(element).opacity,
+    };
+  });
+  if (JSON.stringify(unassignedPickerVisual) !== JSON.stringify(executePickerVisual)) throw new Error("执行事项与未归属时间的进行中选择器样式不一致：" + JSON.stringify({ executePickerVisual, unassignedPickerVisual }));
+  if (await unassignedPicker.locator(".today-plan-search, .today-plan-candidates").count()) throw new Error("未归属时间的进行中选择器仍依赖待办页样式");
+  await unassignedPage.screenshot({ path: path.join(repoRoot, ".tmp-unassigned-today-picker.png"), fullPage: true });
+  await unassignedPicker.getByRole("button", { name: "取消", exact: true }).click();
+  await unassignedPicker.waitFor({ state: "hidden" });
   await unassignedDialog.locator('.timer-task-table-tools button', { hasText: "新增事项" }).click();
   await unassignedDialog.locator('input[aria-label="新事项名称"]').fill("未归属弹框新增事项");
   await unassignedDialog.locator('.timer-task-row.new-task button', { hasText: "保存" }).click();
