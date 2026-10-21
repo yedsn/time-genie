@@ -144,8 +144,9 @@ const templatePreview = computed(() => {
     "{{总工时}}": formatHours(360),
     "{{今日事项}}": `1. 🟢 已完成事项 <预计：${formatHours(60)} 实际：${formatHours(90)}>\n2. 🔴 进行中的事项 <预计：${formatHours(60)} 实际：${formatHours(45)}>`,
     "{{明日计划}}": "1. 明日重点事项\n   - 继续处理子事项",
-    "{{统计信息}}": "- 累计用时：6h\n- 已完成事项：4 项",
-    "{{每日情况}}": "- 2026-09-21：6h\n- 2026-09-22：缺少日报或结算数据",
+    "{{统计信息}}": "【晓健】2026-09-21 周一 10:00-12:00 13:30-17:30 6h  \n共 6.0 h\n\n工资：1200.0",
+    "{{每日情况}}": "【晓健】2026-09-21 周一 10:00-12:00 13:30-17:30 6h\n\n1. 🟢 已完成事项 <实际：6.0h>\n\n## 明日计划：\n\n1. 明日重点事项",
+    "{{日报合集}}": "【晓健】2026-09-21 周一 10:00-12:00 13:30-17:30 6h\n\n1. 🟢 已完成事项 <实际：6.0h>\n\n## 明日计划：\n\n1. 明日重点事项",
     "{{总结}}": "- 在这里补充本期总结。",
   };
   return renderTemplatePreview(templateDraft.value, replacements);
@@ -165,8 +166,9 @@ const draftTemplatePreview = computed(() => {
     "{{总工时}}": formatHours(360),
     "{{今日事项}}": "1. 已完成事项\n2. 进行中的事项",
     "{{明日计划}}": "1. 明日重点事项",
-    "{{统计信息}}": "- 累计用时：6h\n- 已完成事项：4 项",
-    "{{每日情况}}": "- 周一：6h\n- 周二：5h",
+    "{{统计信息}}": "【晓健】2026-09-21 周一 10:00-12:00 13:30-17:30 6h  \n共 6.0 h\n\n工资：1200.0",
+    "{{每日情况}}": "【晓健】2026-09-21 周一 10:00-12:00 13:30-17:30 6h\n\n1. 🟢 已完成事项 <实际：6.0h>\n\n## 明日计划：\n\n1. 明日重点事项",
+    "{{日报合集}}": "【晓健】2026-09-21 周一 10:00-12:00 13:30-17:30 6h\n\n1. 🟢 已完成事项 <实际：6.0h>\n\n## 明日计划：\n\n1. 明日重点事项",
     "{{总结}}": "- 在这里补充本期总结。",
   };
   return renderTemplatePreview(template.content, replacements);
@@ -686,7 +688,7 @@ function newTemplate() {
   selectedTemplateId.value = "";
   templateName.value = "";
   templateDescription.value = "";
-  templateDraft.value = templateType.value === "daily" ? "# {{日期}} {{星期}}\n\n{{今日事项}}\n" : "# {{日期范围}}\n\n{{统计信息}}\n\n{{每日情况}}\n\n{{总结}}\n";
+  templateDraft.value = templateType.value === "daily" ? "# {{日期}} {{星期}}\n\n{{今日事项}}\n" : "{{统计信息}}\n\n{{日报合集}}\n";
 }
 
 async function switchTemplateType(type: ReportType) {

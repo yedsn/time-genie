@@ -510,8 +510,8 @@ begin
   on conflict(workspace_id, key) do nothing;
   insert into timegenie.report_templates(workspace_id, report_type, name, description, content, is_default, is_builtin, sort_order) values
     (p_workspace_id, 'daily', '标准日报', '系统内置模板', E'【{{姓名}}】{{日期}} {{星期}} {{工作时段}} {{总工时}}\n\n{{今日事项}}\n\n## 明日计划：\n\n{{明日计划}}\n', true, true, 10),
-    (p_workspace_id, 'weekly', '标准周报', '系统内置模板', E'# {{日期范围}}\n\n{{统计信息}}\n\n## 每日情况\n\n{{每日情况}}\n\n## 总结\n\n{{总结}}\n', true, true, 10),
-    (p_workspace_id, 'monthly', '标准月报', '系统内置模板', E'# {{日期范围}}\n\n{{统计信息}}\n\n## 本月事项\n\n{{每日情况}}\n\n## 总结\n\n{{总结}}\n', true, true, 10)
+    (p_workspace_id, 'weekly', '标准周报', '合并周期内已保存日报的最终内容', E'{{统计信息}}\n\n{{日报合集}}\n', true, true, 10),
+    (p_workspace_id, 'monthly', '标准月报', '合并周期内已保存日报的最终内容', E'{{统计信息}}\n\n{{日报合集}}\n', true, true, 10)
   on conflict do nothing;
   return jsonb_build_object('workspaceId', p_workspace_id, 'defaultSubjectId', default_subject_id);
 end $$;
@@ -3804,3 +3804,6 @@ notify pgrst, 'reload schema';
 -- Once instance semantics are present, reject writes from clients that do not
 -- advertise the matching data-protocol generation.
 \ir 20261021b_timegenie_client_write_generation.sql
+
+-- Weekly and monthly built-in templates aggregate finalized daily reports.
+\ir 20261021c_timegenie_daily_report_collection_templates.sql

@@ -19,7 +19,8 @@ assert.equal(core.validateReportTemplateDraft({ type: "daily", name: "新模板"
 
 assert.deepEqual(core.insertTemplateToken("前后", 1, 1, "{{日期}}"), { content: "前{{日期}}后", selectionStart: 7, selectionEnd: 7 });
 assert.equal(core.renderTemplatePreview("# {{日期}} {{姓名}}", { "{{日期}}": "2026-10-11", "{{姓名}}": "晓健" }), "# 2026-10-11 晓健");
-assert.deepEqual(core.placeholdersForReportType("weekly").map((item) => item.token), ["{{姓名}}", "{{日期范围}}", "{{总工时}}", "{{统计信息}}", "{{每日情况}}", "{{总结}}"]);
+assert.deepEqual(core.placeholdersForReportType("weekly").map((item) => item.token), ["{{姓名}}", "{{日期范围}}", "{{总工时}}", "{{统计信息}}", "{{每日情况}}", "{{日报合集}}", "{{总结}}"]);
+assert.equal(core.validateReportTemplateDraft({ type: "weekly", name: "日报合集周报", content: "{{统计信息}}\n\n{{日报合集}}", templates: [] }), undefined);
 
 assert.equal(core.selectReportTemplate(templates, { selectDefault: true })?.id, "standard");
 assert.equal(core.selectReportTemplate(templates, { preferredId: "customer", selectDefault: true })?.id, "customer");
@@ -34,6 +35,8 @@ const reportWorkspace = readFileSync(resolve("src-ui/src/components/ReportWorksp
 const globalStyles = readFileSync(resolve("src-ui/src/styles.css"), "utf8");
 assert.match(reportWorkspace, /<section class="report-create-section report-template-section">[\s\S]*?class="report-template-trigger"[\s\S]*?openTemplatePicker/);
 assert.match(reportWorkspace, /class="report-template-picker-dialog"[\s\S]*?class="report-template-picker-list"[\s\S]*?class="report-template-picker-preview"/);
+assert.match(reportWorkspace, /{{日报合集}}/);
+assert.match(reportWorkspace, /{{统计信息}}\\n\\n{{日报合集}}/);
 assert.doesNotMatch(reportWorkspace.match(/<section class="report-create-section report-template-section">[\s\S]*?<\/section>/)?.[0] ?? "", /MdPreview|el-select/);
 assert.match(globalStyles, /\.report-create-form\s*\{[^}]*grid-template-rows:\s*auto auto minmax\(170px, 1fr\)/);
 assert.match(globalStyles, /\.report-create-dialog \.el-dialog__body\s*\{[^}]*overflow:\s*hidden/);

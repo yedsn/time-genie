@@ -525,6 +525,13 @@ fn reject_sensitive_json(value: &Value, path: &str) -> Result<(), String> {
 }
 
 fn validate_setting_key(scope: &SettingsScope, key: &str) -> Result<(), String> {
+    if matches!(scope, SettingsScope::Shared)
+        && key
+            .strip_prefix("subject_salary_hourly_rate:")
+            .is_some_and(|subject_id| uuid::Uuid::parse_str(subject_id).is_ok())
+    {
+        return Ok(());
+    }
     let allowed = match scope {
         SettingsScope::Shared => [
             "user_name",
@@ -563,6 +570,13 @@ fn validate_setting_key(scope: &SettingsScope, key: &str) -> Result<(), String> 
 }
 
 fn validate_setting_value(key: &str, value: &Value) -> Result<(), String> {
+    if (key == "salary_hourly_rate" || key.starts_with("subject_salary_hourly_rate:"))
+        && value
+            .as_f64()
+            .is_none_or(|rate| !rate.is_finite() || rate < 0.0)
+    {
+        return Err("工资时薪必须是大于等于 0 的数字".to_string());
+    }
     if key == "timezone" {
         let timezone = value
             .as_str()

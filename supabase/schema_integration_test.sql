@@ -3519,6 +3519,18 @@ begin
 end $$;
 reset role;
 
+\ir 20261021c_timegenie_daily_report_collection_templates.sql
+\ir 20261021c_timegenie_daily_report_collection_templates.sql
+
+do $$
+begin
+  if exists(
+    select 1 from timegenie.report_templates
+    where is_builtin and report_type in ('weekly','monthly') and deleted_at is null
+      and content not like '%{{日报合集}}%'
+  ) then raise exception 'weekly/monthly built-in templates must aggregate saved daily reports'; end if;
+end $$;
+
 select 'Supabase schema integration tests passed' as result;
 
 rollback;

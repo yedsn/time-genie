@@ -135,6 +135,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "task_day_plan_instances",
         sql: include_str!("../migrations/0024_task_day_plan_instances.sql"),
     },
+    Migration {
+        version: 25,
+        name: "daily_report_collection_templates",
+        sql: include_str!("../migrations/0025_daily_report_collection_templates.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -454,12 +459,12 @@ fn seed_local_workspace(transaction: &Transaction<'_>) -> Result<(), String> {
         (
             "weekly",
             "标准周报",
-            "# {{日期范围}}\n\n{{统计信息}}\n\n## 每日情况\n\n{{每日情况}}\n\n## 总结\n\n{{总结}}\n",
+            "{{统计信息}}\n\n{{日报合集}}\n",
         ),
         (
             "monthly",
             "标准月报",
-            "# {{日期范围}}\n\n{{统计信息}}\n\n## 本月事项\n\n{{每日情况}}\n\n## 总结\n\n{{总结}}\n",
+            "{{统计信息}}\n\n{{日报合集}}\n",
         ),
     ];
     for (index, (report_type, name, content)) in templates.into_iter().enumerate() {

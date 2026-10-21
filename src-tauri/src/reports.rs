@@ -1621,7 +1621,7 @@ fn render_report(
     let user_name = setting_string(connection, workspace_id, "user_name", "晓健")?;
     let fallback_work_period =
         setting_string(connection, workspace_id, "default_work_period_text", "")?;
-    let salary_hourly_rate = setting_number(connection, workspace_id, "salary_hourly_rate", 0.0)?;
+    let salary_hourly_rate = subject_salary_hourly_rate(connection, workspace_id, subject_id)?;
     let duration_format = setting_string(
         connection,
         workspace_id,
@@ -1637,11 +1637,21 @@ fn render_report(
     )?;
     let actuals = task_actual_minutes(connection, workspace_id, period_start, period_end)?;
     let selected: HashSet<String> = task_ids.iter().cloned().collect();
-    let total_minutes: i64 = actuals
-        .iter()
-        .filter(|(task_id, _)| selected.contains(*task_id))
-        .map(|(_, minutes)| *minutes)
-        .sum();
+    let total_minutes = if report_type == "weekly" || report_type == "monthly" {
+        saved_daily_report_total_minutes(
+            connection,
+            workspace_id,
+            subject_id,
+            period_start,
+            period_end,
+        )?
+    } else {
+        actuals
+            .iter()
+            .filter(|(task_id, _)| selected.contains(*task_id))
+            .map(|(_, minutes)| *minutes)
+            .sum()
+    };
     let (today_items, tomorrow_plan) = if report_type == "daily" {
         let tomorrow = (NaiveDate::parse_from_str(period_start, "%Y-%m-%d")
             .map_err(|error| error.to_string())?
@@ -1659,13 +1669,12 @@ fn render_report(
     let daily_situation = if report_type == "daily" {
         String::new()
     } else {
-        render_daily_situation(
+        saved_daily_report_collection(
             connection,
             workspace_id,
             subject_id,
             period_start,
             period_end,
-            duration_format,
         )?
     };
     let salary_amount = total_minutes as f64 / 60.0 * salary_hourly_rate;
@@ -1680,20 +1689,37 @@ fn render_report(
             period_end,
         )?
     };
-    let statistics = format!(
-        "- 累计用时：{}\n- 选中事项：{} 项\n- 已完成事项：{} 项\n- 工资估算：¥{salary_amount:.2}{}",
-        format_report_duration(total_minutes, duration_format),
-        task_ids.len(),
-        completed_count(
+    let statistics = if report_type == "weekly" || report_type == "monthly" {
+        let summary = saved_daily_report_summary(
             connection,
             workspace_id,
-            &tasks,
-            &selected,
+            subject_id,
             period_start,
             period_end,
-        )?,
-        reimbursement_summary
-    );
+        )?;
+        let salary_amount = total_minutes as f64 / 60.0 * salary_hourly_rate;
+        let salary = if salary_hourly_rate > 0.0 {
+            format!("工资：{salary_amount:.1}")
+        } else {
+            "工资：未配置主体时薪".to_string()
+        };
+        format!("{summary}\n\n{salary}{reimbursement_summary}")
+    } else {
+        format!(
+            "- 累计用时：{}\n- 选中事项：{} 项\n- 已完成事项：{} 项\n- 工资估算：¥{salary_amount:.2}{}",
+            format_report_duration(total_minutes, duration_format),
+            task_ids.len(),
+            completed_count(
+                connection,
+                workspace_id,
+                &tasks,
+                &selected,
+                period_start,
+                period_end,
+            )?,
+            reimbursement_summary
+        )
+    };
     let date =
         NaiveDate::parse_from_str(period_start, "%Y-%m-%d").map_err(|error| error.to_string())?;
     let weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
@@ -1721,7 +1747,8 @@ fn render_report(
         ),
         ("{{今日事项}}", today_items),
         ("{{明日计划}}", tomorrow_plan),
-        ("{{每日情况}}", daily_situation),
+        ("{{每日情况}}", daily_situation.clone()),
+        ("{{日报合集}}", daily_situation),
         ("{{统计信息}}", statistics),
         ("{{总结}}", "- 在这里补充本期总结。".to_string()),
     ];
@@ -1791,6 +1818,432 @@ fn daily_work_period_text(
         started.format("%H:%M"),
         ended.format("%H:%M")
     ))
+}
+
+fn subject_salary_hourly_rate(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+) -> Result<f64, String> {
+    let key = format!("subject_salary_hourly_rate:{subject_id}");
+    let value: Option<String> = connection
+        .query_row(
+            "SELECT value_json FROM app_settings WHERE workspace_id = ?1 AND key = ?2",
+            params![workspace_id, key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    match value.and_then(|json| serde_json::from_str::<f64>(&json).ok()) {
+        Some(rate) => Ok(rate),
+        None => setting_number(connection, workspace_id, "salary_hourly_rate", 0.0),
+    }
+}
+
+fn subject_name(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+) -> Result<String, String> {
+    connection
+        .query_row(
+            "SELECT name FROM subjects WHERE workspace_id = ?1 AND id = ?2 AND deleted_at IS NULL",
+            params![workspace_id, subject_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn subject_actual_minutes_for_date(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    work_date: &str,
+) -> Result<i64, String> {
+    connection
+        .query_row(
+            "SELECT COALESCE(SUM(actual.minutes), 0)
+             FROM (
+               SELECT a.task_id, a.minutes
+               FROM time_allocations a JOIN time_entries e ON e.id = a.entry_id
+               WHERE a.workspace_id = ?1 AND e.work_date = ?3 AND e.deleted_at IS NULL
+               UNION ALL
+               SELECT task_id, delta_minutes FROM actual_time_adjustments
+               WHERE workspace_id = ?1 AND work_date = ?3 AND deleted_at IS NULL
+             ) actual JOIN tasks t ON t.id = actual.task_id
+             WHERE t.subject_id = ?2 AND t.deleted_at IS NULL",
+            params![workspace_id, subject_id, work_date],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[allow(dead_code)]
+fn subject_actual_minutes_for_period(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    period_start: &str,
+    period_end: &str,
+) -> Result<i64, String> {
+    connection
+        .query_row(
+            "SELECT COALESCE(SUM(actual.minutes), 0)
+             FROM (
+               SELECT a.task_id, a.minutes
+               FROM time_allocations a JOIN time_entries e ON e.id = a.entry_id
+               WHERE a.workspace_id = ?1 AND e.work_date BETWEEN ?3 AND ?4
+                 AND e.deleted_at IS NULL
+               UNION ALL
+               SELECT task_id, delta_minutes FROM actual_time_adjustments
+               WHERE workspace_id = ?1 AND work_date BETWEEN ?3 AND ?4 AND deleted_at IS NULL
+             ) actual JOIN tasks t ON t.id = actual.task_id
+             WHERE t.subject_id = ?2 AND t.deleted_at IS NULL",
+            params![workspace_id, subject_id, period_start, period_end],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn report_hours(minutes: i64) -> String {
+    let hours = minutes as f64 / 60.0;
+    if (hours.fract()).abs() < f64::EPSILON {
+        format!("{hours:.0}h")
+    } else {
+        format!("{hours:.1}h")
+    }
+}
+
+fn report_day_title(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    user_name: &str,
+    date: NaiveDate,
+) -> Result<String, String> {
+    let date_text = date.format("%Y-%m-%d").to_string();
+    let weekday_index = date.weekday().num_days_from_monday() as usize;
+    let weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][weekday_index];
+    let period = actual_subject_work_period_text(connection, workspace_id, subject_id, &date_text)?
+        .unwrap_or(daily_work_period_text(
+            connection,
+            workspace_id,
+            subject_id,
+            &date_text,
+            weekday_index as i64,
+        )?);
+    let minutes =
+        subject_actual_minutes_for_date(connection, workspace_id, subject_id, &date_text)?;
+    let display_name = if user_name.trim().is_empty() {
+        subject_name(connection, workspace_id, subject_id)?
+    } else {
+        user_name.to_string()
+    };
+    let period = if period == "休息" || period.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" {period}")
+    };
+    Ok(format!(
+        "【{display_name}】{date_text} {weekday}{period} {}",
+        report_hours(minutes)
+    ))
+}
+
+fn actual_subject_work_period_text(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    work_date: &str,
+) -> Result<Option<String>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT e.started_at, e.ended_at
+             FROM time_entries e
+             WHERE e.workspace_id = ?1 AND e.work_date = ?2
+               AND e.kind = 'work' AND e.state = 'ended' AND e.ended_at IS NOT NULL
+               AND e.deleted_at IS NULL
+               AND EXISTS (
+                 SELECT 1 FROM time_allocations a JOIN tasks t ON t.id = a.task_id
+                 WHERE a.workspace_id = e.workspace_id AND a.entry_id = e.id
+                   AND a.minutes > 0 AND t.subject_id = ?3 AND t.deleted_at IS NULL
+               )
+             ORDER BY e.started_at, e.ended_at",
+        )
+        .map_err(|error| error.to_string())?;
+    let intervals = statement
+        .query_map(params![workspace_id, work_date, subject_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    if intervals.is_empty() {
+        return Ok(None);
+    }
+    let mut merged = Vec::<(i64, i64)>::new();
+    for (start, end) in intervals {
+        if let Some((_, previous_end)) = merged.last_mut() {
+            if start <= *previous_end {
+                *previous_end = (*previous_end).max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    let timezone = crate::work_calendar::workspace_timezone(connection, workspace_id)?;
+    let text = merged
+        .into_iter()
+        .map(|(start, end)| {
+            let start = timezone
+                .timestamp_millis_opt(start)
+                .single()
+                .ok_or_else(|| "VALIDATION_ERROR: 工作开始时间无效".to_string())?;
+            let end = timezone
+                .timestamp_millis_opt(end)
+                .single()
+                .ok_or_else(|| "VALIDATION_ERROR: 工作结束时间无效".to_string())?;
+            Ok(format!("{}-{}", start.format("%H:%M"), end.format("%H:%M")))
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .join(" ");
+    Ok(Some(text))
+}
+
+#[derive(Clone)]
+struct SavedDailyReport {
+    date: String,
+    markdown: String,
+}
+
+fn saved_daily_reports(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    period_start: &str,
+    period_end: &str,
+) -> Result<Vec<SavedDailyReport>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT period_start, markdown_content FROM reports
+             WHERE workspace_id = ?1 AND subject_id = ?2 AND report_type = 'daily'
+               AND period_start BETWEEN ?3 AND ?4 AND deleted_at IS NULL
+             ORDER BY period_start",
+        )
+        .map_err(|error| error.to_string())?;
+    let reports = statement
+        .query_map(
+            params![workspace_id, subject_id, period_start, period_end],
+            |row| {
+                Ok(SavedDailyReport {
+                    date: row.get(0)?,
+                    markdown: row.get(1)?,
+                })
+            },
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(reports)
+}
+
+fn first_non_empty_line(markdown: &str) -> Option<String> {
+    markdown
+        .lines()
+        .map(|line| line.trim().trim_start_matches('#').trim())
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn hours_from_report_header(header: &str) -> Option<f64> {
+    let token = header.split_whitespace().last()?;
+    let hours = token.strip_suffix('h')?.parse::<f64>().ok()?;
+    hours.is_finite().then_some(hours)
+}
+
+fn saved_daily_report_summary(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    period_start: &str,
+    period_end: &str,
+) -> Result<String, String> {
+    let reports = saved_daily_reports(
+        connection,
+        workspace_id,
+        subject_id,
+        period_start,
+        period_end,
+    )?;
+    let mut total_hours = 0.0;
+    let mut lines = Vec::new();
+    for report in reports {
+        if let Some(header) = first_non_empty_line(&report.markdown) {
+            total_hours += hours_from_report_header(&header).unwrap_or(
+                subject_actual_minutes_for_date(connection, workspace_id, subject_id, &report.date)?
+                    as f64
+                    / 60.0,
+            );
+            lines.push(header);
+        }
+    }
+    lines.push(format!("共 {total_hours:.1} h"));
+    Ok(lines.join("  \n"))
+}
+
+fn saved_daily_report_total_minutes(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    period_start: &str,
+    period_end: &str,
+) -> Result<i64, String> {
+    let reports = saved_daily_reports(
+        connection,
+        workspace_id,
+        subject_id,
+        period_start,
+        period_end,
+    )?;
+    let mut minutes = 0.0;
+    for report in reports {
+        minutes += first_non_empty_line(&report.markdown)
+            .as_deref()
+            .and_then(hours_from_report_header)
+            .map(|hours| hours * 60.0)
+            .unwrap_or(subject_actual_minutes_for_date(
+                connection,
+                workspace_id,
+                subject_id,
+                &report.date,
+            )? as f64);
+    }
+    Ok(minutes.round() as i64)
+}
+
+fn saved_daily_report_collection(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    period_start: &str,
+    period_end: &str,
+) -> Result<String, String> {
+    let reports = saved_daily_reports(
+        connection,
+        workspace_id,
+        subject_id,
+        period_start,
+        period_end,
+    )?;
+    let collection = reports
+        .into_iter()
+        .map(|report| report.markdown.trim().to_string())
+        .filter(|markdown| !markdown.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if collection.is_empty() {
+        Ok("本期还没有已保存的日报".to_string())
+    } else {
+        Ok(collection)
+    }
+}
+
+#[allow(dead_code)]
+fn render_period_summary(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    period_start: &str,
+    period_end: &str,
+    user_name: &str,
+) -> Result<String, String> {
+    let start =
+        NaiveDate::parse_from_str(period_start, "%Y-%m-%d").map_err(|error| error.to_string())?;
+    let end =
+        NaiveDate::parse_from_str(period_end, "%Y-%m-%d").map_err(|error| error.to_string())?;
+    let mut total = 0;
+    let mut lines = Vec::new();
+    let mut date = start;
+    while date <= end {
+        let date_text = date.format("%Y-%m-%d").to_string();
+        let minutes =
+            subject_actual_minutes_for_date(connection, workspace_id, subject_id, &date_text)?;
+        if minutes > 0 {
+            total += minutes;
+            lines.push(report_day_title(
+                connection,
+                workspace_id,
+                subject_id,
+                user_name,
+                date,
+            )?);
+        }
+        date += Duration::days(1);
+    }
+    lines.push(format!("共 {:.1} h", total as f64 / 60.0));
+    Ok(lines.join("  \n"))
+}
+
+#[allow(dead_code)]
+fn render_period_details(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    period_start: &str,
+    period_end: &str,
+    user_name: &str,
+    duration_format: &str,
+) -> Result<String, String> {
+    let start =
+        NaiveDate::parse_from_str(period_start, "%Y-%m-%d").map_err(|error| error.to_string())?;
+    let end =
+        NaiveDate::parse_from_str(period_end, "%Y-%m-%d").map_err(|error| error.to_string())?;
+    let mut sections = Vec::new();
+    let mut date = start;
+    while date <= end {
+        let date_text = date.format("%Y-%m-%d").to_string();
+        let task_ids = auto_report_task_ids(
+            connection,
+            workspace_id,
+            subject_id,
+            "daily",
+            &date_text,
+            &date_text,
+        )?;
+        if task_ids.is_empty() {
+            date += Duration::days(1);
+            continue;
+        }
+        let tasks = load_tasks(connection, workspace_id, subject_id, Some(&date_text))?;
+        let actuals = task_actual_minutes(connection, workspace_id, &date_text, &date_text)?;
+        let selected = task_ids.into_iter().collect::<HashSet<_>>();
+        let today_items = render_daily_items(&tasks, &selected, &actuals, duration_format);
+        let next_date = date
+            + Duration::days(match date.weekday() {
+                chrono::Weekday::Sat => 2,
+                _ => 1,
+            });
+        let next_date_text = next_date.format("%Y-%m-%d").to_string();
+        let next_tasks = load_tasks(connection, workspace_id, subject_id, Some(&next_date_text))?;
+        let next_plan = render_open_plan(&next_tasks, &next_date_text);
+        let plan_title = if matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun) {
+            "下周一计划"
+        } else {
+            "明日计划"
+        };
+        sections.push(format!(
+            "## {}\n\n{}\n\n## {plan_title}：\n\n{}",
+            report_day_title(connection, workspace_id, subject_id, user_name, date,)?,
+            today_items,
+            next_plan
+        ));
+        date += Duration::days(1);
+    }
+    if sections.is_empty() {
+        Ok("本周暂无工作记录".to_string())
+    } else {
+        Ok(sections.join("\n\n"))
+    }
 }
 
 fn latest_reimbursement_summary(
@@ -2004,89 +2457,6 @@ fn render_open_task(
             lines,
         );
     }
-}
-
-fn render_daily_situation(
-    connection: &rusqlite::Connection,
-    workspace_id: &str,
-    subject_id: &str,
-    period_start: &str,
-    period_end: &str,
-    duration_format: &str,
-) -> Result<String, String> {
-    let start =
-        NaiveDate::parse_from_str(period_start, "%Y-%m-%d").map_err(|error| error.to_string())?;
-    let end =
-        NaiveDate::parse_from_str(period_end, "%Y-%m-%d").map_err(|error| error.to_string())?;
-    let mut lines = Vec::new();
-    let mut date = start;
-    while date <= end {
-        let day = date.format("%Y-%m-%d").to_string();
-        let minutes: i64 = connection
-            .query_row(
-                "SELECT COALESCE(SUM(actual.minutes), 0)
-                 FROM (
-                   SELECT a.task_id, e.work_date, a.minutes
-                   FROM time_allocations a JOIN time_entries e ON e.id = a.entry_id
-                   WHERE a.workspace_id = ?1 AND e.work_date = ?3 AND e.deleted_at IS NULL
-                   UNION ALL
-                   SELECT aa.task_id, aa.work_date, aa.delta_minutes
-                   FROM actual_time_adjustments aa
-                   WHERE aa.workspace_id = ?1 AND aa.work_date = ?3 AND aa.deleted_at IS NULL
-                 ) actual JOIN tasks t ON t.id = actual.task_id
-                 WHERE t.subject_id = ?2 AND t.deleted_at IS NULL",
-                params![workspace_id, subject_id, day],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        let report_exists: bool = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM reports WHERE workspace_id = ?1 AND subject_id = ?2
-                 AND report_type = 'daily' AND period_start = ?3 AND deleted_at IS NULL)",
-                params![workspace_id, subject_id, day],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|error| error.to_string())?
-            == 1;
-        if minutes == 0 && !report_exists {
-            lines.push(format!("- {day}：缺少日报或结算数据"));
-        } else {
-            let mut statement = connection
-                .prepare(
-                    "SELECT DISTINCT t.title
-                     FROM (
-                       SELECT a.task_id, e.work_date, a.minutes
-                       FROM time_allocations a JOIN time_entries e ON e.id = a.entry_id
-                       WHERE a.workspace_id = ?1 AND e.work_date = ?3 AND e.deleted_at IS NULL
-                       UNION ALL
-                       SELECT aa.task_id, aa.work_date, aa.delta_minutes
-                       FROM actual_time_adjustments aa
-                       WHERE aa.workspace_id = ?1 AND aa.work_date = ?3 AND aa.deleted_at IS NULL
-                     ) actual JOIN tasks t ON t.id = actual.task_id
-                     WHERE t.subject_id = ?2 AND t.deleted_at IS NULL AND actual.minutes > 0
-                     ORDER BY t.sort_order, t.created_at LIMIT 5",
-                )
-                .map_err(|error| error.to_string())?;
-            let titles = statement
-                .query_map(params![workspace_id, subject_id, day], |row| {
-                    row.get::<_, String>(0)
-                })
-                .map_err(|error| error.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| error.to_string())?;
-            let summary = if titles.is_empty() {
-                "暂无已分配事项".to_string()
-            } else {
-                titles.join("、")
-            };
-            lines.push(format!(
-                "- {day}：{} · {summary}",
-                format_report_duration(minutes, duration_format)
-            ));
-        }
-        date += Duration::days(1);
-    }
-    Ok(lines.join("\n"))
 }
 
 fn load_tasks(
@@ -2415,7 +2785,9 @@ fn normalize_duration_format(value: &str) -> &str {
 }
 
 fn format_report_duration(minutes: i64, format: &str) -> String {
-    let _ = normalize_duration_format(format);
+    if normalize_duration_format(format) == "hours" {
+        return format!("{:.1}h", minutes as f64 / 60.0);
+    }
     if minutes < 60 {
         return format!("{minutes}min");
     }
@@ -2650,8 +3022,15 @@ const TEMPLATE_PLACEHOLDERS: &[ReportTemplatePlaceholderDto] = &[
     ReportTemplatePlaceholderDto {
         token: "{{每日情况}}",
         label: "每日情况",
-        description: "周期内按日汇总",
-        example: "- 2026-10-11：6h",
+        description: "兼容旧模板的日报合集；新模板建议使用“日报合集”",
+        example: "已保存日报的完整内容",
+        report_types: &["weekly", "monthly"],
+    },
+    ReportTemplatePlaceholderDto {
+        token: "{{日报合集}}",
+        label: "日报合集",
+        description: "周期内已保存日报的最终 Markdown，包含手动调整后的内容",
+        example: "【晓健】2026-10-11 周日 …",
         report_types: &["weekly", "monthly"],
     },
     ReportTemplatePlaceholderDto {
@@ -3258,6 +3637,36 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    fn create_edited_daily_report(
+        database: &Database,
+        subject_id: &str,
+        task_id: &str,
+        date: &str,
+        markdown: &str,
+    ) -> ReportDto {
+        let created = create_report(
+            database,
+            ReportCreateRequest {
+                report_type: "daily".to_string(),
+                reference_date: date.to_string(),
+                subject_id: subject_id.to_string(),
+                task_ids: vec![task_id.to_string()],
+                template_id: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        save_report_content(
+            database,
+            ReportContentSaveRequest {
+                report_id: created.id,
+                markdown: markdown.to_string(),
+                expected_version: created.version,
+            },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -4843,7 +5252,7 @@ mod tests {
         assert_eq!(format_report_duration(12, "minutes"), "12min");
         assert_eq!(format_report_duration(60, "minutes"), "1h");
         assert_eq!(format_report_duration(80, "minutes"), "1h20min");
-        assert_eq!(format_report_duration(90, "hours"), "1h30min");
+        assert_eq!(format_report_duration(90, "hours"), "1.5h");
         assert_eq!(format_report_duration(90, "minutes"), "1h30min");
     }
 
@@ -5097,13 +5506,56 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(report.markdown.contains("预计：20min 实际：30min"));
-        assert!(!report.markdown.contains("0.5h"));
+        assert!(report.markdown.contains("预计：0.3h 实际：0.5h"));
     }
 
     #[test]
-    fn weekly_report_contains_daily_items_and_salary_summary() {
-        let (database, subject_id, task_id) = setup();
+    fn weekly_and_monthly_reports_merge_edited_daily_reports() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("saved-daily-reports.sqlite3")).unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                day_instance_date: None,
+                parent_id: None,
+                title: "不应重新生成的原始事项".to_string(),
+                planned_date: None,
+                estimate_minutes: Some(60),
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        insert_report_work_entry(
+            &database,
+            &workspace_id,
+            Some(&task.id),
+            "saved-daily-raw-entry",
+            "2026-09-01",
+            "2026-09-01 10:00:00",
+            "2026-09-01 12:00:00",
+            "work",
+            false,
+        );
+        let edited_markdown = "【晓健】2026-09-01 周二 09:30-12:00 13:30-19:00 7.5h\n\n## 手工调整后的事项\n\n- 这段内容必须原样进入周报和月报\n\n## 明日计划：\n\n- 手工调整后的计划";
+        create_edited_daily_report(
+            &database,
+            &subject_id,
+            &task.id,
+            "2026-09-01",
+            edited_markdown,
+        );
         crate::settings::update_setting(
             &database,
             crate::settings::SettingsUpdate {
@@ -5113,21 +5565,86 @@ mod tests {
             },
         )
         .unwrap();
-        let report = create_report(
+        crate::settings::update_setting(
+            &database,
+            crate::settings::SettingsUpdate {
+                scope: crate::settings::SettingsScope::Shared,
+                key: format!("subject_salary_hourly_rate:{subject_id}"),
+                value: serde_json::json!(200),
+            },
+        )
+        .unwrap();
+        let weekly = create_report(
             &database,
             ReportCreateRequest {
                 report_type: "weekly".to_string(),
-                reference_date: chrono::Local::now().format("%Y-%m-%d").to_string(),
-                subject_id,
-                task_ids: vec![task_id],
+                reference_date: "2026-09-01".to_string(),
+                subject_id: subject_id.clone(),
+                task_ids: Vec::new(),
                 template_id: None,
                 client_request_id: Uuid::now_v7().to_string(),
             },
         )
         .unwrap();
-        assert!(report.markdown.contains("每日情况"));
-        assert!(report.markdown.contains("工资估算：¥"));
-        assert!(report.markdown.contains("待报销：尚未查询"));
+        let monthly = create_report(
+            &database,
+            ReportCreateRequest {
+                report_type: "monthly".to_string(),
+                reference_date: "2026-09-15".to_string(),
+                subject_id: subject_id.clone(),
+                task_ids: Vec::new(),
+                template_id: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        for report in [&weekly, &monthly] {
+            assert!(report.markdown.contains(edited_markdown));
+            assert!(report.markdown.contains("共 7.5 h"));
+            assert!(report.markdown.contains("工资：1500.0"));
+            assert!(report.markdown.contains("待报销：尚未查询"));
+            assert!(!report.markdown.contains("不应重新生成的原始事项"));
+            assert!(!report.markdown.contains("10:00-12:00 2h"));
+        }
+        let connection = database.open().unwrap();
+        assert_eq!(
+            saved_daily_report_total_minutes(
+                &connection,
+                &workspace_id,
+                &subject_id,
+                "2026-09-01",
+                "2026-09-30",
+            )
+            .unwrap(),
+            450
+        );
+    }
+
+    #[test]
+    fn weekly_report_without_saved_daily_reports_is_explicitly_empty() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("empty-weekly-report.sqlite3")).unwrap();
+        let connection = database.open().unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let report = create_report(
+            &database,
+            ReportCreateRequest {
+                report_type: "weekly".to_string(),
+                reference_date: "2026-09-01".to_string(),
+                subject_id,
+                task_ids: Vec::new(),
+                template_id: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        assert!(report.markdown.contains("共 0.0 h"));
+        assert!(report.markdown.contains("本期还没有已保存的日报"));
+        assert!(report.markdown.contains("工资：未配置主体时薪"));
     }
 
     #[test]

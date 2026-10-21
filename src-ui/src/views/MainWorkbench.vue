@@ -58,6 +58,7 @@ const settingsNavGroups = [
 const subjectDialogOpen = ref(false);
 const subjectNameDraft = ref("");
 const editingSubjectId = ref("");
+const subjectSalaryHourlyRate = ref(0);
 const subjectDialogTitle = computed(() => editingSubjectId.value ? "主体设置" : "添加主体");
 const weekdayLabels = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
 const subjectScheduleDraft = ref<WorkScheduleDay[]>(createDefaultWorkSchedule());
@@ -1075,6 +1076,7 @@ onUnmounted(() => {
 function openSubjectDialog() {
   editingSubjectId.value = "";
   subjectNameDraft.value = "";
+  subjectSalaryHourlyRate.value = 0;
   subjectScheduleDraft.value = createDefaultWorkSchedule();
   subjectScheduleError.value = "";
   subjectDialogOpen.value = true;
@@ -1085,6 +1087,13 @@ async function openSubjectEditor(subjectId: string) {
   if (!subject) return;
   editingSubjectId.value = subject.id;
   subjectNameDraft.value = subject.name;
+  try {
+    const settings = await getSettings();
+    const value = settings.shared[`subject_salary_hourly_rate:${subject.id}`];
+    subjectSalaryHourlyRate.value = typeof value === "number" ? value : settingNumber("shared", "salary_hourly_rate");
+  } catch {
+    subjectSalaryHourlyRate.value = 0;
+  }
   subjectScheduleError.value = "";
   subjectDialogOpen.value = true;
   try {
@@ -1163,6 +1172,7 @@ async function saveSubject() {
       return;
     }
     subjectScheduleDraft.value = await saveSubjectWorkSchedule(editingSubjectId.value, subjectScheduleDraft.value);
+    await updateSetting("shared", `subject_salary_hourly_rate:${editingSubjectId.value}`, Math.max(0, Number(subjectSalaryHourlyRate.value) || 0));
     subjectDialogOpen.value = false;
     ElMessage.success("主体设置已更新");
     return;
@@ -1175,6 +1185,7 @@ async function saveSubject() {
   const defaults = await loadSubjectWorkSchedule(subjectId);
   const customized = defaults.map((day) => ({ ...day, enabled: subjectScheduleDraft.value[day.weekday].enabled, segments: subjectScheduleDraft.value[day.weekday].segments.map((segment) => ({ ...segment })) }));
   await saveSubjectWorkSchedule(subjectId, customized);
+  await updateSetting("shared", `subject_salary_hourly_rate:${subjectId}`, Math.max(0, Number(subjectSalaryHourlyRate.value) || 0));
   subjectDialogOpen.value = false;
   ElMessage.success("主体已添加");
 }
@@ -2167,6 +2178,7 @@ async function handleCompletedTaskDelete(task: Task) {
     <el-dialog v-model="subjectDialogOpen" class="subject-create-dialog subject-settings-dialog" :title="subjectDialogTitle" width="min(720px, 94vw)" append-to-body>
       <div class="subject-settings-content">
         <label class="subject-name-field"><span>主体名称</span><input v-model="subjectNameDraft" autofocus placeholder="例如：研发支持、个人事项" /></label>
+        <label class="subject-name-field subject-salary-field"><span>工资时薪（元/小时）</span><input v-model.number="subjectSalaryHourlyRate" min="0" step="0.01" type="number" placeholder="例如：145" /><small>周报、月报按这个主体的实际工时计算工资；0 表示不计算。</small></label>
         <section class="subject-schedule-editor">
           <header class="subject-schedule-head">
             <div><strong>每周工作时段</strong><span>日报会按主体和日期自动使用当天时段</span></div>

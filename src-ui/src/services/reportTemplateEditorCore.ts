@@ -24,7 +24,8 @@ export const reportTemplatePlaceholders: ReportTemplatePlaceholderDefinition[] =
   { token: "{{今日事项}}", label: "今日事项", description: "日报事项明细", example: "1. 已完成事项", types: ["daily"] },
   { token: "{{明日计划}}", label: "明日计划", description: "下一日待办", example: "1. 明日重点事项", types: ["daily"] },
   { token: "{{统计信息}}", label: "统计信息", description: "周期统计", example: "- 累计用时：6h", types: ["weekly", "monthly"] },
-  { token: "{{每日情况}}", label: "每日情况", description: "周期内逐日汇总", example: "- 周一：6h", types: ["weekly", "monthly"] },
+  { token: "{{每日情况}}", label: "每日情况", description: "兼容旧模板的日报合集，新模板建议使用“日报合集”", example: "已保存日报的完整内容", types: ["weekly", "monthly"] },
+  { token: "{{日报合集}}", label: "日报合集", description: "周期内已保存日报的最终内容，包含手动调整后的内容", example: "【晓健】2026-10-11 周日 …", types: ["weekly", "monthly"] },
   { token: "{{总结}}", label: "总结", description: "周期总结", example: "- 本期总结", types: ["weekly", "monthly"] },
 ];
 

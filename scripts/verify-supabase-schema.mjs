@@ -43,6 +43,7 @@ const timerTransitionPatchFile = path.join(repoRoot, "supabase", "20261016b_time
 const timerRecurringOccurrencePatchFile = path.join(repoRoot, "supabase", "20261019_timegenie_timer_recurring_occurrence.sql");
 const todayTaskInstancesPatchFile = path.join(repoRoot, "supabase", "20261021_timegenie_today_task_instances.sql");
 const clientWriteGenerationPatchFile = path.join(repoRoot, "supabase", "20261021b_timegenie_client_write_generation.sql");
+const dailyReportCollectionTemplatesPatchFile = path.join(repoRoot, "supabase", "20261021c_timegenie_daily_report_collection_templates.sql");
 
 const binaryNames = process.platform === "win32"
   ? {
@@ -133,6 +134,7 @@ function verifyStaticSchemaInvariants() {
   const timerRecurringOccurrencePatch = fs.readFileSync(timerRecurringOccurrencePatchFile, "utf8");
   const todayTaskInstancesPatch = fs.readFileSync(todayTaskInstancesPatchFile, "utf8");
   const clientWriteGenerationPatch = fs.readFileSync(clientWriteGenerationPatchFile, "utf8");
+  const dailyReportCollectionTemplatesPatch = fs.readFileSync(dailyReportCollectionTemplatesPatchFile, "utf8");
   const schemaIntegrationTest = fs.readFileSync(schemaTestFile, "utf8");
   for (const expected of [
     "day_instance_date",
@@ -500,6 +502,14 @@ function verifyStaticSchemaInvariants() {
   }
   if (!schema.includes("\\ir 20261016_timegenie_named_template_bootstrap_fix.sql")) {
     throw new Error("The source schema must finish with the named-template bootstrap fix.");
+  }
+  for (const expected of ["{{日报合集}}", "weekly", "monthly"]) {
+    if (!dailyReportCollectionTemplatesPatch.includes(expected)) {
+      throw new Error(`The daily-report collection template patch must include: ${expected}`);
+    }
+  }
+  if (!schema.includes("\\ir 20261021c_timegenie_daily_report_collection_templates.sql")) {
+    throw new Error("The source schema must apply the daily-report collection template patch.");
   }
   if (!schema.includes("create or replace function timegenie.actual_adjustment_fingerprint")
       || !actualAdjustmentBatchPatch.includes("create or replace function timegenie.actual_adjustment_fingerprint")) {
