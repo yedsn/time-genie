@@ -1482,8 +1482,7 @@ onBeforeUnmount(() => {
       </button>
     </div>
 
-    <el-dialog v-model="todayImportOpen" class="recurrence-dialog today-import-dialog" modal-class="today-import-overlay" :title="todaySourceImportOpen ? '从进行中导入' : '配置今日事项'" width="min(820px, 95vw)" append-to-body align-center :close-on-click-modal="false">
-      <template v-if="!todaySourceImportOpen">
+    <el-dialog v-model="todayImportOpen" class="recurrence-dialog today-import-dialog" modal-class="today-import-overlay" title="配置今日事项" width="min(980px, 96vw)" append-to-body align-center :close-on-click-modal="false">
       <section class="today-import-overview" aria-label="今日计划时长统计">
         <div class="today-import-overview-context">
           <span>今日计划总览</span>
@@ -1518,8 +1517,6 @@ onBeforeUnmount(() => {
         <div ref="todayImportRowsRef" class="today-import-sortable-rows" :class="{ moving: todayImportMoving }">
         <div v-for="row in todayImportInstanceRows" :key="row.task.id" class="today-import-row" :data-today-import-task-id="row.task.id" :data-depth="row.depth" :class="{ group: !row.allocatable, child: row.depth > 0 }" :style="{ '--task-depth': String(row.depth) }">
           <button class="today-import-drag-handle" type="button" :class="{ active: todayImportContextTaskId === row.task.id }" title="拖动排序；右键可复制、插入或删除事项" :aria-label="`${row.task.title}拖动排序，右键打开行菜单`" @pointerdown="todayImportSortable.prepareSubtree(row.task.id)" @contextmenu="openTodayImportContextMenu($event, row.task)"><GripVertical :size="14" /></button>
-          <input v-if="row.allocatable" class="today-import-check" type="checkbox" checked disabled :aria-label="`${row.task.title}已在今日`" />
-          <span v-else class="today-import-check-spacer" aria-hidden="true"></span>
           <div class="today-import-task">
             <div class="today-import-title-line">
               <CornerDownRight v-if="row.depth" :size="14" />
@@ -1577,8 +1574,16 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <div v-else class="quick-estimate-empty today-import-empty"><strong>今天还没有事项</strong><span>可以新增一个今日事项，或从进行中的计划里导入。</span><div><button class="secondary-button compact" type="button" @click="openTodayImportCreate()"><Plus :size="14" />新增事项</button><button class="secondary-button compact" type="button" @click="openTodaySourceImport"><FileInput :size="14" />从进行中导入</button></div></div>
+      <template #footer>
+        <div class="today-import-footer-actions">
+          <button class="secondary-button" type="button" :disabled="todayImportSaving || todayImportCreateSaving || Boolean(todayImportTitleSavingId)" @click="todayImportOpen = false">取消</button>
+          <button class="primary-button" type="button" :disabled="todayImportSaving || todayImportCreateSaving || Boolean(todayImportTitleSavingId) || !todayImportHasChanges" @click="saveTodayImport">{{ todayImportSaving ? '保存中...' : '保存配置' }}</button>
+        </div>
       </template>
-      <section v-else class="today-source-import-view">
+    </el-dialog>
+
+    <el-dialog v-model="todaySourceImportOpen" class="recurrence-dialog today-source-import-dialog" modal-class="today-source-import-overlay" title="从进行中导入" width="min(720px, 94vw)" append-to-body align-center :close-on-click-modal="false">
+      <section class="today-source-import-view">
         <div class="today-source-import-head">
           <div><strong>选择要加入今天的事项</strong><span>这里只选择事项；重复事项会自动使用每次预计，导入后仍可调整。</span></div>
           <button class="secondary-button compact today-source-select-all" type="button" :disabled="!todayImportSelectableIds.length" @click="toggleAllTodaySourceTasks">{{ todayImportAllSelected ? '取消全选' : '全选' }}</button>
@@ -1595,13 +1600,9 @@ onBeforeUnmount(() => {
         <div v-else class="quick-estimate-empty today-source-import-empty">没有可导入的进行中事项。</div>
       </section>
       <template #footer>
-        <div v-show="todaySourceImportOpen" class="today-import-footer-actions">
-          <button class="secondary-button" type="button" :disabled="todayImportSaving" @click="closeTodaySourceImport">返回</button>
+        <div class="today-import-footer-actions">
+          <button class="secondary-button" type="button" :disabled="todayImportSaving" @click="closeTodaySourceImport">取消</button>
           <button class="primary-button" type="button" :disabled="todayImportSaving || !todayImportSelection.length" @click="saveTodaySourceImport">{{ todayImportSaving ? '导入中...' : `导入 ${todayImportSelection.length} 项` }}</button>
-        </div>
-        <div v-show="!todaySourceImportOpen" class="today-import-footer-actions">
-          <button class="secondary-button" type="button" :disabled="todayImportSaving || todayImportCreateSaving || Boolean(todayImportTitleSavingId)" @click="todayImportOpen = false">取消</button>
-          <button class="primary-button" type="button" :disabled="todayImportSaving || todayImportCreateSaving || Boolean(todayImportTitleSavingId) || !todayImportHasChanges" @click="saveTodayImport">{{ todayImportSaving ? '保存中...' : '保存配置' }}</button>
         </div>
       </template>
     </el-dialog>
