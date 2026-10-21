@@ -487,6 +487,66 @@ fn excluded_day_plan_task_ids(
     Ok(ids)
 }
 
+fn day_instance_states(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    work_date: &str,
+) -> Result<HashMap<String, String>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT day_instance_source_task_id, status FROM tasks
+             WHERE workspace_id = ?1 AND day_instance_date = ?2 AND deleted_at IS NULL
+               AND day_instance_source_task_id IS NOT NULL",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut states = HashMap::new();
+    for row in statement
+        .query_map(params![workspace_id, work_date], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?
+    {
+        let (source_id, status) = row.map_err(|error| error.to_string())?;
+        match states.get_mut(&source_id) {
+            Some(current) => {
+                if status == "done" {
+                    *current = status;
+                }
+            }
+            None => {
+                states.insert(source_id, status);
+            }
+        }
+    }
+    Ok(states)
+}
+
+fn completed_day_instance_ids(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    period_start: &str,
+    period_end: &str,
+) -> Result<HashSet<String>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT day_instance_source_task_id FROM tasks
+             WHERE workspace_id = ?1 AND subject_id = ?2 AND status = 'done'
+               AND day_instance_date BETWEEN ?3 AND ?4 AND deleted_at IS NULL
+               AND day_instance_source_task_id IS NOT NULL",
+        )
+        .map_err(|error| error.to_string())?;
+    let ids = statement
+        .query_map(
+            params![workspace_id, subject_id, period_start, period_end],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(ids)
+}
+
 fn tree_ordered_tasks(mut tasks: Vec<TaskRow>) -> Vec<TaskRow> {
     let children = child_map(&tasks);
     let mut order = HashMap::<String, usize>::new();
@@ -566,6 +626,15 @@ fn completed_task_ids_for_period(
         .map_err(|error| error.to_string())?
     {
         completed.insert(task_id.map_err(|error| error.to_string())?);
+    }
+    for task_id in completed_day_instance_ids(
+        connection,
+        workspace_id,
+        subject_id,
+        period_start,
+        period_end,
+    )? {
+        completed.insert(task_id);
     }
     Ok(completed)
 }
@@ -2004,6 +2073,7 @@ fn load_tasks(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
     if let Some(date) = daily_estimate_date {
+        let day_instance_states = day_instance_states(connection, workspace_id, date)?;
         for task in &mut tasks {
             task.recurrence =
                 crate::recurring::get_rule_for_date(connection, workspace_id, &task.id, date)?.or(
@@ -2014,6 +2084,12 @@ fn load_tasks(
             {
                 task.occurrence_status = Some(occurrence.status);
                 task.occurrence_origin = Some(occurrence.origin);
+            }
+            if day_instance_states
+                .get(&task.id)
+                .is_some_and(|status| status == "done")
+            {
+                task.occurrence_status = Some("done".to_string());
             }
         }
     }
@@ -2143,26 +2219,69 @@ fn completed_count(
         .filter(|task| task.recurrence.is_some())
         .map(|task| task.id.as_str())
         .collect::<HashSet<_>>();
+    let completed_instances = {
+        let mut statement = connection
+            .prepare(
+                "SELECT DISTINCT day_instance_source_task_id FROM tasks
+                 WHERE workspace_id = ?1 AND status = 'done'
+                   AND day_instance_date BETWEEN ?2 AND ?3 AND deleted_at IS NULL
+                   AND day_instance_source_task_id IS NOT NULL",
+            )
+            .map_err(|error| error.to_string())?;
+        let ids = statement
+            .query_map(params![workspace_id, period_start, period_end], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        ids
+    };
     let ordinary = tasks
         .iter()
         .filter(|task| {
             selected.contains(&task.id)
                 && !recurring_task_ids.contains(task.id.as_str())
-                && task.status == "done"
+                && (task.status == "done" || completed_instances.contains(&task.id))
         })
         .count() as i64;
     let mut recurring = 0;
     for task_id in selected {
-        let count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM task_occurrences
+        let mut dates = HashSet::new();
+        let mut occurrences = connection
+            .prepare(
+                "SELECT occurrence_date FROM task_occurrences
                  WHERE workspace_id = ?1 AND task_id = ?2 AND status = 'done'
                    AND occurrence_date BETWEEN ?3 AND ?4",
-                params![workspace_id, task_id, period_start, period_end],
-                |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
-        recurring += count;
+        for date in occurrences
+            .query_map(
+                params![workspace_id, task_id, period_start, period_end],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?
+        {
+            dates.insert(date.map_err(|error| error.to_string())?);
+        }
+        let mut instances = connection
+            .prepare(
+                "SELECT day_instance_date FROM tasks
+                 WHERE workspace_id = ?1 AND day_instance_source_task_id = ?2
+                   AND status = 'done' AND day_instance_date BETWEEN ?3 AND ?4
+                   AND deleted_at IS NULL",
+            )
+            .map_err(|error| error.to_string())?;
+        for date in instances
+            .query_map(
+                params![workspace_id, task_id, period_start, period_end],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?
+        {
+            dates.insert(date.map_err(|error| error.to_string())?);
+        }
+        recurring += dates.len() as i64;
     }
     Ok(ordinary + recurring)
 }
@@ -2899,6 +3018,7 @@ mod tests {
     use crate::time_tracking::{create_manual_entry, ManualEntryRequest};
     use crate::today_overview::{get_today_work_overview, TodayWorkOverviewRequest};
     use crate::today_plans::TaskDayPlanSetRequest;
+    use crate::today_plans::{snapshot as day_plan_snapshot, TaskDayPlanSnapshotRequest};
     use chrono::NaiveDateTime;
     use serde_json::{json, Value};
     use tempfile::tempdir;
@@ -3371,6 +3491,212 @@ mod tests {
         assert!(!candidates
             .iter()
             .any(|candidate| candidate.task_id == removed.id));
+    }
+
+    #[test]
+    fn completed_recurring_today_instance_shows_completed_in_daily_report() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("recurring-today-done.sqlite3")).unwrap();
+        let connection = database.open().unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let today_text = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                day_instance_date: None,
+                parent_id: None,
+                title: "每日复盘".to_string(),
+                planned_date: None,
+                estimate_minutes: Some(20),
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        save_rule(
+            &database,
+            RecurrenceSaveRequest {
+                task_id: task.id.clone(),
+                task_expected_version: task.version,
+                frequency: "daily".to_string(),
+                weekdays_mask: None,
+                effective_start: today_text.clone(),
+                rule_expected_version: None,
+            },
+        )
+        .unwrap();
+        set_task_daily_estimate(
+            &database,
+            TaskDailyEstimateSetRequest {
+                task_id: task.id.clone(),
+                work_date: today_text.clone(),
+                estimate_minutes: Some(20),
+            },
+        )
+        .unwrap();
+        let snapshot = day_plan_snapshot(
+            &database,
+            TaskDayPlanSnapshotRequest {
+                subject_id: subject_id.clone(),
+                work_date: today_text.clone(),
+            },
+        )
+        .unwrap();
+        let instance = snapshot
+            .tasks
+            .iter()
+            .find(|item| item.day_instance_source_task_id.as_deref() == Some(task.id.as_str()))
+            .expect("今日计划应生成重复事项的当天实例");
+        let instance_id = instance.id.clone();
+        let instance_version = instance.version;
+        set_task_status(
+            &database,
+            TaskStatusRequest {
+                id: instance_id,
+                expected_version: instance_version,
+                done: true,
+                occurrence_date: None,
+                occurrence_expected_version: None,
+            },
+        )
+        .unwrap();
+
+        let candidates = suggest_report_tasks(
+            &database,
+            ReportTaskSuggestionRequest {
+                report_type: "daily".to_string(),
+                reference_date: today_text.clone(),
+                subject_id: subject_id.clone(),
+                include_task_ids: Vec::new(),
+            },
+        )
+        .unwrap();
+        let candidate = candidates
+            .iter()
+            .find(|item| item.task_id == task.id)
+            .expect("重复事项应进入日报候选");
+        assert_eq!(candidate.period_status, "completed");
+        assert!(candidate.default_selected);
+
+        let report = create_report(
+            &database,
+            ReportCreateRequest {
+                report_type: "daily".to_string(),
+                reference_date: today_text,
+                subject_id,
+                task_ids: vec![task.id.clone()],
+                template_id: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        assert!(
+            report.markdown.contains("🟢 每日复盘"),
+            "报告应把今天已完成的重复事项标记为完成：{}",
+            report.markdown
+        );
+    }
+
+    #[test]
+    fn completed_today_instance_of_ordinary_task_shows_completed_in_daily_report() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("ordinary-today-done.sqlite3")).unwrap();
+        let connection = database.open().unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let today_text = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                day_instance_date: None,
+                parent_id: None,
+                title: "今日普通事项".to_string(),
+                planned_date: None,
+                estimate_minutes: Some(60),
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        set_task_daily_estimate(
+            &database,
+            TaskDailyEstimateSetRequest {
+                task_id: task.id.clone(),
+                work_date: today_text.clone(),
+                estimate_minutes: Some(45),
+            },
+        )
+        .unwrap();
+        let snapshot = day_plan_snapshot(
+            &database,
+            TaskDayPlanSnapshotRequest {
+                subject_id: subject_id.clone(),
+                work_date: today_text.clone(),
+            },
+        )
+        .unwrap();
+        let instance = snapshot
+            .tasks
+            .iter()
+            .find(|item| item.day_instance_source_task_id.as_deref() == Some(task.id.as_str()))
+            .expect("今日计划应生成普通事项的当天实例");
+        set_task_status(
+            &database,
+            TaskStatusRequest {
+                id: instance.id.clone(),
+                expected_version: instance.version,
+                done: true,
+                occurrence_date: None,
+                occurrence_expected_version: None,
+            },
+        )
+        .unwrap();
+
+        let candidates = suggest_report_tasks(
+            &database,
+            ReportTaskSuggestionRequest {
+                report_type: "daily".to_string(),
+                reference_date: today_text.clone(),
+                subject_id: subject_id.clone(),
+                include_task_ids: Vec::new(),
+            },
+        )
+        .unwrap();
+        let candidate = candidates
+            .iter()
+            .find(|item| item.task_id == task.id)
+            .expect("今日计划内事项应进入日报候选");
+        assert_eq!(candidate.period_status, "completed");
+        assert!(candidate.default_selected);
+
+        let report = create_report(
+            &database,
+            ReportCreateRequest {
+                report_type: "daily".to_string(),
+                reference_date: today_text,
+                subject_id,
+                task_ids: vec![task.id.clone()],
+                template_id: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        assert!(
+            report.markdown.contains("🟢 今日普通事项"),
+            "报告应把今天已完成的普通事项标记为完成：{}",
+            report.markdown
+        );
     }
 
     #[test]
