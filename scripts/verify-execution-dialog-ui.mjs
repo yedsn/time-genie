@@ -80,7 +80,7 @@ function mockInitScript() {
     version: 1,
   });
 
-  const calls = { update: [], dayPlanSet: [], dayPlanBatch: [], transition: [], create: [], completed: [], move: [], actualAdjustment: [], cloudCatchUp: 0 };
+  const calls = { update: [], dayPlanSet: [], dayPlanBatch: [], transition: [], create: [], completed: [], move: [], actualAdjustment: [], unassignedResolve: [], cloudCatchUp: 0 };
   let failDayPlanBatchOnce = false;
   let created = 0;
 
@@ -237,6 +237,9 @@ function mockInitScript() {
           return runningEntry();
         case "unassigned_get_state_snapshot":
           return { current: { sessionId: "unassigned-1", workDate, state: "awaiting_resolution", firstStartedAt: Date.now() - 1_800_000, lastEndedAt: Date.now(), elapsedSeconds: 1_800, requiredMinutes: 30, thresholdSeconds: 300, mustResolve: true, version: 1 } };
+        case "unassigned_resolve_work":
+          calls.unassignedResolve.push({ ...args.request });
+          return { resolutionType: "work", generatedEntryId: "unassigned-entry", completedTaskIds: [] };
         case "today_work_overview_get":
           return { scope: { subjectName: "全部主体", todayDate: workDate }, summary: { actualMinutes: 0, estimatedMinutes: 0, completedCount: 0, activeCount: 0, notStartedCount: 0, unassignedMinutes: 0, completionRate: 0 }, days: [], timeline: [], tasks: [], revision: 1 };
         case "report_list":
@@ -510,6 +513,16 @@ async function main() {
   await unassignedActualPopover.getByRole("textbox", { name: "目标实际分钟" }).fill("25");
   await unassignedActualPopover.getByRole("button", { name: "确认调整" }).click();
   await unassignedPage.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.actualAdjustment.some((call) => call.items?.some((item) => item.taskId === "child" && item.targetMinutes === 25)));
+  const partialAllocationInput = unassignedDialog.locator('input[aria-label="写今日计划本次分配分钟"]');
+  if (await partialAllocationInput.getAttribute("max")) throw new Error("未归属时间的分配输入仍限制为参考总时长");
+  await partialAllocationInput.fill("40");
+  const overAllocationSummary = await unassignedDialog.locator(".timer-task-allocation-overview").innerText();
+  if (!overAllocationSummary.includes("超出参考") || !overAllocationSummary.includes("已分配\n40")) throw new Error("超出分配没有显示与参考时长的差额：" + overAllocationSummary);
+  await partialAllocationInput.fill("10");
+  const partialSummary = await unassignedDialog.locator(".timer-task-allocation-overview").innerText();
+  if (!partialSummary.includes("少于参考") || !partialSummary.includes("已分配\n10")) throw new Error("部分分配没有显示与参考时长的差额：" + partialSummary);
+  await unassignedDialog.getByRole("button", { name: "确认分配" }).click();
+  await unassignedPage.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.unassignedResolve.some((call) => call.allocations?.some((item) => item.taskId === "child" && item.minutes === 10)));
 
   if (pageErrors.length) throw new Error("页面错误: " + pageErrors.join("；"));
   await browser.close();

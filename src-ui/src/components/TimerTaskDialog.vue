@@ -377,10 +377,6 @@ async function saveAllocationDrafts() {
     .map(([taskId, draft]) => ({ taskId, minutes: Math.max(0, Math.round(Number(draft.minutes) || 0)), completeTask: draft.completeTask }))
     .filter((allocation) => allocation.minutes > 0 || allocation.completeTask);
   if (!allocations.length) { allocationError.value = "请至少分配 1 分钟到事项"; return; }
-  if (allocationRemainingMinutes.value !== 0) {
-    allocationError.value = allocationRemainingMinutes.value > 0 ? `还剩 ${allocationRemainingMinutes.value} 分钟未分配` : `已超出 ${Math.abs(allocationRemainingMinutes.value)} 分钟`;
-    return;
-  }
   allocationSaving.value = true;
   allocationError.value = "";
   try {
@@ -1017,7 +1013,7 @@ function formatTime(timestamp: number) {
       <div class="timer-task-allocation-context">
         <span>待处理 · 未归属时间</span>
         <strong>{{ allocationPeriodLabel }}</strong>
-        <small>请把这段时间分配到下方事项，也可以记为休息或直接丢弃。</small>
+        <small>计时时长仅供参考，可以按实际情况少分或超出，也可以记为休息或直接丢弃。</small>
       </div>
       <div class="timer-task-allocation-metrics">
         <div class="timer-task-allocation-metric total">
@@ -1026,7 +1022,7 @@ function formatTime(timestamp: number) {
           <small>分钟</small>
         </div>
         <div class="timer-task-allocation-metric pending">
-          <span>{{ allocationRemainingMinutes >= 0 ? '待分配' : '超出' }}</span>
+          <span>{{ allocationRemainingMinutes > 0 ? '少于参考' : allocationRemainingMinutes < 0 ? '超出参考' : '与参考一致' }}</span>
           <strong>{{ Math.abs(allocationRemainingMinutes) }}</strong>
           <small>分钟</small>
         </div>
@@ -1049,7 +1045,7 @@ function formatTime(timestamp: number) {
     <div class="timer-task-dialog-summary">
       <span><strong>{{ currentSubject?.name ?? '当前主体' }}</strong></span>
       <span>{{ openLeafCount }} 个可执行事项<template v-if="completedLeafCount"> · {{ completedLeafCount }} 个今天已完成</template></span>
-      <span v-if="props.mode === 'entry-allocation'">{{ allocationPeriodLabel }} · 共 {{ allocationRequiredMinutes }} 分钟 · 已分配 {{ allocationTotalMinutes }} · {{ allocationRemainingMinutes >= 0 ? `待分配 ${allocationRemainingMinutes}` : `超出 ${Math.abs(allocationRemainingMinutes)}` }} 分钟</span>
+      <span v-if="props.mode === 'entry-allocation'">{{ allocationPeriodLabel }} · 记录 {{ allocationRequiredMinutes }} 分钟 · 实际分配 {{ allocationTotalMinutes }} 分钟 · {{ allocationRemainingMinutes > 0 ? `少于参考 ${allocationRemainingMinutes}` : allocationRemainingMinutes < 0 ? `超出参考 ${Math.abs(allocationRemainingMinutes)}` : '与参考一致' }}<template v-if="allocationRemainingMinutes !== 0"> 分钟</template></span>
       <span v-else-if="props.mode === 'execute'">名称和备注会自动保存 · 今日预计请在待办页调整</span>
     </div>
     <div v-if="props.mode === 'execute' && currentStatus" class="timer-task-current-status">
@@ -1120,7 +1116,7 @@ function formatTime(timestamp: number) {
               <div class="timer-task-note-popover"><strong>{{ row.task.title }} · 备注</strong><textarea data-timer-task-field="note" :value="draftFor(row.task).note" rows="4" @input="updateDraft(row.task, 'note', ($event.target as HTMLTextAreaElement).value)"></textarea><small v-if="draftFor(row.task).errors.note" class="error">{{ draftFor(row.task).errors.note }}</small><div><button class="secondary-button compact" type="button" @click="noteTaskId = ''">关闭</button><button class="primary-button compact" type="button" :disabled="Boolean(draftFor(row.task).saving.note)" @click="saveField(row.task, 'note').then((ok) => { if (ok) noteTaskId = '' })"><Check :size="13" />保存</button></div></div>
             </el-popover>
 
-            <label v-if="presentation.showAllocation && !row.hasChildren" class="timer-task-allocation-input"><input v-model.number="allocationDraft(row.task.id, row.task.title).minutes" min="0" :max="allocationRequiredMinutes" type="number" :aria-label="`${row.task.title}本次分配分钟`" /><span>分</span></label>
+            <label v-if="presentation.showAllocation && !row.hasChildren" class="timer-task-allocation-input"><input v-model.number="allocationDraft(row.task.id, row.task.title).minutes" min="0" type="number" :aria-label="`${row.task.title}本次分配分钟`" /><span>分</span></label>
             <button v-if="!row.hasChildren" class="timer-task-primary-action" :class="actionFor(row.task, false).mode" type="button" :disabled="!actionFor(row.task, false).actionable || Boolean(timerBusyTaskId)" :aria-label="actionFor(row.task, false).ariaLabel" @click="startOrSwitch(row.task, false)"><LoaderCircle v-if="timerBusyTaskId === row.task.id" :size="13" class="spin" /><Play v-else-if="presentation.showTimerActions && actionFor(row.task, false).actionable" :size="13" fill="currentColor" />{{ actionFor(row.task, false).label }}</button>
 
             <el-popover :visible="moreTaskId === row.task.id" placement="bottom-end" :width="330" trigger="click" @update:visible="moreTaskId = $event ? row.task.id : ''">
