@@ -546,6 +546,7 @@ pub fn run() {
             reports::report_list,
             reports::report_task_suggestions,
             reports::report_work_period_preview,
+            reports::report_preview,
             reports::report_create,
             reports::report_update_scope,
             reports::report_save_content,

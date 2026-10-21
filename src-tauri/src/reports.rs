@@ -79,6 +79,16 @@ pub struct ReportWorkPeriodPreviewRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ReportPreviewRequest {
+    pub report_type: String,
+    pub reference_date: String,
+    pub subject_id: String,
+    #[serde(default)]
+    pub template_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReportCreateRequest {
     pub report_type: String,
     pub reference_date: String,
@@ -399,6 +409,37 @@ pub fn suggest_report_tasks(
     .collect())
 }
 
+fn auto_report_task_ids(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    report_type: &str,
+    period_start: &str,
+    period_end: &str,
+) -> Result<Vec<String>, String> {
+    let tasks = load_tasks(
+        connection,
+        workspace_id,
+        subject_id,
+        (report_type == "daily").then_some(period_start),
+    )?;
+    let actuals = task_actual_minutes(connection, workspace_id, period_start, period_end)?;
+    let completed = completed_task_ids_for_period(
+        connection,
+        workspace_id,
+        subject_id,
+        period_start,
+        period_end,
+    )?;
+    Ok(tree_ordered_tasks(tasks)
+        .into_iter()
+        .filter(|task| {
+            completed.contains(&task.id) || actuals.get(&task.id).copied().unwrap_or(0) > 0
+        })
+        .map(|task| task.id)
+        .collect())
+}
+
 fn day_plan_member_task_ids(
     connection: &rusqlite::Connection,
     workspace_id: &str,
@@ -704,6 +745,18 @@ fn create_report_with_cloud_operation(
             "REPORT_ALREADY_EXISTS: 当前日期或周期已有报告|{id}"
         ));
     }
+    let task_ids = if request.task_ids.is_empty() {
+        auto_report_task_ids(
+            &connection,
+            &workspace_id,
+            &request.subject_id,
+            &request.report_type,
+            &period_start,
+            &period_end,
+        )?
+    } else {
+        request.task_ids.clone()
+    };
     let id = Uuid::now_v7().to_string();
     let now = now_millis();
     let transaction = connection
@@ -717,7 +770,7 @@ fn create_report_with_cloud_operation(
         &request.subject_id,
         &period_start,
         &period_end,
-        &request.task_ids,
+        &task_ids,
     )?;
     transaction
         .execute(
@@ -734,7 +787,7 @@ fn create_report_with_cloud_operation(
         &workspace_id,
         &id,
         &request.subject_id,
-        &request.task_ids,
+        &task_ids,
     )?;
     bump_revision(&transaction)?;
     let result = load_report(&transaction, &id)?;
@@ -785,6 +838,18 @@ fn update_report_scope_with_cloud_operation(
             "REPORT_ALREADY_EXISTS: 当前日期或周期已有报告|{id}"
         ));
     }
+    let task_ids = if request.task_ids.is_empty() {
+        auto_report_task_ids(
+            &connection,
+            &workspace_id,
+            &request.subject_id,
+            &request.report_type,
+            &period_start,
+            &period_end,
+        )?
+    } else {
+        request.task_ids.clone()
+    };
     let now = now_millis();
     let transaction = connection
         .transaction()
@@ -822,7 +887,7 @@ fn update_report_scope_with_cloud_operation(
         &workspace_id,
         &request.report_id,
         &request.subject_id,
-        &request.task_ids,
+        &task_ids,
     )?;
     bump_revision(&transaction)?;
     let result = load_report(&transaction, &request.report_id)?;
@@ -2796,6 +2861,53 @@ pub fn report_work_period_preview(
 ) -> Result<String, String> {
     preview_report_work_period(&database, request)
 }
+
+#[tauri::command]
+pub fn report_preview(
+    database: tauri::State<'_, Database>,
+    request: ReportPreviewRequest,
+) -> Result<String, String> {
+    preview_report(&database, request)
+}
+
+pub fn preview_report(
+    database: &Database,
+    request: ReportPreviewRequest,
+) -> Result<String, String> {
+    let (period_start, period_end) =
+        normalize_period(&request.report_type, &request.reference_date)?;
+    let connection = database.open()?;
+    let workspace_id = workspace_id(&connection)?;
+    ensure_subject(&connection, &workspace_id, &request.subject_id)?;
+    if let Some(template_id) = request.template_id.as_deref() {
+        load_selectable_template(
+            &connection,
+            &workspace_id,
+            template_id,
+            &request.report_type,
+        )?;
+    }
+    let task_ids = auto_report_task_ids(
+        &connection,
+        &workspace_id,
+        &request.subject_id,
+        &request.report_type,
+        &period_start,
+        &period_end,
+    )?;
+    let (_, markdown) = render_report(
+        &connection,
+        &workspace_id,
+        &request.report_type,
+        request.template_id.as_deref(),
+        &request.subject_id,
+        &period_start,
+        &period_end,
+        &task_ids,
+    )?;
+    Ok(markdown)
+}
+
 #[tauri::command]
 pub fn report_create(
     database: tauri::State<'_, Database>,
@@ -3491,6 +3603,80 @@ mod tests {
         assert!(!candidates
             .iter()
             .any(|candidate| candidate.task_id == removed.id));
+    }
+
+    #[test]
+    fn create_report_without_task_selection_uses_period_records() {
+        let (database, subject_id, task_id) = setup();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let report = create_report(
+            &database,
+            ReportCreateRequest {
+                report_type: "daily".to_string(),
+                reference_date: today,
+                subject_id: subject_id.clone(),
+                task_ids: Vec::new(),
+                template_id: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(report.task_ids, vec![task_id.clone()]);
+        assert!(report.markdown.contains("🟢 生成日报事项"));
+
+        let empty_day = (chrono::Local::now() - chrono::Duration::days(3))
+            .format("%Y-%m-%d")
+            .to_string();
+        let empty = create_report(
+            &database,
+            ReportCreateRequest {
+                report_type: "daily".to_string(),
+                reference_date: empty_day,
+                subject_id,
+                task_ids: Vec::new(),
+                template_id: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        assert!(empty.task_ids.is_empty());
+    }
+
+    #[test]
+    fn report_preview_matches_generated_report_without_saving() {
+        let (database, subject_id, _) = setup();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let markdown = preview_report(
+            &database,
+            ReportPreviewRequest {
+                report_type: "daily".to_string(),
+                reference_date: today.clone(),
+                subject_id: subject_id.clone(),
+                template_id: None,
+            },
+        )
+        .unwrap();
+        assert!(markdown.contains("🟢 生成日报事项"));
+        let saved: i64 = database
+            .open()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM reports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(saved, 0);
+
+        let report = create_report(
+            &database,
+            ReportCreateRequest {
+                report_type: "daily".to_string(),
+                reference_date: today,
+                subject_id,
+                task_ids: Vec::new(),
+                template_id: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(report.markdown, markdown);
     }
 
     #[test]

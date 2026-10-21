@@ -1546,6 +1546,13 @@ pre {
 .report-scope-result.type-monthly { --report-scope-color: #6198df; }
 .report-import-section { min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); }
 .report-import-section .report-create-section-body { min-height: 0; grid-template-rows: auto minmax(0, 1fr); padding: 6px 8px; gap: 0; overflow: hidden; background: var(--surface-subtle); }
+.report-preview-section { min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); }
+.report-preview-section .report-create-section-body { min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr); padding: 0; overflow: hidden; border: 1px solid var(--line-soft); border-radius: 7px; background: var(--panel-solid); }
+.report-preview-body .md-editor { --md-bk-color: var(--panel-solid); --md-color: var(--text-soft); min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; background: var(--panel-solid); }
+.report-preview-body .md-editor-preview-wrapper { padding: 12px 15px; background: var(--panel-solid); }
+.report-preview-body .md-editor-preview { color: var(--text-soft); font-size: 11px; }
+.report-preview-body .md-editor-preview h1, .report-preview-body .md-editor-preview h2, .report-preview-body .md-editor-preview h3 { color: var(--text); border-bottom-color: var(--line-soft); }
+.report-preview-empty { min-height: 120px; display: grid; place-items: center; gap: 4px; padding: 18px 16px; color: var(--muted); font-size: 11px; text-align: center; }
 .report-import-tools { min-height: 37px; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 3px 2px 5px; border-bottom: 0; }
 .report-import-tools > label { width: min(230px, 42%); height: 31px; display: grid; grid-template-columns: 16px minmax(0, 1fr); align-items: center; gap: 4px; border: 0; border-radius: 5px; padding: 0 7px; color: #708078; background: var(--surface-inset); transition: background 140ms ease, color 140ms ease; }
 .report-import-tools > label:focus-within { color: #a7b4ad; background: rgba(201,239,143,0.055); }

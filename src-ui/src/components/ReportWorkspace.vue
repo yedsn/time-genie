@@ -6,7 +6,7 @@ import { ArrowDown, ArrowUp, Braces, CalendarDays, CalendarRange, Check, Chevron
 import { MdEditor, MdPreview } from "md-editor-v3";
 import "md-editor-v3/lib/style.css";
 import { useWorkdayStore, type ReportRecord, type ReportType } from "../store";
-import { getReportTaskSuggestions, getReportWorkPeriodPreview, getSettings, querySeaTableReimbursements, type ObsidianReportWritePreview, type ReportTaskSuggestion, type ReportTemplateRecord } from "../services/tauri";
+import { getReportTaskSuggestions, getReportWorkPeriodPreview, getSettings, previewReport, querySeaTableReimbursements, type ObsidianReportWritePreview, type ReportTaskSuggestion, type ReportTemplateRecord } from "../services/tauri";
 import { defaultReportTaskIds, preserveReportTaskSelection, reportTaskDepth, selectableReportTaskIds } from "../services/reportTaskCandidateCore";
 import {
   insertTemplateToken,
@@ -39,6 +39,11 @@ const draftTaskQuery = ref("");
 const draftTaskSuggestions = ref<ReportTaskSuggestion[]>([]);
 const draftIncludeTaskIds = ref<string[]>([]);
 const draftTasksLoading = ref(false);
+const draftReportPreview = ref("");
+const draftPreviewError = ref("");
+const draftPreviewLoading = ref(false);
+let draftPreviewRequest = 0;
+let draftPreviewTimer: ReturnType<typeof setTimeout> | undefined;
 const reportDurationFormat = ref<"minutes" | "hours">("minutes");
 let draftSuggestionRequest = 0;
 let draftWorkPeriodRequest = 0;
@@ -120,6 +125,13 @@ const draftSummary = computed(() => {
     minutes: tasks.reduce((sum, task) => sum + task.actualMinutes, 0)
   };
 });
+const draftScopeSummary = computed(() => {
+  const subjectName = store.subjects.find((subject) => subject.id === draftSubjectId.value)?.name ?? "";
+  if (dialogMode.value === "create") {
+    return `${subjectName} · ${draftType.value === "daily" ? "自动汇总当天记录" : "自动汇总本期记录"}`;
+  }
+  return `${subjectName} · ${draftSummary.value.total} 项 · ${formatHours(draftSummary.value.minutes)}`;
+});
 const templatePreview = computed(() => {
   const report = selectedReport.value;
   const period = report?.period ?? periodValue(templateType.value, new Date());
@@ -167,7 +179,11 @@ watch(selectedReport, (report) => {
 watch([draftSubjectId, draftType, draftReferenceDate], () => {
   if (!reportDialogOpen.value) return;
   void loadDraftWorkPeriod();
-  void loadSuggestedTasks(dialogMode.value === "create");
+  if (dialogMode.value === "scope") void loadSuggestedTasks(false);
+});
+watch([draftSubjectId, draftType, draftReferenceDate, draftTemplateId], () => {
+  if (!reportDialogOpen.value || dialogMode.value !== "create") return;
+  scheduleDraftPreview();
 });
 watch(draftSubjectId, (subjectId) => {
   if (subjectId) {
@@ -385,9 +401,12 @@ async function openCreateDialog() {
   draftReferenceDate.value = new Date();
   draftTaskQuery.value = "";
   draftIncludeTaskIds.value = [];
+  draftTaskIds.value = [];
+  draftTaskSuggestions.value = [];
   reportDialogOpen.value = true;
   await loadDraftTemplates(true);
-  await Promise.all([loadSuggestedTasks(true), loadDraftWorkPeriod()]);
+  await loadDraftWorkPeriod();
+  await loadDraftPreview();
 }
 
 async function loadDraftWorkPeriod() {
@@ -405,6 +424,42 @@ async function loadDraftWorkPeriod() {
     if (requestId === draftWorkPeriodRequest) draftWorkPeriod.value = value;
   } catch {
     if (requestId === draftWorkPeriodRequest) draftWorkPeriod.value = fallback;
+  }
+}
+
+function scheduleDraftPreview() {
+  if (draftPreviewTimer) clearTimeout(draftPreviewTimer);
+  draftPreviewTimer = setTimeout(() => {
+    void loadDraftPreview();
+  }, 160);
+}
+
+async function loadDraftPreview() {
+  if (!reportDialogOpen.value || dialogMode.value !== "create") return;
+  const subjectId = draftSubjectId.value;
+  if (!subjectId) {
+    draftReportPreview.value = "";
+    draftPreviewError.value = "";
+    return;
+  }
+  const requestId = ++draftPreviewRequest;
+  draftPreviewLoading.value = true;
+  draftPreviewError.value = "";
+  try {
+    const markdown = await previewReport({
+      reportType: draftType.value,
+      referenceDate: toDateValue(draftReferenceDate.value),
+      subjectId,
+      templateId: draftTemplateId.value || undefined,
+    });
+    if (requestId !== draftPreviewRequest) return;
+    draftReportPreview.value = markdown;
+  } catch (error) {
+    if (requestId !== draftPreviewRequest) return;
+    draftReportPreview.value = "";
+    draftPreviewError.value = errorText(error, "生成预览失败");
+  } finally {
+    if (requestId === draftPreviewRequest) draftPreviewLoading.value = false;
   }
 }
 
@@ -457,7 +512,7 @@ async function saveReportDialog() {
     ElMessage.warning("请选择主体");
     return;
   }
-  if (!draftTaskIds.value.length) {
+  if (dialogMode.value === "scope" && !draftTaskIds.value.length) {
     ElMessage.warning("请至少导入一个事项");
     return;
   }
@@ -468,7 +523,7 @@ async function saveReportDialog() {
       if (existingDraftReport.value) {
         try {
           await ElMessageBox.confirm(
-            "当前主体和周期已有报告。继续后会按当前选择重新生成，并覆盖原 Markdown 内容。",
+            "当前主体和周期已有报告。继续后会按本期记录重新生成，并覆盖原 Markdown 内容。",
             `覆盖原${reportTypeLabel(draftType.value)}`,
             {
               type: "warning",
@@ -761,6 +816,7 @@ let stopSubjectPreferenceSync: (() => void) | undefined;
 onUnmounted(() => {
   window.removeEventListener("keydown", onWorkspaceKeydown);
   stopSubjectPreferenceSync?.();
+  if (draftPreviewTimer) clearTimeout(draftPreviewTimer);
 });
 
 async function regenerateReport(report: ReportRecord) {
@@ -994,7 +1050,7 @@ function existingReportId(error: unknown) {
       <button class="primary-button" type="button" @click="openCreateDialog"><Plus :size="15" />创建第一份报告</button>
     </section>
 
-    <el-dialog v-model="reportDialogOpen" class="report-create-dialog" :title="dialogTitle" width="min(640px, 94vw)" append-to-body destroy-on-close>
+    <el-dialog v-model="reportDialogOpen" class="report-create-dialog" :title="dialogTitle" width="min(780px, 94vw)" append-to-body destroy-on-close>
       <div class="report-create-form">
         <section class="report-create-section report-scope-section">
           <header><span>1</span><div><strong>报告范围</strong><small>确定报告的归档周期和所属主体</small></div></header>
@@ -1022,7 +1078,7 @@ function existingReportId(error: unknown) {
           </button>
         </section>
 
-        <section class="report-create-section report-import-section">
+        <section v-if="dialogMode === 'scope'" class="report-create-section report-import-section">
           <header><span>2</span><div><strong>导入事项</strong><small>{{ draftType === 'daily' ? '当天计划事项' : '报告周期事项' }} · 已选择 {{ draftSummary.total }} 项，其中 {{ draftSummary.completed }} 项已完成</small></div></header>
           <div class="report-create-section-body">
             <div class="report-import-tools">
@@ -1042,10 +1098,20 @@ function existingReportId(error: unknown) {
             </el-checkbox-group>
           </div>
         </section>
+
+        <section v-else class="report-create-section report-preview-section">
+          <header><span>2</span><div><strong>报告预览</strong><small>{{ draftPreviewLoading ? '正在生成预览…' : '按当前日期、主体和模板自动汇总，可直接生成' }}</small></div></header>
+          <div class="report-create-section-body report-preview-body">
+            <div v-if="draftPreviewError" class="report-preview-empty">{{ draftPreviewError }}</div>
+            <div v-else-if="draftPreviewLoading && !draftReportPreview" class="report-preview-empty">正在生成预览…</div>
+            <div v-else-if="!draftReportPreview" class="report-preview-empty">这个周期还没有可汇总的记录</div>
+            <MdPreview v-else :model-value="draftReportPreview" editor-id="report-draft-preview" language="zh-CN" theme="dark" preview-theme="github" code-theme="github" />
+          </div>
+        </section>
       </div>
       <template #footer>
-        <div class="report-dialog-summary"><strong>{{ periodValue(draftType, draftReferenceDate) }}</strong><span>{{ store.subjects.find((subject) => subject.id === draftSubjectId)?.name }} · {{ draftSummary.total }} 项 · {{ formatHours(draftSummary.minutes) }}</span></div>
-        <div class="report-dialog-actions"><button class="secondary-button" type="button" @click="reportDialogOpen = false">取消</button><button class="primary-button" type="button" :disabled="!draftTaskIds.length || !draftTemplateId || reportSaving" @click="saveReportDialog"><Check :size="14" />{{ dialogMode === 'create' ? existingDraftReport ? '覆盖并生成' : '生成并保存' : '保存范围' }}</button></div>
+        <div class="report-dialog-summary"><strong>{{ periodValue(draftType, draftReferenceDate) }}</strong><span>{{ draftScopeSummary }}</span></div>
+        <div class="report-dialog-actions"><button class="secondary-button" type="button" @click="reportDialogOpen = false">取消</button><button class="primary-button" type="button" :disabled="(dialogMode === 'scope' && !draftTaskIds.length) || !draftTemplateId || reportSaving" @click="saveReportDialog"><Check :size="14" />{{ dialogMode === 'create' ? existingDraftReport ? '覆盖并生成' : '生成并保存' : '保存范围' }}</button></div>
       </template>
     </el-dialog>
 

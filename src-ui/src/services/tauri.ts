@@ -1351,6 +1351,15 @@ export async function getReportWorkPeriodPreview(
   });
 }
 
+export async function previewReport(request: {
+  reportType: "daily" | "weekly" | "monthly";
+  referenceDate: string;
+  subjectId: string;
+  templateId?: string;
+}): Promise<string> {
+  return await invoke("report_preview", { request });
+}
+
 export async function createReport(request: {
   reportType: "daily" | "weekly" | "monthly";
   referenceDate: string;
