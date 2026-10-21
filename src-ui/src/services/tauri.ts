@@ -1337,6 +1337,7 @@ export async function getReportTaskSuggestions(request: {
   reportType: "daily" | "weekly" | "monthly";
   referenceDate: string;
   subjectId: string;
+  includeTaskIds?: string[];
 }): Promise<ReportTaskSuggestion[]> {
   return await invoke("report_task_suggestions", { request });
 }

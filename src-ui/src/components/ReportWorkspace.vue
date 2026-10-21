@@ -37,6 +37,7 @@ const draftReferenceDate = ref(new Date(2026, 8, 15));
 const draftTaskIds = ref<string[]>([]);
 const draftTaskQuery = ref("");
 const draftTaskSuggestions = ref<ReportTaskSuggestion[]>([]);
+const draftIncludeTaskIds = ref<string[]>([]);
 const draftTasksLoading = ref(false);
 const reportDurationFormat = ref<"minutes" | "hours">("minutes");
 let draftSuggestionRequest = 0;
@@ -361,6 +362,7 @@ async function loadSuggestedTasks(applySelection = false) {
       reportType: draftType.value,
       referenceDate: toDateValue(draftReferenceDate.value),
       subjectId: draftSubjectId.value,
+      includeTaskIds: draftIncludeTaskIds.value.length ? [...draftIncludeTaskIds.value] : undefined,
     });
     if (requestId !== draftSuggestionRequest) return;
     draftTaskSuggestions.value = suggestions;
@@ -382,6 +384,7 @@ async function openCreateDialog() {
   draftSubjectId.value = reportSubjectId.value || store.subjects[0]?.id || "";
   draftReferenceDate.value = new Date();
   draftTaskQuery.value = "";
+  draftIncludeTaskIds.value = [];
   reportDialogOpen.value = true;
   await loadDraftTemplates(true);
   await Promise.all([loadSuggestedTasks(true), loadDraftWorkPeriod()]);
@@ -413,6 +416,7 @@ async function openScopeDialog(report: ReportRecord) {
   draftReferenceDate.value = new Date(`${report.referenceDate}T00:00:00`);
   draftTaskIds.value = [...report.taskIds];
   draftTaskQuery.value = "";
+  draftIncludeTaskIds.value = [...report.taskIds];
   reportDialogOpen.value = true;
   await loadDraftTemplates(false, report.templateId);
   await Promise.all([loadSuggestedTasks(false), loadDraftWorkPeriod()]);
@@ -1019,7 +1023,7 @@ function existingReportId(error: unknown) {
         </section>
 
         <section class="report-create-section report-import-section">
-          <header><span>2</span><div><strong>导入事项</strong><small>已选择 {{ draftSummary.total }} 项，其中 {{ draftSummary.completed }} 项已完成</small></div></header>
+          <header><span>2</span><div><strong>导入事项</strong><small>{{ draftType === 'daily' ? '当天计划事项' : '报告周期事项' }} · 已选择 {{ draftSummary.total }} 项，其中 {{ draftSummary.completed }} 项已完成</small></div></header>
           <div class="report-create-section-body">
             <div class="report-import-tools">
               <label><Search :size="13" /><input v-model="draftTaskQuery" type="search" placeholder="筛选事项" /></label>
@@ -1034,7 +1038,7 @@ function existingReportId(error: unknown) {
                 <span class="report-task-option-title"><i :class="task.periodStatus === 'completed' ? 'done' : task.periodStatus === 'active' ? 'active' : 'planned'"></i>{{ task.title }}</span>
                 <span class="report-task-option-meta"><template v-if="draftType === 'daily' && task.dailyEstimateMinutes">今日预计 {{ formatHours(task.dailyEstimateMinutes) }} · </template><template v-if="task.estimateMinutes">整体预计 {{ formatHours(task.estimateMinutes) }} · </template><template v-if="task.actualMinutes">实际 {{ formatHours(task.actualMinutes) }} · </template>{{ task.periodStatus === 'completed' ? '本期已完成' : task.periodStatus === 'active' ? '有执行记录' : task.periodStatus === 'context' ? '层级上下文' : '未执行' }}</span>
               </el-checkbox>
-              <div v-if="!visibleDraftTasks.length" class="report-task-empty">没有匹配的事项</div>
+              <div v-if="!visibleDraftTasks.length" class="report-task-empty">{{ draftTaskQuery ? '没有匹配的事项' : draftType === 'daily' ? '当天计划还没有事项' : '本周期还没有相关事项' }}</div>
             </el-checkbox-group>
           </div>
         </section>
