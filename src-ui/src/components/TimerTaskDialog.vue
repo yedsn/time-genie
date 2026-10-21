@@ -1056,9 +1056,6 @@ function formatTime(timestamp: number) {
       <div><span class="storage-state-dot online"></span><strong>{{ currentStatus.title }}</strong><small>{{ currentStatus.stateLabel }}</small></div>
       <span v-if="currentStatus.outsideTodayPlan">当前事项未加入今天计划，仅显示计时状态</span>
     </div>
-    <div v-if="presentation.showAllocation && selectedAllocations.length" class="timer-task-allocation-selection" aria-label="当前已选时间分配">
-      <span v-for="item in selectedAllocations" :key="item.taskId"><strong>{{ item.title }}</strong><template v-if="item.minutes > 0">{{ item.minutes }} 分钟</template><template v-if="item.minutes > 0 && item.completeTask"> · </template><template v-if="item.completeTask">完成</template><button type="button" :aria-label="`移除${item.title}的分配与完成选择`" @click="clearAllocationDraft(item.taskId)">×</button></span>
-    </div>
     <div class="timer-task-table-tools"><button class="secondary-button compact" type="button" @click="openNewTask()"><Plus :size="14" />新增事项</button></div>
 
     <div class="timer-task-list" :class="{ allocation: presentation.showAllocation }" aria-live="polite" :aria-busy="store.workspaceLoading || store.executionSnapshotLoading[subjectId]">
@@ -1138,7 +1135,26 @@ function formatTime(timestamp: number) {
       <div v-if="!panelInitialLoading && !rows.length && !newTask.open" class="timer-task-empty"><AlertCircle :size="22" /><strong>{{ query ? '没有匹配事项' : (usesTodayPlan ? '今日还没有事项' : '当前主体暂无可执行事项') }}</strong><span>{{ query ? '换个关键词，或清空搜索查看全部事项。' : (usesTodayPlan ? '可以新建今日事项，或从进行中加入今日计划。' : '可以直接在这里新建事项。') }}</span><div v-if="!query"><button class="primary-button compact" type="button" @click="openNewTask()"><Plus :size="14" />新增事项</button><button v-if="usesTodayPlan" class="secondary-button compact" type="button" @click="todayPickerOpen = true">从进行中加入</button></div></div>
     </div>
 
-    <template #footer><div class="timer-task-dialog-footer"><button class="secondary-button compact" type="button" @click="goPlan"><ListTodo :size="14" />前往待办页</button><span class="timer-task-allocation-error">{{ allocationError }}</span><template v-if="presentation.showAllocation"><button class="secondary-button compact" type="button" :disabled="allocationSaving || !selectedAllocations.length" @click="clearAllocationDrafts">清空</button><button v-if="presentation.showBreakDiscard" class="secondary-button compact" type="button" :disabled="allocationSaving" @click="resolveAllocationDisposition('break')">记为休息</button><button v-if="presentation.showBreakDiscard" class="danger-button compact" type="button" :disabled="allocationSaving" @click="resolveAllocationDisposition('discard')">丢弃</button><button class="primary-button" type="button" :disabled="allocationSaving" @click="saveAllocationDrafts">{{ allocationSaving ? '保存中...' : presentation.primaryLabel }}</button></template><button v-else class="secondary-button" type="button" :disabled="closing" @click="closeDialog">关闭</button></div></template>
+    <template #footer>
+      <div class="timer-task-dialog-footer">
+        <button class="secondary-button compact" type="button" @click="goPlan"><ListTodo :size="14" />前往待办页</button>
+        <span class="timer-task-allocation-error">{{ allocationError }}</span>
+        <template v-if="presentation.showAllocation">
+          <el-popover v-if="selectedAllocations.length" placement="top-start" :width="320" trigger="hover" :show-after="160" :hide-after="120" popper-class="timer-task-allocation-changes-popper">
+            <template #reference><button class="timer-task-allocation-change-badge" type="button" :aria-label="`查看已调整的 ${selectedAllocations.length} 个事项`"><i></i>已调整 {{ selectedAllocations.length }} 项</button></template>
+            <div class="timer-task-allocation-changes">
+              <div><strong>本次调整</strong><small>鼠标移开后自动收起</small></div>
+              <ul><li v-for="item in selectedAllocations" :key="item.taskId"><span><strong>{{ item.title }}</strong><small><template v-if="item.minutes > 0">分配 {{ item.minutes }} 分钟</template><template v-if="item.minutes > 0 && item.completeTask"> · </template><template v-if="item.completeTask">标记完成</template></small></span><button type="button" :aria-label="`移除${item.title}的分配与完成选择`" @click="clearAllocationDraft(item.taskId)">×</button></li></ul>
+            </div>
+          </el-popover>
+          <button class="secondary-button compact" type="button" :disabled="allocationSaving || !selectedAllocations.length" @click="clearAllocationDrafts">清空</button>
+          <button v-if="presentation.showBreakDiscard" class="secondary-button compact" type="button" :disabled="allocationSaving" @click="resolveAllocationDisposition('break')">记为休息</button>
+          <button v-if="presentation.showBreakDiscard" class="danger-button compact" type="button" :disabled="allocationSaving" @click="resolveAllocationDisposition('discard')">丢弃</button>
+          <button class="primary-button" type="button" :disabled="allocationSaving" @click="saveAllocationDrafts">{{ allocationSaving ? '保存中...' : presentation.primaryLabel }}</button>
+        </template>
+        <button v-else class="secondary-button" type="button" :disabled="closing" @click="closeDialog">关闭</button>
+      </div>
+    </template>
   </el-dialog>
 
   <el-dialog v-model="todayPickerOpen" class="recurrence-dialog timer-today-picker-dialog" modal-class="timer-today-picker-overlay" title="从进行中加入今日" width="min(680px, 94vw)" append-to-body align-center :close-on-click-modal="false">

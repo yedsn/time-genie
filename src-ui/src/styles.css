@@ -2417,11 +2417,6 @@ pre {
 .timer-task-allocation-metric.pending > strong { color: var(--amber); }
 .timer-task-allocation-metric.assigned > strong { color: var(--green); }
 .timer-task-allocation-overview.over .timer-task-allocation-metric.pending > strong { color: var(--danger-text); }
-.timer-task-allocation-selection { display: flex; flex-wrap: wrap; gap: 5px 18px; margin: 9px 2px 11px; }
-.timer-task-allocation-selection > span { display: inline-flex; align-items: center; gap: 5px; padding: 0; color: var(--text-soft); background: transparent; font-size: 10px; }
-.timer-task-allocation-selection strong { color: var(--text); font-weight: 650; }
-.timer-task-allocation-selection button { width: 16px; height: 18px; display: grid; place-items: center; border: 0; padding: 0; color: var(--muted); background: transparent; }
-.timer-task-allocation-selection button:hover { color: var(--danger-text); }
 .timer-task-current-status { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 2px 10px; border: 1px solid color-mix(in srgb, var(--green) 24%, var(--line)); border-radius: 8px; padding: 7px 10px; color: var(--text-soft); background: var(--success-surface); font-size: 10px; }
 .timer-task-current-status > div { min-width: 0; display: flex; align-items: center; gap: 7px; }
 .timer-task-current-status strong { overflow: hidden; color: var(--text); text-overflow: ellipsis; white-space: nowrap; }
@@ -2489,6 +2484,22 @@ pre {
 .timer-task-dialog-footer { width: 100%; display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
 .timer-task-dialog-footer > :nth-child(2) { margin-right: auto; }
 .timer-task-allocation-error { color: var(--danger-text); font-size: 10px; }
+.timer-task-allocation-change-badge { height: 28px; display: inline-flex; align-items: center; gap: 6px; border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--line)); border-radius: 999px; padding: 0 10px; color: var(--text-soft); background: color-mix(in srgb, var(--accent) 7%, var(--control-bg)); font-size: 10px; white-space: nowrap; }
+.timer-task-allocation-change-badge:hover { border-color: color-mix(in srgb, var(--accent) 48%, var(--line)); color: var(--text); background: color-mix(in srgb, var(--accent) 12%, var(--control-bg)); }
+.timer-task-allocation-change-badge i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent); }
+.timer-task-allocation-changes-popper.el-popper { border-color: var(--line); padding: 0; background: var(--panel); box-shadow: 0 16px 42px rgba(0,0,0,.34); }
+.timer-task-allocation-changes { display: grid; gap: 8px; padding: 11px; }
+.timer-task-allocation-changes > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 0 2px; }
+.timer-task-allocation-changes > div strong { color: var(--text); font-size: 11px; }
+.timer-task-allocation-changes > div small { color: var(--muted); font-size: 9px; }
+.timer-task-allocation-changes ul { max-height: 220px; display: grid; gap: 3px; overflow: auto; margin: 0; padding: 0; list-style: none; }
+.timer-task-allocation-changes li { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) 22px; align-items: center; gap: 7px; border-radius: 6px; padding: 6px 5px 6px 8px; background: var(--panel-2); }
+.timer-task-allocation-changes li > span { min-width: 0; display: grid; gap: 2px; }
+.timer-task-allocation-changes li strong, .timer-task-allocation-changes li small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.timer-task-allocation-changes li strong { color: var(--text); font-size: 10px; font-weight: 650; }
+.timer-task-allocation-changes li small { color: var(--muted); font-size: 9px; }
+.timer-task-allocation-changes li > button { width: 22px; height: 22px; display: grid; place-items: center; border: 0; border-radius: 5px; padding: 0; color: var(--muted); background: transparent; }
+.timer-task-allocation-changes li > button:hover { color: var(--danger-text); background: color-mix(in srgb, var(--danger) 8%, transparent); }
 .timer-today-picker-overlay .el-overlay-dialog { display: flex; align-items: center; justify-content: center; padding: 4vh 0; }
 .timer-today-picker-dialog.el-dialog { --el-dialog-bg-color: var(--panel); --el-text-color-primary: var(--text); height: min(640px, 80vh); max-height: 80vh; display: flex; flex-direction: column; overflow: hidden; margin: 0 auto !important; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); box-shadow: 0 24px 70px rgba(0,0,0,.48); }
 .timer-today-picker-dialog .el-dialog__header { flex: 0 0 auto; margin: 0; padding: 16px 18px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
@@ -3581,7 +3592,7 @@ pre {
   .timer-task-dialog-footer { align-items: stretch; flex-wrap: wrap; }
   .timer-task-dialog-footer > :first-child { order: 10; }
   .timer-task-dialog-footer > :nth-child(2) { width: 100%; order: -1; margin: 0; }
-  .timer-task-allocation-selection { max-height: 70px; overflow: auto; }
+  .timer-task-allocation-change-badge { max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
   .global-timer-main { grid-template-columns: 8px minmax(0, 1fr); }
   .global-timer-main time { grid-column: 2; font-size: 15px; }
   .time-focus-panel { padding: 18px; }

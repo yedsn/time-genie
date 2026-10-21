@@ -445,6 +445,14 @@ async function main() {
   if (await allocationChildRow.locator('.timer-task-actions .timer-task-complete-toggle').count()) throw new Error("未归属时间右侧仍显示旧的完成操作");
   await allocationCompletion.click();
   if ((await allocationCompletion.getAttribute("aria-pressed")) !== "true") throw new Error("未归属时间的完成勾选不可用");
+  if (await unassignedDialog.locator(".timer-task-allocation-selection").count()) throw new Error("未归属时间仍在事项列表上方平铺调整明细");
+  const allocationChangeBadge = unassignedDialog.locator(".timer-task-allocation-change-badge");
+  if ((await allocationChangeBadge.innerText()).trim() !== "已调整 1 项") throw new Error("未归属时间底部缺少调整标识");
+  await allocationChangeBadge.hover();
+  const allocationChangesPopover = unassignedPage.locator(".timer-task-allocation-changes-popper:visible");
+  await allocationChangesPopover.waitFor({ state: "visible" });
+  const allocationChangesText = await allocationChangesPopover.innerText();
+  if (!allocationChangesText.includes("写今日计划") || !allocationChangesText.includes("标记完成")) throw new Error("未归属时间悬停标识没有显示调整明细：" + allocationChangesText);
   const allocationParentCompletion = unassignedDialog.locator('.timer-task-row[data-timer-task-id="parent"] .timer-task-complete-check');
   if (!await allocationParentCompletion.isDisabled()) throw new Error("未归属时间的父事项完成勾选应禁用");
   const allocationNameCell = allocationChildRow.locator('.timer-task-name-cell');
