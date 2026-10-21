@@ -6,7 +6,7 @@ import "md-editor-v3/lib/style.css";
 import { CalendarDays, CheckCircle2, Circle, Clock3, Copy, CornerDownRight, DatabaseZap, FileInput, FilePenLine, GripVertical, IndentDecrease, IndentIncrease, ListMinus, ListPlus, MessageSquareText, Minus, Play, Plus, Radio, Repeat2, TimerReset, Trash2 } from "lucide-vue-next";
 import type { Task } from "../store";
 import { isActivePlanTask } from "../services/completedTaskHistoryCore";
-import { contextMenuPosition, taskSubtreeIds, todayEstimateDraft } from "../services/planTaskInteractionCore";
+import { contextMenuPosition, hierarchicalTaskSelectionRows, taskSubtreeIds, todayEstimateDraft, toggleTaskSelectionGroup } from "../services/planTaskInteractionCore";
 import { createTaskTreeSortable } from "../services/taskTreeSortable";
 import type { ActualAdjustmentBatchRequest, ActualAdjustmentBatchResult, ActualAdjustmentSnapshotRecord, ActualAdjustmentSnapshotTaskRecord } from "../services/tauri";
 import { adjustQuickEstimateMinutes, parseQuickEstimateMinutes } from "../services/quickPlanEstimateCore";
@@ -244,10 +244,16 @@ const todayImportInstanceRows = computed(() => todayImportInstanceTasks.value
     depth: getDepth(task),
     allocatable: Boolean(task.todayMember) && !todayImportInstanceTasks.value.some((candidate) => candidate.parentId === task.id),
   })));
-const todayImportCandidateRows = computed(() => activeImportTasks.value
-  .filter((task) => !todayPlannedIds.value.has(task.id))
-  .map((task) => ({ task, depth: getTaskDepthIn(task, activeImportTasks.value), allocatable: !activeImportTasks.value.some((candidate) => candidate.parentId === task.id) })));
-const todayImportSelectableIds = computed(() => todayImportCandidateRows.value.filter((row) => row.allocatable).map((row) => row.task.id));
+const todayImportCandidateSelectableIds = computed(() => new Set(activeImportTasks.value
+  .filter((task) => !todayPlannedIds.value.has(task.id)
+    && !activeImportTasks.value.some((candidate) => candidate.parentId === task.id))
+  .map((task) => task.id)));
+const todayImportCandidateRows = computed(() => hierarchicalTaskSelectionRows(
+  activeImportTasks.value,
+  todayImportCandidateSelectableIds.value,
+  todayImportSelection.value,
+));
+const todayImportSelectableIds = computed(() => [...todayImportCandidateSelectableIds.value]);
 const todayImportAllSelected = computed(() => todayImportSelectableIds.value.length > 0 && todayImportSelectableIds.value.every((taskId) => todayImportSelection.value.includes(taskId)));
 const todayMemberLeafTasks = computed(() => displayedTasks.value.filter((task) => (Boolean(task.todayMember) || task.version <= 0) && !displayedTasks.value.some((candidate) => candidate.parentId === task.id)));
 const todayEstimatedTotalMinutes = computed(() => todayMemberLeafTasks.value.reduce((sum, task) => sum + (task.todayEstimate ?? 0), 0));
@@ -868,6 +874,10 @@ function toggleAllTodaySourceTasks() {
     return;
   }
   todayImportSelection.value = [...new Set([...todayImportSelection.value, ...todayImportSelectableIds.value])];
+}
+
+function toggleTodaySourceTaskGroup(taskIds: readonly string[]) {
+  todayImportSelection.value = toggleTaskSelectionGroup(todayImportSelection.value, taskIds);
 }
 
 function updateTodayImportTaskTitle(taskId: string, title: string) {
@@ -1585,15 +1595,14 @@ onBeforeUnmount(() => {
     <el-dialog v-model="todaySourceImportOpen" class="recurrence-dialog today-source-import-dialog" modal-class="today-source-import-overlay" title="从进行中导入" width="min(720px, 94vw)" append-to-body align-center :close-on-click-modal="false">
       <section class="today-source-import-view">
         <div class="today-source-import-head">
-          <div><strong>选择要加入今天的事项</strong><span>这里只选择事项；重复事项会自动使用每次预计，导入后仍可调整。</span></div>
+          <div><strong>选择要导入今日计划的事项</strong><span>这里只选择事项；重复事项会自动使用每次预计，导入后仍可调整。</span></div>
           <button class="secondary-button compact today-source-select-all" type="button" :disabled="!todayImportSelectableIds.length" @click="toggleAllTodaySourceTasks">{{ todayImportAllSelected ? '取消全选' : '全选' }}</button>
         </div>
         <div v-if="todayImportCandidateRows.length" class="today-import-list today-import-candidate-list">
           <div class="today-source-import-rows">
-            <label v-for="row in todayImportCandidateRows" :key="row.task.id" class="today-source-import-row" :class="{ context: !row.allocatable, child: row.depth > 0, selected: row.allocatable && todayImportSelection.includes(row.task.id) }" :style="{ '--task-depth': String(row.depth) }">
-              <span v-if="!row.allocatable" class="today-source-check-spacer" aria-hidden="true"></span>
-              <input v-else v-model="todayImportSelection" type="checkbox" :value="row.task.id" :aria-label="`${row.task.title}加入今日`" />
-              <div class="today-source-import-title"><CornerDownRight v-if="row.depth" :size="14" /><strong>{{ row.task.title }}</strong><small v-if="!row.allocatable">父事项</small></div>
+            <label v-for="row in todayImportCandidateRows" :key="row.task.id" class="today-source-import-row" :class="{ child: row.depth > 0, selected: row.checked }" :style="{ '--task-depth': String(row.depth) }">
+              <input type="checkbox" :checked="row.checked" :indeterminate="row.indeterminate" :aria-checked="row.indeterminate ? 'mixed' : row.checked" :aria-label="`${row.task.title}${row.selectableIds.length > 1 ? '全选子事项' : '导入今日计划'}`" @change="toggleTodaySourceTaskGroup(row.selectableIds)" />
+              <div class="today-source-import-title"><CornerDownRight v-if="row.depth" :size="14" /><strong>{{ row.task.title }}</strong></div>
             </label>
           </div>
         </div>

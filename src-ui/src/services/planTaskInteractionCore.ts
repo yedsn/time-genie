@@ -24,6 +24,87 @@ export function taskSubtreeIds(rows: readonly PlanTaskTreeItem[], taskId: string
   return ids;
 }
 
+export type HierarchicalTaskSelectionRow<T extends PlanTaskTreeItem> = {
+  task: T;
+  depth: number;
+  selectableIds: string[];
+  checked: boolean;
+  indeterminate: boolean;
+};
+
+/**
+ * Flattens a task forest for hierarchical checkbox pickers. Parent rows remain
+ * visible as indentation context and act as a checkbox group for their
+ * selectable descendants.
+ */
+export function hierarchicalTaskSelectionRows<T extends PlanTaskTreeItem>(
+  tasks: readonly T[],
+  selectableIds: ReadonlySet<string>,
+  selectedIds: readonly string[],
+  options: { query?: string; queryText?: (task: T) => string } = {},
+): HierarchicalTaskSelectionRow<T>[] {
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  const children = new Map<string, T[]>();
+  const roots: T[] = [];
+  for (const task of tasks) {
+    if (task.parentId && byId.has(task.parentId)) {
+      const siblings = children.get(task.parentId) ?? [];
+      siblings.push(task);
+      children.set(task.parentId, siblings);
+    } else {
+      roots.push(task);
+    }
+  }
+
+  const candidateIdsCache = new Map<string, string[]>();
+  const candidateIds = (task: T): string[] => {
+    const cached = candidateIdsCache.get(task.id);
+    if (cached) return cached;
+    const subtree = taskSubtreeIds(tasks, task.id);
+    const ids = tasks.filter((candidate) => subtree.has(candidate.id) && selectableIds.has(candidate.id)).map((candidate) => candidate.id);
+    candidateIdsCache.set(task.id, ids);
+    return ids;
+  };
+  const branchHasCandidates = (task: T): boolean => candidateIds(task).length > 0;
+
+  const keyword = options.query?.trim().toLocaleLowerCase() ?? "";
+  const matches = (task: T) => !keyword || (options.queryText?.(task) ?? "").toLocaleLowerCase().includes(keyword);
+  const branchMatches = (task: T): boolean => matches(task) || (children.get(task.id) ?? []).some(branchMatches);
+  const selected = new Set(selectedIds);
+  const rows: HierarchicalTaskSelectionRow<T>[] = [];
+
+  const flatten = (task: T, depth: number) => {
+    const ids = candidateIds(task);
+    const selectedCount = ids.filter((taskId) => selected.has(taskId)).length;
+    rows.push({
+      task,
+      depth,
+      selectableIds: ids,
+      checked: ids.length > 0 && selectedCount === ids.length,
+      indeterminate: selectedCount > 0 && selectedCount < ids.length,
+    });
+    for (const child of children.get(task.id) ?? []) {
+      if (branchHasCandidates(child)) flatten(child, depth + 1);
+    }
+  };
+
+  for (const root of roots) {
+    if (branchHasCandidates(root) && (!keyword || branchMatches(root))) flatten(root, 0);
+  }
+  return rows;
+}
+
+export function toggleTaskSelectionGroup(selectedIds: readonly string[], groupIds: readonly string[]) {
+  const normalizedGroup = [...new Set(groupIds)];
+  if (!normalizedGroup.length) return [...selectedIds];
+  const selected = new Set(selectedIds);
+  if (normalizedGroup.every((taskId) => selected.has(taskId))) {
+    const group = new Set(normalizedGroup);
+    return selectedIds.filter((taskId) => !group.has(taskId));
+  }
+  return [...selectedIds, ...normalizedGroup.filter((taskId) => !selected.has(taskId))];
+}
+
 export function taskDragTargetDepth(relatedDepth: number, pointerX: number, listLeft: number, indentThreshold = 92): 0 | 1 {
   return relatedDepth > 0 || pointerX > listLeft + indentThreshold ? 1 : 0;
 }

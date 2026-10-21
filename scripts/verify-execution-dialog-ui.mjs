@@ -53,6 +53,9 @@ function mockInitScript() {
   const activeTasks = [
     record("parent", { title: "项目", selectable: false, isLeaf: false, canAcceptChildren: true }),
     record("child", { title: "写今日计划", parentId: "parent", pathLabel: "项目 / 写今日计划", sortOrder: 20 }),
+    record("group", { title: "项目组", selectable: false, isLeaf: false, canAcceptChildren: true, sortOrder: 25 }),
+    record("group-a", { title: "分组子事项 A", parentId: "group", pathLabel: "项目组 / 分组子事项 A", sortOrder: 26 }),
+    record("group-b", { title: "分组子事项 B", parentId: "group", pathLabel: "项目组 / 分组子事项 B", sortOrder: 27 }),
     record("backlog", { title: "跨日继续的长期待办", sortOrder: 30 }),
     record("plain-done", { title: "已完成普通事项", status: "done", executionState: "done", version: 2, sortOrder: 40 }),
   ];
@@ -321,8 +324,8 @@ async function main() {
   await page.locator(".timer-task-note-popover:visible button", { hasText: "保存" }).click();
   await page.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.update.some((call) => call.note === "弹框内备注"));
 
-  // 4. 从进行中加入今日：加入后弹框保持打开并立即成为候选
-  await dialog.locator("button", { hasText: "从进行中加入" }).click();
+  // 4. 从进行中导入：导入后弹框保持打开并立即成为候选
+  await dialog.locator("button", { hasText: "从进行中导入" }).click();
   const picker = page.locator(".timer-today-picker-dialog");
   await picker.waitFor({ state: "visible" });
   await page.waitForTimeout(350);
@@ -344,28 +347,57 @@ async function main() {
   });
   if (await picker.locator(".today-plan-search, .today-plan-candidates").count()) throw new Error("执行弹框的进行中选择器仍依赖待办页样式");
   if (executePickerVisual.bodyOverflow !== "hidden" || executePickerVisual.listOverflow !== "auto" || executePickerVisual.rowHeight < 46 || executePickerVisual.opacity !== "1") throw new Error("执行弹框的进行中选择器布局异常：" + JSON.stringify(executePickerVisual));
+  const groupRow = picker.locator(".timer-today-picker-row", { hasText: "项目组" });
+  const groupCheckbox = groupRow.locator('input[type="checkbox"]');
+  const groupChildA = picker.locator(".timer-today-picker-row", { hasText: "分组子事项 A" }).locator('input[type="checkbox"]');
+  const groupChildB = picker.locator(".timer-today-picker-row", { hasText: "分组子事项 B" }).locator('input[type="checkbox"]');
+  if (!await groupCheckbox.count()) throw new Error("一级事项缺少层级勾选框");
+  if (await picker.getByText("父事项", { exact: true }).count()) throw new Error("来源导入仍显示父事项标签");
+  const [groupPadding, groupChildPadding] = await Promise.all([
+    groupRow.evaluate((element) => Number.parseFloat(getComputedStyle(element).paddingLeft)),
+    picker.locator(".timer-today-picker-row", { hasText: "分组子事项 A" }).evaluate((element) => Number.parseFloat(getComputedStyle(element).paddingLeft)),
+  ]);
+  if (groupChildPadding <= groupPadding + 10) throw new Error(`来源导入没有保留下级缩进：${groupPadding} -> ${groupChildPadding}`);
+  await groupCheckbox.check();
+  if (!await groupChildA.isChecked() || !await groupChildB.isChecked()) throw new Error("勾选一级事项没有联动全部子项");
+  await groupChildA.uncheck();
+  if (!await groupCheckbox.evaluate((element) => element.indeterminate)) throw new Error("部分子项选中时一级事项没有半选状态");
+  await groupChildA.check();
+  await groupCheckbox.uncheck();
+  if (await groupChildA.isChecked() || await groupChildB.isChecked()) throw new Error("取消一级事项没有清除全部子项");
   await page.screenshot({ path: path.join(repoRoot, ".tmp-execution-today-picker.png"), fullPage: true });
   await picker.locator("label", { hasText: "跨日继续的长期待办" }).locator("input").check();
-  await picker.locator("button", { hasText: "加入今日" }).click();
+  await picker.getByRole("button", { name: /导入 \d+ 项/ }).click();
   await page.waitForFunction((expected) => document.querySelectorAll(".timer-task-dialog .timer-task-row:not(.new-task)").length === expected, initialRowCount + 1);
-  if (!await dialog.isVisible()) throw new Error("加入今日后执行弹框不应关闭");
+  if (!await dialog.isVisible()) throw new Error("导入后执行弹框不应关闭");
 
   // 5. 执行弹框通过拖动柄右键菜单同层插入、复制当前行，并可点击实际用时调整。
   if (await dialog.locator('.timer-task-add-child').count()) throw new Error("执行弹框仍显示逐行新增子项按钮");
   const existingChildRow = dialog.locator('.timer-task-row[data-timer-task-id="child"]');
+  await dialog.locator(".timer-task-table-tools button", { hasText: "新增事项" }).click();
+  let inlineNewTaskRow = dialog.locator(".timer-task-row.new-task");
+  if (await inlineNewTaskRow.locator("button", { hasText: /保存|取消|开始/ }).count()) throw new Error("执行弹框的新增事项仍显示独立表单按钮");
+  const [firstNewRowBox, firstExistingRowBox] = await Promise.all([inlineNewTaskRow.boundingBox(), rows.first().boundingBox()]);
+  if (!firstNewRowBox || !firstExistingRowBox || firstNewRowBox.y > firstExistingRowBox.y) throw new Error("顶部新增事项没有作为列表第一条占位行");
+  await inlineNewTaskRow.locator('input[aria-label="新事项名称"]').blur();
+  await inlineNewTaskRow.waitFor({ state: "detached" });
   await existingChildRow.locator('.timer-task-drag-handle').click({ button: "right" });
   const executeRowMenu = page.locator('.task-row-context-menu:visible');
   const executeMenuItems = await executeRowMenu.getByRole("menuitem").allTextContents();
   if (executeMenuItems.join("|") !== "复制事项|新增事项|在上方插入行|在下方插入行|删除事项") throw new Error("执行弹框右键菜单顺序或文案不正确");
   await executeRowMenu.getByRole("menuitem", { name: "新增事项" }).click();
-  await dialog.locator('input[aria-label="新事项名称"]').fill("执行右键新增事项");
-  await dialog.locator('.timer-task-row.new-task button', { hasText: "保存" }).click();
+  inlineNewTaskRow = dialog.locator(".timer-task-row.new-task");
+  await inlineNewTaskRow.locator('input[aria-label="新事项名称"]').fill("执行右键新增事项");
+  await inlineNewTaskRow.locator('input[aria-label="新事项名称"]').press("Enter");
   await page.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.create.some((call) => call.title === "执行右键新增事项" && !call.parentId));
   await existingChildRow.locator('.timer-task-drag-handle').click({ button: "right" });
   const refreshedExecuteRowMenu = page.locator('.task-row-context-menu:visible');
   await refreshedExecuteRowMenu.getByRole("menuitem", { name: "在下方插入行" }).click();
-  await dialog.locator('input[aria-label="新事项名称"]').fill("执行弹框新增子项");
-  await dialog.locator('.timer-task-row.new-task button', { hasText: "保存" }).click();
+  inlineNewTaskRow = dialog.locator(".timer-task-row.new-task");
+  const [relativeNewRowBox, targetRowBox] = await Promise.all([inlineNewTaskRow.boundingBox(), existingChildRow.boundingBox()]);
+  if (!relativeNewRowBox || !targetRowBox || relativeNewRowBox.y <= targetRowBox.y) throw new Error("在下方插入行没有显示在目标事项下方");
+  await inlineNewTaskRow.locator('input[aria-label="新事项名称"]').fill("执行弹框新增子项");
+  await inlineNewTaskRow.locator('input[aria-label="新事项名称"]').press("Enter");
   await page.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.create.some((call) => call.title === "执行弹框新增子项" && call.parentId === "parent"));
   await existingChildRow.locator('.timer-task-drag-handle').click({ button: "right" });
   await page.locator('.task-row-context-menu:visible').getByRole("menuitem", { name: "复制事项" }).click();
@@ -382,31 +414,28 @@ async function main() {
   await dialog.locator(".timer-task-table-tools button", { hasText: "新增事项" }).click();
   const newTaskTitle = dialog.locator('input[aria-label="新事项名称"]');
   await newTaskTitle.fill("加入会失败的新事项");
-  await dialog.locator(".timer-task-row.new-task button", { hasText: "保存" }).click();
-  const rowError = dialog.locator(".timer-task-row-error");
+  await newTaskTitle.press("Enter");
+  const rowError = dialog.locator(".timer-task-row.new-task .timer-task-name-editor > small.error");
   await rowError.waitFor({ state: "visible" });
   if (!(await rowError.innerText()).includes("事项已创建，但加入今日失败")) throw new Error("加入失败时未给出补偿提示：" + await rowError.innerText());
   if (!(await calls()).transition.length) { /* 未触发计时转换即为预期 */ } 
   if ((await calls()).transition.length !== 0) throw new Error("加入今日失败后不应开始计时");
-  await dialog.locator(".timer-task-row.new-task button", { hasText: "取消" }).click();
+  await rowError.locator("xpath=ancestor::div[contains(@class,'timer-task-row')]").locator('input[aria-label="新事项名称"]').press("Escape");
 
-  // 7. 新建并开始走原子计时转换请求，成功后关闭弹框
+  // 7. 列表内新建后保持当前弹框，可继续直接编辑或开始事项。
   await dialog.locator("button", { hasText: "新增事项" }).click();
-  await dialog.locator('input[aria-label="新事项名称"]').fill("新建并开始的事项");
-  await dialog.locator(".timer-task-row.new-task button", { hasText: "开始" }).click();
-  await page.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.transition.some((call) => call.newTask?.title === "新建并开始的事项"));
-  const transitionCall = (await calls()).transition.at(-1);
-  if (!transitionCall.newTask || transitionCall.newTask.subjectId !== "subject-a") throw new Error("新建并开始没有携带主体信息");
-  await dialog.waitFor({ state: "hidden" });
+  const inlineCreatedTitle = dialog.locator('input[aria-label="新事项名称"]');
+  await inlineCreatedTitle.fill("列表内创建的事项");
+  await inlineCreatedTitle.press("Enter");
+  await page.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.create.some((call) => call.title === "列表内创建的事项"));
+  if (!await dialog.isVisible()) throw new Error("列表内新增事项后执行弹框不应关闭");
 
   // 8. 空今日计划的主体：空状态保留两条补充入口
-  await page.locator(".global-timer-main").click();
-  await dialog.waitFor({ state: "visible" });
   await dialog.locator(".timer-task-subject-tabs button", { hasText: "个人" }).click();
   const empty = dialog.locator(".timer-task-empty");
   await empty.waitFor({ state: "visible" });
   if (await empty.locator("button", { hasText: "新增事项" }).count() !== 1) throw new Error("空状态缺少新增今日事项入口");
-  if (await empty.locator("button", { hasText: "从进行中加入" }).count() !== 1) throw new Error("空状态缺少从进行中加入入口");
+  if (await empty.locator("button", { hasText: "从进行中导入" }).count() !== 1) throw new Error("空状态缺少从进行中导入入口");
   if (await dialog.locator(".timer-task-row:not(.new-task)").count() !== 0) throw new Error("空计划主体不应展示其他主体事项");
 
   // 9. 回到工作主体后验证当天已完成事项可从执行弹框继续，计时转换携带恢复版本。
@@ -462,7 +491,7 @@ async function main() {
   const allocationNameInput = allocationNameCell.locator('input[data-timer-task-field="title"]');
   const [allocationNameCellBox, allocationNameInputBox] = await Promise.all([allocationNameCell.boundingBox(), allocationNameInput.boundingBox()]);
   if (!allocationNameCellBox || !allocationNameInputBox || allocationNameInputBox.width < allocationNameCellBox.width - 105) throw new Error("未归属时间的事项输入框没有填满事项列：" + JSON.stringify({ allocationNameCellBox, allocationNameInputBox }));
-  await unassignedDialog.locator('button', { hasText: "从进行中加入" }).click();
+  await unassignedDialog.locator('button', { hasText: "从进行中导入" }).click();
   const unassignedPicker = unassignedPage.locator('.timer-today-picker-dialog');
   await unassignedPicker.waitFor({ state: "visible" });
   await unassignedPage.waitForTimeout(350);
@@ -489,7 +518,7 @@ async function main() {
   await unassignedPicker.waitFor({ state: "hidden" });
   await unassignedDialog.locator('.timer-task-table-tools button', { hasText: "新增事项" }).click();
   await unassignedDialog.locator('input[aria-label="新事项名称"]').fill("未归属弹框新增事项");
-  await unassignedDialog.locator('.timer-task-row.new-task button', { hasText: "保存" }).click();
+  await unassignedDialog.locator('input[aria-label="新事项名称"]').press("Enter");
   await unassignedPage.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.create.some((call) => call.title === "未归属弹框新增事项" && !call.parentId));
   const unassignedRoot = (await unassignedCalls()).create.find((call) => call.title === "未归属弹框新增事项");
   const unassignedRootRow = unassignedDialog.locator(`[data-timer-task-id="${unassignedRoot.id}"]`);
@@ -501,12 +530,12 @@ async function main() {
   if (unassignedMenuItems.join("|") !== "复制事项|新增事项|在上方插入行|在下方插入行|删除事项") throw new Error("未归属弹框右键菜单顺序或文案不正确");
   await unassignedRowMenu.getByRole("menuitem", { name: "新增事项" }).click();
   await unassignedDialog.locator('input[aria-label="新事项名称"]').fill("未归属右键新增事项");
-  await unassignedDialog.locator('.timer-task-row.new-task button', { hasText: "保存" }).click();
+  await unassignedDialog.locator('input[aria-label="新事项名称"]').press("Enter");
   await unassignedPage.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.create.some((call) => call.title === "未归属右键新增事项" && !call.parentId));
   await unassignedChildRow.locator('.timer-task-drag-handle').click({ button: "right" });
   await unassignedPage.locator('.task-row-context-menu:visible').getByRole("menuitem", { name: "在下方插入行" }).click();
   await unassignedDialog.locator('input[aria-label="新事项名称"]').fill("未归属弹框新增子项");
-  await unassignedDialog.locator('.timer-task-row.new-task button', { hasText: "保存" }).click();
+  await unassignedDialog.locator('input[aria-label="新事项名称"]').press("Enter");
   await unassignedPage.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.create.some((call) => call.title === "未归属弹框新增子项" && call.parentId === "parent"));
   await unassignedDialog.getByRole("button", { name: "调整写今日计划今日实际" }).click();
   const unassignedActualPopover = unassignedPage.locator('.el-popper:visible .actual-adjustment-inline').filter({ hasText: "写今日计划 · 今日实际" }).last();

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { contextMenuPosition, effectiveTodayEstimate, planTaskMoveIntent, taskDragTargetDepth, taskDragTargetInvalid, taskSubtreeIds, todayEstimateDraft } from "../.tmp-plan-task-interactions-test/planTaskInteractionCore.js";
+import { contextMenuPosition, effectiveTodayEstimate, hierarchicalTaskSelectionRows, planTaskMoveIntent, taskDragTargetDepth, taskDragTargetInvalid, taskSubtreeIds, todayEstimateDraft, toggleTaskSelectionGroup } from "../.tmp-plan-task-interactions-test/planTaskInteractionCore.js";
 
 const rows = [
   { id: "a" },
@@ -16,6 +16,26 @@ assert.deepEqual(planTaskMoveIntent([rows[0], rows[1], rows[3], rows[2], rows[4]
 assert.deepEqual(planTaskMoveIntent([rows[0], rows[1], rows[2], rows[3], rows[4]], "b", new Set(["b"]), 1, false), { parentId: "a", previousSiblingId: "a2", nextSiblingId: undefined });
 assert.equal(planTaskMoveIntent(rows, "a", new Set(["a", "a1", "a2"]), 1, true), undefined);
 assert.deepEqual([...taskSubtreeIds(rows, "a")], ["a", "a1", "a2"]);
+const selectableIds = new Set(["a1", "a2", "b1"]);
+const pickerRows = hierarchicalTaskSelectionRows(rows, selectableIds, []);
+assert.deepEqual(pickerRows.map((row) => [row.task.id, row.depth, row.selectableIds]), [
+  ["a", 0, ["a1", "a2"]],
+  ["a1", 1, ["a1"]],
+  ["a2", 1, ["a2"]],
+  ["b", 0, ["b1"]],
+  ["b1", 1, ["b1"]],
+]);
+const partialPickerRows = hierarchicalTaskSelectionRows(rows, selectableIds, ["a1"]);
+assert.deepEqual(partialPickerRows[0], {
+  task: rows[0], depth: 0, selectableIds: ["a1", "a2"], checked: false, indeterminate: true,
+});
+const completePickerRows = hierarchicalTaskSelectionRows(rows, selectableIds, ["a1", "a2"]);
+assert.equal(completePickerRows[0].checked, true);
+assert.equal(completePickerRows[0].indeterminate, false);
+assert.deepEqual(hierarchicalTaskSelectionRows(rows, selectableIds, [], { query: "a2", queryText: (task) => task.id }).map((row) => row.task.id), ["a", "a1", "a2"]);
+assert.deepEqual(toggleTaskSelectionGroup([], ["a1", "a2"]), ["a1", "a2"]);
+assert.deepEqual(toggleTaskSelectionGroup(["a1", "a2"], ["a1", "a2"]), []);
+assert.deepEqual(toggleTaskSelectionGroup(["b1"], ["a1", "a2"]), ["b1", "a1", "a2"]);
 assert.equal(taskDragTargetDepth(0, 80, 0), 0);
 assert.equal(taskDragTargetDepth(0, 100, 0), 1);
 assert.equal(taskDragTargetDepth(1, 20, 0), 1);

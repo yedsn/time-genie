@@ -580,10 +580,11 @@ async function mainSharedPlanEditor() {
   await sourceImportDialog.waitFor({ state: "visible" });
   if (await sourceImport.getByRole("textbox").count()) throw new Error("从进行中导入不应包含搜索或时间输入");
   if (await sourceImport.locator(".today-import-estimate").count()) throw new Error("从进行中导入不应显示预计时间编辑器");
+  if (await sourceImport.getByText("父事项", { exact: true }).count()) throw new Error("从进行中导入仍显示父事项标签");
   await sourceImport.getByRole("button", { name: "全选", exact: true }).click();
-  if (!await sourceImport.getByRole("checkbox", { name: "长期待办加入今日" }).isChecked()) throw new Error("来源导入弹框未选中事项");
-  if (!await sourceImport.getByRole("checkbox", { name: "预计自动加入事项加入今日" }).isChecked()) throw new Error("全选未选中全部可导入事项");
-  await sourceImport.getByRole("checkbox", { name: "预计自动加入事项加入今日" }).uncheck();
+  if (!await sourceImport.getByRole("checkbox", { name: "长期待办导入今日计划" }).isChecked()) throw new Error("来源导入弹框未选中事项");
+  if (!await sourceImport.getByRole("checkbox", { name: "预计自动加入事项导入今日计划" }).isChecked()) throw new Error("全选未选中全部可导入事项");
+  await sourceImport.getByRole("checkbox", { name: "预计自动加入事项导入今日计划" }).uncheck();
   await page.waitForTimeout(100);
   const footerButtons = await sourceImportDialog.locator(".el-dialog__footer button").allTextContents();
   const importAction = sourceImportDialog.locator(".el-dialog__footer button").filter({ hasText: "导入" });

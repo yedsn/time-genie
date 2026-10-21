@@ -13,7 +13,7 @@ import {
   type ExecutionPanelMode,
   type ExecutionPanelTaskRow,
 } from "../services/executionTaskPanelCore";
-import { contextMenuPosition, taskSubtreeIds } from "../services/planTaskInteractionCore";
+import { contextMenuPosition, hierarchicalTaskSelectionRows, taskSubtreeIds, toggleTaskSelectionGroup } from "../services/planTaskInteractionCore";
 import { createTaskTreeSortable } from "../services/taskTreeSortable";
 import { parseActualMinutes } from "../services/quickActualAdjustmentCore";
 import { readRememberedPanelSubjectId, rememberPanelSubjectId } from "../services/executionPanelSubjectPreference";
@@ -43,6 +43,7 @@ const store = useWorkdayStore();
 const subjectId = ref("");
 const query = ref("");
 const searchRef = ref<HTMLInputElement>();
+const newTaskInputRef = ref<HTMLInputElement>();
 const rowsRef = ref<HTMLElement>();
 const returnFocusElement = ref<HTMLElement>();
 const drafts = reactive<Record<string, TimerDialogDraft>>({});
@@ -130,6 +131,19 @@ const panelTasks = computed<PanelTask[]>(() => {
   return snapshot.value?.tasks.map(snapshotTaskToPanelTask) ?? store.tasks.map((task) => ({ ...task, totalMinutes: task.actual, completedToday: false }));
 });
 const rows = computed(() => executionPanelRows<PanelTask>(panelTasks.value, subjectId.value, query.value));
+const newTaskInsertIndex = computed(() => {
+  if (!newTask.open || !newTask.targetId) return 0;
+  const targetIndex = rows.value.findIndex((row) => row.task.id === newTask.targetId);
+  if (targetIndex < 0 || newTask.placement === "before") return Math.max(0, targetIndex);
+  const targetDepth = rows.value[targetIndex].depth;
+  let insertIndex = targetIndex + 1;
+  while (insertIndex < rows.value.length && rows.value[insertIndex].depth > targetDepth) insertIndex += 1;
+  return insertIndex;
+});
+const newTaskDepth = computed(() => {
+  const target = rows.value.find((row) => row.task.id === newTask.targetId);
+  return target?.depth ?? (newTask.parentId ? 1 : 0);
+});
 const openLeafCount = computed(() => rows.value.filter((row) => !row.hasChildren && !row.task.completedToday).length);
 const completedLeafCount = computed(() => rows.value.filter((row) => !row.hasChildren && row.task.completedToday).length);
 const currentStatus = computed(() => executionPanelCurrentStatus({
@@ -143,12 +157,21 @@ const currentSubject = computed(() => store.subjects.find((subject) => subject.i
 const todayPlannedIds = computed(() => new Set(store.todayPlanTasks
   .filter((task) => task.todayMember && task.dayInstanceSourceTaskId)
   .map((task) => task.dayInstanceSourceTaskId!)));
+const todayPickerSourceTasks = computed(() => store.tasks.filter((task) => task.subjectId === subjectId.value && task.status === "open"));
+const todayPickerCandidateSelectableIds = computed(() => new Set(todayPickerSourceTasks.value
+  .filter((task) => task.selectable && !todayPlannedIds.value.has(task.id)
+    && !todayPickerSourceTasks.value.some((candidate) => candidate.parentId === task.id))
+  .map((task) => task.id)));
 const todayPickerCandidates = computed(() => {
-  const keyword = todayPickerQuery.value.trim().toLocaleLowerCase();
-  return store.tasks
-    .filter((task) => task.subjectId === subjectId.value && task.status === "open" && task.selectable && !todayPlannedIds.value.has(task.id))
-    .filter((task) => !keyword || `${task.pathLabel ?? task.title} ${task.note ?? ""}`.toLocaleLowerCase().includes(keyword));
+  return hierarchicalTaskSelectionRows(
+    todayPickerSourceTasks.value,
+    todayPickerCandidateSelectableIds.value,
+    todayPickerSelected.value,
+    { query: todayPickerQuery.value, queryText: (task) => `${task.pathLabel ?? task.title} ${task.note ?? ""}` },
+  );
 });
+const todayPickerSelectableIds = computed(() => [...todayPickerCandidateSelectableIds.value]);
+const todayPickerAllSelected = computed(() => todayPickerSelectableIds.value.length > 0 && todayPickerSelectableIds.value.every((taskId) => todayPickerSelected.value.includes(taskId)));
 const actualTask = computed(() => panelTasks.value.find((task) => task.id === actualTaskId.value));
 const actualBaseline = computed(() => actualTask.value?.directMinutes ?? 0);
 const actualParsed = computed(() => parseActualMinutes(actualTargetText.value));
@@ -233,7 +256,7 @@ const treeSortable = createTaskTreeSortable({
   rowSelector: ".timer-task-row[data-timer-task-id]",
   handleSelector: ".timer-task-drag-handle",
   taskIdAttribute: "data-timer-task-id",
-  disabled: () => Boolean(query.value.trim()),
+  disabled: () => Boolean(query.value.trim()) || newTask.open,
   subtreeIds,
   parentId: (taskId) => rows.value.find((row) => row.task.id === taskId)?.task.parentId,
   onStart: () => { moving.value = true; },
@@ -256,7 +279,7 @@ const treeSortable = createTaskTreeSortable({
   },
 });
 
-watch([() => props.modelValue, rows, query], async ([open]) => {
+watch([() => props.modelValue, rows, query, () => newTask.open], async ([open]) => {
   if (!open) { treeSortable.destroy(); return; }
   await nextTick();
   treeSortable.mount();
@@ -309,6 +332,25 @@ async function confirmAddExistingTodayTasks() {
   } catch (error) {
     ElMessage.error(errorText(error, "加入今日失败"));
   }
+}
+
+function openTodayPicker() {
+  todayPickerSelected.value = [];
+  todayPickerQuery.value = "";
+  todayPickerOpen.value = true;
+}
+
+function toggleAllTodayPickerTasks() {
+  if (todayPickerAllSelected.value) {
+    const selectable = new Set(todayPickerSelectableIds.value);
+    todayPickerSelected.value = todayPickerSelected.value.filter((taskId) => !selectable.has(taskId));
+    return;
+  }
+  todayPickerSelected.value = [...new Set([...todayPickerSelected.value, ...todayPickerSelectableIds.value])];
+}
+
+function toggleTodayPickerGroup(taskIds: readonly string[]) {
+  todayPickerSelected.value = toggleTaskSelectionGroup(todayPickerSelected.value, taskIds);
 }
 
 function draftFor(task: PanelTask) {
@@ -676,24 +718,35 @@ async function selectSubject(nextSubjectId: string) {
   else await store.loadExecutionSnapshot(nextSubjectId);
 }
 
-function openNewTask(parentId = "") {
+async function focusNewTaskInput() {
+  await nextTick();
+  newTaskInputRef.value?.focus();
+}
+
+function openNewTask() {
   closeRowContextMenu();
+  if (newTask.open) { void focusNewTaskInput(); return; }
+  query.value = "";
+  const firstRow = rows.value[0];
   newTask.open = true;
-  newTask.parentId = parentId;
-  newTask.targetId = "";
-  newTask.placement = "after";
+  newTask.parentId = firstRow?.task.parentId ?? "";
+  newTask.targetId = firstRow?.task.id ?? "";
+  newTask.placement = "before";
   newTask.title = "";
   newTask.error = "";
+  void focusNewTaskInput();
 }
 
 function openRelativeTask(task: PanelTask, placement: "before" | "after") {
   closeRowContextMenu();
+  if (newTask.open) { void focusNewTaskInput(); return; }
   newTask.open = true;
   newTask.parentId = task.parentId ?? "";
   newTask.targetId = task.id;
   newTask.placement = placement;
   newTask.title = "";
   newTask.error = "";
+  void focusNewTaskInput();
 }
 
 function resetNewTask() {
@@ -706,29 +759,24 @@ function resetNewTask() {
   newTask.error = "";
 }
 
-async function createNewTask(startAfterCreate = false) {
+let newTaskSavePromise: Promise<boolean> | undefined;
+
+function createNewTask() {
+  if (newTaskSavePromise) return newTaskSavePromise;
+  const operation = persistNewTask();
+  newTaskSavePromise = operation;
+  void operation.finally(() => {
+    if (newTaskSavePromise === operation) newTaskSavePromise = undefined;
+  });
+  return operation;
+}
+
+async function persistNewTask(): Promise<boolean> {
   const title = newTask.title.trim();
-  if (!title) { newTask.error = "事项名称不能为空"; return; }
+  if (!title) { resetNewTask(); return false; }
   newTask.saving = true;
   newTask.error = "";
   try {
-    if (startAfterCreate && props.mode === "execute" && !newTask.targetId) {
-      const parent = newTask.parentId ? store.todayPlanTasks.find((task) => task.id === newTask.parentId) : undefined;
-      const result = await store.transitionTimer({
-        newTask: {
-          subjectId: subjectId.value,
-          parentId: newTask.parentId || undefined,
-          expectedParentVersion: parent?.version,
-          title,
-          dayInstanceDate: store.workspaceToday,
-        },
-      }, props.timerNote ?? "");
-      resetNewTask();
-      if (result.previousStopResult && !result.noOp) ElMessage.success("已切换事项，上一段计时可稍后确认归属");
-      emit("timerStarted");
-      emit("update:modelValue", false);
-      return;
-    }
     const taskId = newTask.targetId
       ? await store.createTaskRelative(newTask.targetId, newTask.placement, title)
       : await (async () => {
@@ -753,17 +801,20 @@ async function createNewTask(startAfterCreate = false) {
     recentTaskId.value = taskId;
     resetNewTask();
     window.setTimeout(() => { if (recentTaskId.value === taskId) recentTaskId.value = ""; }, 1_200);
-    if (startAfterCreate) {
-      const result = await store.transitionTimer({ taskId }, props.timerNote ?? "");
-      if (result.previousStopResult && !result.noOp) ElMessage.success("已切换事项，上一段计时可稍后确认归属");
-      emit("timerStarted");
-      emit("update:modelValue", false);
-    }
+    return true;
   } catch (error) {
     newTask.error = errorText(error, "新事项保存失败");
+    await focusNewTaskInput();
+    return false;
   } finally {
     newTask.saving = false;
   }
+}
+
+function handleNewTaskBlur() {
+  if (newTask.saving) return;
+  if (!newTask.title.trim()) resetNewTask();
+  else if (!newTask.error) void createNewTask();
 }
 
 function rowContextTask() {
@@ -1039,7 +1090,7 @@ function formatTime(timestamp: number) {
         <button v-for="subject in store.subjects" :key="subject.id" type="button" role="tab" :aria-selected="subjectId === subject.id" :class="{ active: subjectId === subject.id }" @click="selectSubject(subject.id)">{{ subject.name }}</button>
       </div>
       <label class="timer-task-search"><Search :size="15" /><input ref="searchRef" v-model="query" placeholder="搜索当前主体事项" aria-label="搜索执行事项" /></label>
-      <button v-if="usesTodayPlan" class="secondary-button compact" type="button" @click="todayPickerOpen = true"><ListTodo :size="14" />从进行中加入</button>
+      <button v-if="usesTodayPlan" class="secondary-button compact" type="button" @click="openTodayPicker"><ListTodo :size="14" />从进行中导入</button>
     </div>
 
     <div class="timer-task-dialog-summary">
@@ -1058,16 +1109,24 @@ function formatTime(timestamp: number) {
       <div class="timer-task-list-head" aria-hidden="true"><span>事项</span><span>今日预计</span><span>{{ presentation.showAllocation ? '已确认实际' : '已确认实际' }}</span><span>{{ presentation.showAllocation ? '本次分配' : '操作' }}</span></div>
       <div v-if="panelInitialLoading" class="timer-task-empty timer-task-loading" role="status"><LoaderCircle :size="22" class="spin" /><strong>正在加载事项…</strong><span>列表准备好后即可编辑或开始执行。</span></div>
 
-      <div v-else-if="newTask.open" class="timer-task-row new-task" :class="{ child: newTask.parentId }">
-        <div class="timer-task-name-cell"><CornerDownRight v-if="newTask.parentId" :size="14" /><div class="timer-task-name-editor"><input v-model="newTask.title" placeholder="新事项名称" aria-label="新事项名称" @keydown.enter="createNewTask(false)" /></div></div>
-        <span class="timer-task-estimate-cell readonly empty">—</span>
-        <span class="timer-task-actual-cell">{{ newTask.targetId ? (newTask.placement === 'before' ? '插入上方' : '插入下方') : '新事项' }}</span>
-        <div class="timer-task-actions"><button class="secondary-button compact" type="button" :disabled="newTask.saving" @click="resetNewTask">取消</button><button class="secondary-button compact" type="button" :disabled="newTask.saving" @click="createNewTask(false)">保存</button><button v-if="presentation.showTimerActions" class="primary-button compact" type="button" :disabled="newTask.saving" @click="createNewTask(true)"><LoaderCircle v-if="newTask.saving" :size="13" class="spin" /><Play v-else :size="13" fill="currentColor" />开始</button></div>
-        <small v-if="newTask.error" class="timer-task-row-error">{{ newTask.error }}</small>
-      </div>
+      <div v-if="!panelInitialLoading && (rows.length || newTask.open)" ref="rowsRef" class="timer-task-sortable-rows" :class="{ moving }">
+        <div v-if="newTask.open" class="timer-task-row new-task" :class="{ child: newTaskDepth > 0, saving: newTask.saving }" :data-depth="newTaskDepth" :style="{ order: newTaskInsertIndex, '--task-depth': String(newTaskDepth) }">
+          <div class="timer-task-name-cell">
+            <span class="timer-task-drag-placeholder" aria-hidden="true"><GripVertical :size="14" /></span>
+            <span v-if="presentation.showAllocation" class="timer-task-complete-placeholder" aria-hidden="true"><Circle :size="18" /></span>
+            <CornerDownRight v-if="newTaskDepth" :size="14" />
+            <div class="timer-task-name-editor">
+              <input ref="newTaskInputRef" v-model="newTask.title" placeholder="输入事项名称" aria-label="新事项名称" :disabled="newTask.saving" @keydown.enter.prevent="($event.target as HTMLInputElement).blur()" @keydown.esc.stop.prevent="resetNewTask" @blur="handleNewTaskBlur" />
+              <small v-if="newTask.error" class="error">{{ newTask.error }}</small>
+              <small v-else>{{ newTask.saving ? '正在创建…' : '回车或移开焦点后创建，留空则取消' }}</small>
+            </div>
+          </div>
+          <span class="timer-task-estimate-cell readonly empty">—</span>
+          <span class="timer-task-actual-cell">—</span>
+          <div class="timer-task-actions timer-task-new-hint"><span>{{ newTask.targetId ? (newTask.placement === 'before' ? '插入上方' : '插入下方') : '新增事项' }}</span></div>
+        </div>
 
-      <div v-if="!panelInitialLoading && rows.length" ref="rowsRef" class="timer-task-sortable-rows" :class="{ moving }">
-        <div v-for="row in rows" :key="row.task.id" class="timer-task-row" :data-timer-task-id="row.task.id" :data-depth="row.depth" :class="[{ parent: row.hasChildren, child: row.depth > 0, recent: recentTaskId === row.task.id, active: store.runningEntry?.defaultTask === row.task.id, completed: row.task.completedToday }, `state-${actionFor(row.task, row.hasChildren).mode}`]">
+        <div v-for="(row, rowIndex) in rows" :key="row.task.id" class="timer-task-row" :data-timer-task-id="row.task.id" :data-depth="row.depth" :style="{ order: rowIndex >= newTaskInsertIndex && newTask.open ? rowIndex + 1 : rowIndex }" :class="[{ parent: row.hasChildren, child: row.depth > 0, recent: recentTaskId === row.task.id, active: store.runningEntry?.defaultTask === row.task.id, completed: row.task.completedToday }, `state-${actionFor(row.task, row.hasChildren).mode}`]">
           <div class="timer-task-name-cell" :style="{ '--task-depth': String(row.depth) }">
             <button class="timer-task-drag-handle" type="button" :disabled="Boolean(query.trim())" :class="{ active: rowContextTaskId === row.task.id }" :title="query.trim() ? '清空搜索后调整顺序和层级' : '拖动排序；右键可复制、插入或删除事项'" :aria-label="`${row.task.title}拖动排序，右键打开行菜单`" @pointerdown="prepareSubtreeDrag(row.task.id)" @contextmenu="openRowContextMenu($event, row.task)"><GripVertical :size="14" /></button>
             <button v-if="presentation.showAllocation" class="timer-task-complete-check" :class="{ completed: !row.hasChildren && allocationDraft(row.task.id, row.task.title).completeTask }" type="button" :disabled="row.hasChildren" :title="row.hasChildren ? '父事项不能直接完成' : '保存归属时同时完成事项'" :aria-label="row.hasChildren ? `${row.task.title}为父事项，不能直接完成` : `${row.task.title}保存归属时完成`" :aria-pressed="row.hasChildren ? undefined : allocationDraft(row.task.id, row.task.title).completeTask" @click="allocationDraft(row.task.id, row.task.title).completeTask = !allocationDraft(row.task.id, row.task.title).completeTask">
@@ -1128,7 +1187,7 @@ function formatTime(timestamp: number) {
       </div>
       <small v-if="query.trim()" class="timer-task-search-drag-hint">搜索状态下不能拖动；清空搜索后可调整顺序和层级。</small>
 
-      <div v-if="!panelInitialLoading && !rows.length && !newTask.open" class="timer-task-empty"><AlertCircle :size="22" /><strong>{{ query ? '没有匹配事项' : (usesTodayPlan ? '今日还没有事项' : '当前主体暂无可执行事项') }}</strong><span>{{ query ? '换个关键词，或清空搜索查看全部事项。' : (usesTodayPlan ? '可以新建今日事项，或从进行中加入今日计划。' : '可以直接在这里新建事项。') }}</span><div v-if="!query"><button class="primary-button compact" type="button" @click="openNewTask()"><Plus :size="14" />新增事项</button><button v-if="usesTodayPlan" class="secondary-button compact" type="button" @click="todayPickerOpen = true">从进行中加入</button></div></div>
+        <div v-if="!panelInitialLoading && !rows.length && !newTask.open" class="timer-task-empty"><AlertCircle :size="22" /><strong>{{ query ? '没有匹配事项' : (usesTodayPlan ? '今日还没有事项' : '当前主体暂无可执行事项') }}</strong><span>{{ query ? '换个关键词，或清空搜索查看全部事项。' : (usesTodayPlan ? '可以新建今日事项，或从进行中导入今日计划。' : '可以直接在这里新建事项。') }}</span><div v-if="!query"><button class="primary-button compact" type="button" @click="openNewTask()"><Plus :size="14" />新增事项</button><button v-if="usesTodayPlan" class="secondary-button compact" type="button" @click="openTodayPicker">从进行中导入</button></div></div>
     </div>
 
     <template #footer>
@@ -1153,19 +1212,24 @@ function formatTime(timestamp: number) {
     </template>
   </el-dialog>
 
-  <el-dialog v-model="todayPickerOpen" class="recurrence-dialog timer-today-picker-dialog" modal-class="timer-today-picker-overlay" title="从进行中加入今日" width="min(680px, 94vw)" append-to-body align-center :close-on-click-modal="false">
+  <el-dialog v-model="todayPickerOpen" class="recurrence-dialog timer-today-picker-dialog" modal-class="timer-today-picker-overlay" title="从进行中导入" width="min(720px, 94vw)" append-to-body align-center :close-on-click-modal="false">
     <section class="timer-today-picker-view">
       <label class="timer-today-picker-search"><Search :size="15" /><input v-model="todayPickerQuery" placeholder="搜索事项或父级路径" aria-label="搜索进行中事项" /></label>
-      <div class="timer-today-picker-summary"><strong>进行中事项</strong><span>选择后加入今日计划，再继续执行或分配时间。</span></div>
-      <div class="timer-today-picker-list">
-        <label v-for="task in todayPickerCandidates" :key="task.id" class="timer-today-picker-row" :class="{ selected: todayPickerSelected.includes(task.id) }">
-          <input v-model="todayPickerSelected" type="checkbox" :value="task.id" :aria-label="`${task.title}加入今日`" />
-          <span><strong>{{ task.title }}</strong><small v-if="task.pathLabel && task.pathLabel !== task.title">{{ task.pathLabel }}</small></span>
-        </label>
-        <div v-if="!todayPickerCandidates.length" class="timer-today-picker-empty"><AlertCircle :size="22" /><strong>{{ todayPickerQuery ? '没有匹配事项' : '没有可加入的进行中事项' }}</strong><span>{{ todayPickerQuery ? '换个关键词试试。' : '当前进行中的事项都已经加入今天。' }}</span></div>
+      <div class="today-source-import-head">
+        <div><strong>选择要导入今日计划的事项</strong><span>保留事项层级；勾选一级事项会同时选中它下面的全部子事项。</span></div>
+        <button class="secondary-button compact today-source-select-all" type="button" :disabled="!todayPickerSelectableIds.length" @click="toggleAllTodayPickerTasks">{{ todayPickerAllSelected ? '取消全选' : '全选' }}</button>
+      </div>
+      <div class="today-import-list today-import-candidate-list timer-today-picker-list">
+        <div class="today-source-import-rows">
+          <label v-for="row in todayPickerCandidates" :key="row.task.id" class="today-source-import-row timer-today-picker-row" :class="{ child: row.depth > 0, selected: row.checked }" :style="{ '--task-depth': String(row.depth) }">
+            <input type="checkbox" :checked="row.checked" :indeterminate="row.indeterminate" :aria-checked="row.indeterminate ? 'mixed' : row.checked" :aria-label="`${row.task.title}${row.selectableIds.length > 1 ? '全选子事项' : '导入今日计划'}`" @change="toggleTodayPickerGroup(row.selectableIds)" />
+            <div class="today-source-import-title"><CornerDownRight v-if="row.depth" :size="14" /><strong>{{ row.task.title }}</strong></div>
+          </label>
+        </div>
+        <div v-if="!todayPickerCandidates.length" class="timer-today-picker-empty"><AlertCircle :size="22" /><strong>{{ todayPickerQuery ? '没有匹配事项' : '没有可导入的进行中事项' }}</strong><span>{{ todayPickerQuery ? '换个关键词试试。' : '当前进行中的事项都已经导入今日计划。' }}</span></div>
       </div>
     </section>
-    <template #footer><div class="timer-today-picker-footer"><span>已选择 {{ todayPickerSelected.length }} 项</span><button class="secondary-button" type="button" @click="todayPickerOpen = false">取消</button><button class="primary-button" type="button" :disabled="!todayPickerSelected.length" @click="confirmAddExistingTodayTasks">加入今日（{{ todayPickerSelected.length }}）</button></div></template>
+    <template #footer><div class="timer-today-picker-footer"><span>已选择 {{ todayPickerSelected.length }} 项</span><button class="secondary-button" type="button" @click="todayPickerOpen = false">取消</button><button class="primary-button" type="button" :disabled="!todayPickerSelected.length" @click="confirmAddExistingTodayTasks">导入 {{ todayPickerSelected.length }} 项</button></div></template>
   </el-dialog>
 
   <Teleport to="body">
