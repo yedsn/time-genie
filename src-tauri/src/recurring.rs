@@ -768,6 +768,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: None,
                 title: "重复事项".to_string(),
                 planned_date: None,
@@ -857,6 +858,7 @@ mod tests {
                     &database,
                     TaskCreateRequest {
                         subject_id,
+                        day_instance_date: None,
                         parent_id: Some(parent_task_id),
                         title: "嵌套重复事项".to_string(),
                         planned_date: None,
@@ -895,6 +897,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id,
+                day_instance_date: None,
                 parent_id: Some(task_id.clone()),
                 title: "子事项".to_string(),
                 planned_date: None,

@@ -77,14 +77,14 @@ const todayPickerSelected = ref<string[]>([]);
 const moreDrafts = reactive<Record<string, { estimate: string; planDate: string; recurrence: "none" | "daily" | "weekdays" | "weekly"; recurrenceStart: string; recurrenceWeekdays: number[] }>>({});
 const weekdayLabels = ["一", "二", "三", "四", "五", "六", "日"];
 
-const activeTask = computed(() => store.tasks.find((task) => task.id === store.runningEntry?.defaultTask));
+const activeTask = computed(() => [...store.todayPlanTasks, ...store.tasks].find((task) => task.id === store.runningEntry?.defaultTask));
 const presentation = computed(() => executionPanelPresentation(props.mode));
 const snapshot = computed(() => store.executionSnapshots[subjectId.value]);
 const panelInitialLoading = computed(() => props.mode === "execute"
   ? store.todayPlanLoading
   : !snapshot.value && (store.workspaceLoading || store.executionSnapshotLoading[subjectId.value]));
 function snapshotTaskToPanelTask(task: ActualAdjustmentSnapshotTaskRecord): PanelTask {
-  const live = store.tasks.find((item) => item.id === task.id);
+  const live = [...store.todayPlanTasks, ...store.tasks].find((item) => item.id === task.id);
   return {
     id: task.id,
     subjectId: task.subjectId,
@@ -139,7 +139,9 @@ const currentStatus = computed(() => executionPanelCurrentStatus({
   candidateTaskIds: panelTasks.value.map((task) => task.id),
 }));
 const currentSubject = computed(() => store.subjects.find((subject) => subject.id === subjectId.value));
-const todayPlannedIds = computed(() => new Set(store.todayPlanTasks.filter((task) => task.todayMember).map((task) => task.id)));
+const todayPlannedIds = computed(() => new Set(store.todayPlanTasks
+  .filter((task) => task.todayMember && task.dayInstanceSourceTaskId)
+  .map((task) => task.dayInstanceSourceTaskId!)));
 const todayPickerCandidates = computed(() => {
   const keyword = todayPickerQuery.value.trim().toLocaleLowerCase();
   return store.tasks
@@ -499,6 +501,7 @@ async function saveActualAdjustment() {
     await store.saveActualAdjustmentBatch({
       subjectId: actualSnapshotTask.subjectId,
       workDate: actualSnapshot.workDate,
+      dayInstanceDate: props.mode === "execute" ? store.workspaceToday : undefined,
       clientRequestId: crypto.randomUUID(),
       batchId: crypto.randomUUID(),
       note: actualNote.value.trim() || undefined,
@@ -578,21 +581,37 @@ async function saveField(task: PanelTask, field: TimerDialogDraftField) {
   return enqueueSave(task.id, async () => {
     let mutatedStoreTitle = false;
     try {
+      const source = task.dayInstanceSourceTaskId
+        ? store.tasks.find((item) => item.id === task.dayInstanceSourceTaskId)
+        : undefined;
+      let applyToFuture = false;
+      if (props.mode === "execute" && source?.recurrence) {
+        const scope = await ElMessageBox.confirm(
+          `要把“${task.title}”的修改应用到今后的重复事项吗？`,
+          "修改重复事项",
+          { confirmButtonText: "修改今后全部", cancelButtonText: "仅修改今天", distinguishCancelAndClose: true, type: "info" },
+        ).then(() => "future" as const).catch((action) => action === "cancel" ? "today" as const : "closed" as const);
+        if (scope === "closed") return false;
+        applyToFuture = scope === "future";
+      }
       if (field === "title") {
         const title = value.trim();
         if (!title) throw new Error("事项名称不能为空");
-        const target = store.tasks.find((item) => item.id === task.id);
+        const target = [...store.todayPlanTasks, ...store.tasks].find((item) => item.id === task.id);
         if (target) { target.title = title; mutatedStoreTitle = true; }
-        await store.saveExecutionTaskTitle(task.id, task.version, title, task.subjectId);
+        await store.saveExecutionTaskTitle(task.id, task.version, title, task.subjectId, applyToFuture);
         settleTimerDialogSave(draft, token, { ok: true, savedValue: title });
       } else {
-        await store.saveExecutionTaskNote(task.id, task.version, value, task.subjectId);
+        await store.saveExecutionTaskNote(task.id, task.version, value, task.subjectId, applyToFuture);
         settleTimerDialogSave(draft, token, { ok: true, savedValue: value });
       }
       return true;
     } catch (error) {
       settleTimerDialogSave(draft, token, { ok: false, message: errorText(error, "保存失败") });
-      if (field === "title" && mutatedStoreTitle) await store.loadWorkspaceData();
+      if (field === "title" && mutatedStoreTitle) {
+        if (props.mode === "execute") await store.loadTodayPlan(task.subjectId);
+        else await store.loadWorkspaceData();
+      }
       if (timerBusyTaskId.value === task.id) await focusTaskControl(task.id, field);
       return false;
     }
@@ -697,13 +716,14 @@ async function createNewTask(startAfterCreate = false) {
   newTask.error = "";
   try {
     if (startAfterCreate && props.mode === "execute" && !newTask.targetId) {
-      const parent = newTask.parentId ? store.tasks.find((task) => task.id === newTask.parentId) : undefined;
+      const parent = newTask.parentId ? store.todayPlanTasks.find((task) => task.id === newTask.parentId) : undefined;
       const result = await store.transitionTimer({
         newTask: {
           subjectId: subjectId.value,
           parentId: newTask.parentId || undefined,
           expectedParentVersion: parent?.version,
           title,
+          dayInstanceDate: store.workspaceToday,
         },
       }, props.timerNote ?? "");
       resetNewTask();
@@ -821,18 +841,36 @@ async function saveMore(task: PanelTask) {
   try {
     const estimate = draft.estimate.trim() ? Number(draft.estimate) : undefined;
     if (estimate !== undefined && (!Number.isFinite(estimate) || estimate < 0)) throw new Error("整体预计需为非负分钟");
-    const hadLiveTask = store.tasks.some((item) => item.id === task.id);
+    const source = task.dayInstanceSourceTaskId
+      ? store.tasks.find((item) => item.id === task.dayInstanceSourceTaskId)
+      : undefined;
+    const currentTitle = draftFor(task).title.trim() || task.title;
+    const currentNote = draftFor(task).note.trim();
+    const recurringContentChanged = currentTitle !== task.title
+      || currentNote !== (task.note ?? "")
+      || (estimate === undefined ? task.estimate != null : Math.round(estimate) !== task.estimate);
+    let applyToFuture = false;
+    if (props.mode === "execute" && source?.recurrence && recurringContentChanged) {
+      const scope = await ElMessageBox.confirm(
+        `要把“${task.title}”的设置应用到今后的重复事项吗？`,
+        "修改重复事项",
+        { confirmButtonText: "修改今后全部", cancelButtonText: "仅修改今天", distinguishCancelAndClose: true, type: "info" },
+      ).then(() => "future" as const).catch((action) => action === "cancel" ? "today" as const : "closed" as const);
+      if (scope === "closed") return;
+      applyToFuture = scope === "future";
+    }
+    const hadLiveTask = [...store.todayPlanTasks, ...store.tasks].some((item) => item.id === task.id);
     await store.saveExecutionTaskDetails({
       id: task.id,
       subjectId: task.subjectId,
       expectedVersion: task.version,
-      title: draftFor(task).title.trim() || task.title,
+      title: currentTitle,
       plannedDate: draft.planDate || undefined,
       estimateMinutes: estimate === undefined ? undefined : Math.round(estimate),
-      note: draftFor(task).note,
+      note: currentNote,
       projectName: task.project,
-    });
-    const refreshedLiveTask = store.tasks.find((item) => item.id === task.id);
+    }, applyToFuture);
+    const refreshedLiveTask = [...store.todayPlanTasks, ...store.tasks].find((item) => item.id === task.id);
     if (draft.recurrence === "none") {
       if (refreshedLiveTask?.recurrence) await store.setTaskRecurrence(task.id, undefined);
     } else {

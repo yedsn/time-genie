@@ -925,6 +925,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: None,
                 title: "主体事项".to_string(),
                 planned_date: Some("2026-09-29".to_string()),
@@ -939,6 +940,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: other_subject.clone(),
+                day_instance_date: None,
                 parent_id: None,
                 title: "其他事项".to_string(),
                 planned_date: Some("2026-09-29".to_string()),
@@ -981,6 +983,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: None,
                 title: "仅调整事项".into(),
                 planned_date: Some("2026-09-29".into()),
@@ -1045,6 +1048,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: None,
                 title: "未来分组".into(),
                 planned_date: Some("2026-10-01".into()),
@@ -1059,6 +1063,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: Some(group.id.clone()),
                 title: "未来子事项".into(),
                 planned_date: Some("2026-10-01".into()),
@@ -1073,6 +1078,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: None,
                 title: "未来独立事项".into(),
                 planned_date: Some("2026-10-01".into()),
@@ -1121,6 +1127,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id,
+                day_instance_date: None,
                 parent_id: None,
                 title: "时间轴事项".to_string(),
                 planned_date: Some("2026-09-29".to_string()),
@@ -1179,6 +1186,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id,
+                day_instance_date: None,
                 parent_id: None,
                 title: "已完成后继续".to_string(),
                 planned_date: Some("2026-09-29".to_string()),
@@ -1225,6 +1233,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id,
+                day_instance_date: None,
                 parent_id: None,
                 title: "每日梳理".to_string(),
                 planned_date: None,

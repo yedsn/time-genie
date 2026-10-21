@@ -96,6 +96,10 @@ end $$;
 \ir 20261020_timegenie_actual_adjustment_target_rebase.sql
 \ir 20261020b_timegenie_actual_adjustment_snapshot.sql
 \ir 20261020b_timegenie_actual_adjustment_snapshot.sql
+\ir 20261021_timegenie_today_task_instances.sql
+\ir 20261021_timegenie_today_task_instances.sql
+\ir 20261021b_timegenie_client_write_generation.sql
+\ir 20261021b_timegenie_client_write_generation.sql
 
 do $$
 begin
@@ -207,6 +211,7 @@ begin
 end $$;
 
 begin;
+select set_config('request.headers', '{"x-timegenie-client-schema-generation":"1"}', true);
 
 insert into auth.users(id) values
   ('10000000-0000-0000-0000-000000000001'),
@@ -222,6 +227,24 @@ insert into timegenie.workspaces(id, owner_user_id, name) values
   ('20000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000002', '账号 B 未归属测试工作空间');
 
 select timegenie.device_authorize('20000000-0000-0000-0000-000000000002', '30000000-0000-0000-0000-000000000003', '设备 C', 'windows', '0.1.0');
+
+select set_config('request.headers', '{}', true);
+do $$
+begin
+  begin
+    perform timegenie.cloud_apply_patch(
+      '20000000-0000-0000-0000-000000000002',
+      '30000000-0000-0000-0000-000000000003',
+      '40000000-0000-0000-0000-000000000098',
+      'app_setting.update','app_setting','old_client_write_probe',null,
+      jsonb_build_object('key','old_client_write_probe','value_json','true'::jsonb,'updated_at',1792271999000,'version',1)
+    );
+    raise exception 'old client write was accepted';
+  exception when others then
+    if sqlerrm not like '%CLIENT_UPGRADE_REQUIRED%' then raise; end if;
+  end;
+end $$;
+select set_config('request.headers', '{"x-timegenie-client-schema-generation":"1"}', true);
 
 select timegenie.cloud_apply_patch(
   '20000000-0000-0000-0000-000000000002',
@@ -3299,7 +3322,7 @@ reset role;
 -- request header for every business write and returns reset-only pull data.
 set local role authenticated;
 select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
-select set_config('request.headers','{}',true);
+select set_config('request.headers','{"x-timegenie-client-schema-generation":"1"}',true);
 do $$
 declare legacy_snapshot jsonb;
 begin
@@ -3308,7 +3331,7 @@ begin
     raise exception 'epoch 1 legacy snapshot did not report the server epoch: %',legacy_snapshot;
   end if;
 end $$;
-select set_config('request.headers','{"x-timegenie-workspace-epoch":"1"}',true);
+select set_config('request.headers','{"x-timegenie-workspace-epoch":"1","x-timegenie-client-schema-generation":"1"}',true);
 select timegenie.cloud_apply_patch(
   '20000000-0000-0000-0000-000000000001',
   '30000000-0000-0000-0000-000000000001',
@@ -3319,7 +3342,7 @@ select timegenie.cloud_apply_patch(
 reset role;
 update timegenie.workspaces set workspace_epoch=2 where id='20000000-0000-0000-0000-000000000001';
 set local role authenticated;
-select set_config('request.headers','{}',true);
+select set_config('request.headers','{"x-timegenie-client-schema-generation":"1"}',true);
 do $$
 begin
   begin
@@ -3333,7 +3356,7 @@ begin
     if sqlerrm not like '%WORKSPACE_EPOCH_STALE%' then raise; end if;
   end;
 end $$;
-select set_config('request.headers','{"x-timegenie-workspace-epoch":"1"}',true);
+select set_config('request.headers','{"x-timegenie-workspace-epoch":"1","x-timegenie-client-schema-generation":"1"}',true);
 do $$
 declare retry integer;
 begin
@@ -3350,7 +3373,7 @@ begin
     end;
   end loop;
 end $$;
-select set_config('request.headers','{"x-timegenie-workspace-epoch":"2"}',true);
+select set_config('request.headers','{"x-timegenie-workspace-epoch":"2","x-timegenie-client-schema-generation":"1"}',true);
 select timegenie.cloud_apply_patch(
   '20000000-0000-0000-0000-000000000001',
   '30000000-0000-0000-0000-000000000001',
@@ -3365,7 +3388,7 @@ begin
   if (snapshot->>'workspace_epoch')::bigint<>2 then
     raise exception 'snapshot omitted the current workspace epoch: %',snapshot;
   end if;
-  perform set_config('request.headers','{"x-timegenie-workspace-epoch":"1"}',true);
+  perform set_config('request.headers','{"x-timegenie-workspace-epoch":"1","x-timegenie-client-schema-generation":"1"}',true);
   mismatch:=timegenie.cloud_incremental_pull(
     '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',0,100
   );
@@ -3380,7 +3403,7 @@ reset role;
 
 -- A restore lock excludes ordinary writes, creates a safety snapshot, restores
 -- atomically in place, increments epoch, emits reset, and is idempotent.
-select set_config('request.headers','{"x-timegenie-workspace-epoch":"2"}',true);
+select set_config('request.headers','{"x-timegenie-workspace-epoch":"2","x-timegenie-client-schema-generation":"1"}',true);
 update timegenie.time_entries set state='ended',ended_at=coalesce(ended_at,updated_at),duration_seconds=greatest(duration_seconds,0)
 where workspace_id='20000000-0000-0000-0000-000000000001' and state in('running','paused');
 update timegenie.time_segments set ended_at=coalesce(ended_at,started_at),duration_seconds=greatest(duration_seconds,0)
@@ -3444,6 +3467,7 @@ begin
   exception when others then
     if sqlerrm not like '%WORKSPACE_RESTORE_IN_PROGRESS%' then raise; end if;
   end;
+  perform set_config('request.headers','{"x-timegenie-workspace-epoch":"2","x-timegenie-client-schema-generation":"1"}',true);
   restored:=timegenie.workspace_restore_commit(
     '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
     (prepared->>'lockToken')::uuid,target_id,prepared->>'targetContentHash',(prepared->>'preparedEpoch')::bigint,
@@ -3455,7 +3479,7 @@ begin
     '4f000000-0000-0000-0000-000000000004',true
   );
   if restored is distinct from repeated or (restored->>'workspaceEpoch')::bigint<>3 then raise exception 'restore commit was not idempotent or did not advance epoch: % / %',restored,repeated; end if;
-  perform set_config('request.headers','{"x-timegenie-workspace-epoch":"3"}',true);
+  perform set_config('request.headers','{"x-timegenie-workspace-epoch":"3","x-timegenie-client-schema-generation":"1"}',true);
   restored_snapshot:=timegenie.cloud_snapshot_get('20000000-0000-0000-0000-000000000001');
   if not exists(select 1 from jsonb_array_elements(restored_snapshot->'app_settings') value where value->>'key'='workspace_epoch_probe' and value->'value_json'='4'::jsonb) then raise exception 'restore did not recover target business value'; end if;
   if before_task_count<>jsonb_array_length(restored_snapshot->'tasks') then raise exception 'restore changed target task count'; end if;
@@ -3472,7 +3496,7 @@ do $$ begin
 end $$;
 
 select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
-select set_config('request.headers','{"x-timegenie-workspace-epoch":"3"}',true);
+select set_config('request.headers','{"x-timegenie-workspace-epoch":"3","x-timegenie-client-schema-generation":"1"}',true);
 do $$
 declare target_task uuid; target_subject uuid; snapshot jsonb; adjustment_id uuid := '4f000000-0000-0000-0000-000000000099';
 begin

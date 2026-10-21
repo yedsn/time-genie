@@ -138,6 +138,8 @@ pub struct TimerTransitionNewTaskRequest {
     pub parent_id: Option<String>,
     pub expected_parent_version: Option<i64>,
     pub title: String,
+    #[serde(default)]
+    pub day_instance_date: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -467,9 +469,10 @@ fn transition_timer_with_cloud_operation(
         let draft = request.new_task.as_ref().expect("validated new task");
         let task_request = crate::tasks::TaskCreateRequest {
             subject_id: draft.subject_id.clone(),
+            day_instance_date: draft.day_instance_date.clone(),
             parent_id: draft.parent_id.clone(),
             title: draft.title.clone(),
-            planned_date: Some(work_date.clone()),
+            planned_date: draft.day_instance_date.is_none().then(|| work_date.clone()),
             estimate_minutes: None,
             note: None,
             project_name: None,
@@ -490,7 +493,10 @@ fn transition_timer_with_cloud_operation(
         created_task = Some(task);
         id
     };
-    let created_day_plan = if created_task.is_some() {
+    let created_day_plan = if created_task
+        .as_ref()
+        .is_some_and(|task| task.day_instance_date.is_none())
+    {
         Some(crate::today_plans::ensure_included_in_transaction(
             &transaction,
             &workspace_id,
@@ -3076,6 +3082,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id,
+                day_instance_date: None,
                 parent_id: None,
                 title: "计时事项".to_string(),
                 planned_date: None,
@@ -3148,6 +3155,7 @@ mod tests {
                     parent_id: None,
                     expected_parent_version: None,
                     title: "临时一级事项".to_string(),
+                    day_instance_date: None,
                 }),
                 note: None,
             },
@@ -3188,6 +3196,7 @@ mod tests {
                     parent_id: None,
                     expected_parent_version: None,
                     title: "临时一级事项".to_string(),
+                    day_instance_date: None,
                 }),
                 note: None,
             },
@@ -3198,12 +3207,60 @@ mod tests {
     }
 
     #[test]
+    fn transition_creates_today_instance_without_source_mapping() {
+        let (database, _, _) = setup();
+        let work_date = test_work_date();
+        let result = transition(
+            &database,
+            TimerTransitionRequest {
+                client_request_id: Uuid::now_v7().to_string(),
+                current_entry_id: None,
+                current_entry_expected_version: None,
+                task_id: None,
+                reopen_completed_task_version: None,
+                new_task: Some(TimerTransitionNewTaskRequest {
+                    subject_id: subject_id(&database),
+                    parent_id: None,
+                    expected_parent_version: None,
+                    title: "今日临时事项".to_string(),
+                    day_instance_date: Some(work_date.clone()),
+                }),
+                note: None,
+            },
+        )
+        .unwrap();
+        let created = result.created_task.unwrap();
+        assert_eq!(
+            created.day_instance_date.as_deref(),
+            Some(work_date.as_str())
+        );
+        assert_eq!(created.day_instance_kind.as_deref(), Some("member"));
+        assert_eq!(created.day_instance_source_task_id, None);
+        assert_eq!(created.planned_date, None);
+        let mapping_count: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM task_day_plans WHERE task_id=?1",
+                [&created.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mapping_count, 0);
+        assert_eq!(
+            result.active_entry.default_task_id.as_deref(),
+            Some(created.id.as_str())
+        );
+    }
+
+    #[test]
     fn transition_creates_child_and_switches_at_one_boundary() {
         let (database, _, initial_task_id) = setup();
         let parent = create_task(
             &database,
             TaskCreateRequest {
                 subject_id: subject_id(&database),
+                day_instance_date: None,
                 parent_id: None,
                 title: "父事项".to_string(),
                 planned_date: None,
@@ -3236,6 +3293,7 @@ mod tests {
                     parent_id: Some(parent.id.clone()),
                     expected_parent_version: Some(parent.version),
                     title: "临时二级事项".to_string(),
+                    day_instance_date: None,
                 }),
                 note: None,
             },
@@ -3272,6 +3330,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id(&database),
+                day_instance_date: None,
                 parent_id: None,
                 title: "暂停后切换目标".to_string(),
                 planned_date: None,
@@ -3428,6 +3487,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id(&database),
+                day_instance_date: None,
                 parent_id: None,
                 title: "待继续".into(),
                 planned_date: None,
@@ -3497,6 +3557,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id(&database),
+                day_instance_date: None,
                 parent_id: None,
                 title: "并发父事项".to_string(),
                 planned_date: None,
@@ -3520,6 +3581,7 @@ mod tests {
                     parent_id: Some(parent.id),
                     expected_parent_version: Some(parent.version + 1),
                     title: "不应创建".to_string(),
+                    day_instance_date: None,
                 }),
                 note: None,
             },
@@ -3582,6 +3644,7 @@ mod tests {
                     parent_id: None,
                     expected_parent_version: None,
                     title: "计时失败回滚事项".to_string(),
+                    day_instance_date: None,
                 }),
                 note: None,
             },
@@ -3616,6 +3679,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id(&database),
+                day_instance_date: None,
                 parent_id: None,
                 title: "已完成父事项".to_string(),
                 planned_date: None,
@@ -3648,6 +3712,7 @@ mod tests {
                     parent_id: Some(parent.id),
                     expected_parent_version: Some(parent.version + 1),
                     title: "不应创建在已完成父项下".to_string(),
+                    day_instance_date: None,
                 }),
                 note: None,
             },
@@ -3705,6 +3770,7 @@ mod tests {
                     parent_id: None,
                     expected_parent_version: None,
                     title: "跨自然日事项".to_string(),
+                    day_instance_date: None,
                 }),
                 note: None,
             },
@@ -3729,6 +3795,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id(&database),
+                day_instance_date: None,
                 parent_id: None,
                 title: "跨日切换目标".to_string(),
                 planned_date: None,
@@ -3780,6 +3847,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id(&database),
+                day_instance_date: None,
                 parent_id: None,
                 title: "重复计时目标".to_string(),
                 planned_date: None,
@@ -3885,6 +3953,7 @@ mod tests {
                     parent_id: None,
                     expected_parent_version: None,
                     title: "云端原子今日事项".to_string(),
+                    day_instance_date: None,
                 }),
                 note: None,
             },
@@ -3956,6 +4025,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id(&database),
+                day_instance_date: None,
                 parent_id: None,
                 title: "云端周期计时目标".to_string(),
                 planned_date: None,
@@ -4415,6 +4485,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id(&database),
+                day_instance_date: None,
                 parent_id: None,
                 title: "云端只完成不分配".to_string(),
                 planned_date: None,
@@ -5068,6 +5139,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id,
+                day_instance_date: None,
                 parent_id: None,
                 title: "重新归属事项".to_string(),
                 planned_date: None,
@@ -5124,6 +5196,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id,
+                day_instance_date: None,
                 parent_id: None,
                 title: "重启恢复事项".to_string(),
                 planned_date: None,
@@ -5221,6 +5294,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id,
+                day_instance_date: None,
                 parent_id: Some(task_id.clone()),
                 title: "子项".to_string(),
                 planned_date: None,
@@ -5411,6 +5485,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id,
+                day_instance_date: None,
                 parent_id: None,
                 title: "保持未完成".to_string(),
                 planned_date: None,
@@ -5525,6 +5600,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id,
+                day_instance_date: None,
                 parent_id: None,
                 title: "只完成不分配时间".to_string(),
                 planned_date: None,
@@ -5621,6 +5697,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id,
+                day_instance_date: None,
                 parent_id: None,
                 title: "第二个重复事项".to_string(),
                 planned_date: None,

@@ -67,6 +67,7 @@ import {
   stopTimerRecord,
   notifyTimerStopConfirmation,
   updateTask as updateTaskRecord,
+  updateTodayRecurringTask,
   updateTimeEntry,
   updateTimeEntryDisposition,
   type TimeEntryRecord,
@@ -106,6 +107,9 @@ export type Task = {
   id: string;
   subjectId: string;
   parentId?: string;
+  dayInstanceDate?: string;
+  dayInstanceKind?: "member" | "context";
+  dayInstanceSourceTaskId?: string;
   title: string;
   project: string;
   planDate?: string;
@@ -487,6 +491,9 @@ export const useWorkdayStore = defineStore("workday", () => {
       id: task.id,
       subjectId: task.subjectId,
       parentId: task.parentId,
+      dayInstanceDate: task.dayInstanceDate,
+      dayInstanceKind: task.dayInstanceKind,
+      dayInstanceSourceTaskId: task.dayInstanceSourceTaskId,
       title: task.title,
       project: task.projectName ?? "",
       planDate: task.plannedDate,
@@ -563,12 +570,13 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   function taskPathLabel(task: Task) {
+    const source = task.dayInstanceDate ? todayPlanTasks : tasks;
     const path = [task.title];
     const visited = new Set([task.id]);
     let parentId = task.parentId;
     while (parentId && !visited.has(parentId)) {
       visited.add(parentId);
-      const parent = tasks.find((item) => item.id === parentId);
+      const parent = source.find((item) => item.id === parentId);
       if (!parent) break;
       path.unshift(parent.title);
       parentId = parent.parentId;
@@ -578,7 +586,7 @@ export const useWorkdayStore = defineStore("workday", () => {
 
   function taskDisplayLabel(taskId?: string, fallback = "未关联事项") {
     if (!taskId) return fallback;
-    const task = tasks.find((item) => item.id === taskId);
+    const task = [...todayPlanTasks, ...tasks].find((item) => item.id === taskId);
     return task ? taskPathLabel(task) : fallback;
   }
 
@@ -953,8 +961,14 @@ export const useWorkdayStore = defineStore("workday", () => {
   async function setTodayPlanMembership(taskId: string, state: "included" | "excluded") {
     const task = [...todayPlanTasks, ...tasks].find((item) => item.id === taskId);
     const workDate = await ensureWorkspaceCalendar();
-    await setTaskDayPlan(taskId, workDate, state, task?.dayPlanVersion);
-    await Promise.all([loadWorkspaceData(), loadTodayPlan(task?.subjectId ?? selectedSubjectId.value), loadTodayOverview()]);
+    const plan = await setTaskDayPlan(taskId, workDate, state, task?.dayPlanVersion);
+    const sourceTaskId = task?.dayInstanceSourceTaskId ?? plan.taskId;
+    const source = tasks.find((item) => item.id === sourceTaskId);
+    if (source) {
+      source.dayPlanState = state;
+      source.dayPlanVersion = plan.version;
+    }
+    await Promise.all([loadTodayPlan(task?.subjectId ?? selectedSubjectId.value), loadTodayOverview()]);
   }
 
   async function addTasksToToday(taskIds: string[]) {
@@ -968,7 +982,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       const task = [...todayPlanTasks, ...tasks].find((item) => item.id === taskId);
       return { taskId, state: "included" as const, expectedVersion: task?.dayPlanVersion };
     }));
-    await Promise.all([loadWorkspaceData(), loadTodayPlan(subjectId), loadTodayOverview()]);
+    await Promise.all([loadTodayPlan(subjectId), loadTodayOverview()]);
   }
 
   async function selectCompletedTasksPage(page: number) {
@@ -1472,10 +1486,10 @@ export const useWorkdayStore = defineStore("workday", () => {
 
   async function persistTimerTask(taskId?: string) {
     if (!taskId) return undefined;
-    const task = tasks.find((item) => item.id === taskId);
+    const task = [...todayPlanTasks, ...tasks].find((item) => item.id === taskId);
     if (!task) return undefined;
     if (task.version > 0) return task.id;
-    const savedId = await saveTask(task.id);
+    const savedId = task.dayInstanceDate ? await saveTodayTask(task.id) : await saveTask(task.id);
     return savedId || undefined;
   }
 
@@ -1679,23 +1693,398 @@ export const useWorkdayStore = defineStore("workday", () => {
       expectedDailyEstimateVersion?: number;
       estimateMinutes?: number;
     }>;
+    instanceEstimates?: Array<{ taskId: string; estimateMinutes?: number }>;
   }) {
-    const estimateMemberIds = new Set(request.estimates.filter((item) => item.estimateMinutes !== undefined).map((item) => item.taskId));
-    if (request.estimates.length) await saveTaskEstimateBatch(request.estimates);
-    const membershipOnlyIds = request.taskIds.filter((taskId) => !estimateMemberIds.has(taskId));
-    if (membershipOnlyIds.length) await addTasksToToday(membershipOnlyIds);
+    const sourceIds = [...new Set([...request.taskIds, ...request.estimates.map((item) => item.taskId)])];
+    if (sourceIds.length) await addTasksToToday(sourceIds);
+    const instanceBySourceId = new Map(todayPlanTasks
+      .filter((task) => task.dayInstanceSourceTaskId)
+      .map((task) => [task.dayInstanceSourceTaskId!, task]));
+    const instanceEstimates = request.estimates.flatMap((item) => {
+      const instance = instanceBySourceId.get(item.taskId);
+      if (!instance) return [];
+      return [{
+        taskId: instance.id,
+        expectedTaskVersion: instance.version,
+        expectedDailyEstimateVersion: instance.dailyEstimateVersion,
+        estimateMinutes: item.estimateMinutes,
+      }];
+    });
+    const directInstanceEstimates = (request.instanceEstimates ?? []).flatMap((item) => {
+      const instance = todayPlanTask(item.taskId);
+      if (!instance || instance.version <= 0) return [];
+      return [{
+        taskId: instance.id,
+        expectedTaskVersion: instance.version,
+        expectedDailyEstimateVersion: instance.dailyEstimateVersion,
+        estimateMinutes: item.estimateMinutes,
+      }];
+    });
+    if (instanceEstimates.length || directInstanceEstimates.length) {
+      await saveTaskEstimateBatch([...instanceEstimates, ...directInstanceEstimates]);
+    }
   }
 
-  async function saveTaskPlanBatch(request: QuickPlanBatchRequest) {
-    const result = await applyTaskPlanBatch(request);
+  async function saveTaskPlanBatch(request: QuickPlanBatchRequest, dayInstanceDate?: string) {
+    const result = await applyTaskPlanBatch({ ...request, dayInstanceDate });
     await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(selectedSubjectId.value), loadTodayOverview()]);
     return result;
+  }
+
+  function todayPlanTask(taskId: string) {
+    return todayPlanTasks.find((task) => task.id === taskId);
+  }
+
+  function addTodayTask(title = "", subjectId = selectedSubjectId.value) {
+    const subject = subjects.find((item) => item.id === subjectId) ?? selectedSubject.value;
+    const task: Task = {
+      id: createTaskId(),
+      subjectId: subject?.id ?? defaultSubjectId,
+      dayInstanceDate: workspaceToday.value || undefined,
+      dayInstanceKind: "member",
+      title,
+      project: subject?.name ?? "默认",
+      actual: 0,
+      directMinutes: 0,
+      status: "open",
+      sortOrder: Number.MAX_SAFE_INTEGER,
+      version: 0,
+      selectable: true,
+      executionState: "not_started",
+    };
+    todayPlanTasks.push(task);
+    selectedTaskId.value = task.id;
+    return task.id;
+  }
+
+  function addTodayChildTask(parentId: string, title = "") {
+    const parent = todayPlanTask(parentId);
+    if (!parent) return;
+    const child: Task = {
+      id: createTaskId(),
+      subjectId: parent.subjectId,
+      parentId,
+      dayInstanceDate: parent.dayInstanceDate ?? (workspaceToday.value || undefined),
+      dayInstanceKind: "member",
+      title,
+      project: parent.project,
+      planDate: parent.planDate,
+      actual: 0,
+      directMinutes: 0,
+      status: "open",
+      sortOrder: Number.MAX_SAFE_INTEGER,
+      version: 0,
+      selectable: true,
+      executionState: "not_started",
+    };
+    const parentIndex = todayPlanTasks.findIndex((task) => task.id === parentId);
+    let insertIndex = parentIndex + 1;
+    const descendantIds = getTodaySubtreeIds(parentId);
+    while (insertIndex < todayPlanTasks.length && descendantIds.has(todayPlanTasks[insertIndex].id)) insertIndex += 1;
+    todayPlanTasks.splice(insertIndex, 0, child);
+    selectedTaskId.value = child.id;
+    return child.id;
+  }
+
+  function addTodayTaskRelative(targetId: string, placement: "before" | "after") {
+    const ordered = buildVisibleTaskList(todayPlanTasks);
+    const target = ordered.find((task) => task.id === targetId);
+    if (!target) return;
+    const siblings = ordered.filter((task) => task.subjectId === target.subjectId && task.parentId === target.parentId);
+    const siblingIndex = siblings.findIndex((task) => task.id === target.id);
+    const insertIndex = placement === "before" ? siblingIndex : siblingIndex + 1;
+    const previous = siblings[insertIndex - 1];
+    const next = siblings[insertIndex];
+    const task: Task = {
+      id: createTaskId(),
+      subjectId: target.subjectId,
+      parentId: target.parentId,
+      dayInstanceDate: target.dayInstanceDate ?? (workspaceToday.value || undefined),
+      dayInstanceKind: "member",
+      title: "",
+      project: target.project,
+      planDate: target.planDate,
+      actual: 0,
+      directMinutes: 0,
+      status: "open",
+      sortOrder: target.sortOrder,
+      version: 0,
+      selectable: true,
+      executionState: "not_started",
+      createPreviousSiblingId: previous?.id,
+      createNextSiblingId: next?.id,
+    };
+    const targetIndex = todayPlanTasks.findIndex((item) => item.id === target.id);
+    const localInsertIndex = placement === "before" ? targetIndex : findSubtreeEndIndex(todayPlanTasks, target.id);
+    todayPlanTasks.splice(Math.max(0, localInsertIndex), 0, task);
+    selectedTaskId.value = task.id;
+    return task.id;
+  }
+
+  function replaceTodayTask(record: TaskRecord) {
+    const next = toUiTask(record);
+    const index = todayPlanTasks.findIndex((task) => task.id === record.id);
+    if (index >= 0) todayPlanTasks.splice(index, 1, next);
+    else todayPlanTasks.push(next);
+    return next;
+  }
+
+  async function saveTodayTask(taskId: string): Promise<string | false> {
+    const task = todayPlanTask(taskId);
+    if (!task || !task.title.trim()) return false;
+    if (savingTaskIds.has(taskId)) return false;
+    savingTaskIds.add(taskId);
+    try {
+      const workDate = await ensureWorkspaceCalendar();
+      const subjectId = task.subjectId;
+      if (task.version <= 0) {
+        const create = task.quickCreate
+          ? createQuickTaskRecord
+          : task.createPreviousSiblingId || task.createNextSiblingId
+            ? createPositionedTask
+            : createTaskRecord;
+        const created = await create({
+          subjectId,
+          parentId: task.parentId,
+          dayInstanceDate: workDate,
+          title: task.title,
+          plannedDate: task.planDate,
+          estimateMinutes: task.estimate,
+          note: task.note,
+          projectName: task.project,
+          ...(task.quickCreate ? {} : {
+            previousSiblingId: task.createPreviousSiblingId,
+            nextSiblingId: task.createNextSiblingId,
+          }),
+        });
+        const oldId = task.id;
+        let index = todayPlanTasks.findIndex((item) => item.id === oldId);
+        const existingCreatedIndex = todayPlanTasks.findIndex((item) => item.id === created.id);
+        if (existingCreatedIndex >= 0 && existingCreatedIndex !== index) {
+          todayPlanTasks.splice(existingCreatedIndex, 1);
+          if (existingCreatedIndex < index) index -= 1;
+        }
+        if (index >= 0) todayPlanTasks.splice(index, 1, toUiTask(created));
+        else todayPlanTasks.push(toUiTask(created));
+        for (const child of todayPlanTasks) if (child.parentId === oldId) child.parentId = created.id;
+        if (selectedTaskId.value === oldId) selectedTaskId.value = created.id;
+        await Promise.all([reloadTodayPlanForSubject(subjectId), loadTodayOverview()]);
+        return created.id;
+      }
+      await updateTaskRecord({
+        id: task.id,
+        expectedVersion: task.version,
+        title: task.title,
+        plannedDate: task.planDate ?? null,
+        estimateMinutes: task.estimate ?? null,
+        note: task.note ?? null,
+        projectName: task.project || null,
+      });
+      await Promise.all([reloadTodayPlanForSubject(subjectId), loadTodayOverview()]);
+      return task.id;
+    } finally {
+      savingTaskIds.delete(taskId);
+    }
+  }
+
+  async function saveTodayTaskToFuture(taskId: string, field: "title" | "estimate"): Promise<string | false> {
+    const draft = todayPlanTask(taskId);
+    const source = draft?.dayInstanceSourceTaskId
+      ? tasks.find((task) => task.id === draft.dayInstanceSourceTaskId)
+      : undefined;
+    if (!draft || !source?.recurrence) return await saveTodayTask(taskId);
+    const result = await updateTodayRecurringTask({
+      instanceId: draft.id,
+      instanceExpectedVersion: draft.version,
+      sourceExpectedVersion: source.version,
+      ...(field === "title" ? { title: draft.title } : { estimateMinutes: draft.estimate ?? null }),
+    });
+    replaceTodayTask(result.instance);
+    await loadWorkspaceData();
+    return result.instance.id;
+  }
+
+  async function deleteTodayTask(taskId: string) {
+    const deletedTask = todayPlanTask(taskId);
+    if (!deletedTask) return;
+    const idsToDelete = getTodaySubtreeIds(taskId);
+    if (deletedTask.version > 0) await deleteTaskSubtree(deletedTask.id, deletedTask.version);
+    for (let index = todayPlanTasks.length - 1; index >= 0; index -= 1) {
+      if (idsToDelete.has(todayPlanTasks[index].id)) todayPlanTasks.splice(index, 1);
+    }
+    if (idsToDelete.has(selectedTaskId.value)) {
+      selectedTaskId.value = buildVisibleTaskList(todayPlanTasks.filter((task) => task.subjectId === deletedTask.subjectId))[0]?.id ?? "";
+    }
+    if (deletedTask.version > 0) await Promise.all([reloadTodayPlanForSubject(deletedTask.subjectId), loadTodayOverview()]);
+  }
+
+  async function saveTodayTaskNote(taskId: string, note: string) {
+    const task = todayPlanTask(taskId);
+    if (!task || task.version <= 0) return;
+    const normalized = note.trim() || undefined;
+    replaceTodayTask(await updateTaskRecord({
+      id: task.id,
+      expectedVersion: task.version,
+      note: normalized ?? null,
+    }));
+    await reloadTodayPlanForSubject(task.subjectId);
+  }
+
+  async function saveTodayTaskNoteToFuture(taskId: string, note: string) {
+    const task = todayPlanTask(taskId);
+    if (!task || task.version <= 0) return;
+    const source = task?.dayInstanceSourceTaskId
+      ? tasks.find((candidate) => candidate.id === task.dayInstanceSourceTaskId)
+      : undefined;
+    if (!source?.recurrence) { await saveTodayTaskNote(taskId, note); return; }
+    replaceTodayTask((await updateTodayRecurringTask({
+      instanceId: task.id,
+      instanceExpectedVersion: task.version,
+      sourceExpectedVersion: source.version,
+      note: note.trim() || null,
+    })).instance);
+    await loadWorkspaceData();
+  }
+
+  async function saveTodayTaskTodayEstimate(taskId: string, estimateMinutes?: number) {
+    const task = todayPlanTask(taskId);
+    if (!task || task.version <= 0) return;
+    const todayDate = await ensureWorkspaceCalendar();
+    await setTaskDailyEstimate(task.id, todayDate, estimateMinutes);
+    await Promise.all([reloadTodayPlanForSubject(task.subjectId), loadTodayOverview()]);
+  }
+
+  async function commitTodayTaskToggle(task: Task): Promise<TaskCompletionResult | undefined> {
+    if (task.version <= 0) return;
+    const target = todayPlanTask(task.id);
+    if (!target) return;
+    const direction = target.status === "done" ? "reopened" : "completed";
+    const previousStatus = target.status;
+    const previousExecutionState = target.executionState;
+    target.status = direction === "completed" ? "done" : "open";
+    target.executionState = target.status === "done" ? "done" : target.actual > 0 ? "started" : "not_started";
+    try {
+      const updated = await setTaskCompleted(target.id, target.version, direction === "completed");
+      replaceTodayTask(updated);
+      return {
+        taskId: target.id,
+        subjectId: target.subjectId,
+        direction,
+        completedCount: direction === "completed" && updated.status === "done" ? 1 : 0,
+      };
+    } catch (error) {
+      target.status = previousStatus;
+      target.executionState = previousExecutionState;
+      throw error;
+    }
+  }
+
+  async function toggleTodayTask(task: Task) {
+    const result = await commitTodayTaskToggle(task);
+    if (!result) return;
+    await Promise.all([reloadTodayPlanForSubject(task.subjectId), loadTodayOverview()]);
+    return result;
+  }
+
+  async function moveTodayTask(taskId: string, parentId?: string, previousSiblingId?: string, nextSiblingId?: string) {
+    const moving = todayPlanTask(taskId);
+    if (!moving || moving.version <= 0) return;
+    const ordered = buildVisibleTaskList(todayPlanTasks);
+    const movingIds = getTodaySubtreeIds(taskId);
+    const movingBlock = ordered.filter((task) => movingIds.has(task.id));
+    const remaining = ordered.filter((task) => !movingIds.has(task.id));
+    moving.parentId = parentId;
+    let insertIndex = remaining.length;
+    if (nextSiblingId) insertIndex = remaining.findIndex((task) => task.id === nextSiblingId);
+    else if (previousSiblingId) insertIndex = findSubtreeEndIndex(remaining, previousSiblingId);
+    if (insertIndex < 0) insertIndex = remaining.length;
+    todayPlanTasks.splice(0, todayPlanTasks.length, ...remaining.slice(0, insertIndex), ...movingBlock, ...remaining.slice(insertIndex));
+    try {
+      replaceTodayTask(await moveTaskRecord({
+        id: moving.id,
+        expectedVersion: moving.version,
+        parentId,
+        previousSiblingId,
+        nextSiblingId,
+      }));
+      await reloadTodayPlanForSubject(moving.subjectId);
+    } catch (error) {
+      await reloadTodayPlanForSubject(moving.subjectId);
+      throw error;
+    }
+  }
+
+  async function changeTodayTaskParent(taskId: string, newParentId?: string) {
+    const moving = todayPlanTask(taskId);
+    if (!moving || moving.version <= 0) return;
+    replaceTodayTask(await changeTaskParent(moving.id, moving.version, newParentId));
+    await reloadTodayPlanForSubject(moving.subjectId);
+  }
+
+  async function indentTodayTask(taskId: string) {
+    const ordered = buildVisibleTaskList(todayPlanTasks);
+    const index = ordered.findIndex((task) => task.id === taskId);
+    const moving = ordered[index];
+    if (!moving || index <= 0) return;
+    const currentDepth = getTaskDepth(moving, ordered);
+    const newParent = ordered.slice(0, index).reverse().find((task) => getTaskDepth(task, ordered) === currentDepth && task.parentId === moving.parentId);
+    if (!newParent) return;
+    await changeTodayTaskParent(taskId, newParent.id);
+  }
+
+  async function outdentTodayTask(taskId: string) {
+    const moving = todayPlanTask(taskId);
+    if (!moving?.parentId) return;
+    const parent = todayPlanTask(moving.parentId);
+    if (!parent) return;
+    await changeTodayTaskParent(taskId, parent.parentId);
+  }
+
+  async function duplicateTodayTask(taskId: string) {
+    const source = todayPlanTask(taskId);
+    if (!source || source.version <= 0) return;
+    const result = await duplicateTaskSubtree(source.id, source.version);
+    await Promise.all([reloadTodayPlanForSubject(source.subjectId), loadTodayOverview()]);
+    selectedTaskId.value = result.rootId;
+    return result.rootId;
+  }
+
+  async function duplicateSingleTodayTask(taskId: string) {
+    const source = todayPlanTask(taskId);
+    if (!source || source.version <= 0) return;
+    const draftId = addTodayTaskRelative(source.id, "after");
+    if (!draftId) return;
+    const draft = todayPlanTask(draftId);
+    if (!draft) return;
+    draft.title = source.title;
+    draft.project = source.project;
+    draft.planDate = source.planDate;
+    draft.estimate = source.estimate;
+    draft.note = source.note;
+    const savedTaskId = await saveTodayTask(draftId);
+    if (!savedTaskId) throw new Error("事项复制失败");
+    return savedTaskId;
+  }
+
+  function getTodaySubtreeIds(taskId: string) {
+    const ids = new Set([taskId]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const task of todayPlanTasks) {
+        if (task.parentId && ids.has(task.parentId) && !ids.has(task.id)) {
+          ids.add(task.id);
+          changed = true;
+        }
+      }
+    }
+    return ids;
   }
 
   async function loadActualAdjustmentSnapshot(subjectId = selectedSubjectId.value) {
     await catchUpCloudSync();
     const workDate = await ensureWorkspaceCalendar();
-    return await getActualAdjustmentSnapshot(subjectId, workDate);
+    return await getActualAdjustmentSnapshot(subjectId, workDate, false);
   }
 
   async function loadExecutionSnapshot(subjectId = selectedSubjectId.value) {
@@ -1703,7 +2092,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     const workDate = await ensureWorkspaceCalendar();
     executionSnapshotLoading[subjectId] = true;
     try {
-      const snapshot = await getActualAdjustmentSnapshot(subjectId, workDate);
+      const snapshot = await getActualAdjustmentSnapshot(subjectId, workDate, false);
       if (JSON.stringify(executionSnapshots[subjectId]) !== JSON.stringify(snapshot)) executionSnapshots[subjectId] = snapshot;
       return snapshot;
     } finally {
@@ -1711,15 +2100,27 @@ export const useWorkdayStore = defineStore("workday", () => {
     }
   }
 
-  async function saveExecutionTaskTitle(taskId: string, expectedVersion: number, title: string, subjectId: string) {
-    await updateTaskRecord({ id: taskId, expectedVersion, title });
-    await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(subjectId), loadTodayOverview()]);
+  async function saveExecutionTaskTitle(taskId: string, expectedVersion: number, title: string, subjectId: string, applyToFuture = false) {
+    const instance = todayPlanTask(taskId);
+    const source = applyToFuture && instance?.dayInstanceSourceTaskId
+      ? tasks.find((task) => task.id === instance.dayInstanceSourceTaskId)
+      : undefined;
+    if (source?.recurrence) await updateTodayRecurringTask({ instanceId: taskId, instanceExpectedVersion: expectedVersion, sourceExpectedVersion: source.version, title });
+    else await updateTaskRecord({ id: taskId, expectedVersion, title });
+    await Promise.all([reloadTodayPlanForSubject(subjectId), loadTodayOverview()]);
+    if (source) await loadWorkspaceData();
     return await loadExecutionSnapshot(subjectId);
   }
 
-  async function saveExecutionTaskNote(taskId: string, expectedVersion: number, note: string, subjectId: string) {
-    await updateTaskRecord({ id: taskId, expectedVersion, note: note.trim() || null });
-    await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(subjectId)]);
+  async function saveExecutionTaskNote(taskId: string, expectedVersion: number, note: string, subjectId: string, applyToFuture = false) {
+    const instance = todayPlanTask(taskId);
+    const source = applyToFuture && instance?.dayInstanceSourceTaskId
+      ? tasks.find((task) => task.id === instance.dayInstanceSourceTaskId)
+      : undefined;
+    if (source?.recurrence) await updateTodayRecurringTask({ instanceId: taskId, instanceExpectedVersion: expectedVersion, sourceExpectedVersion: source.version, note: note.trim() || null });
+    else await updateTaskRecord({ id: taskId, expectedVersion, note: note.trim() || null });
+    await reloadTodayPlanForSubject(subjectId);
+    if (source) await loadWorkspaceData();
     return await loadExecutionSnapshot(subjectId);
   }
 
@@ -1732,8 +2133,23 @@ export const useWorkdayStore = defineStore("workday", () => {
     estimateMinutes?: number;
     note?: string;
     projectName?: string;
-  }) {
-    await updateTaskRecord({
+  }, applyToFuture = false) {
+    const instance = todayPlanTask(task.id);
+    const source = applyToFuture && instance?.dayInstanceSourceTaskId
+      ? tasks.find((candidate) => candidate.id === instance.dayInstanceSourceTaskId)
+      : undefined;
+    if (source?.recurrence) {
+      await updateTodayRecurringTask({
+        instanceId: task.id,
+        instanceExpectedVersion: task.expectedVersion,
+        sourceExpectedVersion: source.version,
+        title: task.title,
+        plannedDate: task.plannedDate ?? null,
+        estimateMinutes: task.estimateMinutes ?? null,
+        note: task.note?.trim() || null,
+        projectName: task.projectName?.trim() || null,
+      });
+    } else await updateTaskRecord({
       id: task.id,
       expectedVersion: task.expectedVersion,
       title: task.title,
@@ -1742,13 +2158,14 @@ export const useWorkdayStore = defineStore("workday", () => {
       note: task.note?.trim() || null,
       projectName: task.projectName?.trim() || null,
     });
-    await Promise.all([loadWorkspaceData(), loadTimeData(), reloadTodayPlanForSubject(task.subjectId), loadTodayOverview()]);
+    await Promise.all([loadTimeData(), reloadTodayPlanForSubject(task.subjectId), loadTodayOverview()]);
+    if (source) await loadWorkspaceData();
     return await loadExecutionSnapshot(task.subjectId);
   }
 
   async function deleteExecutionTask(taskId: string, expectedVersion: number, subjectId: string) {
     await deleteTaskSubtree(taskId, expectedVersion);
-    await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(subjectId), loadTodayOverview()]);
+    await Promise.all([reloadTodayPlanForSubject(subjectId), loadTodayOverview()]);
     return await loadExecutionSnapshot(subjectId);
   }
 
@@ -1782,7 +2199,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     if (!entry.defaultTask || timerStopConfirmationSlices.value.every((slice) => slice.minutes <= 0)) return false;
     const taskId = await persistTimerTask(entry.defaultTask);
     if (!taskId) throw new Error("分配事项保存失败");
-    const task = tasks.find((candidate) => candidate.id === taskId);
+    const task = [...todayPlanTasks, ...tasks].find((candidate) => candidate.id === taskId);
     const completionCandidate = completeTask && task?.status !== "done" ? taskId : undefined;
     for (const slice of timerStopConfirmationSlices.value) {
       const allocations = slice.minutes > 0 ? [{
@@ -1798,7 +2215,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     }
     await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(task?.subjectId), loadTodayOverview()]);
     await loadTimeHistory(timeHistoryPage.value);
-    const completedTaskIds = completionCandidate && tasks.find((item) => item.id === completionCandidate)?.status === "done"
+    const completedTaskIds = completionCandidate && [...todayPlanTasks, ...tasks].find((item) => item.id === completionCandidate)?.status === "done"
       ? [completionCandidate]
       : [];
     timerStopConfirmationEntryId.value = "";
@@ -1827,7 +2244,10 @@ export const useWorkdayStore = defineStore("workday", () => {
       currentEntryExpectedVersion: current?.version,
       taskId: "taskId" in target ? target.taskId : undefined,
       reopenCompletedTaskVersion: "taskId" in target ? target.reopenCompletedTaskVersion : undefined,
-      newTask: "newTask" in target ? target.newTask : undefined,
+      newTask: "newTask" in target ? {
+        ...target.newTask,
+        dayInstanceDate: target.newTask.dayInstanceDate ?? (workspaceToday.value || undefined),
+      } : undefined,
       note: note.trim() || undefined,
     });
     resetUnassignedTracking();
@@ -1857,7 +2277,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       if (!item.taskId || (minutes <= 0 && !item.completeTask)) continue;
       const taskId = await persistTimerTask(item.taskId);
       if (!taskId) throw new Error("分配事项保存失败");
-      const task = tasks.find((candidate) => candidate.id === taskId);
+      const task = [...todayPlanTasks, ...tasks].find((candidate) => candidate.id === taskId);
       normalized.push({
         taskId,
         minutes,
@@ -1867,13 +2287,13 @@ export const useWorkdayStore = defineStore("workday", () => {
       });
     }
     const completionCandidates = new Set(normalized
-      .filter((allocation) => allocation.completeTask && tasks.find((task) => task.id === allocation.taskId)?.status !== "done")
+      .filter((allocation) => allocation.completeTask && [...todayPlanTasks, ...tasks].find((task) => task.id === allocation.taskId)?.status !== "done")
       .map((allocation) => allocation.taskId));
     markTimeDataChanged();
     replaceTimeEntry(await replaceTimeAllocations(entry.id, entry.version, normalized));
     await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(), loadTodayOverview()]);
     await loadTimeHistory(timeHistoryPage.value);
-    const completedTaskIds = [...completionCandidates].filter((taskId) => tasks.find((task) => task.id === taskId)?.status === "done");
+    const completedTaskIds = [...completionCandidates].filter((taskId) => [...todayPlanTasks, ...tasks].find((task) => task.id === taskId)?.status === "done");
     return { completedCount: completedTaskIds.length, completedTaskIds };
   }
 
@@ -1881,10 +2301,10 @@ export const useWorkdayStore = defineStore("workday", () => {
     const todayDate = await ensureWorkspaceCalendar();
     const persistedTaskId = await persistTimerTask(taskId);
     if (taskId && !persistedTaskId) throw new Error("补录事项保存失败");
-    const completionCandidate = completeTask && persistedTaskId && tasks.find((task) => task.id === persistedTaskId)?.status !== "done"
+    const completionCandidate = completeTask && persistedTaskId && [...todayPlanTasks, ...tasks].find((task) => task.id === persistedTaskId)?.status !== "done"
       ? persistedTaskId
       : undefined;
-    const task = persistedTaskId ? tasks.find((candidate) => candidate.id === persistedTaskId) : undefined;
+    const task = persistedTaskId ? [...todayPlanTasks, ...tasks].find((candidate) => candidate.id === persistedTaskId) : undefined;
     const entry = toUiTimeEntry(await createManualTimeEntry({
       taskId: persistedTaskId,
       workDate: todayDate,
@@ -2116,6 +2536,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen, unassignedWorkDate, unassignedSessionId, unassignedVersion,
     unassignedCurrentSession,
     workspaceLoaded, workspaceLoading, executionSnapshots, executionSnapshotLoading, loadExecutionSnapshot, saveExecutionTaskTitle, saveExecutionTaskNote, saveExecutionTaskDetails, deleteExecutionTask, loadWorkspaceData, loadTodayPlan, setTodayPlanMembership, addTasksToToday, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addTaskSelectionDraft, addChildTask, addTaskRelative, createTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTodayImport, saveTaskPlanBatch, loadActualAdjustmentSnapshot, saveActualAdjustmentBatch, removeActualAdjustment, duplicateTask, duplicateSingleTask, deleteTask, moveTask, reorderTask, movePlanTask,
+    addTodayTask, addTodayChildTask, addTodayTaskRelative, saveTodayTask, saveTodayTaskToFuture, deleteTodayTask, saveTodayTaskNote, saveTodayTaskNoteToFuture, saveTodayTaskTodayEstimate, commitTodayTaskToggle, toggleTodayTask, moveTodayTask, indentTodayTask, outdentTodayTask, duplicateTodayTask, duplicateSingleTodayTask,
     indentTask, outdentTask, moveExecutionTask, startTimer, transitionTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, loadReportTemplates, createReportTemplate, updateReportTemplate, duplicateReportTemplate, setDefaultReportTemplate, deleteReportTemplate, reorderReportTemplates, getReportTemplatePlaceholders, publicReportText, previewObsidianReport, writeObsidianReport,
     beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, dismissUnassignedResolution, resolveUnassignedTime
   };

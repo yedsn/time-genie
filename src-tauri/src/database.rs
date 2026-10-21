@@ -125,6 +125,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "retry_actual_adjustment_target_conflicts",
         sql: include_str!("../migrations/0022_retry_actual_adjustment_target_conflicts.sql"),
     },
+    Migration {
+        version: 23,
+        name: "today_task_instances",
+        sql: include_str!("../migrations/0023_today_task_instances.sql"),
+    },
+    Migration {
+        version: 24,
+        name: "task_day_plan_instances",
+        sql: include_str!("../migrations/0024_task_day_plan_instances.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -625,7 +635,7 @@ mod tests {
         let workspace_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(migration_count, 22);
+        assert_eq!(migration_count, latest_migration_version());
         assert_eq!(workspace_count, 1);
     }
 
@@ -775,6 +785,166 @@ mod tests {
             )
             .unwrap();
         assert_eq!(migration_count, 1);
+    }
+
+    #[test]
+    fn today_instance_migrations_enforce_scope_and_allow_readd_after_archive() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("today-instance-upgrade.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                   version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        for migration in &MIGRATIONS[..22] {
+            let transaction = connection.transaction().unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version,name,applied_at) VALUES (?1,?2,1)",
+                    params![migration.version, migration.name],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO workspaces(id,name,timezone,storage_mode,created_at,updated_at,version)
+                   VALUES ('instance-ws','Instance','Asia/Shanghai','local',1,1,1);
+                 INSERT INTO subjects(id,workspace_id,name,sort_order,created_at,updated_at,version)
+                   VALUES ('instance-subject','instance-ws','Instance',10,1,1,1);
+                 INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version)
+                   VALUES ('source-parent','instance-ws','instance-subject','Parent','open','manual',10,1,1,1),
+                          ('source-child','instance-ws','instance-subject','Child','open','manual',20,1,1,1);",
+            )
+            .unwrap();
+        drop(connection);
+
+        Database::initialize_at(path.clone()).unwrap();
+        Database::initialize_at(path.clone()).unwrap();
+        let connection = Connection::open(path).unwrap();
+        configure_connection(&connection).unwrap();
+
+        let ordinary_scope: (Option<String>, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT day_instance_date,day_instance_kind,day_instance_source_task_id
+                 FROM tasks WHERE id='source-child'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(ordinary_scope, (None, None, None));
+
+        connection
+            .execute_batch(
+                "INSERT INTO tasks(
+                     id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version,
+                     day_instance_date,day_instance_kind,day_instance_source_task_id
+                   ) VALUES (
+                     'context-1','instance-ws','instance-subject','Parent','open','manual',10,2,2,1,
+                     '2026-10-21','context','source-parent'
+                   );
+                 INSERT INTO tasks(
+                     id,workspace_id,subject_id,parent_id,title,status,source_type,sort_order,created_at,updated_at,version,
+                     day_instance_date,day_instance_kind,day_instance_source_task_id
+                   ) VALUES (
+                     'member-1','instance-ws','instance-subject','context-1','Child','open','manual',20,2,2,1,
+                     '2026-10-21','member','source-child'
+                   );
+                 INSERT INTO task_day_plans(
+                     workspace_id,task_id,work_date,state,created_at,updated_at,version,instance_task_id
+                   ) VALUES (
+                     'instance-ws','source-child','2026-10-21','included',2,2,1,'member-1'
+                   );",
+            )
+            .unwrap();
+
+        let invalid_field_pair = connection.execute(
+            "INSERT INTO tasks(
+               id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version,
+               day_instance_date
+             ) VALUES (
+               'invalid-fields','instance-ws','instance-subject','Invalid','open','manual',30,2,2,1,
+               '2026-10-21'
+             )",
+            [],
+        );
+        assert!(invalid_field_pair.is_err());
+
+        let cross_date_parent = connection.execute(
+            "INSERT INTO tasks(
+               id,workspace_id,subject_id,parent_id,title,status,source_type,sort_order,created_at,updated_at,version,
+               day_instance_date,day_instance_kind
+             ) VALUES (
+               'cross-date-member','instance-ws','instance-subject','context-1','Cross date','open','manual',30,2,2,1,
+               '2026-10-22','member'
+             )",
+            [],
+        );
+        assert!(cross_date_parent.is_err());
+
+        let duplicate_active_source = connection.execute(
+            "INSERT INTO tasks(
+               id,workspace_id,subject_id,parent_id,title,status,source_type,sort_order,created_at,updated_at,version,
+               day_instance_date,day_instance_kind,day_instance_source_task_id
+             ) VALUES (
+               'member-duplicate','instance-ws','instance-subject','context-1','Duplicate','open','manual',30,2,2,1,
+               '2026-10-21','member','source-child'
+             )",
+            [],
+        );
+        assert!(duplicate_active_source.is_err());
+
+        connection
+            .execute(
+                "UPDATE tasks SET deleted_at=3,updated_at=3,version=version+1 WHERE id='member-1'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO tasks(
+                   id,workspace_id,subject_id,parent_id,title,status,source_type,sort_order,created_at,updated_at,version,
+                   day_instance_date,day_instance_kind,day_instance_source_task_id
+                 ) VALUES (
+                   'member-2','instance-ws','instance-subject','context-1','Child again','open','manual',20,4,4,1,
+                   '2026-10-21','member','source-child'
+                 );
+                 UPDATE task_day_plans
+                    SET state='included',instance_task_id='member-2',updated_at=4,version=version+1
+                  WHERE task_id='source-child' AND work_date='2026-10-21';",
+            )
+            .unwrap();
+
+        let plan: (String, String) = connection
+            .query_row(
+                "SELECT state,instance_task_id FROM task_day_plans
+                 WHERE task_id='source-child' AND work_date='2026-10-21'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(plan, ("included".to_string(), "member-2".to_string()));
+        let archived_old_instance: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id='member-1' AND deleted_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archived_old_instance, 1);
+        let migration_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (23,24)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 2);
     }
 
     #[test]

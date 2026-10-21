@@ -1381,9 +1381,11 @@ async function startTimerForTask(taskId: string) {
   if (startingTimerTaskIds.has(taskId)) return;
   startingTimerTaskIds.add(taskId);
   try {
-    const task = store.tasks.find((item) => item.id === taskId);
+    const task = [...store.todayPlanTasks, ...store.tasks].find((item) => item.id === taskId);
     if (!task || store.runningEntry?.defaultTask === taskId) return;
-    const persistedTaskId = task.version > 0 ? task.id : await store.saveTask(task.id);
+    const persistedTaskId = task.version > 0
+      ? task.id
+      : task.dayInstanceDate ? await store.saveTodayTask(task.id) : await store.saveTask(task.id);
     if (!persistedTaskId) throw new Error("计时事项保存失败");
     const result = await store.transitionTimer({ taskId: persistedTaskId });
     if (result.previousStopResult && !result.noOp) ElMessage.success("已切换事项，上一段计时可稍后确认归属");
@@ -1415,13 +1417,29 @@ async function handleTaskRecurrence(
   }
 }
 
-async function handleTaskSave(taskId: string) {
+async function handleTaskSave(taskId: string, field?: "title" | "plannedDate" | "estimate") {
   try {
-    const wasNewTodayTask = store.planTaskTab === "today" && (store.tasks.find((task) => task.id === taskId)?.version ?? 0) <= 0;
-    const savedTaskId = await store.saveTask(taskId);
-    if (wasNewTodayTask && savedTaskId) await store.addTasksToToday([savedTaskId]);
+    if (store.planTaskTab === "today") {
+      const task = store.todayPlanTasks.find((item) => item.id === taskId);
+      const source = task?.dayInstanceSourceTaskId
+        ? store.tasks.find((item) => item.id === task.dayInstanceSourceTaskId)
+        : undefined;
+      if (source?.recurrence && (field === "title" || field === "estimate")) {
+        const scope = await ElMessageBox.confirm(
+          `“${task?.title || "重复事项"}”来自重复计划，要把这次修改应用到今后的重复事项吗？`,
+          "修改重复事项",
+          { confirmButtonText: "修改今后全部", cancelButtonText: "仅修改今天", distinguishCancelAndClose: true, type: "info" },
+        ).then(() => "future" as const).catch((action) => action === "cancel" ? "today" as const : "closed" as const);
+        if (scope === "closed") { await store.loadTodayPlan(task!.subjectId); return false; }
+        if (scope === "future") return await store.saveTodayTaskToFuture(taskId, field);
+        return await store.saveTodayTask(taskId);
+      }
+      return await store.saveTodayTask(taskId);
+    }
+    return await store.saveTask(taskId);
   } catch (error) {
     ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "事项保存失败");
+    return false;
   }
 }
 
@@ -1442,12 +1460,14 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
   const completing = task.status !== "done";
   if (completing && isCompletionFeedbackEnabled()) row?.classList.add("task-completion-confirmed");
   try {
-    const result = await store.commitTaskToggle(task);
+    const result = store.planTaskTab === "today"
+      ? await store.commitTodayTaskToggle(task)
+      : await store.commitTaskToggle(task);
     if (!result) return;
     if (result.direction === "completed" && isCompletionFeedbackEnabled()) {
       window.setTimeout(() => row?.classList.remove("task-completion-confirmed"), 380);
     }
-    void Promise.all([store.loadWorkspaceData(), store.loadTodayOverview()]);
+    void Promise.all([store.planTaskTab === "today" ? store.loadTodayPlan(task.subjectId) : store.loadWorkspaceData(), store.loadTodayOverview()]);
     if (result.completedCount > 0 && isCompletionFeedbackEnabled()) {
       recentCompletedTaskId.value = result.taskId;
       if (recentCompletedTimer) window.clearTimeout(recentCompletedTimer);
@@ -1471,7 +1491,8 @@ async function handleTaskToggle(task: Task, event: MouseEvent) {
 
 async function handleTaskMove(taskId: string, parentId?: string, previousSiblingId?: string, nextSiblingId?: string) {
   try {
-    await store.movePlanTask(taskId, parentId, previousSiblingId, nextSiblingId);
+    if (store.planTaskTab === "today") await store.moveTodayTask(taskId, parentId, previousSiblingId, nextSiblingId);
+    else await store.movePlanTask(taskId, parentId, previousSiblingId, nextSiblingId);
   } catch (error) {
     await store.loadWorkspaceData();
     ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "事项移动失败");
@@ -1480,7 +1501,22 @@ async function handleTaskMove(taskId: string, parentId?: string, previousSibling
 
 async function handleTaskNoteSave(taskId: string, note: string) {
   try {
-    await store.saveTaskNote(taskId, note);
+    if (store.planTaskTab === "today") {
+      const task = store.todayPlanTasks.find((item) => item.id === taskId);
+      const source = task?.dayInstanceSourceTaskId
+        ? store.tasks.find((item) => item.id === task.dayInstanceSourceTaskId)
+        : undefined;
+      if (source?.recurrence) {
+        const scope = await ElMessageBox.confirm(
+          `要把“${task?.title || "重复事项"}”的备注修改应用到今后的重复事项吗？`,
+          "修改重复事项",
+          { confirmButtonText: "修改今后全部", cancelButtonText: "仅修改今天", distinguishCancelAndClose: true, type: "info" },
+        ).then(() => "future" as const).catch((action) => action === "cancel" ? "today" as const : "closed" as const);
+        if (scope === "closed") return;
+        if (scope === "future") await store.saveTodayTaskNoteToFuture(taskId, note);
+        else await store.saveTodayTaskNote(taskId, note);
+      } else await store.saveTodayTaskNote(taskId, note);
+    } else await store.saveTaskNote(taskId, note);
   } catch (error) {
     ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "备注保存失败");
   }
@@ -1488,12 +1524,27 @@ async function handleTaskNoteSave(taskId: string, note: string) {
 
 async function createTaskFromTodayImport(title: string, parentId?: string) {
   const draftId = parentId
-    ? store.addChildTask(parentId, title)
-    : store.addTask(title, store.selectedSubjectId);
+    ? store.addTodayChildTask(parentId, title)
+    : store.addTodayTask(title, store.selectedSubjectId);
   if (!draftId) throw new Error(parentId ? "该一级事项暂时不能新增子项" : "事项新增失败");
-  const savedTaskId = await store.saveTask(draftId);
+  const savedTaskId = await store.saveTodayTask(draftId);
   if (!savedTaskId) throw new Error("事项新增失败");
   return savedTaskId;
+}
+
+async function createTodayTaskRelativeFromImport(targetId: string, placement: "before" | "after", title: string) {
+  const draftId = store.addTodayTaskRelative(targetId, placement);
+  if (!draftId) throw new Error("事项新增失败");
+  const draft = store.todayPlanTasks.find((task) => task.id === draftId);
+  if (!draft) throw new Error("事项新增失败");
+  draft.title = title;
+  const savedTaskId = await store.saveTodayTask(draftId);
+  if (!savedTaskId) throw new Error("事项新增失败");
+  return savedTaskId;
+}
+
+async function saveTodayTaskTitleFromImport(taskId: string) {
+  return await handleTaskSave(taskId, "title");
 }
 
 async function handleTodayPlanRemove(taskId: string) {
@@ -1514,8 +1565,7 @@ async function handleAddTasksToToday(taskIds: string[]) {
 
 async function handleTodayTaskDuplicate(taskId: string) {
   try {
-    const duplicatedTaskId = await store.duplicateTask(taskId);
-    if (duplicatedTaskId) await store.addTasksToToday([duplicatedTaskId]);
+    await store.duplicateTodayTask(taskId);
   } catch (error) {
     ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "复制今日事项失败");
   }
@@ -1523,7 +1573,8 @@ async function handleTodayTaskDuplicate(taskId: string) {
 
 async function handleTodayEstimateSave(taskId: string, estimateMinutes?: number) {
   try {
-    await store.saveTaskTodayEstimate(taskId, estimateMinutes);
+    if (store.planTaskTab === "today") await store.saveTodayTaskTodayEstimate(taskId, estimateMinutes);
+    else await store.saveTaskTodayEstimate(taskId, estimateMinutes);
   } catch (error) {
     ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "今日预计保存失败");
   }
@@ -1660,17 +1711,17 @@ async function handleCompletedTaskDelete(task: Task) {
           :timezone="store.workspaceTimezone"
           :save-today-import="store.saveTodayImport"
           :create-task="createTaskFromTodayImport"
-          :create-relative-task="store.createTaskRelative"
-          :duplicate-single-task="store.duplicateSingleTask"
-          :save-task="store.saveTask"
+          :create-relative-task="createTodayTaskRelativeFromImport"
+          :duplicate-single-task="store.duplicateSingleTodayTask"
+          :save-task="saveTodayTaskTitleFromImport"
           :save-plan-batch="store.saveTaskPlanBatch"
           :load-actual-snapshot="store.loadActualAdjustmentSnapshot"
           :save-actual-batch="store.saveActualAdjustmentBatch"
-          :move-task="store.movePlanTask"
+          :move-task="store.moveTodayTask"
           @select="store.selectedTaskId = $event"
-          @add="store.addTask('', store.selectedSubjectId)"
-          @add-child="store.addChildTask"
-          @add-relative="store.addTaskRelative"
+          @add="store.addTodayTask('', store.selectedSubjectId)"
+          @add-child="store.addTodayChildTask"
+          @add-relative="store.addTodayTaskRelative"
           @save="handleTaskSave"
           @save-note="handleTaskNoteSave"
           @save-today-estimate="handleTodayEstimateSave"
@@ -1679,10 +1730,10 @@ async function handleCompletedTaskDelete(task: Task) {
           @import-plan="openPlanImport"
           @sync-sea-table="openSeaTableSync"
           @duplicate="handleTodayTaskDuplicate"
-          @delete="store.deleteTask"
+          @delete="store.deleteTodayTask"
           @toggle="handleTaskToggle"
-          @indent="store.indentTask"
-          @outdent="store.outdentTask"
+          @indent="store.indentTodayTask"
+          @outdent="store.outdentTodayTask"
           @start-timer="startTimerForTask"
           @move="handleTaskMove"
           @set-recurrence="handleTaskRecurrence"
@@ -1691,7 +1742,7 @@ async function handleCompletedTaskDelete(task: Task) {
           v-if="store.planTaskTab === 'active'"
           :tasks="store.selectedSubjectTasks"
           :today-status-tasks="store.todayPlanTasks"
-          :today-member-ids="store.todayPlanTasks.filter((task) => task.todayMember).map((task) => task.id)"
+          :today-member-ids="store.todayPlanTasks.filter((task) => task.todayMember && task.dayInstanceSourceTaskId).map((task) => task.dayInstanceSourceTaskId!)"
           :subject-id="store.selectedSubjectId"
           :subject-name="store.selectedSubject?.name ?? '待办'"
           :selected-id="store.selectedTaskId"

@@ -1991,12 +1991,12 @@ fn apply_incremental_entity(
         "work_days" => transaction.execute("INSERT INTO work_days(workspace_id,work_date,timezone,work_period_text,note,settled_at,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(workspace_id,work_date) DO UPDATE SET timezone=excluded.timezone,work_period_text=excluded.work_period_text,note=excluded.note,settled_at=excluded.settled_at,updated_at=excluded.updated_at,version=excluded.version", params![workspace_id,text(data,"work_date"),text(data,"timezone"),optional_text(data,"work_period_text"),optional_text(data,"note"),optional_millis(data,"settled_at"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version")]),
         "app_settings" => transaction.execute("INSERT INTO app_settings(workspace_id,key,value_json,updated_at,version) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(workspace_id,key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at,version=excluded.version", params![workspace_id,text(data,"key"),data.get("value_json").cloned().unwrap_or(Value::Null).to_string(),millis(data,"updated_at"),integer(data,"version")]),
         "tasks" => {
-            let changed = transaction.execute("INSERT INTO tasks(id,workspace_id,subject_id,parent_id,title,status,planned_date,planned_time,estimate_minutes,note,project_name,solution_name,source_type,source_ref,sort_order,completed_at,created_at,updated_at,version,deleted_at) VALUES (?1,?2,?3,NULL,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19) ON CONFLICT(id) DO UPDATE SET subject_id=excluded.subject_id,parent_id=NULL,title=excluded.title,status=excluded.status,planned_date=excluded.planned_date,planned_time=excluded.planned_time,estimate_minutes=excluded.estimate_minutes,note=excluded.note,project_name=excluded.project_name,solution_name=excluded.solution_name,source_type=excluded.source_type,source_ref=excluded.source_ref,sort_order=excluded.sort_order,completed_at=excluded.completed_at,updated_at=excluded.updated_at,version=excluded.version,deleted_at=excluded.deleted_at", params![text(data,"id"),workspace_id,text(data,"subject_id"),text(data,"title"),text(data,"status"),optional_text(data,"planned_date"),optional_time(data,"planned_time"),optional_integer(data,"estimate_minutes"),optional_text(data,"note"),optional_text(data,"project_name"),optional_text(data,"solution_name"),text(data,"source_type"),optional_text(data,"source_ref"),integer(data,"sort_order"),optional_millis(data,"completed_at"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version"),optional_millis(data,"deleted_at")]).map_err(|error| error.to_string())?;
+            let changed = transaction.execute("INSERT INTO tasks(id,workspace_id,subject_id,parent_id,title,status,planned_date,planned_time,estimate_minutes,note,project_name,solution_name,source_type,source_ref,sort_order,completed_at,created_at,updated_at,version,deleted_at,day_instance_date,day_instance_kind,day_instance_source_task_id) VALUES (?1,?2,?3,NULL,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22) ON CONFLICT(id) DO UPDATE SET subject_id=excluded.subject_id,parent_id=NULL,title=excluded.title,status=excluded.status,planned_date=excluded.planned_date,planned_time=excluded.planned_time,estimate_minutes=excluded.estimate_minutes,note=excluded.note,project_name=excluded.project_name,solution_name=excluded.solution_name,source_type=excluded.source_type,source_ref=excluded.source_ref,sort_order=excluded.sort_order,completed_at=excluded.completed_at,updated_at=excluded.updated_at,version=excluded.version,deleted_at=excluded.deleted_at,day_instance_date=excluded.day_instance_date,day_instance_kind=excluded.day_instance_kind,day_instance_source_task_id=excluded.day_instance_source_task_id", params![text(data,"id"),workspace_id,text(data,"subject_id"),text(data,"title"),text(data,"status"),optional_text(data,"planned_date"),optional_time(data,"planned_time"),optional_integer(data,"estimate_minutes"),optional_text(data,"note"),optional_text(data,"project_name"),optional_text(data,"solution_name"),text(data,"source_type"),optional_text(data,"source_ref"),integer(data,"sort_order"),optional_millis(data,"completed_at"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version"),optional_millis(data,"deleted_at"),optional_text(data,"day_instance_date"),optional_text(data,"day_instance_kind"),optional_text(data,"day_instance_source_task_id")]).map_err(|error| error.to_string())?;
             Ok(changed)
         }
         "task_status_events" => transaction.execute("INSERT INTO task_status_events(id,workspace_id,task_id,status,occurred_at,source_type,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET status=excluded.status,occurred_at=excluded.occurred_at,source_type=excluded.source_type", params![text(data,"id"),workspace_id,text(data,"task_id"),text(data,"status"),millis(data,"occurred_at"),text(data,"source_type"),millis(data,"created_at")]),
         "task_daily_estimates" => transaction.execute("INSERT INTO task_daily_estimates(workspace_id,task_id,work_date,estimate_minutes,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(task_id,work_date) DO UPDATE SET estimate_minutes=excluded.estimate_minutes,updated_at=excluded.updated_at,version=excluded.version", params![workspace_id,text(data,"task_id"),text(data,"work_date"),integer(data,"estimate_minutes"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version")]),
-        "task_day_plans" => transaction.execute("INSERT INTO task_day_plans(workspace_id,task_id,work_date,state,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(task_id,work_date) DO UPDATE SET state=excluded.state,updated_at=excluded.updated_at,version=excluded.version", params![workspace_id,text(data,"task_id"),text(data,"work_date"),text(data,"state"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version")]),
+        "task_day_plans" => transaction.execute("INSERT INTO task_day_plans(workspace_id,task_id,work_date,state,instance_task_id,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(task_id,work_date) DO UPDATE SET state=excluded.state,instance_task_id=excluded.instance_task_id,updated_at=excluded.updated_at,version=excluded.version", params![workspace_id,text(data,"task_id"),text(data,"work_date"),text(data,"state"),optional_text(data,"instance_task_id"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version")]),
         "task_recurrence_rules" => {
             transaction.execute("DELETE FROM task_recurrence_rules WHERE workspace_id=?1 AND task_id=?2", params![workspace_id,entity.entity_id]).map_err(|error| error.to_string())?;
             for rule in data.get("rules").and_then(Value::as_array).cloned().unwrap_or_default() {
@@ -2958,12 +2958,52 @@ pub(crate) fn enqueue_actual_adjustment_batch_in_transaction(
         .ok_or_else(|| "VALIDATION_ERROR: 实际调整批次缺少批次 ID".to_string())?;
     Uuid::parse_str(batch_id)
         .map_err(|_| "VALIDATION_ERROR: 云端实际调整批次 ID 必须是 UUID".to_string())?;
+    let mut task_ids = std::collections::HashSet::new();
+    if let Some(items) = payload.get("items").and_then(Value::as_array) {
+        for item in items {
+            if let Some(task_id) = item.get("taskId").and_then(Value::as_str) {
+                task_ids.insert(task_id.to_string());
+            }
+        }
+    }
+    if let Some(created_tasks) = payload.get("createdTasks").and_then(Value::as_array) {
+        for created in created_tasks {
+            if let Some(task_id) = created
+                .get("task")
+                .and_then(|task| task.get("id"))
+                .and_then(Value::as_str)
+            {
+                task_ids.insert(task_id.to_string());
+            }
+        }
+    }
+    let mut dependency: Option<(i64, String)> = None;
+    for task_id in task_ids {
+        let candidate = transaction
+            .query_row(
+                "SELECT created_at,operation_id FROM sync_outbox
+                 WHERE workspace_id=?1 AND entity_type='task' AND entity_id=?2
+                   AND state IN ('pending','sending','failed')
+                 ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                params![state.workspace_id, task_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if candidate.as_ref().is_some_and(|candidate| {
+            dependency
+                .as_ref()
+                .is_none_or(|current| candidate > current)
+        }) {
+            dependency = candidate;
+        }
+    }
     transaction
         .execute(
             "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, payload_version, depends_on_operation_id, workspace_epoch, state, attempt_count, created_at)
-             VALUES (?1, ?2, ?3, 'actual_adjustment_batch_apply', 'actual_adjustment_batch', ?4, NULL, ?5, NULL, NULL, ?6, 'pending', 0, ?7)
+             VALUES (?1, ?2, ?3, 'actual_adjustment_batch_apply', 'actual_adjustment_batch', ?4, NULL, ?5, NULL, ?6, ?7, 'pending', 0, ?8)
              ON CONFLICT(operation_id) DO NOTHING",
-            params![operation_id, state.workspace_id, state.device_id, batch_id, payload.to_string(), state.workspace_epoch, now_millis()],
+            params![operation_id, state.workspace_id, state.device_id, batch_id, payload.to_string(), dependency.map(|item| item.1), state.workspace_epoch, now_millis()],
         )
         .map_err(|error| error.to_string())?;
     Ok(Some(operation_id.to_string()))
@@ -8037,7 +8077,17 @@ fn replace_snapshot_table(
         }
         "tasks" => {
             for row in &rows {
-                transaction.execute("INSERT INTO tasks(id,workspace_id,subject_id,parent_id,title,status,planned_date,planned_time,estimate_minutes,note,project_name,solution_name,source_type,source_ref,sort_order,completed_at,created_at,updated_at,version,deleted_at) VALUES (?1,?2,?3,NULL,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)", params![text(row,"id"),workspace_id,text(row,"subject_id"),text(row,"title"),text(row,"status"),optional_text(row,"planned_date"),optional_time(row,"planned_time"),optional_integer(row,"estimate_minutes"),optional_text(row,"note"),optional_text(row,"project_name"),optional_text(row,"solution_name"),text(row,"source_type"),optional_text(row,"source_ref"),integer(row,"sort_order"),optional_millis(row,"completed_at"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version"),optional_millis(row,"deleted_at")]).map_err(|error| error.to_string())?;
+                transaction.execute("INSERT INTO tasks(id,workspace_id,subject_id,parent_id,title,status,planned_date,planned_time,estimate_minutes,note,project_name,solution_name,source_type,source_ref,sort_order,completed_at,created_at,updated_at,version,deleted_at,day_instance_date,day_instance_kind,day_instance_source_task_id) VALUES (?1,?2,?3,NULL,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,NULL)", params![text(row,"id"),workspace_id,text(row,"subject_id"),text(row,"title"),text(row,"status"),optional_text(row,"planned_date"),optional_time(row,"planned_time"),optional_integer(row,"estimate_minutes"),optional_text(row,"note"),optional_text(row,"project_name"),optional_text(row,"solution_name"),text(row,"source_type"),optional_text(row,"source_ref"),integer(row,"sort_order"),optional_millis(row,"completed_at"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version"),optional_millis(row,"deleted_at"),optional_text(row,"day_instance_date"),optional_text(row,"day_instance_kind")]).map_err(|error| format!("LOCAL_SNAPSHOT_APPLY_FAILED: tasks.day_instance: {error}"))?;
+            }
+            for row in &rows {
+                if let Some(source_task_id) = optional_text(row, "day_instance_source_task_id") {
+                    transaction
+                        .execute(
+                            "UPDATE tasks SET day_instance_source_task_id=?1 WHERE workspace_id=?2 AND id=?3",
+                            params![source_task_id, workspace_id, text(row, "id")],
+                        )
+                        .map_err(|error| format!("LOCAL_SNAPSHOT_APPLY_FAILED: tasks.day_instance_source_task_id: {error}"))?;
+                }
             }
             for row in rows {
                 if let Some(parent_id) = optional_text(&row, "parent_id") {
@@ -8062,7 +8112,7 @@ fn replace_snapshot_table(
         }
         "task_day_plans" => {
             replace_simple_rows(transaction, table, workspace_id, rows, |tx, row, ws| {
-                tx.execute("INSERT INTO task_day_plans(workspace_id,task_id,work_date,state,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![ws,text(row,"task_id"),text(row,"work_date"),text(row,"state"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version")])
+                tx.execute("INSERT INTO task_day_plans(workspace_id,task_id,work_date,state,instance_task_id,created_at,updated_at,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![ws,text(row,"task_id"),text(row,"work_date"),text(row,"state"),optional_text(row,"instance_task_id"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version")])
             })?
         }
         "task_recurrence_rules" => {
@@ -9818,11 +9868,17 @@ mod tests {
         assert!(interim
             .tasks
             .iter()
-            .any(|task| task.id == first_id && task.today_member));
+            .any(
+                |task| task.day_instance_source_task_id.as_deref() == Some(first_id.as_str())
+                    && task.today_member
+            ));
         assert!(interim
             .tasks
             .iter()
-            .any(|task| task.id == second_id && task.today_member));
+            .any(
+                |task| task.day_instance_source_task_id.as_deref() == Some(second_id.as_str())
+                    && task.today_member
+            ));
 
         apply_incremental_entities(
             &database,
@@ -9859,7 +9915,7 @@ mod tests {
             let row = final_snapshot
                 .tasks
                 .iter()
-                .find(|task| &task.id == task_id)
+                .find(|task| task.day_instance_source_task_id.as_deref() == Some(task_id.as_str()))
                 .unwrap();
             assert!(row.today_member);
             assert_eq!(row.day_plan_state.as_deref(), Some("included"));
@@ -14200,6 +14256,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: None,
                 title: "同步中计时".to_string(),
                 planned_date: None,
@@ -14260,6 +14317,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: None,
                 title: "本机未推送计时".to_string(),
                 planned_date: None,
@@ -14328,6 +14386,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: None,
                 title: "本机缓存损坏计时".to_string(),
                 planned_date: None,
@@ -14407,6 +14466,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: None,
                 title: "旧云端结束状态".to_string(),
                 planned_date: None,

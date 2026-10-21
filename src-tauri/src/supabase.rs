@@ -25,6 +25,7 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 12;
 const SNAPSHOT_TIMEOUT_SECONDS: u64 = 150;
 const RESTORE_TIMEOUT_SECONDS: u64 = 630;
 pub(crate) const CLOUD_SCHEMA: &str = "timegenie";
+pub(crate) const CLIENT_SCHEMA_GENERATION: i64 = 1;
 const CLOUD_BUSINESS_ENTITIES: [&str; 8] = [
     "tasks",
     "task_daily_estimates",
@@ -1955,6 +1956,10 @@ impl SupabaseClient {
         self.http
             .get(url)
             .header("apikey", &self.anon_key)
+            .header(
+                "x-timegenie-client-schema-generation",
+                CLIENT_SCHEMA_GENERATION.to_string(),
+            )
             .header("Accept-Profile", CLOUD_SCHEMA)
             .header("Content-Profile", CLOUD_SCHEMA)
     }
@@ -1963,6 +1968,10 @@ impl SupabaseClient {
         self.http
             .post(url)
             .header("apikey", &self.anon_key)
+            .header(
+                "x-timegenie-client-schema-generation",
+                CLIENT_SCHEMA_GENERATION.to_string(),
+            )
             .header("Accept-Profile", CLOUD_SCHEMA)
             .header("Content-Profile", CLOUD_SCHEMA)
     }
@@ -3438,17 +3447,14 @@ mod tests {
                             }
                         }
                     }
-                    let first_line = String::from_utf8_lossy(&request)
-                        .lines()
-                        .next()
-                        .unwrap_or_default()
-                        .to_string();
+                    let request_text = String::from_utf8_lossy(&request).to_string();
+                    let first_line = request_text.lines().next().unwrap_or_default().to_string();
                     assert!(
                         first_line.contains(expected.path),
                         "expected request path {}, got {first_line}",
                         expected.path
                     );
-                    thread_hits.lock().unwrap().push(first_line);
+                    thread_hits.lock().unwrap().push(request_text);
                     let reason = match expected.status {
                         200 => "OK",
                         204 => "No Content",
@@ -3489,6 +3495,32 @@ mod tests {
 
     fn reset_test_credentials() {
         TEST_CREDENTIAL_STORE.with(|store| *store.borrow_mut() = TestCredentialStore::default());
+    }
+
+    #[test]
+    fn supabase_business_requests_advertise_client_schema_generation() {
+        let server = TestHttpServer::start(vec![TestHttpResponse {
+            path: "/rest/v1/rpc/handshake_probe",
+            status: 200,
+            body: "{}",
+        }]);
+        let api = SupabaseClient {
+            project_url: server.base_url(),
+            anon_key: "anon-test-key".to_string(),
+            http: Client::builder().build().unwrap(),
+        };
+        api.request(
+            api.post(format!("{}/rest/v1/rpc/handshake_probe", api.project_url))
+                .json(&json!({})),
+            &test_session("schema-generation", Some(now_seconds() + 3600)),
+        )
+        .unwrap();
+        let requests = server.finish();
+        assert!(requests[0].lines().any(|line| {
+            line.eq_ignore_ascii_case(&format!(
+                "x-timegenie-client-schema-generation: {CLIENT_SCHEMA_GENERATION}"
+            ))
+        }));
     }
 
     fn lock_test_session_state() -> std::sync::MutexGuard<'static, ()> {
@@ -4875,6 +4907,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id,
+                day_instance_date: None,
                 parent_id: None,
                 title: "不支持迁移的重复事项".to_string(),
                 planned_date: None,
@@ -5006,6 +5039,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id,
+                day_instance_date: None,
                 parent_id: None,
                 title: "迁移预览规划事项".to_string(),
                 planned_date: None,

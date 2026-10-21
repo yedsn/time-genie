@@ -1813,11 +1813,21 @@ fn load_tasks(
     let mut statement = connection
         .prepare(
             "SELECT t.id, t.parent_id, t.title, t.status, t.estimate_minutes,
-                    de.estimate_minutes, t.sort_order
+                    CASE WHEN instance.id IS NOT NULL THEN instance_de.estimate_minutes ELSE de.estimate_minutes END, t.sort_order
              FROM tasks t
              LEFT JOIN task_daily_estimates de
                ON de.task_id = t.id AND de.workspace_id = t.workspace_id AND de.work_date = ?3
+             LEFT JOIN tasks instance
+               ON instance.workspace_id = t.workspace_id
+              AND instance.day_instance_source_task_id = t.id
+              AND instance.day_instance_date = ?3
+              AND instance.deleted_at IS NULL
+             LEFT JOIN task_daily_estimates instance_de
+               ON instance_de.task_id = instance.id
+              AND instance_de.workspace_id = instance.workspace_id
+              AND instance_de.work_date = ?3
              WHERE t.workspace_id = ?1 AND t.subject_id = ?2 AND t.deleted_at IS NULL
+               AND (t.day_instance_date IS NULL OR t.day_instance_source_task_id IS NULL)
              ORDER BY t.sort_order, t.created_at",
         )
         .map_err(|error| error.to_string())?;
@@ -1873,14 +1883,16 @@ fn task_actual_minutes(
 ) -> Result<HashMap<String, i64>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT task_id, SUM(minutes) FROM (
+            "SELECT COALESCE(t.day_instance_source_task_id, actual.task_id), SUM(actual.minutes) FROM (
                SELECT a.task_id AS task_id,a.minutes AS minutes
                FROM time_allocations a JOIN time_entries e ON e.id=a.entry_id
                WHERE a.workspace_id=?1 AND e.work_date BETWEEN ?2 AND ?3 AND e.deleted_at IS NULL
                UNION ALL
                SELECT task_id,delta_minutes FROM actual_time_adjustments
                WHERE workspace_id=?1 AND work_date BETWEEN ?2 AND ?3 AND deleted_at IS NULL
-             ) GROUP BY task_id",
+             ) actual
+             JOIN tasks t ON t.id=actual.task_id
+             GROUP BY COALESCE(t.day_instance_source_task_id, actual.task_id)",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
@@ -2753,6 +2765,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: None,
                 title: "生成日报事项".to_string(),
                 planned_date: None,
@@ -3050,6 +3063,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: None,
                 title: "尚未执行的后续计划".to_string(),
                 planned_date: None,
@@ -3131,6 +3145,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: None,
                 title: "候选父事项".to_string(),
                 planned_date: None,
@@ -3145,6 +3160,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: Some(parent.id.clone()),
                 title: "无计时完成事项".to_string(),
                 planned_date: None,
@@ -3159,6 +3175,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: None,
                 title: "周期外历史完成".to_string(),
                 planned_date: None,
@@ -3248,6 +3265,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: None,
                 title: "每周多次完成".to_string(),
                 planned_date: None,
@@ -3324,6 +3342,14 @@ mod tests {
                 params![task_id, today],
             )
             .unwrap();
+        connection
+            .execute(
+                "DELETE FROM task_daily_estimates WHERE task_id IN (
+                   SELECT id FROM tasks WHERE day_instance_source_task_id=?1 AND day_instance_date=?2
+                 ) AND work_date=?2",
+                params![task_id, today],
+            )
+            .unwrap();
         let now = chrono::Local::now().timestamp_millis();
         let entry_id = Uuid::now_v7().to_string();
         connection
@@ -3372,6 +3398,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: None,
                 title: "同日口径事项".to_string(),
                 planned_date: Some("2026-09-29".to_string()),
@@ -3441,6 +3468,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: None,
                 title: "日报调整事项".into(),
                 planned_date: Some("2026-09-29".into()),
@@ -3484,6 +3512,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: None,
                 title: "每日方案预备".to_string(),
                 planned_date: None,
@@ -3595,6 +3624,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id: subject_id.clone(),
+                day_instance_date: None,
                 parent_id: None,
                 title: "仅工作日事项".to_string(),
                 planned_date: None,

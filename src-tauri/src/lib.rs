@@ -505,6 +505,7 @@ pub fn run() {
             tasks::task_create_positioned,
             tasks::task_create_quick,
             tasks::task_update,
+            tasks::task_today_recurring_update,
             tasks::task_set_completed,
             tasks::task_delete_subtree,
             tasks::task_reorder_subtree,

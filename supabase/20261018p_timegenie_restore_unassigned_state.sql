@@ -20,7 +20,12 @@ begin
   if timegenie.workspace_snapshot_hash(target)<>p_target_content_hash then raise exception 'SNAPSHOT_CHECKSUM_FAILED'; end if;
   update timegenie.workspace_restore_locks set status='committing',updated_at=now() where workspace_id=p_workspace_id;
   perform set_config('timegenie.restore_lock_token',p_lock_token::text,true);
-  perform set_config('request.headers',jsonb_build_object('x-timegenie-workspace-epoch',current_epoch::text)::text,true);
+  perform set_config(
+    'request.headers',
+    (coalesce(nullif(current_setting('request.headers',true),'')::jsonb,'{}'::jsonb)
+      || jsonb_build_object('x-timegenie-workspace-epoch',current_epoch::text))::text,
+    true
+  );
   delete from timegenie.report_tasks where workspace_id=p_workspace_id;
   delete from timegenie.reports where workspace_id=p_workspace_id;
   delete from timegenie.actual_time_adjustments where workspace_id=p_workspace_id;

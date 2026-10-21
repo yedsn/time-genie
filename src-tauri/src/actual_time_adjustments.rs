@@ -32,6 +32,9 @@ pub struct ActualAdjustmentSnapshotTaskDto {
     pub id: String,
     pub subject_id: String,
     pub parent_id: Option<String>,
+    pub day_instance_date: Option<String>,
+    pub day_instance_kind: Option<String>,
+    pub day_instance_source_task_id: Option<String>,
     pub title: String,
     pub note: Option<String>,
     pub status: String,
@@ -66,6 +69,8 @@ pub struct ActualAdjustmentSnapshotDto {
 pub struct ActualAdjustmentSnapshotRequest {
     pub subject_id: String,
     pub work_date: String,
+    #[serde(default)]
+    pub execution_only: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -97,6 +102,8 @@ pub struct ActualAdjustmentBatchRequest {
     pub client_request_id: String,
     pub batch_id: String,
     pub note: Option<String>,
+    #[serde(default)]
+    pub day_instance_date: Option<String>,
     #[serde(default)]
     pub items: Vec<ActualAdjustmentBatchItem>,
     #[serde(default)]
@@ -311,15 +318,19 @@ pub fn snapshot(
     let direct = direct_actual_minutes_map(&connection, &workspace_id, Some(&request.work_date))?;
     let timezone = crate::work_calendar::workspace_timezone(&connection, &workspace_id)?;
     let workday = crate::work_calendar::day_bounds(timezone, &request.work_date)?;
+    let execution_only = request.execution_only.unwrap_or(false);
     let mut statement = connection.prepare(
         "SELECT t.id,t.subject_id,t.parent_id,t.title,t.note,t.status,t.completed_at,
                 t.planned_date,t.estimate_minutes,de.estimate_minutes,de.version,t.sort_order,t.version,
                 NOT EXISTS(SELECT 1 FROM tasks c WHERE c.parent_id=t.id AND c.deleted_at IS NULL),
                 (SELECT state FROM time_entries e WHERE e.default_task_id=t.id AND e.deleted_at IS NULL AND e.state IN ('running','paused') LIMIT 1),
-                t.parent_id IS NULL AND t.status='open' AND NOT EXISTS(SELECT 1 FROM task_recurrence_rules r WHERE r.task_id=t.id AND r.effective_end IS NULL)
+                t.parent_id IS NULL AND t.status='open' AND NOT EXISTS(SELECT 1 FROM task_recurrence_rules r WHERE r.task_id=t.id AND r.effective_end IS NULL),
+                t.day_instance_date,t.day_instance_kind,t.day_instance_source_task_id
          FROM tasks t
          LEFT JOIN task_daily_estimates de ON de.workspace_id=t.workspace_id AND de.task_id=t.id AND de.work_date=?3
          WHERE t.workspace_id=?1 AND t.subject_id=?2 AND t.deleted_at IS NULL
+           AND (t.day_instance_date IS NULL OR t.day_instance_date=?3)
+           AND (?6=0 OR t.day_instance_date=?3)
            AND (t.status='open' OR (t.completed_at>=?4 AND t.completed_at<?5)
                 OR EXISTS(SELECT 1 FROM time_allocations a JOIN time_entries e ON e.id=a.entry_id WHERE a.task_id=t.id AND e.work_date=?3 AND e.deleted_at IS NULL)
                 OR EXISTS(SELECT 1 FROM actual_time_adjustments aa WHERE aa.task_id=t.id AND aa.work_date=?3 AND aa.deleted_at IS NULL)
@@ -338,7 +349,8 @@ pub fn snapshot(
                 request.subject_id,
                 request.work_date,
                 workday.start_at,
-                workday.end_at
+                workday.end_at,
+                execution_only as i64,
             ],
             |row| {
                 Ok((
@@ -358,6 +370,9 @@ pub fn snapshot(
                     row.get::<_, bool>(13)?,
                     row.get::<_, Option<String>>(14)?,
                     row.get::<_, bool>(15)?,
+                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<String>>(17)?,
+                    row.get::<_, Option<String>>(18)?,
                 ))
             },
         )
@@ -405,6 +420,9 @@ pub fn snapshot(
         is_leaf,
         timer_state,
         parent_candidate,
+        day_instance_date,
+        day_instance_kind,
+        day_instance_source_task_id,
     ) in raw
     {
         let direct_minutes = *direct.get(&id).unwrap_or(&0);
@@ -416,6 +434,9 @@ pub fn snapshot(
             id: id.clone(),
             subject_id,
             parent_id,
+            day_instance_date,
+            day_instance_kind,
+            day_instance_source_task_id,
             title,
             note,
             status,
@@ -575,15 +596,32 @@ pub fn apply_batch(
         } else if draft.expected_parent_version.is_some() {
             return Err("VALIDATION_ERROR: 顶层事项不应携带父项版本".to_string());
         }
-        let id = Uuid::now_v7().to_string();
         let now = now_millis();
-        let sort_order = crate::tasks::next_sort_order(
+        let (task, _) = crate::tasks::create_task_in_transaction(
             &transaction,
             &workspace_id,
-            &request.subject_id,
-            draft.parent_id.as_deref(),
+            &crate::tasks::TaskCreateRequest {
+                subject_id: request.subject_id.clone(),
+                parent_id: draft.parent_id.clone(),
+                day_instance_date: request.day_instance_date.clone(),
+                title: draft.title.clone(),
+                planned_date: request
+                    .day_instance_date
+                    .is_none()
+                    .then(|| request.work_date.clone()),
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+            "manual",
+            draft.expected_parent_version,
+            now,
+            None,
+            None,
+            None,
         )?;
-        transaction.execute("INSERT INTO tasks(id,workspace_id,subject_id,parent_id,title,status,planned_date,source_type,source_ref,sort_order,created_at,updated_at,version,created_by_device_id,updated_by_device_id) VALUES(?1,?2,?3,?4,?5,'open',?6,'manual','actual_adjustment_quick_create',?7,?8,?8,1,?9,?9)",params![id,workspace_id,request.subject_id,draft.parent_id,draft.title.trim(),request.work_date,sort_order,now,state.device_id]).map_err(|error|error.to_string())?;
+        let id = task.id;
         created_tasks.push(ActualAdjustmentCreatedTaskDto {
             client_task_id: draft.client_task_id.clone(),
             task_id: id.clone(),
@@ -744,6 +782,7 @@ mod tests {
             client_request_id: "request-1".into(),
             batch_id: "batch-1".into(),
             note: Some("核对".into()),
+            day_instance_date: None,
             items: vec![],
             new_tasks: vec![ActualAdjustmentNewTaskInput {
                 client_task_id: "draft-1".into(),
@@ -772,6 +811,59 @@ mod tests {
     }
 
     #[test]
+    fn today_instance_actual_adjustment_does_not_increase_source_minutes() {
+        let (database, workspace, subject) = fixture();
+        let work_date = current_work_date(&database);
+        let source = insert_task(&database, &workspace, &subject, "长期来源", None);
+        let instance = insert_task(&database, &workspace, &subject, "今日副本", None);
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET day_instance_date=?1,day_instance_kind='member',day_instance_source_task_id=?2 WHERE id=?3",
+                params![work_date, source, instance],
+            )
+            .unwrap();
+        let fingerprint =
+            adjustment_fingerprint(&database.open().unwrap(), &workspace, &instance, &work_date)
+                .unwrap();
+
+        let result = apply_batch(
+            &database,
+            ActualAdjustmentBatchRequest {
+                subject_id: subject,
+                work_date: work_date.clone(),
+                client_request_id: "instance-actual-request".into(),
+                batch_id: "instance-actual-batch".into(),
+                note: None,
+                day_instance_date: Some(work_date.clone()),
+                items: vec![ActualAdjustmentBatchItem {
+                    task_id: instance.clone(),
+                    expected_task_version: 1,
+                    baseline_minutes: 0,
+                    target_minutes: 35,
+                    delta_minutes: 35,
+                    adjustment_fingerprint: fingerprint,
+                }],
+                new_tasks: vec![],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.adjustments.len(), 1);
+        assert_eq!(result.adjustments[0].task_id, instance);
+        let connection = database.open().unwrap();
+        assert_eq!(
+            direct_actual_minutes(&connection, &workspace, &source, Some(&work_date)).unwrap(),
+            0
+        );
+        assert_eq!(
+            direct_actual_minutes(&connection, &workspace, &instance, Some(&work_date)).unwrap(),
+            35
+        );
+    }
+
+    #[test]
     fn zero_target_creates_task_without_adjustment_and_invalid_draft_rolls_back() {
         let (database, _workspace, subject) = fixture();
         let work_date = current_work_date(&database);
@@ -783,6 +875,7 @@ mod tests {
                 client_request_id: "zero".into(),
                 batch_id: "zero-batch".into(),
                 note: None,
+                day_instance_date: None,
                 items: vec![],
                 new_tasks: vec![ActualAdjustmentNewTaskInput {
                     client_task_id: "zero-task".into(),
@@ -804,6 +897,7 @@ mod tests {
                 client_request_id: "bad".into(),
                 batch_id: "bad-batch".into(),
                 note: None,
+                day_instance_date: None,
                 items: vec![],
                 new_tasks: vec![ActualAdjustmentNewTaskInput {
                     client_task_id: "bad-task".into(),
@@ -940,6 +1034,7 @@ mod tests {
             ActualAdjustmentSnapshotRequest {
                 subject_id: subject,
                 work_date: work_date.into(),
+                execution_only: None,
             },
         )
         .unwrap();
@@ -984,6 +1079,7 @@ mod tests {
             client_request_id: "mixed-rollback".into(),
             batch_id: "mixed-rollback-batch".into(),
             note: None,
+            day_instance_date: None,
             items: vec![ActualAdjustmentBatchItem {
                 task_id: leaf.clone(),
                 expected_task_version: 1,
@@ -1058,6 +1154,7 @@ mod tests {
             client_request_id: request_id.into(),
             batch_id: format!("{request_id}-batch"),
             note: None,
+            day_instance_date: None,
             items: vec![],
             new_tasks: vec![ActualAdjustmentNewTaskInput {
                 client_task_id: format!("{request_id}-draft"),
@@ -1117,6 +1214,7 @@ mod tests {
                 client_request_id: "40000000-0000-0000-0000-000000000001".into(),
                 batch_id: "41000000-0000-0000-0000-000000000001".into(),
                 note: None,
+                day_instance_date: None,
                 items: vec![],
                 new_tasks: vec![ActualAdjustmentNewTaskInput {
                     client_task_id: "draft".into(),
@@ -1161,6 +1259,7 @@ mod tests {
                 client_request_id: "delete-adjustment".into(),
                 batch_id: "delete-adjustment-batch".into(),
                 note: None,
+                day_instance_date: None,
                 items: vec![ActualAdjustmentBatchItem {
                     task_id: task.clone(),
                     expected_task_version: 1,
@@ -1250,6 +1349,7 @@ mod tests {
                 client_request_id: "historical-create".into(),
                 batch_id: "historical-create-batch".into(),
                 note: None,
+                day_instance_date: None,
                 items: vec![ActualAdjustmentBatchItem {
                     task_id: task.clone(),
                     expected_task_version: 1,

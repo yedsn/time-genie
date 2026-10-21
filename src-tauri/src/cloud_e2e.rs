@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
 use uuid::Uuid;
@@ -164,6 +165,7 @@ fn create_task(database: &Database, subject_id: &str, title: &str) -> tasks::Tas
         database,
         TaskCreateRequest {
             subject_id: subject_id.to_string(),
+            day_instance_date: None,
             parent_id: None,
             title: title.to_string(),
             planned_date: None,
@@ -272,7 +274,42 @@ fn is_today_member(database: &Database, subject_id: &str, work_date: &str, task_
     .unwrap()
     .tasks
     .iter()
-    .any(|task| task.id == task_id && task.today_member)
+    .any(|task| {
+        task.today_member
+            && (task.id == task_id || task.day_instance_source_task_id.as_deref() == Some(task_id))
+    })
+}
+
+fn today_instance(
+    database: &Database,
+    subject_id: &str,
+    work_date: &str,
+    source_task_id: &str,
+) -> tasks::TaskDto {
+    today_plans::snapshot(
+        database,
+        TaskDayPlanSnapshotRequest {
+            subject_id: subject_id.to_string(),
+            work_date: work_date.to_string(),
+        },
+    )
+    .unwrap()
+    .tasks
+    .into_iter()
+    .find(|task| {
+        task.today_member && task.day_instance_source_task_id.as_deref() == Some(source_task_id)
+    })
+    .unwrap()
+}
+
+fn task_title(database: &Database, task_id: &str) -> String {
+    database
+        .open()
+        .unwrap()
+        .query_row("SELECT title FROM tasks WHERE id=?1", [task_id], |row| {
+            row.get(0)
+        })
+        .unwrap()
 }
 
 fn running_entry_count(database: &Database, work_date: &str) -> usize {
@@ -483,6 +520,7 @@ struct PlanningSnapshotState {
     daily_estimates: HashMap<String, Value>,
     recurrence_rules: HashMap<String, Vec<Value>>,
     time_entries: HashMap<String, Value>,
+    actual_time_adjustments: HashMap<String, Value>,
     report_templates: HashMap<String, Value>,
     reports: HashMap<String, Value>,
     base_change_seq: i64,
@@ -499,6 +537,7 @@ struct PlanningCloudState {
     daily_estimates: HashMap<String, Value>,
     recurrence_rules: HashMap<String, Vec<Value>>,
     time_entries: HashMap<String, Value>,
+    actual_time_adjustments: HashMap<String, Value>,
     report_templates: HashMap<String, Value>,
     reports: HashMap<String, Value>,
     changes: Vec<Value>,
@@ -533,6 +572,7 @@ impl Default for PlanningCloudState {
             daily_estimates: HashMap::new(),
             recurrence_rules: HashMap::new(),
             time_entries: HashMap::new(),
+            actual_time_adjustments: HashMap::new(),
             report_templates: HashMap::new(),
             reports: HashMap::new(),
             changes: Vec::new(),
@@ -683,6 +723,7 @@ impl PlanningCloudServer {
             daily_estimates: state.daily_estimates.clone(),
             recurrence_rules: state.recurrence_rules.clone(),
             time_entries: state.time_entries.clone(),
+            actual_time_adjustments: state.actual_time_adjustments.clone(),
             report_templates: state.report_templates.clone(),
             reports: state.reports.clone(),
             base_change_seq: state.latest_change_seq,
@@ -851,6 +892,7 @@ fn planning_snapshot_record(state: &PlanningCloudState) -> PlanningSnapshotState
         daily_estimates: state.daily_estimates.clone(),
         recurrence_rules: state.recurrence_rules.clone(),
         time_entries: state.time_entries.clone(),
+        actual_time_adjustments: state.actual_time_adjustments.clone(),
         report_templates: state.report_templates.clone(),
         reports: state.reports.clone(),
         base_change_seq: state.latest_change_seq,
@@ -866,6 +908,7 @@ fn restore_planning_snapshot(state: &mut PlanningCloudState, snapshot: &Planning
     state.daily_estimates = snapshot.daily_estimates.clone();
     state.recurrence_rules = snapshot.recurrence_rules.clone();
     state.time_entries = snapshot.time_entries.clone();
+    state.actual_time_adjustments = snapshot.actual_time_adjustments.clone();
     state.report_templates = snapshot.report_templates.clone();
     state.reports = snapshot.reports.clone();
 }
@@ -903,6 +946,7 @@ fn planning_snapshot(state: &PlanningCloudState) -> Value {
         "task_recurrence_rules": state.recurrence_rules.values().flatten().cloned().collect::<Vec<_>>(),
         "task_occurrences": state.occurrences.values().cloned().collect::<Vec<_>>(),
         "work_days": [], "time_entries": state.time_entries.values().cloned().collect::<Vec<_>>(), "time_segments": [], "time_allocations": [],
+        "actual_time_adjustments": state.actual_time_adjustments.values().cloned().collect::<Vec<_>>(),
         "unassigned_sessions": [], "unassigned_segments": [], "report_templates": state.report_templates.values().cloned().collect::<Vec<_>>(),
         "reports": state.reports.values().cloned().collect::<Vec<_>>(), "report_tasks": [], "app_settings": [], "integration_configs": [],
         "external_bindings": []
@@ -941,6 +985,10 @@ fn planning_incremental_entity(
         "time_entries" | "time_segments" | "time_allocations" => {
             ("time_entries", state.time_entries.get(entity_id).cloned())
         }
+        "actual_time_adjustments" => (
+            "actual_time_adjustments",
+            state.actual_time_adjustments.get(entity_id).cloned(),
+        ),
         "reports" | "report_tasks" => ("reports", state.reports.get(entity_id).cloned()),
         "report_templates" => (
             "report_templates",
@@ -1003,6 +1051,147 @@ fn planning_incremental_pull(state: &PlanningCloudState, body: &Value) -> Value 
         "reset_required": false,
         "workspace_epoch": state.workspace_epoch
     })
+}
+
+fn planning_actual_adjustment_fingerprint(
+    state: &PlanningCloudState,
+    task_id: &str,
+    work_date: &str,
+) -> String {
+    let mut rows = state
+        .actual_time_adjustments
+        .values()
+        .filter(|adjustment| {
+            adjustment["task_id"].as_str() == Some(task_id)
+                && adjustment["work_date"].as_str() == Some(work_date)
+        })
+        .map(|adjustment| {
+            format!(
+                "{}:{}:{}",
+                adjustment["id"].as_str().unwrap_or_default(),
+                adjustment["version"].as_i64().unwrap_or_default(),
+                adjustment["deleted_at"].as_i64().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    format!("{:x}", Sha256::digest(rows.join("|").as_bytes()))
+}
+
+fn planning_apply_actual_adjustment_batch(
+    state: &mut PlanningCloudState,
+    workspace_id: &str,
+    device_id: &str,
+    payload: &Value,
+) -> Result<Value, String> {
+    let subject_id = payload["subjectId"]
+        .as_str()
+        .ok_or_else(|| "VALIDATION_ERROR: missing subject".to_string())?;
+    let work_date = payload["workDate"]
+        .as_str()
+        .ok_or_else(|| "VALIDATION_ERROR: missing work date".to_string())?;
+    let adjustments = payload["adjustments"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    for item in payload["items"].as_array().into_iter().flatten() {
+        let task_id = item["taskId"]
+            .as_str()
+            .ok_or_else(|| "VALIDATION_ERROR: missing task".to_string())?;
+        let task = state
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| "VERSION_CONFLICT: actual adjustment task missing".to_string())?;
+        if task["subject_id"].as_str() != Some(subject_id)
+            || !task["deleted_at"].is_null()
+            || task["version"].as_i64() != item["expectedTaskVersion"].as_i64()
+        {
+            return Err("VERSION_CONFLICT: actual adjustment task version changed".to_string());
+        }
+        if planning_actual_adjustment_fingerprint(state, task_id, work_date)
+            != item["adjustmentFingerprint"].as_str().unwrap_or_default()
+        {
+            return Err(
+                "ADJUSTMENT_BASELINE_CONFLICT: actual adjustment baseline changed".to_string(),
+            );
+        }
+    }
+
+    let mut created_task_count = 0;
+    for wrapper in payload["createdTasks"].as_array().into_iter().flatten() {
+        let task = wrapper["task"].clone();
+        let task_id = task["id"]
+            .as_str()
+            .ok_or_else(|| "VALIDATION_ERROR: created task image missing".to_string())?
+            .to_string();
+        let version = task["version"].as_i64().unwrap_or(1);
+        state.tasks.insert(task_id.clone(), task);
+        record_change(state, workspace_id, "tasks", &task_id, "insert", version);
+        created_task_count += 1;
+    }
+
+    let mut applied = Vec::new();
+    let mut discarded = Vec::new();
+    for mut adjustment in adjustments {
+        let adjustment_id = adjustment["id"]
+            .as_str()
+            .ok_or_else(|| "VALIDATION_ERROR: adjustment image missing".to_string())?
+            .to_string();
+        let task_id = adjustment["task_id"]
+            .as_str()
+            .ok_or_else(|| "VALIDATION_ERROR: adjustment task missing".to_string())?
+            .to_string();
+        if let Some(item) = payload["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|item| item["taskId"].as_str() == Some(task_id.as_str()))
+        {
+            let current_actual = state
+                .actual_time_adjustments
+                .values()
+                .filter(|existing| {
+                    existing["task_id"].as_str() == Some(task_id.as_str())
+                        && existing["work_date"].as_str() == Some(work_date)
+                        && existing["deleted_at"].is_null()
+                })
+                .map(|existing| existing["delta_minutes"].as_i64().unwrap_or_default())
+                .sum::<i64>();
+            let target = item["targetMinutes"].as_i64().unwrap_or_default();
+            let effective_delta = target - current_actual;
+            if effective_delta == 0 {
+                discarded.push(Value::String(adjustment_id));
+                continue;
+            }
+            adjustment["delta_minutes"] = Value::Number(effective_delta.into());
+            adjustment["baseline_minutes"] = Value::Number(current_actual.into());
+            adjustment["target_minutes"] = Value::Number(target.into());
+        }
+        adjustment["workspace_id"] = Value::String(workspace_id.to_string());
+        adjustment["updated_by_device_id"] = Value::String(device_id.to_string());
+        let version = adjustment["version"].as_i64().unwrap_or(1);
+        state
+            .actual_time_adjustments
+            .insert(adjustment_id.clone(), adjustment.clone());
+        record_change(
+            state,
+            workspace_id,
+            "actual_time_adjustments",
+            &adjustment_id,
+            "insert",
+            version,
+        );
+        applied.push(adjustment);
+    }
+
+    Ok(json!({
+        "batchId": payload["batchId"],
+        "createdTaskCount": created_task_count,
+        "createdAdjustmentCount": applied.len(),
+        "adjustments": applied,
+        "discardedAdjustmentIds": discarded
+    }))
 }
 
 fn handle_planning_cloud_request(
@@ -1527,6 +1716,30 @@ fn handle_planning_cloud_request(
                 "occurrence": authoritative_occurrence
             }),
         );
+    }
+    if request_line.contains("/rest/v1/rpc/actual_adjustment_batch_apply") {
+        if request_epoch != state.workspace_epoch {
+            return write_http_json(
+                &mut stream,
+                409,
+                json!({ "message": format!("WORKSPACE_EPOCH_STALE: server={}", state.workspace_epoch) }),
+            );
+        }
+        let workspace_id = body["p_workspace_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let device_id = body["p_device_id"].as_str().unwrap_or_default().to_string();
+        let payload = body["p_payload"].clone();
+        return match planning_apply_actual_adjustment_batch(
+            &mut state,
+            &workspace_id,
+            &device_id,
+            &payload,
+        ) {
+            Ok(result) => write_http_json(&mut stream, 200, result),
+            Err(error) => write_http_json(&mut stream, 409, json!({ "message": error })),
+        };
     }
     if !request_line.contains("/rest/v1/rpc/cloud_apply_patch") {
         return write_http_json(
@@ -2213,7 +2426,7 @@ fn isolated_supabase_planning_two_device_flow() {
         cloud_sync::sync_status(&device_a)
             .unwrap()
             .pending_operations,
-        2
+        1
     );
     let estimate_outbox: Vec<(String, String, Option<String>)> = device_a
         .open()
@@ -2232,15 +2445,9 @@ fn isolated_supabase_planning_two_device_flow() {
             .iter()
             .map(|(operation, entity, _)| (operation.as_str(), entity.as_str()))
             .collect::<Vec<_>>(),
-        vec![
-            ("task_day_plan_set", "task_day_plan"),
-            ("task_daily_estimate_set", "task_daily_estimate"),
-        ]
+        vec![("task_daily_estimate_set", "task_daily_estimate")]
     );
-    assert!(
-        estimate_outbox[1].2.is_some(),
-        "预计操作应依赖先写入的今日成员操作"
-    );
+    assert_eq!(estimate_outbox[0].2, None);
     assert_eq!(push_all(&device_a).conflicts, 0);
     cloud_sync::pull(
         &device_b,
@@ -2252,11 +2459,7 @@ fn isolated_supabase_planning_two_device_flow() {
     .unwrap();
 
     assert_eq!(daily_estimate(&device_b, &task.id, &today_text), Some(45));
-    assert_eq!(
-        day_plan_state(&device_b, &task.id, &today_text).as_deref(),
-        Some("included"),
-        "设置今日预计应随成员操作同步到另一台设备"
-    );
+    assert_eq!(day_plan_state(&device_b, &task.id, &today_text), None);
     let (incremental_pulls, snapshots_after_incremental) = cloud.request_counts();
     assert!(incremental_pulls > 0);
     assert_eq!(
@@ -2462,7 +2665,13 @@ fn isolated_supabase_planning_two_device_flow() {
     )
     .unwrap();
     assert_eq!(push_all(&device_a).conflicts, 0);
-    assert_eq!(push_all(&device_b).conflicts, 0);
+    let instance_push = push_all(&device_b);
+    assert_eq!(
+        instance_push.conflicts,
+        0,
+        "今日实例内容/实际同步冲突: {:?}",
+        cloud_sync::list_conflicts(&device_b).unwrap()
+    );
     cloud_sync::pull(
         &device_a,
         CloudSyncPullRequest {
@@ -2651,7 +2860,7 @@ fn isolated_supabase_today_plan_two_device_flow() {
         cloud_sync::sync_status(&device_a)
             .unwrap()
             .pending_operations,
-        1
+        2
     );
     assert_eq!(push_all(&device_a).conflicts, 0);
     pull_all(&device_b);
@@ -2666,6 +2875,96 @@ fn isolated_supabase_today_plan_two_device_flow() {
         &today_text,
         &manual.id
     ));
+    let manual_instance_b = today_instance(&device_b, &subject.id, &today_text, &manual.id);
+    assert_ne!(manual_instance_b.id, manual.id);
+    let renamed_instance = tasks::update_task_for_cloud_test(
+        &device_b,
+        TaskUpdateRequest {
+            id: manual_instance_b.id.clone(),
+            expected_version: manual_instance_b.version,
+            title: Some("设备 B 今日独立标题".to_string()),
+            parent_id: None,
+            planned_date: None,
+            estimate_minutes: None,
+            note: None,
+            project_name: None,
+            solution_name: None,
+        },
+        &state_b,
+    )
+    .unwrap();
+    let fingerprint = actual_time_adjustments::snapshot(
+        &device_b,
+        ActualAdjustmentSnapshotRequest {
+            subject_id: subject.id.clone(),
+            work_date: today_text.clone(),
+            execution_only: Some(true),
+        },
+    )
+    .unwrap()
+    .tasks
+    .into_iter()
+    .find(|task| task.id == renamed_instance.id)
+    .unwrap()
+    .adjustment_fingerprint;
+    actual_time_adjustments::apply_batch(
+        &device_b,
+        ActualAdjustmentBatchRequest {
+            subject_id: subject.id.clone(),
+            work_date: today_text.clone(),
+            client_request_id: Uuid::now_v7().to_string(),
+            batch_id: Uuid::now_v7().to_string(),
+            note: None,
+            day_instance_date: Some(today_text.clone()),
+            items: vec![ActualAdjustmentBatchItem {
+                task_id: renamed_instance.id.clone(),
+                expected_task_version: renamed_instance.version,
+                baseline_minutes: 0,
+                target_minutes: 25,
+                delta_minutes: 25,
+                adjustment_fingerprint: fingerprint,
+            }],
+            new_tasks: vec![],
+        },
+    )
+    .unwrap();
+    let instance_push = push_all(&device_b);
+    assert_eq!(
+        instance_push.conflicts,
+        0,
+        "今日实例内容/实际同步冲突: {:?}",
+        cloud_sync::list_conflicts(&device_b).unwrap()
+    );
+    pull_all(&device_a);
+    let manual_instance_a = today_instance(&device_a, &subject.id, &today_text, &manual.id);
+    assert_eq!(manual_instance_a.id, renamed_instance.id);
+    assert_eq!(manual_instance_a.title, "设备 B 今日独立标题");
+    assert_eq!(task_title(&device_a, &manual.id), "无预计手动加入");
+    let local_workspace_a: String = device_a
+        .open()
+        .unwrap()
+        .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        actual_time_adjustments::direct_actual_minutes(
+            &device_a.open().unwrap(),
+            &local_workspace_a,
+            &manual.id,
+            Some(&today_text),
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        actual_time_adjustments::direct_actual_minutes(
+            &device_a.open().unwrap(),
+            &local_workspace_a,
+            &manual_instance_a.id,
+            Some(&today_text),
+        )
+        .unwrap(),
+        25
+    );
 
     // 重复规则命中的事项默认属于今日，移出后仅当天生效。
     recurring::save_rule_for_cloud_test(
@@ -2687,18 +2986,29 @@ fn isolated_supabase_today_plan_two_device_flow() {
         is_today_member(&device_b, &subject.id, &today_text, &recurring.id),
         "重复规则命中的事项应默认为今日成员"
     );
+    assert_eq!(push_all(&device_b).conflicts, 0);
+    pull_all(&device_a);
+    let recurring_plan_version: i64 = device_a
+        .open()
+        .unwrap()
+        .query_row(
+            "SELECT version FROM task_day_plans WHERE task_id=?1 AND work_date=?2",
+            rusqlite::params![recurring.id, today_text],
+            |row| row.get(0),
+        )
+        .unwrap();
     let recurring_excluded = today_plans::set_day_plan_for_cloud_test(
         &device_a,
         TaskDayPlanSetRequest {
             task_id: recurring.id.clone(),
             work_date: today_text.clone(),
             state: "excluded".to_string(),
-            expected_version: None,
+            expected_version: Some(recurring_plan_version),
         },
         &state_a,
     )
     .unwrap();
-    assert_eq!(recurring_excluded.version, 1);
+    assert_eq!(recurring_excluded.version, recurring_plan_version + 1);
     assert_eq!(push_all(&device_a).conflicts, 0);
     pull_all(&device_b);
     assert_eq!(
@@ -2708,6 +3018,46 @@ fn isolated_supabase_today_plan_two_device_flow() {
     assert!(
         !is_today_member(&device_b, &subject.id, &today_text, &recurring.id),
         "显式移出应覆盖重复规则命中"
+    );
+    let archived_recurring_instance_id = recurring_excluded
+        .instance_task_id
+        .clone()
+        .expect("移出映射应保留归档实例 ID");
+    for _ in 0..2 {
+        let _ = today_plans::snapshot(
+            &device_b,
+            TaskDayPlanSnapshotRequest {
+                subject_id: subject.id.clone(),
+                work_date: today_text.clone(),
+            },
+        )
+        .unwrap();
+    }
+    assert!(
+        !is_today_member(&device_b, &subject.id, &today_text, &recurring.id),
+        "移出后的重复事项不得在刷新时自动重建"
+    );
+    let recurring_reincluded = today_plans::set_day_plan_for_cloud_test(
+        &device_b,
+        TaskDayPlanSetRequest {
+            task_id: recurring.id.clone(),
+            work_date: today_text.clone(),
+            state: "included".to_string(),
+            expected_version: Some(recurring_excluded.version),
+        },
+        &state_b,
+    )
+    .unwrap();
+    let rejoined_instance_id = recurring_reincluded
+        .instance_task_id
+        .clone()
+        .expect("再次加入应创建实例");
+    assert_ne!(rejoined_instance_id, archived_recurring_instance_id);
+    assert_eq!(push_all(&device_b).conflicts, 0);
+    pull_all(&device_a);
+    assert_eq!(
+        today_instance(&device_a, &subject.id, &today_text, &recurring.id).id,
+        rejoined_instance_id
     );
     assert!(
         is_today_member(&device_a, &subject.id, &tomorrow_text, &recurring.id),
@@ -2751,7 +3101,7 @@ fn isolated_supabase_today_plan_two_device_flow() {
         TaskDayPlanSetRequest {
             task_id: concurrent.id.clone(),
             work_date: today_text.clone(),
-            state: "included".to_string(),
+            state: "excluded".to_string(),
             expected_version: Some(concurrent_first.version),
         },
         &state_b,
@@ -2759,11 +3109,25 @@ fn isolated_supabase_today_plan_two_device_flow() {
     .unwrap();
     let plan_push = push_all(&device_b);
     assert_eq!(plan_push.conflicts, 1, "过期版本写入应产生今日计划冲突");
+    let instance_conflict = cloud_sync::list_conflicts(&device_b)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.entity_type == "task")
+        .expect("今日实例冲突没有进入冲突列表");
+    cloud_sync::resolve_conflict(
+        &device_b,
+        CloudConflictResolveRequest {
+            operation_id: instance_conflict.operation_id,
+            strategy: "use_cloud".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(push_all(&device_b).conflicts, 1);
     let plan_conflict = cloud_sync::list_conflicts(&device_b)
         .unwrap()
         .into_iter()
         .find(|item| item.entity_type == "task_day_plan")
-        .expect("今日计划冲突没有进入冲突列表");
+        .expect("今日计划映射冲突没有进入冲突列表");
     cloud_sync::resolve_conflict(
         &device_b,
         CloudConflictResolveRequest {
@@ -2791,7 +3155,7 @@ fn isolated_supabase_today_plan_two_device_flow() {
         &concurrent.id
     ));
 
-    // 一端设置预计并自动加入、另一端同时移出：冲突解决后 excluded 优先于预计兜底。
+    // 来源预计同步后，设备 B 的懒物化可能已创建映射；使用最新版本显式移出。
     tasks::set_task_daily_estimate_for_cloud_test(
         &device_a,
         TaskDailyEstimateSetRequest {
@@ -2804,13 +3168,22 @@ fn isolated_supabase_today_plan_two_device_flow() {
     .unwrap();
     assert_eq!(push_all(&device_a).conflicts, 0);
     pull_all(&device_b);
+    let mixed_plan_version = device_b
+        .open()
+        .unwrap()
+        .query_row(
+            "SELECT version FROM task_day_plans WHERE task_id=?1 AND work_date=?2",
+            rusqlite::params![mixed.id, today_text],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
     today_plans::set_day_plan_for_cloud_test(
         &device_b,
         TaskDayPlanSetRequest {
             task_id: mixed.id.clone(),
             work_date: today_text.clone(),
             state: "excluded".to_string(),
-            expected_version: Some(1),
+            expected_version: (mixed_plan_version > 0).then_some(mixed_plan_version),
         },
         &state_b,
     )
@@ -2853,7 +3226,7 @@ fn isolated_supabase_today_plan_two_device_flow() {
     let offline = cloud_sync::push_outbox(&device_a).unwrap();
     assert_eq!(
         (offline.pushed, offline.pending, offline.conflicts),
-        (0, 1, 0)
+        (0, 2, 0)
     );
     assert_eq!(day_plan_state(&device_b, &retriable.id, &today_text), None);
     thread::sleep(Duration::from_millis(2_100));
@@ -2892,6 +3265,38 @@ fn isolated_supabase_today_plan_two_device_flow() {
             &concurrent.id
         ));
     }
+
+    // 新设备从完整快照恢复后，保留今日实例、来源映射和独立实际用时。
+    let device_c = Database::initialize_at(directory.path().join("today-plan-c.sqlite3")).unwrap();
+    configure_isolated_planning_device(
+        &device_c,
+        &cloud.base_url,
+        &workspace_id,
+        "today-plan-user-c",
+    );
+    cloud_sync::pull_snapshot(&device_c).unwrap();
+    let manual_instance_c = today_instance(&device_c, &subject.id, &today_text, &manual.id);
+    assert_eq!(manual_instance_c.id, renamed_instance.id);
+    assert_eq!(manual_instance_c.title, "设备 B 今日独立标题");
+    assert_eq!(
+        day_plan_state(&device_c, &manual.id, &today_text).as_deref(),
+        Some("included")
+    );
+    let local_workspace_c: String = device_c
+        .open()
+        .unwrap()
+        .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        actual_time_adjustments::direct_actual_minutes(
+            &device_c.open().unwrap(),
+            &local_workspace_c,
+            &manual_instance_c.id,
+            Some(&today_text),
+        )
+        .unwrap(),
+        25
+    );
 }
 
 #[test]
@@ -3354,6 +3759,7 @@ fn isolated_timer_transition_offline_retry_converges_two_devices() {
                 parent_id: None,
                 expected_parent_version: None,
                 title: "离线新事项".to_string(),
+                day_instance_date: None,
             }),
             note: None,
         },
@@ -5067,6 +5473,7 @@ fn real_supabase_two_device_flow() {
             client_request_id: Uuid::now_v7().to_string(),
             batch_id: Uuid::now_v7().to_string(),
             note: Some("Supabase E2E 快速新增".to_string()),
+            day_instance_date: None,
             items: vec![],
             new_tasks: vec![
                 ActualAdjustmentNewTaskInput {
@@ -5155,6 +5562,7 @@ fn real_supabase_two_device_flow() {
             client_request_id: interrupted_request_id.clone(),
             batch_id: Uuid::now_v7().to_string(),
             note: Some("Supabase E2E 中断续传".to_string()),
+            day_instance_date: None,
             items: vec![],
             new_tasks: vec![ActualAdjustmentNewTaskInput {
                 client_task_id: Uuid::now_v7().to_string(),
@@ -5249,6 +5657,7 @@ fn real_supabase_two_device_flow() {
         ActualAdjustmentSnapshotRequest {
             subject_id: subject_id.clone(),
             work_date: adjustment_date.clone(),
+            execution_only: None,
         },
     )
     .unwrap();
@@ -5257,6 +5666,7 @@ fn real_supabase_two_device_flow() {
         ActualAdjustmentSnapshotRequest {
             subject_id: subject_id.clone(),
             work_date: adjustment_date.clone(),
+            execution_only: None,
         },
     )
     .unwrap();
@@ -5281,6 +5691,7 @@ fn real_supabase_two_device_flow() {
                 client_request_id: Uuid::now_v7().to_string(),
                 batch_id: Uuid::now_v7().to_string(),
                 note: Some("Supabase E2E 并发基线".to_string()),
+                day_instance_date: None,
                 items: vec![ActualAdjustmentBatchItem {
                     task_id: concurrent_task.id.clone(),
                     expected_task_version: task.version,

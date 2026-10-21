@@ -131,9 +131,35 @@ create table if not exists timegenie.tasks (
   created_by_device_id uuid references timegenie.devices(id),
   updated_by_device_id uuid references timegenie.devices(id),
   deleted_at timestamptz,
+  day_instance_date date,
+  day_instance_kind text check (day_instance_kind in ('member', 'context')),
+  day_instance_source_task_id uuid references timegenie.tasks(id),
+  check ((day_instance_date is null) = (day_instance_kind is null)),
+  check (day_instance_source_task_id is null or day_instance_date is not null),
   check ((status = 'done' and completed_at is not null) or status = 'open')
 );
 create index if not exists idx_tasks_tree on timegenie.tasks(workspace_id, subject_id, parent_id, sort_order);
+create index if not exists idx_tasks_day_instances on timegenie.tasks(workspace_id, subject_id, day_instance_date, parent_id, sort_order);
+create unique index if not exists uq_tasks_day_instance_source on timegenie.tasks(workspace_id, day_instance_source_task_id, day_instance_date) where deleted_at is null and day_instance_source_task_id is not null and day_instance_date is not null;
+
+create or replace function timegenie.validate_task_day_instance_scope() returns trigger
+language plpgsql set search_path = timegenie, pg_catalog as $$
+begin
+  if new.parent_id is not null and not exists (
+    select 1 from timegenie.tasks parent
+    where parent.id = new.parent_id
+      and parent.workspace_id = new.workspace_id
+      and parent.subject_id = new.subject_id
+      and parent.deleted_at is null
+      and parent.day_instance_date is not distinct from new.day_instance_date
+  ) then
+    raise exception 'task parent must be in the same day instance scope';
+  end if;
+  return new;
+end $$;
+drop trigger if exists trg_tasks_day_instance_scope on timegenie.tasks;
+create trigger trg_tasks_day_instance_scope before insert or update of parent_id, day_instance_date, day_instance_kind, subject_id
+on timegenie.tasks for each row execute function timegenie.validate_task_day_instance_scope();
 
 create table if not exists timegenie.task_status_events (
   id uuid primary key default gen_random_uuid(),
@@ -162,6 +188,7 @@ create table if not exists timegenie.task_day_plans (
   task_id uuid not null references timegenie.tasks(id) on delete cascade,
   work_date date not null,
   state text not null check (state in ('included', 'excluded')),
+  instance_task_id uuid references timegenie.tasks(id),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   version bigint not null default 1,
@@ -1227,9 +1254,9 @@ begin
     imported_subjects := imported_subjects + 1;
   end loop;
   for row_data in select value from jsonb_array_elements(coalesce(p_snapshot->'tasks', '[]'::jsonb)) loop
-    insert into timegenie.tasks(id, workspace_id, subject_id, parent_id, title, status, planned_date, planned_time, estimate_minutes, note, project_name, solution_name, source_type, source_ref, sort_order, completed_at, created_at, updated_at, version, created_by_device_id, updated_by_device_id, deleted_at)
-    values((row_data->>'id')::uuid, p_workspace_id, (row_data->>'subject_id')::uuid, null, row_data->>'title', row_data->>'status', nullif(row_data->>'planned_date','')::date, nullif(row_data->>'planned_time','')::time, nullif(row_data->>'estimate_minutes','')::integer, row_data->>'note', row_data->>'project_name', row_data->>'solution_name', case when row_data->>'source_type' in ('manual','obsidian_import','timer_quick_create') then row_data->>'source_type' else 'migration' end, row_data->>'source_ref', coalesce((row_data->>'sort_order')::integer,0), case when row_data->>'completed_at' is null then null else to_timestamp((row_data->>'completed_at')::double precision / 1000) end, to_timestamp((row_data->>'created_at')::double precision / 1000), to_timestamp((row_data->>'updated_at')::double precision / 1000), coalesce((row_data->>'version')::bigint,1), p_device_id, p_device_id, case when row_data->>'deleted_at' is null then null else to_timestamp((row_data->>'deleted_at')::double precision / 1000) end)
-    on conflict(id) do update set parent_id = null, title = excluded.title, status = excluded.status, planned_date = excluded.planned_date, planned_time = excluded.planned_time, estimate_minutes = excluded.estimate_minutes, note = excluded.note, project_name = excluded.project_name, solution_name = excluded.solution_name, sort_order = excluded.sort_order, completed_at = excluded.completed_at, updated_at = excluded.updated_at, version = greatest(timegenie.tasks.version, excluded.version), deleted_at = excluded.deleted_at;
+    insert into timegenie.tasks(id, workspace_id, subject_id, parent_id, title, status, planned_date, planned_time, estimate_minutes, note, project_name, solution_name, source_type, source_ref, sort_order, completed_at, created_at, updated_at, version, created_by_device_id, updated_by_device_id, deleted_at, day_instance_date, day_instance_kind, day_instance_source_task_id)
+    values((row_data->>'id')::uuid, p_workspace_id, (row_data->>'subject_id')::uuid, null, row_data->>'title', row_data->>'status', nullif(row_data->>'planned_date','')::date, nullif(row_data->>'planned_time','')::time, nullif(row_data->>'estimate_minutes','')::integer, row_data->>'note', row_data->>'project_name', row_data->>'solution_name', case when row_data->>'source_type' in ('manual','obsidian_import','timer_quick_create') then row_data->>'source_type' else 'migration' end, row_data->>'source_ref', coalesce((row_data->>'sort_order')::integer,0), case when row_data->>'completed_at' is null then null else to_timestamp((row_data->>'completed_at')::double precision / 1000) end, to_timestamp((row_data->>'created_at')::double precision / 1000), to_timestamp((row_data->>'updated_at')::double precision / 1000), coalesce((row_data->>'version')::bigint,1), p_device_id, p_device_id, case when row_data->>'deleted_at' is null then null else to_timestamp((row_data->>'deleted_at')::double precision / 1000) end, nullif(row_data->>'day_instance_date','')::date, nullif(row_data->>'day_instance_kind',''), nullif(row_data->>'day_instance_source_task_id','')::uuid)
+    on conflict(id) do update set parent_id = null, title = excluded.title, status = excluded.status, planned_date = excluded.planned_date, planned_time = excluded.planned_time, estimate_minutes = excluded.estimate_minutes, note = excluded.note, project_name = excluded.project_name, solution_name = excluded.solution_name, sort_order = excluded.sort_order, completed_at = excluded.completed_at, updated_at = excluded.updated_at, version = greatest(timegenie.tasks.version, excluded.version), deleted_at = excluded.deleted_at, day_instance_date = excluded.day_instance_date, day_instance_kind = excluded.day_instance_kind, day_instance_source_task_id = excluded.day_instance_source_task_id;
     imported_tasks := imported_tasks + 1;
   end loop;
   for row_data in select value from jsonb_array_elements(coalesce(p_snapshot->'tasks', '[]'::jsonb)) loop
@@ -1263,9 +1290,9 @@ begin
     on conflict(id) do nothing;
   end loop;
   for row_data in select value from jsonb_array_elements(coalesce(p_snapshot->'task_day_plans', '[]'::jsonb)) loop
-    insert into timegenie.task_day_plans(workspace_id, task_id, work_date, state, created_at, updated_at, version)
-    values(p_workspace_id, (row_data->>'task_id')::uuid, (row_data->>'work_date')::date, row_data->>'state', to_timestamp((row_data->>'created_at')::double precision / 1000), to_timestamp((row_data->>'updated_at')::double precision / 1000), coalesce((row_data->>'version')::bigint,1))
-    on conflict(task_id, work_date) do update set state = excluded.state, updated_at = excluded.updated_at, version = greatest(timegenie.task_day_plans.version, excluded.version);
+    insert into timegenie.task_day_plans(workspace_id, task_id, work_date, state, instance_task_id, created_at, updated_at, version)
+    values(p_workspace_id, (row_data->>'task_id')::uuid, (row_data->>'work_date')::date, row_data->>'state', nullif(row_data->>'instance_task_id','')::uuid, to_timestamp((row_data->>'created_at')::double precision / 1000), to_timestamp((row_data->>'updated_at')::double precision / 1000), coalesce((row_data->>'version')::bigint,1))
+    on conflict(task_id, work_date) do update set state = excluded.state, instance_task_id = excluded.instance_task_id, updated_at = excluded.updated_at, version = greatest(timegenie.task_day_plans.version, excluded.version);
   end loop;
   for row_data in select value from jsonb_array_elements(coalesce(p_snapshot->'task_daily_estimates', '[]'::jsonb)) loop
     insert into timegenie.task_daily_estimates(workspace_id, task_id, work_date, estimate_minutes, created_at, updated_at, version)
@@ -1653,9 +1680,9 @@ begin
     on conflict(id) do update set name = excluded.name, sort_order = excluded.sort_order, updated_at = excluded.updated_at, version = excluded.version, updated_by_device_id = p_device_id, deleted_at = excluded.deleted_at;
     result_value := jsonb_build_object('entityType','subject','entityId',p_entity_id,'version',(select version from timegenie.subjects where id = p_entity_id::uuid));
   elsif p_entity_type = 'task' then
-    insert into timegenie.tasks(id, workspace_id, subject_id, parent_id, title, status, planned_date, planned_time, estimate_minutes, note, project_name, solution_name, source_type, source_ref, sort_order, completed_at, created_at, updated_at, version, created_by_device_id, updated_by_device_id, deleted_at)
-    values((row_data->>'id')::uuid, p_workspace_id, (row_data->>'subject_id')::uuid, nullif(row_data->>'parent_id','')::uuid, row_data->>'title', row_data->>'status', nullif(row_data->>'planned_date','')::date, nullif(row_data->>'planned_time','')::time, nullif(row_data->>'estimate_minutes','')::integer, row_data->>'note', row_data->>'project_name', row_data->>'solution_name', case when row_data->>'source_type' in ('manual','obsidian_import','timer_quick_create','migration') then row_data->>'source_type' else 'manual' end, row_data->>'source_ref', coalesce((row_data->>'sort_order')::integer,0), case when row_data->>'completed_at' is null then null else to_timestamp((row_data->>'completed_at')::double precision / 1000) end, to_timestamp(coalesce((row_data->>'created_at')::double precision, extract(epoch from now()) * 1000) / 1000), to_timestamp(coalesce((row_data->>'updated_at')::double precision, extract(epoch from now()) * 1000) / 1000), coalesce((row_data->>'version')::bigint,1), p_device_id, p_device_id, case when row_data->>'deleted_at' is null then null else to_timestamp((row_data->>'deleted_at')::double precision / 1000) end)
-    on conflict(id) do update set subject_id = excluded.subject_id, parent_id = excluded.parent_id, title = excluded.title, status = excluded.status, planned_date = excluded.planned_date, planned_time = excluded.planned_time, estimate_minutes = excluded.estimate_minutes, note = excluded.note, project_name = excluded.project_name, solution_name = excluded.solution_name, source_ref = excluded.source_ref, sort_order = excluded.sort_order, completed_at = excluded.completed_at, updated_at = excluded.updated_at, version = excluded.version, updated_by_device_id = p_device_id, deleted_at = excluded.deleted_at;
+    insert into timegenie.tasks(id, workspace_id, subject_id, parent_id, title, status, planned_date, planned_time, estimate_minutes, note, project_name, solution_name, source_type, source_ref, sort_order, completed_at, created_at, updated_at, version, created_by_device_id, updated_by_device_id, deleted_at, day_instance_date, day_instance_kind, day_instance_source_task_id)
+    values((row_data->>'id')::uuid, p_workspace_id, (row_data->>'subject_id')::uuid, nullif(row_data->>'parent_id','')::uuid, row_data->>'title', row_data->>'status', nullif(row_data->>'planned_date','')::date, nullif(row_data->>'planned_time','')::time, nullif(row_data->>'estimate_minutes','')::integer, row_data->>'note', row_data->>'project_name', row_data->>'solution_name', case when row_data->>'source_type' in ('manual','obsidian_import','timer_quick_create','migration') then row_data->>'source_type' else 'manual' end, row_data->>'source_ref', coalesce((row_data->>'sort_order')::integer,0), case when row_data->>'completed_at' is null then null else to_timestamp((row_data->>'completed_at')::double precision / 1000) end, to_timestamp(coalesce((row_data->>'created_at')::double precision, extract(epoch from now()) * 1000) / 1000), to_timestamp(coalesce((row_data->>'updated_at')::double precision, extract(epoch from now()) * 1000) / 1000), coalesce((row_data->>'version')::bigint,1), p_device_id, p_device_id, case when row_data->>'deleted_at' is null then null else to_timestamp((row_data->>'deleted_at')::double precision / 1000) end, nullif(row_data->>'day_instance_date','')::date, nullif(row_data->>'day_instance_kind',''), nullif(row_data->>'day_instance_source_task_id','')::uuid)
+    on conflict(id) do update set subject_id = excluded.subject_id, parent_id = excluded.parent_id, title = excluded.title, status = excluded.status, planned_date = excluded.planned_date, planned_time = excluded.planned_time, estimate_minutes = excluded.estimate_minutes, note = excluded.note, project_name = excluded.project_name, solution_name = excluded.solution_name, source_ref = excluded.source_ref, sort_order = excluded.sort_order, completed_at = excluded.completed_at, updated_at = excluded.updated_at, version = excluded.version, updated_by_device_id = p_device_id, deleted_at = excluded.deleted_at, day_instance_date = excluded.day_instance_date, day_instance_kind = excluded.day_instance_kind, day_instance_source_task_id = excluded.day_instance_source_task_id;
     insert into timegenie.task_status_events(id, workspace_id, task_id, status, occurred_at, source_type, created_at)
     select (item->>'id')::uuid, p_workspace_id, p_entity_id::uuid, item->>'status', to_timestamp((item->>'occurred_at')::double precision / 1000), item->>'source_type', to_timestamp((item->>'created_at')::double precision / 1000)
     from jsonb_array_elements(coalesce(row_data->'status_events','[]'::jsonb)) item
@@ -1761,9 +1788,9 @@ begin
     on conflict(task_id, occurrence_date) do update set origin = excluded.origin, status = excluded.status, completed_at = excluded.completed_at, updated_at = excluded.updated_at, version = excluded.version;
     result_value := jsonb_build_object('entityType','task_occurrence','entityId',p_entity_id,'version',(select version from timegenie.task_occurrences where workspace_id = p_workspace_id and task_id = (row_data->>'task_id')::uuid and occurrence_date = (row_data->>'occurrence_date')::date));
   elsif p_entity_type = 'task_day_plan' then
-    insert into timegenie.task_day_plans(workspace_id, task_id, work_date, state, created_at, updated_at, version)
-    values(p_workspace_id, (row_data->>'task_id')::uuid, (row_data->>'work_date')::date, row_data->>'state', to_timestamp(coalesce((row_data->>'created_at')::double precision, extract(epoch from now()) * 1000) / 1000), to_timestamp(coalesce((row_data->>'updated_at')::double precision, extract(epoch from now()) * 1000) / 1000), coalesce((row_data->>'version')::bigint,1))
-    on conflict(task_id, work_date) do update set state = excluded.state, updated_at = excluded.updated_at, version = excluded.version;
+    insert into timegenie.task_day_plans(workspace_id, task_id, work_date, state, instance_task_id, created_at, updated_at, version)
+    values(p_workspace_id, (row_data->>'task_id')::uuid, (row_data->>'work_date')::date, row_data->>'state', nullif(row_data->>'instance_task_id','')::uuid, to_timestamp(coalesce((row_data->>'created_at')::double precision, extract(epoch from now()) * 1000) / 1000), to_timestamp(coalesce((row_data->>'updated_at')::double precision, extract(epoch from now()) * 1000) / 1000), coalesce((row_data->>'version')::bigint,1))
+    on conflict(task_id, work_date) do update set state = excluded.state, instance_task_id = excluded.instance_task_id, updated_at = excluded.updated_at, version = excluded.version;
     result_value := jsonb_build_object('entityType','task_day_plan','entityId',p_entity_id,'version',(select version from timegenie.task_day_plans where workspace_id = p_workspace_id and task_id = (row_data->>'task_id')::uuid and work_date = (row_data->>'work_date')::date));
   elsif p_entity_type = 'task_daily_estimate' then
     if coalesce((row_data->>'deleted')::boolean, false) then
@@ -2129,8 +2156,8 @@ begin
         and (image->>'target_minutes')::integer = (draft->>'targetMinutes')::integer;
       if matching_count <> 1 then raise exception 'VALIDATION_ERROR: new task adjustment image does not match draft'; end if;
     end if;
-    insert into timegenie.tasks(id,workspace_id,subject_id,parent_id,title,status,planned_date,planned_time,estimate_minutes,note,project_name,solution_name,source_type,source_ref,sort_order,completed_at,created_at,updated_at,version,created_by_device_id,updated_by_device_id,deleted_at)
-    values((task_image->>'id')::uuid,p_workspace_id,(task_image->>'subject_id')::uuid,nullif(task_image->>'parent_id','')::uuid,task_image->>'title',task_image->>'status',nullif(task_image->>'planned_date','')::date,nullif(task_image->>'planned_time','')::time,nullif(task_image->>'estimate_minutes','')::integer,task_image->>'note',task_image->>'project_name',task_image->>'solution_name','manual',task_image->>'source_ref',coalesce((task_image->>'sort_order')::integer,0),null,to_timestamp((task_image->>'created_at')::double precision/1000),to_timestamp((task_image->>'updated_at')::double precision/1000),1,p_device_id,p_device_id,null);
+    insert into timegenie.tasks(id,workspace_id,subject_id,parent_id,title,status,planned_date,planned_time,estimate_minutes,note,project_name,solution_name,source_type,source_ref,sort_order,completed_at,created_at,updated_at,version,created_by_device_id,updated_by_device_id,deleted_at,day_instance_date,day_instance_kind,day_instance_source_task_id)
+    values((task_image->>'id')::uuid,p_workspace_id,(task_image->>'subject_id')::uuid,nullif(task_image->>'parent_id','')::uuid,task_image->>'title',task_image->>'status',nullif(task_image->>'planned_date','')::date,nullif(task_image->>'planned_time','')::time,nullif(task_image->>'estimate_minutes','')::integer,task_image->>'note',task_image->>'project_name',task_image->>'solution_name','manual',task_image->>'source_ref',coalesce((task_image->>'sort_order')::integer,0),null,to_timestamp((task_image->>'created_at')::double precision/1000),to_timestamp((task_image->>'updated_at')::double precision/1000),1,p_device_id,p_device_id,null,nullif(task_image->>'day_instance_date','')::date,nullif(task_image->>'day_instance_kind',''),nullif(task_image->>'day_instance_source_task_id','')::uuid);
   end loop;
 
   for adjustment_image in select value from jsonb_array_elements(coalesce(p_payload->'adjustments','[]'::jsonb)) loop
@@ -3391,13 +3418,13 @@ begin
        or coalesce((day_plan_row->>'version')::bigint,0)<>1 then
       raise exception 'VALIDATION_ERROR: timer day plan must be an included initial version';
     end if;
-    insert into timegenie.task_day_plans(workspace_id,task_id,work_date,state,created_at,updated_at,version)
+    insert into timegenie.task_day_plans(workspace_id,task_id,work_date,state,instance_task_id,created_at,updated_at,version)
     values(
-      p_workspace_id,(day_plan_row->>'task_id')::uuid,(day_plan_row->>'work_date')::date,'included',
+      p_workspace_id,(day_plan_row->>'task_id')::uuid,(day_plan_row->>'work_date')::date,'included',nullif(day_plan_row->>'instance_task_id','')::uuid,
       to_timestamp(coalesce((day_plan_row->>'created_at')::double precision,extract(epoch from now())*1000)/1000),
       to_timestamp(coalesce((day_plan_row->>'updated_at')::double precision,extract(epoch from now())*1000)/1000),1
     )
-    on conflict(task_id,work_date) do update set state='included',updated_at=excluded.updated_at,version=timegenie.task_day_plans.version+1;
+    on conflict(task_id,work_date) do update set state='included',instance_task_id=excluded.instance_task_id,updated_at=excluded.updated_at,version=timegenie.task_day_plans.version+1;
   end if;
   perform timegenie.apply_calendar_time_entry_pre_simplified_anchor(
     p_workspace_id,p_device_id,timegenie.calendar_stable_uuid('timer-transition-start:'||p_operation_id),
@@ -3770,3 +3797,10 @@ notify pgrst, 'reload schema';
 
 -- Expose actual-time adjustments in full snapshots for upgrade deployments.
 \ir 20261020b_timegenie_actual_adjustment_snapshot.sql
+
+-- Independent today-task instances and their source/date mapping.
+\ir 20261021_timegenie_today_task_instances.sql
+
+-- Once instance semantics are present, reject writes from clients that do not
+-- advertise the matching data-protocol generation.
+\ir 20261021b_timegenie_client_write_generation.sql

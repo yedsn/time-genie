@@ -30,6 +30,7 @@ end $$;
 \ir schema.sql
 
 begin;
+select set_config('request.headers', '{"x-timegenie-client-schema-generation":"1"}', true);
 
 insert into auth.users(id) values ('11000000-0000-0000-0000-000000000001');
 insert into timegenie.workspaces(id, owner_user_id, name) values

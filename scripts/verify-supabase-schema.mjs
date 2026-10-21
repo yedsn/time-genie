@@ -41,6 +41,8 @@ const actualAdjustmentSnapshotPatchFile = path.join(repoRoot, "supabase", "20261
 const namedTemplateBootstrapFixFile = path.join(repoRoot, "supabase", "20261016_timegenie_named_template_bootstrap_fix.sql");
 const timerTransitionPatchFile = path.join(repoRoot, "supabase", "20261016b_timegenie_timer_transition.sql");
 const timerRecurringOccurrencePatchFile = path.join(repoRoot, "supabase", "20261019_timegenie_timer_recurring_occurrence.sql");
+const todayTaskInstancesPatchFile = path.join(repoRoot, "supabase", "20261021_timegenie_today_task_instances.sql");
+const clientWriteGenerationPatchFile = path.join(repoRoot, "supabase", "20261021b_timegenie_client_write_generation.sql");
 
 const binaryNames = process.platform === "win32"
   ? {
@@ -129,7 +131,43 @@ function verifyStaticSchemaInvariants() {
   const namedTemplateBootstrapFix = fs.readFileSync(namedTemplateBootstrapFixFile, "utf8");
   const timerTransitionPatch = fs.readFileSync(timerTransitionPatchFile, "utf8");
   const timerRecurringOccurrencePatch = fs.readFileSync(timerRecurringOccurrencePatchFile, "utf8");
+  const todayTaskInstancesPatch = fs.readFileSync(todayTaskInstancesPatchFile, "utf8");
+  const clientWriteGenerationPatch = fs.readFileSync(clientWriteGenerationPatchFile, "utf8");
   const schemaIntegrationTest = fs.readFileSync(schemaTestFile, "utf8");
+  for (const expected of [
+    "day_instance_date",
+    "day_instance_kind",
+    "day_instance_source_task_id",
+    "instance_task_id",
+    "validate_task_day_instance_scope",
+  ]) {
+    if (!todayTaskInstancesPatch.includes(expected)) {
+      throw new Error(`The today-task instance patch must include: ${expected}`);
+    }
+  }
+  for (const expected of [
+    "minimum_client_schema_generation",
+    "x-timegenie-client-schema-generation",
+    "CLIENT_UPGRADE_REQUIRED",
+    "client_schema_generation_write_barrier",
+    "workspace_restore_commit_pre_client_generation",
+  ]) {
+    if (!clientWriteGenerationPatch.includes(expected)) {
+      throw new Error(`The client write-generation patch must include: ${expected}`);
+    }
+  }
+  if (!schema.includes("\\ir 20261021_timegenie_today_task_instances.sql")
+      || !schema.includes("\\ir 20261021b_timegenie_client_write_generation.sql")) {
+    throw new Error("The source schema must apply today-task instances and the compatible-client write barrier.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261021_timegenie_today_task_instances\.sql/g) ?? []).length < 2
+      || (schemaIntegrationTest.match(/\\ir 20261021b_timegenie_client_write_generation\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the today-instance and client-generation patches are idempotent.");
+  }
+  if (!schemaIntegrationTest.includes("old client write was accepted")
+      || !schemaIntegrationTest.includes("CLIENT_UPGRADE_REQUIRED")) {
+    throw new Error("The schema integration test must reject a write without the compatible-client handshake.");
+  }
   for (const expected of [
     "occurrence_row:=p_payload->'occurrence'",
     "timer occurrence identity mismatch",

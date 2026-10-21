@@ -406,6 +406,9 @@ export type TaskRecord = {
   id: string;
   subjectId: string;
   parentId?: string;
+  dayInstanceDate?: string;
+  dayInstanceKind?: "member" | "context";
+  dayInstanceSourceTaskId?: string;
   title: string;
   status: "open" | "done";
   plannedDate?: string;
@@ -471,6 +474,7 @@ export type ActualTimeAdjustmentRecord = {
 
 export type ActualAdjustmentSnapshotTaskRecord = {
   id: string; subjectId: string; parentId?: string; title: string; note?: string; status: "open" | "done"; completedAt?: number; completedToday: boolean;
+  dayInstanceDate?: string; dayInstanceKind?: "member" | "context"; dayInstanceSourceTaskId?: string;
   plannedDate?: string; estimateMinutes?: number; todayEstimateMinutes?: number; dailyEstimateVersion?: number; sortOrder: number;
   version: number; isLeaf: boolean; selectable: boolean; directMinutes: number; totalMinutes: number;
   adjustmentFingerprint: string; timerState?: "running" | "paused"; canAcceptChildren: boolean;
@@ -483,6 +487,7 @@ export type ActualAdjustmentSnapshotRecord = {
 
 export type ActualAdjustmentBatchRequest = {
   subjectId: string; workDate: string; clientRequestId: string; batchId: string; note?: string;
+  dayInstanceDate?: string;
   items: Array<{ taskId: string; expectedTaskVersion: number; baselineMinutes: number; targetMinutes: number; deltaMinutes: number; adjustmentFingerprint: string }>;
   newTasks: Array<{ clientTaskId: string; title: string; parentId?: string; expectedParentVersion?: number; targetMinutes: number }>;
 };
@@ -566,6 +571,7 @@ export type TimerTransitionNewTaskRequest = {
   parentId?: string;
   expectedParentVersion?: number;
   title: string;
+  dayInstanceDate?: string;
 };
 
 export type TimerTransitionRequest = {
@@ -904,6 +910,7 @@ export async function setTaskDailyEstimate(taskId: string, workDate: string, est
 export async function createQuickTask(request: {
   subjectId: string;
   parentId?: string;
+  dayInstanceDate?: string;
   title: string;
   plannedDate?: string;
   estimateMinutes?: number;
@@ -919,6 +926,7 @@ export async function createQuickTask(request: {
 export async function createTask(request: {
   subjectId: string;
   parentId?: string;
+  dayInstanceDate?: string;
   title: string;
   plannedDate?: string;
   estimateMinutes?: number;
@@ -1023,6 +1031,21 @@ export async function confirmObsidianPlan(
   return result;
 }
 
+export async function updateTodayRecurringTask(request: {
+  instanceId: string;
+  instanceExpectedVersion: number;
+  sourceExpectedVersion: number;
+  title?: string;
+  plannedDate?: string | null;
+  estimateMinutes?: number | null;
+  note?: string | null;
+  projectName?: string | null;
+}): Promise<{ instance: TaskRecord; source: TaskRecord }> {
+  const result = await invoke<{ instance: TaskRecord; source: TaskRecord }>("task_today_recurring_update", { request });
+  await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-today-recurring-update");
+  return result;
+}
+
 export async function getTaskDayPlanSnapshot(subjectId: string, workDate: string): Promise<TaskDayPlanSnapshotRecord> {
   return await invoke<TaskDayPlanSnapshotRecord>("task_day_plan_snapshot", { request: { subjectId, workDate } });
 }
@@ -1041,8 +1064,8 @@ export async function setTaskDayPlanBatch(subjectId: string, workDate: string, i
   return result;
 }
 
-export async function getActualAdjustmentSnapshot(subjectId: string, workDate: string): Promise<ActualAdjustmentSnapshotRecord> {
-  return await invoke("actual_adjustment_snapshot", { request: { subjectId, workDate } });
+export async function getActualAdjustmentSnapshot(subjectId: string, workDate: string, executionOnly?: boolean): Promise<ActualAdjustmentSnapshotRecord> {
+  return await invoke("actual_adjustment_snapshot", { request: { subjectId, workDate, executionOnly } });
 }
 
 export async function applyActualAdjustmentBatch(request: ActualAdjustmentBatchRequest): Promise<ActualAdjustmentBatchResult> {
@@ -1080,6 +1103,7 @@ export async function setTaskDailyEstimateBatch(
 
 export type TaskPlanBatchRequest = {
   subjectId: string;
+  dayInstanceDate?: string;
   baselineTasks: Array<{ taskId: string; expectedVersion: number }>;
   finalItems: Array<{ lineKey: string; taskId?: string; title: string; parentLineKey?: string }>;
   confirmedDeleteTaskIds: string[];
@@ -1127,6 +1151,7 @@ export async function moveTaskRecord(request: {
 export async function createPositionedTask(request: {
   subjectId: string;
   parentId?: string;
+  dayInstanceDate?: string;
   title: string;
   plannedDate?: string;
   estimateMinutes?: number;

@@ -1605,6 +1605,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id,
+                day_instance_date: None,
                 parent_id: None,
                 title: "未归属分配事项".to_string(),
                 planned_date: None,
@@ -1674,6 +1675,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id,
+                day_instance_date: None,
                 parent_id: None,
                 title: "未归属流程只完成".to_string(),
                 planned_date: None,
@@ -2278,6 +2280,7 @@ mod tests {
             &database,
             TaskCreateRequest {
                 subject_id,
+                day_instance_date: None,
                 parent_id: None,
                 title: "云端未归属只完成".to_string(),
                 planned_date: None,

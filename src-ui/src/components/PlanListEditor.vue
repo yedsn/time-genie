@@ -11,7 +11,7 @@ import { createTaskTreeSortable } from "../services/taskTreeSortable";
 import type { ActualAdjustmentBatchRequest, ActualAdjustmentBatchResult, ActualAdjustmentSnapshotRecord, ActualAdjustmentSnapshotTaskRecord } from "../services/tauri";
 import { adjustQuickEstimateMinutes, parseQuickEstimateMinutes } from "../services/quickPlanEstimateCore";
 import { actualAdjustmentSummary, eligibleActualAdjustmentParents, parentTargetTotal, parseActualMinutes, type ActualAdjustmentDraft, type ActualAdjustmentNewTaskDraft } from "../services/quickActualAdjustmentCore";
-import { analyzeQuickPlanDraft, buildQuickPlanBatchRequest, createQuickPlanBaseline, createQuickPlanDraft, mergeScopedQuickPlanDraft, reconcileQuickPlanText, serializeQuickPlanLines, type QuickPlanBaselineTask, type QuickPlanBatchRequest, type QuickPlanDraftLine } from "../services/quickPlanTextCore";
+import { analyzeQuickPlanDraft, buildQuickPlanBatchRequest, createQuickPlanBaseline, createQuickPlanDraft, reconcileQuickPlanText, serializeQuickPlanLines, type QuickPlanBaselineTask, type QuickPlanBatchRequest, type QuickPlanDraftLine } from "../services/quickPlanTextCore";
 
 const props = defineProps<{
   tasks: Task[];
@@ -27,12 +27,16 @@ const props = defineProps<{
   formatMinutes: (minutes: number) => string;
   todayDate: string;
   timezone: string;
-  saveTodayImport: (request: { taskIds: string[]; estimates: Array<{ taskId: string; expectedTaskVersion: number; expectedDailyEstimateVersion?: number; estimateMinutes?: number }> }) => Promise<void>;
+  saveTodayImport: (request: {
+    taskIds: string[];
+    estimates: Array<{ taskId: string; expectedTaskVersion: number; expectedDailyEstimateVersion?: number; estimateMinutes?: number }>;
+    instanceEstimates?: Array<{ taskId: string; estimateMinutes?: number }>;
+  }) => Promise<void>;
   createTask: (title: string, parentId?: string) => Promise<string>;
   createRelativeTask: (targetId: string, placement: "before" | "after", title: string) => Promise<string>;
   duplicateSingleTask: (taskId: string) => Promise<string | undefined>;
   saveTask: (taskId: string) => Promise<string | false>;
-  savePlanBatch: (request: QuickPlanBatchRequest) => Promise<{ createdCount: number; updatedCount: number; deletedCount: number; todayPlanChangedCount: number; createdItems: Array<{ lineKey: string; taskId: string }> }>;
+  savePlanBatch: (request: QuickPlanBatchRequest, dayInstanceDate?: string) => Promise<{ createdCount: number; updatedCount: number; deletedCount: number; todayPlanChangedCount: number; createdItems: Array<{ lineKey: string; taskId: string }> }>;
   loadActualSnapshot: () => Promise<ActualAdjustmentSnapshotRecord>;
   saveActualBatch: (request: ActualAdjustmentBatchRequest) => Promise<ActualAdjustmentBatchResult>;
   moveTask: (taskId: string, parentId?: string, previousSiblingId?: string, nextSiblingId?: string) => Promise<void>;
@@ -42,7 +46,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   select: [id: string];
-  save: [id: string];
+  save: [id: string, field?: "title" | "plannedDate" | "estimate"];
   importPlan: [];
   syncSeaTable: [];
   add: [];
@@ -66,7 +70,7 @@ const listRef = ref<HTMLElement | null>(null);
 const rowsRef = ref<HTMLElement | null>(null);
 const todayImportRowsRef = ref<HTMLElement | null>(null);
 const todayImportOpen = ref(false);
-const todayImportQuery = ref("");
+const todaySourceImportOpen = ref(false);
 const todayImportSelection = ref<string[]>([]);
 const todayImportEstimates = ref<Record<string, string>>({});
 const todayImportErrors = ref<Record<string, string>>({});
@@ -138,8 +142,6 @@ const quickPlanMode = ref<"edit" | "summary">("edit");
 const quickPlanBaseline = ref<QuickPlanBaselineTask[]>([]);
 const quickPlanSourceLines = ref<QuickPlanDraftLine[]>([]);
 const quickPlanLines = ref<QuickPlanDraftLine[]>([]);
-const quickPlanFullBaseline = ref<QuickPlanBaselineTask[]>([]);
-const quickPlanFullSourceLines = ref<QuickPlanDraftLine[]>([]);
 const quickPlanText = ref("");
 const quickPlanConfirmingClose = ref(false);
 const quickPlanPasteErrors = ref<Array<{ lineIndex: number; message: string }>>([]);
@@ -164,6 +166,7 @@ const quickPlanMarkdownToolbars = [
 
 
 const mode = computed(() => props.mode ?? "active");
+const editableTasks = computed(() => mode.value === "today" ? (props.displayTasks ?? []) : props.tasks);
 const scopedDisplayTasks = computed(() => (props.displayTasks ?? []).filter((task) => task.subjectId === props.subjectId));
 const todayStatusById = computed(() => new Map(
   (props.todayStatusTasks ?? [])
@@ -225,44 +228,42 @@ const pendingRows = computed(() => mode.value === "today"
   : flatRows.value.filter((row) => isActivePlanTask({ status: row.task.status, recurring: Boolean(row.task.recurrence) })));
 const todayLoading = computed(() => mode.value === "today" && Boolean(props.loading));
 const visiblePendingRows = computed(() => todayLoading.value ? [] : pendingRows.value);
-const todayPlannedIds = computed(() => new Set(scopedDisplayTasks.value.filter((task) => task.todayMember).map((task) => task.id)));
+const todayPlannedIds = computed(() => new Set(scopedDisplayTasks.value
+  .filter((task) => task.todayMember && task.dayInstanceSourceTaskId)
+  .map((task) => task.dayInstanceSourceTaskId!)));
 const knownTodayMemberIds = computed(() => new Set([
   ...todayPlannedIds.value,
   ...(props.todayMemberIds ?? []),
 ]));
-const activeImportTasks = computed(() => {
-  const snapshotById = new Map(scopedDisplayTasks.value.map((task) => [task.id, task]));
-  return props.tasks
-    .filter((task) => isActivePlanTask({ status: task.status, recurring: Boolean(task.recurrence) }))
-    .map((task) => ({ ...task, ...(snapshotById.get(task.id) ?? {}) }));
-});
-const todayImportRows = computed(() => {
-  const keyword = todayImportQuery.value.trim().toLocaleLowerCase();
-  const visibleIds = new Set<string>();
-  if (keyword) {
-    for (const task of activeImportTasks.value) {
-      if (![task.title, task.pathLabel ?? "", task.note ?? ""].join(" ").toLocaleLowerCase().includes(keyword)) continue;
-      visibleIds.add(task.id);
-      let parentId = task.parentId;
-      while (parentId) {
-        visibleIds.add(parentId);
-        parentId = props.tasks.find((candidate) => candidate.id === parentId)?.parentId;
-      }
-    }
-  }
-  return activeImportTasks.value
-    .filter((task) => !keyword || visibleIds.has(task.id))
-    .map((task) => ({ task, depth: getDepth(task), allocatable: !activeImportTasks.value.some((candidate) => candidate.parentId === task.id) }));
-});
+const activeImportTasks = computed(() => props.tasks
+  .filter((task) => isActivePlanTask({ status: task.status, recurring: Boolean(task.recurrence) })));
+const todayImportInstanceTasks = computed(() => scopedDisplayTasks.value);
+const todayImportInstanceRows = computed(() => todayImportInstanceTasks.value
+  .map((task) => ({
+    task,
+    depth: getDepth(task),
+    allocatable: Boolean(task.todayMember) && !todayImportInstanceTasks.value.some((candidate) => candidate.parentId === task.id),
+  })));
+const todayImportCandidateRows = computed(() => activeImportTasks.value
+  .filter((task) => !todayPlannedIds.value.has(task.id))
+  .map((task) => ({ task, depth: getTaskDepthIn(task, activeImportTasks.value), allocatable: !activeImportTasks.value.some((candidate) => candidate.parentId === task.id) })));
+const todayImportSelectableIds = computed(() => todayImportCandidateRows.value.filter((row) => row.allocatable).map((row) => row.task.id));
+const todayImportAllSelected = computed(() => todayImportSelectableIds.value.length > 0 && todayImportSelectableIds.value.every((taskId) => todayImportSelection.value.includes(taskId)));
 const todayMemberLeafTasks = computed(() => displayedTasks.value.filter((task) => (Boolean(task.todayMember) || task.version <= 0) && !displayedTasks.value.some((candidate) => candidate.parentId === task.id)));
 const todayEstimatedTotalMinutes = computed(() => todayMemberLeafTasks.value.reduce((sum, task) => sum + (task.todayEstimate ?? 0), 0));
 const todayActualTotalMinutes = computed(() => todayMemberLeafTasks.value.reduce((sum, task) => sum + task.directMinutes, 0));
-const activeImportTaskIds = computed(() => new Set(activeImportTasks.value.map((task) => task.id)));
-const todayImportFixedEstimateMinutes = computed(() => todayMemberLeafTasks.value.reduce((sum, task) => activeImportTaskIds.value.has(task.id) ? sum : sum + (task.todayEstimate ?? 0), 0));
-const todayImportTotalMinutes = computed(() => todayImportFixedEstimateMinutes.value + todayImportSelection.value.reduce((sum, taskId) => {
-  const parsed = parseQuickEstimateMinutes(todayImportEstimates.value[taskId] ?? "");
-  return sum + (parsed.ok ? parsed.minutes ?? 0 : 0);
-}, 0));
+const todayImportTotalMinutes = computed(() => {
+  return todayImportInstanceRows.value.reduce((sum, row) => {
+    if (!row.allocatable) return sum;
+    const parsed = parseQuickEstimateMinutes(todayImportEstimates.value[row.task.id] ?? "");
+    return sum + (parsed.ok ? parsed.minutes ?? 0 : row.task.todayEstimate ?? 0);
+  }, 0);
+});
+const todayImportHasChanges = computed(() => todayImportInstanceRows.value.some(({ task, allocatable }) => {
+  if (!allocatable) return false;
+  const parsed = parseQuickEstimateMinutes(todayImportEstimates.value[task.id] ?? "");
+  return parsed.ok && todayImportEstimateChanged(task, parsed.minutes);
+}));
 const actualAdjustmentSummaryValue = computed(() => actualAdjustmentSummary(actualAdjustmentDrafts.value, actualAdjustmentNewTasks.value));
 const actualAdjustmentDirty = computed(() => actualAdjustmentSummaryValue.value.changes.length > 0 || actualAdjustmentNewTasks.value.length > 0);
 const actualAdjustmentParents = computed(() => eligibleActualAdjustmentParents(actualAdjustmentSnapshot.value?.tasks ?? []));
@@ -272,7 +273,7 @@ const inlineActualDelta = computed(() => inlineActualParsed.value.ok ? inlineAct
 const quickPlanSummary = computed(() => {
   const summary = analyzeQuickPlanDraft(quickPlanBaseline.value, quickPlanLines.value);
   const contextErrors = mode.value === "today"
-    ? summary.deleted.flatMap((item) => item.taskId && !todayPlannedIds.value.has(item.taskId)
+    ? summary.deleted.flatMap((item) => item.taskId && props.displayTasks?.find((task) => task.id === item.taskId)?.dayInstanceKind === "context"
       ? [{ lineIndex: quickPlanSourceLines.value.findIndex((line) => line.taskId === item.taskId), message: `父级上下文“${item.title}”需要保留；如需调整今日事项，请编辑其下的今日成员` }]
       : [])
     : [];
@@ -280,10 +281,14 @@ const quickPlanSummary = computed(() => {
 });
 
 function getDepth(task: Task) {
+  return getTaskDepthIn(task, editableTasks.value);
+}
+
+function getTaskDepthIn(task: Task, taskList: Task[]) {
   let depth = 0;
   let parentId = task.parentId;
   while (parentId && depth < 8) {
-    const parent = props.tasks.find((item) => item.id === parentId);
+    const parent = taskList.find((item) => item.id === parentId);
     if (!parent) break;
     depth += 1;
     parentId = parent.parentId;
@@ -295,7 +300,7 @@ function getRootTask(task: Task) {
   let root = task;
   let parentId = task.parentId;
   while (parentId) {
-    const parent = props.tasks.find((item) => item.id === parentId);
+    const parent = editableTasks.value.find((item) => item.id === parentId);
     if (!parent) break;
     root = parent;
     parentId = parent.parentId;
@@ -322,7 +327,7 @@ function isTaskGroupStart(rowIndex: number) {
 }
 
 function getSubtreeIds(taskId: string) {
-  return taskSubtreeIds(props.tasks, taskId);
+  return taskSubtreeIds(editableTasks.value, taskId);
 }
 
 function isTodayMember(task: Task) {
@@ -345,7 +350,7 @@ function isTaskCompleted(task: Task) {
 }
 
 function syncEditableTask(task: Task) {
-  const source = props.tasks.find((item) => item.id === task.id);
+  const source = editableTasks.value.find((item) => item.id === task.id);
   if (!source || source === task) return;
   source.title = task.title;
   source.planDate = task.planDate;
@@ -390,10 +395,10 @@ function selectTask(task: Task) {
 }
 
 async function addTask() {
-  const existingIds = new Set(props.tasks.map((task) => task.id));
+  const existingIds = new Set(editableTasks.value.map((task) => task.id));
   emit("add");
   await nextTick();
-  const taskId = props.tasks.find((task) => !existingIds.has(task.id) && !task.parentId)?.id
+  const taskId = editableTasks.value.find((task) => !existingIds.has(task.id) && !task.parentId)?.id
     ?? (!existingIds.has(props.selectedId) ? props.selectedId : "");
   if (!taskId) return;
   temporaryTaskId.value = taskId;
@@ -401,10 +406,10 @@ async function addTask() {
 }
 
 async function addChild(task: Task) {
-  const existingIds = new Set(props.tasks.map((item) => item.id));
+  const existingIds = new Set(editableTasks.value.map((item) => item.id));
   emit("addChild", task.id);
   await nextTick();
-  const taskId = props.tasks.find((item) => !existingIds.has(item.id) && item.parentId === task.id)?.id
+  const taskId = editableTasks.value.find((item) => !existingIds.has(item.id) && item.parentId === task.id)?.id
     ?? (!existingIds.has(props.selectedId) ? props.selectedId : "");
   if (!taskId) return;
   temporaryTaskId.value = taskId;
@@ -412,10 +417,10 @@ async function addChild(task: Task) {
 }
 
 async function addRelative(task: Task, placement: "before" | "after") {
-  const existingIds = new Set(props.tasks.map((item) => item.id));
+  const existingIds = new Set(editableTasks.value.map((item) => item.id));
   emit("addRelative", task.id, placement);
   await nextTick();
-  const taskId = props.tasks.find((item) => !existingIds.has(item.id))?.id
+  const taskId = editableTasks.value.find((item) => !existingIds.has(item.id))?.id
     ?? (!existingIds.has(props.selectedId) ? props.selectedId : "");
   if (!taskId) return;
   temporaryTaskId.value = taskId;
@@ -449,7 +454,7 @@ function finishTaskEdit(task: Task) {
     return;
   }
   syncEditableTask(task);
-  emit("save", task.id);
+  emit("save", task.id, "title");
 }
 
 function openNativePicker(taskId: string) {
@@ -477,12 +482,12 @@ function finishEstimateEditor(task: Task) {
   task.estimate = normalizeEstimate(task.estimate);
   syncEditableTask(task);
   closeEstimateEditor();
-  emit("save", task.id);
+  emit("save", task.id, "estimate");
 }
 
-function saveEditableTask(task: Task) {
+function saveEditableTask(task: Task, field?: "plannedDate") {
   syncEditableTask(task);
-  emit("save", task.id);
+  emit("save", task.id, field);
 }
 
 async function openTodayEstimateEditor(task: Task) {
@@ -520,7 +525,7 @@ function saveNote() {
 }
 
 function contextTask() {
-  return props.tasks.find((task) => task.id === contextTaskId.value);
+  return editableTasks.value.find((task) => task.id === contextTaskId.value);
 }
 
 function openContextMenu(event: MouseEvent, task: Task) {
@@ -571,14 +576,12 @@ function normalizeEstimate(value: number | undefined) {
 }
 
 function openQuickPlan() {
-  const activeTasks = props.tasks.filter((task) => isActivePlanTask({ status: task.status, recurring: Boolean(task.recurrence) }));
-  quickPlanFullBaseline.value = createQuickPlanBaseline(activeTasks);
-  quickPlanFullSourceLines.value = createQuickPlanDraft(activeTasks);
-  const editableTasks = mode.value === "today"
-    ? displayedTasks.value.filter((task) => task.status === "open")
-    : activeTasks;
-  quickPlanBaseline.value = createQuickPlanBaseline(editableTasks);
-  quickPlanSourceLines.value = createQuickPlanDraft(editableTasks);
+  const activeTasks = mode.value === "today"
+    ? displayedTasks.value
+    : props.tasks.filter((task) => isActivePlanTask({ status: task.status, recurring: Boolean(task.recurrence) }));
+  const scopedTasks = mode.value === "today" ? displayedTasks.value : activeTasks;
+  quickPlanBaseline.value = createQuickPlanBaseline(scopedTasks);
+  quickPlanSourceLines.value = createQuickPlanDraft(scopedTasks);
   quickPlanLines.value = quickPlanSourceLines.value.map((line) => ({ ...line }));
   quickPlanText.value = serializeQuickPlanLines(quickPlanLines.value);
   quickPlanPasteErrors.value = [];
@@ -659,25 +662,8 @@ async function saveQuickPlan() {
   if (quickPlanSaving.value || quickPlanSummary.value.errors.length) return;
   quickPlanSaving.value = true;
   try {
-    let request: QuickPlanBatchRequest;
-    if (mode.value === "today") {
-      const mergedDraft = mergeScopedQuickPlanDraft(quickPlanFullSourceLines.value, quickPlanFullBaseline.value, quickPlanBaseline.value, quickPlanSummary.value);
-      const fullSummary = analyzeQuickPlanDraft(quickPlanFullBaseline.value, mergedDraft);
-      if (fullSummary.errors.length) throw new Error(fullSummary.errors[0].message);
-      request = buildQuickPlanBatchRequest(props.subjectId, quickPlanFullBaseline.value, fullSummary);
-      request.todayPlanChange = {
-        workDate: props.todayDate,
-        includeLineKeys: quickPlanSummary.value.added.map((item) => item.lineKey),
-        excludeItems: quickPlanSummary.value.deleted.flatMap((item) => {
-          if (!item.taskId || !todayPlannedIds.value.has(item.taskId)) return [];
-          const task = props.displayTasks?.find((candidate) => candidate.id === item.taskId);
-          return [{ taskId: item.taskId, expectedVersion: task?.dayPlanVersion }];
-        }),
-      };
-    } else {
-      request = buildQuickPlanBatchRequest(props.subjectId, quickPlanBaseline.value, quickPlanSummary.value);
-    }
-    await props.savePlanBatch(request);
+    const request = buildQuickPlanBatchRequest(props.subjectId, quickPlanBaseline.value, quickPlanSummary.value);
+    await props.savePlanBatch(request, mode.value === "today" ? props.todayDate : undefined);
     quickPlanOpen.value = false;
     ElMessage.success("计划已保存");
   } catch (error) {
@@ -784,17 +770,18 @@ async function saveActualAdjustment() {
   try { await ElMessageBox.confirm(message, "确认今日实际变化", { confirmButtonText: "保存", cancelButtonText: "继续调整", type: "info", dangerouslyUseHTMLString: true }); } catch { return; }
   actualAdjustmentSaving.value = true;
   try {
-    await props.saveActualBatch({ subjectId: actualAdjustmentSubjectId.value, workDate: actualAdjustmentSnapshot.value.workDate, clientRequestId: actualAdjustmentClientRequestId.value, batchId: actualAdjustmentBatchId.value, note: actualAdjustmentNote.value.trim() || undefined, items: latestSummary.changes, newTasks: actualAdjustmentNewTasks.value.map((draft) => ({ clientTaskId: draft.clientTaskId, title: draft.title.trim(), parentId: draft.parentId, expectedParentVersion: draft.expectedParentVersion, targetMinutes: draft.targetMinutes })) });
+    await props.saveActualBatch({ subjectId: actualAdjustmentSubjectId.value, workDate: actualAdjustmentSnapshot.value.workDate, dayInstanceDate: mode.value === "today" ? props.todayDate : undefined, clientRequestId: actualAdjustmentClientRequestId.value, batchId: actualAdjustmentBatchId.value, note: actualAdjustmentNote.value.trim() || undefined, items: latestSummary.changes, newTasks: actualAdjustmentNewTasks.value.map((draft) => ({ clientTaskId: draft.clientTaskId, title: draft.title.trim(), parentId: draft.parentId, expectedParentVersion: draft.expectedParentVersion, targetMinutes: draft.targetMinutes })) });
     actualAdjustmentOpen.value = false; ElMessage.success("今日实际已调整");
   } catch (error) { ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "今日实际保存失败，草稿已保留"); }
   finally { actualAdjustmentSaving.value = false; }
 }
 
 function hasChildren(taskId: string) {
-  return props.tasks.some((task) => task.parentId === taskId);
+  return editableTasks.value.some((task) => task.parentId === taskId);
 }
 
 function openRecurrenceEditor(task: Task) {
+  if (mode.value === "today") return;
   if (hasChildren(task.id)) return;
   recurrenceTaskId.value = task.id;
   recurrenceFrequency.value = task.recurrence?.frequency ?? "none";
@@ -806,7 +793,7 @@ function openRecurrenceEditor(task: Task) {
 }
 
 function saveRecurrence() {
-  const task = props.tasks.find((item) => item.id === recurrenceTaskId.value);
+  const task = editableTasks.value.find((item) => item.id === recurrenceTaskId.value);
   if (!task) return;
   if (recurrenceFrequency.value === "none") {
     emit("setRecurrence", task.id, undefined);
@@ -828,7 +815,7 @@ function saveRecurrence() {
 }
 
 async function confirmDelete(task: Task): Promise<boolean> {
-  const childCount = props.tasks.filter((item) => item.parentId === task.id).length;
+  const childCount = editableTasks.value.filter((item) => item.parentId === task.id).length;
   const suffix = childCount ? `，并同时删除 ${childCount} 个子项` : "";
   try {
     await ElMessageBox.confirm(`确定删除“${task.title || "未命名事项"}”${suffix}？`, "删除事项", {
@@ -846,12 +833,12 @@ async function confirmDelete(task: Task): Promise<boolean> {
 }
 
 function openTodayImport() {
-  const memberIds = new Set(todayPlannedIds.value);
-  todayImportSelection.value = activeImportTasks.value
-    .filter((task) => task.selectable && memberIds.has(task.id))
-    .map((task) => task.id);
-  todayImportEstimates.value = Object.fromEntries(activeImportTasks.value.map((task) => [task.id, task.todayEstimate ? String(task.todayEstimate) : ""]));
-  todayImportTaskTitles.value = Object.fromEntries(activeImportTasks.value.map((task) => [task.id, task.title]));
+  todayImportSelection.value = [];
+  todayImportEstimates.value = Object.fromEntries([
+    ...activeImportTasks.value.map((task) => [task.id, ""] as const),
+    ...todayImportInstanceTasks.value.map((task) => [task.id, task.todayEstimate == null ? "" : String(task.todayEstimate)] as const),
+  ]);
+  todayImportTaskTitles.value = Object.fromEntries(todayImportInstanceTasks.value.map((task) => [task.id, task.title]));
   todayImportErrors.value = {};
   todayImportTitleErrors.value = {};
   todayImportTitleSavingId.value = "";
@@ -859,8 +846,28 @@ function openTodayImport() {
   todayImportCreateParentId.value = "";
   todayImportCreateTitle.value = "";
   todayImportCreateError.value = "";
-  todayImportQuery.value = "";
+  todaySourceImportOpen.value = false;
   todayImportOpen.value = true;
+}
+
+function openTodaySourceImport() {
+  todayImportSelection.value = [];
+  todayImportErrors.value = {};
+  todaySourceImportOpen.value = true;
+}
+
+function closeTodaySourceImport() {
+  if (todayImportSaving.value) return;
+  todaySourceImportOpen.value = false;
+}
+
+function toggleAllTodaySourceTasks() {
+  if (todayImportAllSelected.value) {
+    const selectableIds = new Set(todayImportSelectableIds.value);
+    todayImportSelection.value = todayImportSelection.value.filter((taskId) => !selectableIds.has(taskId));
+    return;
+  }
+  todayImportSelection.value = [...new Set([...todayImportSelection.value, ...todayImportSelectableIds.value])];
 }
 
 function updateTodayImportTaskTitle(taskId: string, title: string) {
@@ -884,17 +891,17 @@ async function saveTodayImportTaskTitle(task: Task) {
     return;
   }
   if (title === task.title) return;
-  const source = props.tasks.find((candidate) => candidate.id === task.id);
-  if (!source) return;
-  const previousTitle = source.title;
-  source.title = title;
+  const instance = todayImportInstanceTasks.value.find((candidate) => candidate.id === task.id);
+  if (!instance) return;
+  const previousTitle = instance.title;
+  instance.title = title;
   todayImportTitleSavingId.value = task.id;
   try {
     const savedId = await props.saveTask(task.id);
     if (!savedId) throw new Error("事项名称保存失败");
     updateTodayImportTaskTitle(savedId, title);
   } catch (error) {
-    source.title = previousTitle;
+    instance.title = previousTitle;
     updateTodayImportTaskTitle(task.id, previousTitle);
     todayImportTitleErrors.value = {
       ...todayImportTitleErrors.value,
@@ -906,7 +913,7 @@ async function saveTodayImportTaskTitle(task: Task) {
 }
 
 async function openTodayImportCreate(parentId = "") {
-  const parent = parentId ? activeImportTasks.value.find((task) => task.id === parentId) : undefined;
+  const parent = parentId ? todayImportInstanceTasks.value.find((task) => task.id === parentId) : undefined;
   if (parent?.recurrence) {
     ElMessage.warning("重复事项新增子项前必须先关闭重复");
     return;
@@ -916,7 +923,6 @@ async function openTodayImportCreate(parentId = "") {
   todayImportCreateTitle.value = "";
   todayImportCreateError.value = "";
   todayImportCreateOpen.value = true;
-  todayImportQuery.value = "";
   await nextTick();
   todayImportCreateInputRef.value?.focus();
 }
@@ -929,7 +935,6 @@ async function openTodayImportRelativeCreate(task: Task, placement: "before" | "
   todayImportCreateTitle.value = "";
   todayImportCreateError.value = "";
   todayImportCreateOpen.value = true;
-  todayImportQuery.value = "";
   await nextTick();
   todayImportCreateInputRef.value?.focus();
 }
@@ -954,12 +959,11 @@ async function createTodayImportTask() {
     const taskId = todayImportCreateTargetId.value
       ? await props.createRelativeTask(todayImportCreateTargetId.value, todayImportCreatePlacement.value, title)
       : await props.createTask(title, parentId || undefined);
-    todayImportSelection.value = [...new Set([...todayImportSelection.value.filter((id) => id !== parentId), taskId])];
     todayImportEstimates.value = { ...todayImportEstimates.value, [taskId]: "" };
     todayImportTaskTitles.value = { ...todayImportTaskTitles.value, [taskId]: title };
     todayImportCreateSaving.value = false;
     closeTodayImportCreate();
-    ElMessage.success(parentId ? "子事项已新增并选中" : "事项已新增并选中");
+    ElMessage.success(parentId ? "今日子事项已新增" : "今日事项已新增");
   } catch (error) {
     todayImportCreateError.value = typeof error === "string" ? error : error instanceof Error ? error.message : "事项新增失败";
   } finally {
@@ -968,7 +972,7 @@ async function createTodayImportTask() {
 }
 
 function todayImportContextTask() {
-  return activeImportTasks.value.find((task) => task.id === todayImportContextTaskId.value);
+  return todayImportInstanceTasks.value.find((task) => task.id === todayImportContextTaskId.value);
 }
 
 function openTodayImportContextMenu(event: MouseEvent, task: Task) {
@@ -992,7 +996,6 @@ async function duplicateTodayImportRow(task: Task) {
   try {
     const taskId = await props.duplicateSingleTask(task.id);
     if (!taskId) throw new Error("事项复制失败");
-    todayImportSelection.value = [...new Set([...todayImportSelection.value, taskId])];
     todayImportEstimates.value = { ...todayImportEstimates.value, [taskId]: "" };
     todayImportTaskTitles.value = { ...todayImportTaskTitles.value, [taskId]: task.title };
     ElMessage.success("已复制事项");
@@ -1025,19 +1028,7 @@ function runTodayImportContextCommand(command: "before" | "after" | "duplicate" 
 }
 
 function todayImportSubtreeIds(taskId: string) {
-  return taskSubtreeIds(activeImportTasks.value, taskId);
-}
-
-function isTodayImportSelected(taskId: string) {
-  return todayImportSelection.value.includes(taskId);
-}
-
-function updateTodayImportSelection(taskId: string, selected: boolean) {
-  if (todayPlannedIds.value.has(taskId)) return;
-  const next = new Set(todayImportSelection.value);
-  if (selected) next.add(taskId);
-  else next.delete(taskId);
-  todayImportSelection.value = [...next];
+  return taskSubtreeIds(todayImportInstanceTasks.value, taskId);
 }
 
 function inputTodayImportEstimate(taskId: string, value: string) {
@@ -1046,7 +1037,7 @@ function inputTodayImportEstimate(taskId: string, value: string) {
   const errors = { ...todayImportErrors.value };
   if (parsed.ok) {
     delete errors[taskId];
-    if (parsed.minutes !== undefined && !isTodayImportSelected(taskId)) todayImportSelection.value = [...todayImportSelection.value, taskId];
+    if (parsed.minutes !== undefined && activeImportTasks.value.some((task) => task.id === taskId) && !todayImportSelection.value.includes(taskId)) todayImportSelection.value = [...todayImportSelection.value, taskId];
   } else errors[taskId] = parsed.message;
   todayImportErrors.value = errors;
 }
@@ -1065,33 +1056,53 @@ function todayImportEstimateChanged(task: Task, minutes?: number) {
   return minutes !== task.todayEstimate;
 }
 
+async function saveTodaySourceImport() {
+  if (todayImportSaving.value) return;
+  const newlySelectedIds = todayImportSelection.value.filter((taskId) => !todayPlannedIds.value.has(taskId));
+  if (!newlySelectedIds.length) return;
+  todayImportSaving.value = true;
+  try {
+    await props.saveTodayImport({ taskIds: newlySelectedIds, estimates: [] });
+    await nextTick();
+    todayImportEstimates.value = {
+      ...todayImportEstimates.value,
+      ...Object.fromEntries(todayImportInstanceTasks.value.map((task) => [task.id, task.todayEstimate == null ? "" : String(task.todayEstimate)] as const)),
+    };
+    todayImportTaskTitles.value = {
+      ...todayImportTaskTitles.value,
+      ...Object.fromEntries(todayImportInstanceTasks.value.map((task) => [task.id, task.title])),
+    };
+    todayImportSelection.value = [];
+    todaySourceImportOpen.value = false;
+    ElMessage.success(`已从进行中导入 ${newlySelectedIds.length} 项`);
+  } catch (error) {
+    ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "今日事项导入失败");
+  } finally {
+    todayImportSaving.value = false;
+  }
+}
+
 async function saveTodayImport() {
   if (todayImportSaving.value) return;
   const errors: Record<string, string> = {};
-  const parsedEstimates = new Map<string, number | undefined>();
-  for (const taskId of todayImportSelection.value) {
-    const parsed = parseQuickEstimateMinutes(todayImportEstimates.value[taskId] ?? "");
-    if (!parsed.ok) errors[taskId] = parsed.message;
-    else parsedEstimates.set(taskId, parsed.minutes);
-  }
+  const instanceEstimates = todayImportInstanceRows.value.flatMap(({ task, allocatable }) => {
+    if (!allocatable) return [];
+    const parsed = parseQuickEstimateMinutes(todayImportEstimates.value[task.id] ?? "");
+    if (!parsed.ok) { errors[task.id] = parsed.message; return []; }
+    if (!todayImportEstimateChanged(task, parsed.minutes)) return [];
+    return [{ taskId: task.id, estimateMinutes: parsed.minutes }];
+  });
   todayImportErrors.value = errors;
   if (Object.keys(errors).length) return;
-  const newlySelectedIds = todayImportSelection.value.filter((taskId) => !todayPlannedIds.value.has(taskId));
-  const estimates = todayImportSelection.value.flatMap((taskId) => {
-    const task = props.tasks.find((candidate) => candidate.id === taskId);
-    const minutes = parsedEstimates.get(taskId);
-    if (!task || !todayImportEstimateChanged(task, minutes)) return [];
-    return [{ taskId, expectedTaskVersion: task.version, expectedDailyEstimateVersion: task.dailyEstimateVersion, estimateMinutes: minutes }];
-  });
-  if (!newlySelectedIds.length && !estimates.length) {
+  if (!instanceEstimates.length) {
     todayImportOpen.value = false;
     return;
   }
   todayImportSaving.value = true;
   try {
-    await props.saveTodayImport({ taskIds: newlySelectedIds, estimates });
+    await props.saveTodayImport({ taskIds: [], estimates: [], instanceEstimates });
     todayImportOpen.value = false;
-    ElMessage.success(`已导入 ${newlySelectedIds.length} 项，更新 ${estimates.length} 项今日预计`);
+    ElMessage.success("今日事项配置已保存");
   } catch (error) {
     ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "今日事项配置失败");
   } finally {
@@ -1105,7 +1116,7 @@ const treeSortable = createTaskTreeSortable({
   handleSelector: ".drag-handle",
   taskIdAttribute: "data-task-id",
   subtreeIds: getSubtreeIds,
-  parentId: (taskId) => props.tasks.find((task) => task.id === taskId)?.parentId,
+  parentId: (taskId) => editableTasks.value.find((task) => task.id === taskId)?.parentId,
   onStart() {
     closeContextMenu();
     isSorting.value = true;
@@ -1122,7 +1133,6 @@ const todayImportSortable = createTaskTreeSortable({
   rowSelector: ".today-import-row[data-today-import-task-id]",
   handleSelector: ".today-import-drag-handle",
   taskIdAttribute: "data-today-import-task-id",
-  disabled: () => Boolean(todayImportQuery.value.trim()),
   subtreeIds: todayImportSubtreeIds,
   parentId: (taskId) => activeImportTasks.value.find((task) => task.id === taskId)?.parentId,
   onStart: () => { todayImportMoving.value = true; },
@@ -1219,6 +1229,7 @@ async function saveInlineActualAdjustment() {
     await props.saveActualBatch({
       subjectId: task.subjectId,
       workDate: snapshot.workDate,
+      dayInstanceDate: mode.value === "today" ? props.todayDate : undefined,
       clientRequestId: crypto.randomUUID(),
       batchId: crypto.randomUUID(),
       note: inlineActualNote.value.trim() || undefined,
@@ -1262,8 +1273,8 @@ onMounted(() => {
   window.addEventListener("scroll", closeTodayImportContextMenu, true);
 });
 
-watch([todayImportOpen, todayImportRows, todayImportQuery], async ([open]) => {
-  if (!open) { todayImportSortable.destroy(); closeTodayImportContextMenu(); return; }
+watch([todayImportOpen, todaySourceImportOpen, todayImportInstanceRows], async ([open, sourceImportOpen]) => {
+  if (!open || sourceImportOpen) { todayImportSortable.destroy(); closeTodayImportContextMenu(); return; }
   await nextTick();
   todayImportSortable.mount();
 }, { flush: "post" });
@@ -1341,7 +1352,7 @@ onBeforeUnmount(() => {
             <div class="reminder-meta">
               <span class="task-level-label"><CornerDownRight v-if="row.depth" :size="12" />{{ row.depth + 1 }}级</span>
               <span class="meta-picker" :class="{ filled: row.task.planDate }" title="设置预计开始日期" @click.stop="openNativePicker(row.task.id)">
-                <input :data-date-input="row.task.id" v-model="row.task.planDate" aria-label="预计开始日期" tabindex="-1" type="date" @change="saveEditableTask(row.task)" />
+                <input :data-date-input="row.task.id" v-model="row.task.planDate" aria-label="预计开始日期" tabindex="-1" type="date" @change="saveEditableTask(row.task, 'plannedDate')" />
                 <CalendarDays :size="12" />{{ row.task.planDate || '未设置开始日期' }}
               </span>
               <span class="meta-picker estimate-picker" :class="{ filled: row.task.estimate }" :title="row.task.recurrence ? '设置每次预计用时' : '设置整体预计用时'" @click.stop="openEstimateEditor(row.task.id)">
@@ -1359,7 +1370,7 @@ onBeforeUnmount(() => {
                   @keydown.esc.prevent="closeEstimateEditor"
                 />
               </span>
-              <span class="meta-picker estimate-picker today-estimate-picker" :class="{ filled: row.task.todayEstimate }" title="设置今日预计用时" @click.stop="openTodayEstimateEditor(row.task)">
+              <span v-if="mode === 'today'" class="meta-picker estimate-picker today-estimate-picker" :class="{ filled: row.task.todayEstimate }" title="设置今日预计用时" @click.stop="openTodayEstimateEditor(row.task)">
                 <TimerReset :size="12" />{{ row.task.todayEstimate ? '今日预计 ' + formatMinutes(row.task.todayEstimate) : '未填今日预计' }}
                 <input
                   v-if="editingTodayEstimateId === row.task.id"
@@ -1421,7 +1432,7 @@ onBeforeUnmount(() => {
                 </button>
               </el-tooltip>
               <button
-                v-if="!hasChildren(row.task.id)"
+                v-if="mode === 'active' && !hasChildren(row.task.id)"
                 class="meta-picker recurrence-picker"
                 :class="{ filled: row.task.recurrence }"
                 type="button"
@@ -1471,7 +1482,8 @@ onBeforeUnmount(() => {
       </button>
     </div>
 
-    <el-dialog v-model="todayImportOpen" class="recurrence-dialog today-import-dialog" modal-class="today-import-overlay" title="配置今日事项" width="min(820px, 95vw)" append-to-body align-center :close-on-click-modal="false">
+    <el-dialog v-model="todayImportOpen" class="recurrence-dialog today-import-dialog" modal-class="today-import-overlay" :title="todaySourceImportOpen ? '从进行中导入' : '配置今日事项'" width="min(820px, 95vw)" append-to-body align-center :close-on-click-modal="false">
+      <template v-if="!todaySourceImportOpen">
       <section class="today-import-overview" aria-label="今日计划时长统计">
         <div class="today-import-overview-context">
           <span>今日计划总览</span>
@@ -1484,35 +1496,29 @@ onBeforeUnmount(() => {
         </div>
       </section>
       <div class="today-import-toolbar">
-        <div><strong>选择今日事项</strong><span>从全部进行中事项中选择；今日预计可留空，单位为分钟。</span></div>
-        <input v-model="todayImportQuery" class="today-plan-search" placeholder="搜索事项或父级路径" />
+        <div><strong>今日事项</strong></div>
       </div>
       <div class="today-import-table-tools">
         <button class="secondary-button compact" type="button" @click="openTodayImportCreate()"><Plus :size="14" />新增事项</button>
-        <div class="today-import-summary">
-          <span>已选择 <strong>{{ todayImportSelection.length }}</strong> 项</span>
-          <span>新加入 <strong>{{ todayImportSelection.filter((id) => !todayPlannedIds.has(id)).length }}</strong> 项</span>
-        </div>
+        <button class="secondary-button compact" type="button" @click="openTodaySourceImport"><FileInput :size="14" />从进行中导入</button>
       </div>
       <form v-if="todayImportCreateOpen" class="today-import-create-bar" @submit.prevent="createTodayImportTask">
         <div>
           <strong>{{ todayImportCreateParentId ? '新增子事项' : '新增一级事项' }}</strong>
-          <small v-if="todayImportCreateParentId">添加到“{{ activeImportTasks.find((task) => task.id === todayImportCreateParentId)?.title }}”下</small>
-          <small v-else>创建后会自动选中，可继续填写今日预计。</small>
+          <small v-if="todayImportCreateParentId">添加到“{{ todayImportInstanceTasks.find((task) => task.id === todayImportCreateParentId)?.title }}”下</small>
+          <small v-else>直接创建为今天的独立事项。</small>
         </div>
         <input ref="todayImportCreateInputRef" v-model="todayImportCreateTitle" placeholder="输入事项名称" aria-label="新增事项名称" @input="todayImportCreateError = ''" @keydown.esc.prevent="closeTodayImportCreate" />
         <button class="secondary-button compact" type="button" :disabled="todayImportCreateSaving" @click="closeTodayImportCreate">取消</button>
         <button class="primary-button compact" type="submit" :disabled="todayImportCreateSaving">{{ todayImportCreateSaving ? '新增中...' : '新增' }}</button>
         <small v-if="todayImportCreateError" class="today-import-create-error">{{ todayImportCreateError }}</small>
       </form>
-      <div v-if="todayImportRows.length" class="today-import-list">
-        <div class="today-import-list-head" aria-hidden="true"><span>事项</span><span>今日实际</span><span>今日预计</span><span>操作</span></div>
+      <div v-if="todayImportInstanceRows.length" class="today-import-list">
+        <div class="today-import-list-head" aria-hidden="true"><span>事项</span><span>今日实际</span><span>今日预计</span></div>
         <div ref="todayImportRowsRef" class="today-import-sortable-rows" :class="{ moving: todayImportMoving }">
-        <div v-for="row in todayImportRows" :key="row.task.id" class="today-import-row" :data-today-import-task-id="row.task.id" :data-depth="row.depth" :class="{ group: !row.allocatable, child: row.depth > 0, selected: isTodayImportSelected(row.task.id) }" :style="{ '--task-depth': String(row.depth) }">
-          <button class="today-import-drag-handle" type="button" :disabled="Boolean(todayImportQuery.trim())" :class="{ active: todayImportContextTaskId === row.task.id }" :title="todayImportQuery.trim() ? '清空搜索后调整顺序和层级' : '拖动排序；右键可复制、插入或删除事项'" :aria-label="`${row.task.title}拖动排序，右键打开行菜单`" @pointerdown="todayImportSortable.prepareSubtree(row.task.id)" @contextmenu="openTodayImportContextMenu($event, row.task)"><GripVertical :size="14" /></button>
-          <template v-if="row.allocatable">
-            <input class="today-import-check" type="checkbox" :checked="isTodayImportSelected(row.task.id)" :disabled="todayPlannedIds.has(row.task.id)" :aria-label="`${row.task.title}加入今日`" @change="updateTodayImportSelection(row.task.id, ($event.target as HTMLInputElement).checked)" />
-          </template>
+        <div v-for="row in todayImportInstanceRows" :key="row.task.id" class="today-import-row" :data-today-import-task-id="row.task.id" :data-depth="row.depth" :class="{ group: !row.allocatable, child: row.depth > 0 }" :style="{ '--task-depth': String(row.depth) }">
+          <button class="today-import-drag-handle" type="button" :class="{ active: todayImportContextTaskId === row.task.id }" title="拖动排序；右键可复制、插入或删除事项" :aria-label="`${row.task.title}拖动排序，右键打开行菜单`" @pointerdown="todayImportSortable.prepareSubtree(row.task.id)" @contextmenu="openTodayImportContextMenu($event, row.task)"><GripVertical :size="14" /></button>
+          <input v-if="row.allocatable" class="today-import-check" type="checkbox" checked disabled :aria-label="`${row.task.title}已在今日`" />
           <span v-else class="today-import-check-spacer" aria-hidden="true"></span>
           <div class="today-import-task">
             <div class="today-import-title-line">
@@ -1526,7 +1532,6 @@ onBeforeUnmount(() => {
                 @keydown.esc.prevent="resetTodayImportTaskTitle(row.task); ($event.target as HTMLInputElement).blur()"
               />
             </div>
-            <small v-if="!row.allocatable">父事项 · 仅用于层级识别</small>
             <small v-if="todayImportTitleSavingId === row.task.id" class="today-import-title-status">保存中...</small>
             <small v-else-if="todayImportTitleErrors[row.task.id]" class="today-import-title-error">{{ todayImportTitleErrors[row.task.id] }}</small>
           </div>
@@ -1566,17 +1571,38 @@ onBeforeUnmount(() => {
               <button type="button" title="增加 15 分钟" :aria-label="`${row.task.title}增加 15 分钟`" @click="adjustTodayImportEstimate(row.task.id, 15)"><Plus :size="14" /></button>
             </div>
           </div>
-          <span v-else class="today-import-estimate-empty">—</span>
-          <div class="today-import-actions"></div>
+          <span v-else class="today-import-estimate-empty"></span>
           <small v-if="todayImportErrors[row.task.id]" class="today-import-error">{{ todayImportErrors[row.task.id] }}</small>
         </div>
         </div>
       </div>
-      <small v-if="todayImportQuery.trim()" class="today-import-drag-hint">搜索状态下不能拖动；清空搜索后可调整顺序和层级。</small>
-      <div v-else-if="!todayImportRows.length" class="quick-estimate-empty">没有匹配的进行中事项。</div>
+      <div v-else class="quick-estimate-empty today-import-empty"><strong>今天还没有事项</strong><span>可以新增一个今日事项，或从进行中的计划里导入。</span><div><button class="secondary-button compact" type="button" @click="openTodayImportCreate()"><Plus :size="14" />新增事项</button><button class="secondary-button compact" type="button" @click="openTodaySourceImport"><FileInput :size="14" />从进行中导入</button></div></div>
+      </template>
+      <section v-else class="today-source-import-view">
+        <div class="today-source-import-head">
+          <div><strong>选择要加入今天的事项</strong><span>这里只选择事项；重复事项会自动使用每次预计，导入后仍可调整。</span></div>
+          <button class="secondary-button compact today-source-select-all" type="button" :disabled="!todayImportSelectableIds.length" @click="toggleAllTodaySourceTasks">{{ todayImportAllSelected ? '取消全选' : '全选' }}</button>
+        </div>
+        <div v-if="todayImportCandidateRows.length" class="today-import-list today-import-candidate-list">
+          <div class="today-source-import-rows">
+            <label v-for="row in todayImportCandidateRows" :key="row.task.id" class="today-source-import-row" :class="{ context: !row.allocatable, child: row.depth > 0, selected: row.allocatable && todayImportSelection.includes(row.task.id) }" :style="{ '--task-depth': String(row.depth) }">
+              <span v-if="!row.allocatable" class="today-source-check-spacer" aria-hidden="true"></span>
+              <input v-else v-model="todayImportSelection" type="checkbox" :value="row.task.id" :aria-label="`${row.task.title}加入今日`" />
+              <div class="today-source-import-title"><CornerDownRight v-if="row.depth" :size="14" /><strong>{{ row.task.title }}</strong><small v-if="!row.allocatable">父事项</small></div>
+            </label>
+          </div>
+        </div>
+        <div v-else class="quick-estimate-empty today-source-import-empty">没有可导入的进行中事项。</div>
+      </section>
       <template #footer>
-        <button class="secondary-button" type="button" :disabled="todayImportSaving || todayImportCreateSaving || Boolean(todayImportTitleSavingId)" @click="todayImportOpen = false">取消</button>
-        <button class="primary-button" type="button" :disabled="todayImportSaving || todayImportCreateSaving || Boolean(todayImportTitleSavingId) || !todayImportSelection.length" @click="saveTodayImport">{{ todayImportSaving ? '保存中...' : `保存配置（${todayImportSelection.length}）` }}</button>
+        <div v-show="todaySourceImportOpen" class="today-import-footer-actions">
+          <button class="secondary-button" type="button" :disabled="todayImportSaving" @click="closeTodaySourceImport">返回</button>
+          <button class="primary-button" type="button" :disabled="todayImportSaving || !todayImportSelection.length" @click="saveTodaySourceImport">{{ todayImportSaving ? '导入中...' : `导入 ${todayImportSelection.length} 项` }}</button>
+        </div>
+        <div v-show="!todaySourceImportOpen" class="today-import-footer-actions">
+          <button class="secondary-button" type="button" :disabled="todayImportSaving || todayImportCreateSaving || Boolean(todayImportTitleSavingId)" @click="todayImportOpen = false">取消</button>
+          <button class="primary-button" type="button" :disabled="todayImportSaving || todayImportCreateSaving || Boolean(todayImportTitleSavingId) || !todayImportHasChanges" @click="saveTodayImport">{{ todayImportSaving ? '保存中...' : '保存配置' }}</button>
+        </div>
       </template>
     </el-dialog>
 

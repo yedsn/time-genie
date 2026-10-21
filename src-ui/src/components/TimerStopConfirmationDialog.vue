@@ -22,7 +22,7 @@ const open = computed({
 const entry = computed(() => store.timerStopConfirmationEntry);
 const defaultTask = computed(() => {
   const taskId = entry.value?.defaultTask;
-  return store.tasks.find((task) => task.id === taskId && task.selectable && task.status !== "done");
+  return [...store.todayPlanTasks, ...store.tasks].find((task) => task.id === taskId && task.selectable && task.status !== "done");
 });
 const canUseDefaultTask = computed(() => Boolean(defaultTask.value && store.timerStopConfirmationSlices.some((slice) => slice.minutes > 0)));
 const defaultTaskLabel = computed(() => store.taskDisplayLabel(entry.value?.defaultTask));
@@ -68,7 +68,7 @@ function adjustAllocation() {
   if (!entry.value) return;
   const targetEntry = entry.value;
   const subjectId = targetEntry.allocations?.find((allocation) => allocation.subjectId)?.subjectId
-    ?? store.tasks.find((task) => task.id === targetEntry.defaultTask)?.subjectId;
+    ?? [...store.todayPlanTasks, ...store.tasks].find((task) => task.id === targetEntry.defaultTask)?.subjectId;
   pendingAllocationTarget.value = { entryId: targetEntry.id, subjectId };
   store.dismissTimerStopConfirmation();
 }
