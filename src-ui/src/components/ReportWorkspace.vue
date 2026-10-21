@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { storeToRefs } from "pinia";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { ArrowDown, ArrowUp, Braces, CalendarDays, CalendarRange, Check, ChevronRight, ClipboardCopy, Clock3, Copy, FilePenLine, FileText, Folder, HardDriveDownload, LayoutTemplate, MoreHorizontal, Pencil, Plus, ReceiptText, RefreshCcw, Search, Sparkles, Star, Trash2 } from "lucide-vue-next";
@@ -19,11 +19,14 @@ import {
 } from "../services/reportTemplateEditorCore";
 import { loadSubjectWorkSchedule, workPeriodTextForDate } from "../services/subjectWorkScheduleMock";
 import { onRememberedPanelSubjectChange, readRememberedPanelSubjectId, rememberPanelSubjectId } from "../services/executionPanelSubjectPreference";
+import { resolveReportSelection } from "../services/reportPaginationCore";
 
 const store = useWorkdayStore();
-const { reports } = storeToRefs(store);
+const { reports, reportTypeCounts, reportHasMore, reportsLoading, reportsLoadingMore, reportsError } = storeToRefs(store);
 const reportFilter = ref<"all" | ReportType>("all");
 const reportQuery = ref("");
+const debouncedReportQuery = ref("");
+const reportListRef = ref<HTMLElement>();
 const reportSubjectId = ref("");
 const rememberedReportSubjectId = ref(readRememberedPanelSubjectId());
 const selectedReportId = ref("");
@@ -68,22 +71,15 @@ const obsidianLoading = ref(false);
 const obsidianWriting = ref(false);
 const obsidianStrategy = ref<"overwrite" | "append">("overwrite");
 const obsidianPreview = ref<ObsidianReportWritePreview>();
+let reportQueryTimer: ReturnType<typeof setTimeout> | undefined;
 
 const toolbars = [
-  "revoke", "next", "-", "bold", "italic", "strikeThrough", "title", "quote",
-  "unorderedList", "orderedList", "task", "codeRow", "code", "link", "table", "=", "preview"
+  "revoke", "next", "-", "bold", "italic", "strikeThrough", "quote",
+  "unorderedList", "orderedList", "task", "codeRow", "code", "link", "=", "preview"
 ] as const;
 
 const selectedReport = computed(() => reports.value.find((report) => report.id === selectedReportId.value));
-const filteredReports = computed(() => {
-  const query = reportQuery.value.trim().toLocaleLowerCase();
-  return reports.value.filter((report) => {
-    if (report.subjectId !== reportSubjectId.value) return false;
-    if (reportFilter.value !== "all" && report.type !== reportFilter.value) return false;
-    if (!query) return true;
-    return `${report.period} ${report.subjectName} ${reportTypeLabel(report.type)}`.toLocaleLowerCase().includes(query);
-  });
-});
+const filteredReports = computed(() => reports.value);
 const draftTasks = computed(() => draftTaskSuggestions.value);
 const selectableDraftTasks = computed(() => draftTasks.value.filter((task) => task.candidateRole === "selectable"));
 const visibleDraftTasks = computed(() => {
@@ -110,12 +106,7 @@ const existingDraftReport = computed(() => {
     && report.subjectId === draftSubjectId.value
     && report.period === period);
 });
-const reportCounts = computed(() => ({
-  all: reports.value.filter((report) => report.subjectId === reportSubjectId.value).length,
-  daily: reports.value.filter((report) => report.subjectId === reportSubjectId.value && report.type === "daily").length,
-  weekly: reports.value.filter((report) => report.subjectId === reportSubjectId.value && report.type === "weekly").length,
-  monthly: reports.value.filter((report) => report.subjectId === reportSubjectId.value && report.type === "monthly").length
-}));
+const reportCounts = computed(() => reportTypeCounts.value);
 const draftSummary = computed(() => {
   const selected = new Set(draftTaskIds.value);
   const tasks = selectableDraftTasks.value.filter((task) => selected.has(task.taskId));
@@ -178,6 +169,23 @@ watch(selectedReport, (report) => {
   editorDraft.value = report?.markdown ?? "";
 }, { immediate: true });
 
+watch(reportQuery, (query) => {
+  if (reportQueryTimer) clearTimeout(reportQueryTimer);
+  reportQueryTimer = setTimeout(() => {
+    debouncedReportQuery.value = query.trim();
+  }, 250);
+});
+
+watch([reportSubjectId, reportFilter, debouncedReportQuery], ([subjectId, reportType, query]) => {
+  if (!subjectId) return;
+  void store.loadReports({ subjectId, reportType, query: query || undefined });
+});
+
+watch(reports, (items) => {
+  selectedReportId.value = resolveReportSelection(items, selectedReportId.value);
+  void fillReportListViewport();
+}, { immediate: true });
+
 watch([draftSubjectId, draftType, draftReferenceDate], () => {
   if (!reportDialogOpen.value) return;
   void loadDraftWorkPeriod();
@@ -199,10 +207,7 @@ watch(draftType, () => {
   templatePickerOpen.value = false;
   void loadDraftTemplates(true);
 });
-watch([
-  () => store.subjects.map((subject) => subject.id).join("|"),
-  () => reports.value.map((report) => `${report.id}:${report.subjectId}`).join("|"),
-], () => {
+watch(() => store.subjects.map((subject) => subject.id).join("|"), () => {
   if (store.subjects.some((subject) => subject.id === rememberedReportSubjectId.value)
     && reportSubjectId.value !== rememberedReportSubjectId.value) {
     reportSubjectId.value = rememberedReportSubjectId.value;
@@ -211,14 +216,10 @@ watch([
       ? rememberedReportSubjectId.value
       : store.selectedSubjectId || store.subjects[0]?.id || "";
   }
-  if (selectedReport.value?.subjectId !== reportSubjectId.value) {
-    selectedReportId.value = reports.value.find((report) => report.subjectId === reportSubjectId.value)?.id ?? "";
-  }
 }, { immediate: true });
 
 async function selectReportSubject(subjectId: string) {
   if (subjectId === reportSubjectId.value || !store.subjects.some((subject) => subject.id === subjectId)) return;
-  const nextReport = reports.value.find((report) => report.subjectId === subjectId);
   if (hasUnsavedChanges.value && selectedReport.value?.subjectId !== subjectId) {
     try {
       await ElMessageBox.confirm("当前报告有未保存修改，保存后再切换主体。", "保存当前修改", {
@@ -234,7 +235,7 @@ async function selectReportSubject(subjectId: string) {
     if (!await saveMarkdown(false)) return;
   }
   reportSubjectId.value = subjectId;
-  selectedReportId.value = nextReport?.id ?? "";
+  selectedReportId.value = "";
   rememberedReportSubjectId.value = subjectId;
   rememberPanelSubjectId(subjectId);
 }
@@ -590,8 +591,11 @@ async function saveReportDialog() {
   } catch (error) {
     const existingId = existingReportId(error);
     if (existingId) {
-      await store.loadReports();
-      const existing = reports.value.find((report) => report.id === existingId);
+      reportSubjectId.value = subject.id;
+      reportFilter.value = draftType.value;
+      reportQuery.value = "";
+      debouncedReportQuery.value = "";
+      const existing = await store.loadReportsThroughId(existingId, { subjectId: subject.id, reportType: draftType.value });
       if (!existing) {
         ElMessage.error("已有报告加载失败，请刷新后重试");
         return;
@@ -801,6 +805,32 @@ function onWorkspaceKeydown(event: KeyboardEvent) {
   if (hasUnsavedChanges.value) void saveMarkdown();
 }
 
+function onReportListScroll(event: Event) {
+  const target = event.currentTarget as HTMLElement;
+  if (target.scrollHeight - target.scrollTop - target.clientHeight <= 120) {
+    void store.loadMoreReports();
+  }
+}
+
+async function fillReportListViewport() {
+  await nextTick();
+  const list = reportListRef.value;
+  if (!list || reportsLoading.value || reportsLoadingMore.value || !reportHasMore.value) return;
+  if (list.scrollHeight <= list.clientHeight + 1) {
+    const loaded = await store.loadMoreReports();
+    if (loaded) await fillReportListViewport();
+  }
+}
+
+function retryReportList() {
+  if (reports.value.length) void store.loadMoreReports();
+  else void store.loadReports({
+    subjectId: reportSubjectId.value,
+    reportType: reportFilter.value,
+    query: debouncedReportQuery.value || undefined,
+  });
+}
+
 onMounted(async () => {
   window.addEventListener("keydown", onWorkspaceKeydown);
   stopSubjectPreferenceSync = onRememberedPanelSubjectChange((subjectId) => {
@@ -819,6 +849,7 @@ onUnmounted(() => {
   window.removeEventListener("keydown", onWorkspaceKeydown);
   stopSubjectPreferenceSync?.();
   if (draftPreviewTimer) clearTimeout(draftPreviewTimer);
+  if (reportQueryTimer) clearTimeout(reportQueryTimer);
 });
 
 async function regenerateReport(report: ReportRecord) {
@@ -963,7 +994,7 @@ function existingReportId(error: unknown) {
         <button v-for="option in [{ value: 'all', label: '全部' }, { value: 'daily', label: '日报' }, { value: 'weekly', label: '周报' }, { value: 'monthly', label: '月报' }]" :key="option.value" type="button" :class="[{ active: reportFilter === option.value }, option.value === 'all' ? 'type-all' : reportTypeClass(option.value as ReportType)]" @click="reportFilter = option.value as 'all' | ReportType"><span>{{ option.label }}</span><small>{{ reportCounts[option.value as keyof typeof reportCounts] }}</small></button>
       </div>
 
-      <div v-if="filteredReports.length" class="report-record-list">
+      <div v-if="filteredReports.length" ref="reportListRef" class="report-record-list" @scroll.passive="onReportListScroll">
         <article v-for="report in filteredReports" :key="report.id" class="report-record" :class="[{ active: selectedReportId === report.id }, reportTypeClass(report.type)]">
           <button class="report-record-main" type="button" @click="selectReport(report)">
             <span class="report-record-icon"><FileText :size="15" /></span>
@@ -986,6 +1017,22 @@ function existingReportId(error: unknown) {
             </template>
           </el-dropdown>
         </article>
+        <div class="report-list-status" aria-live="polite">
+          <span v-if="reportsLoadingMore" class="loading">正在加载更多…</span>
+          <button v-else-if="reportsError" type="button" @click="retryReportList">加载失败，点击重试</button>
+          <span v-else-if="!reportHasMore">已显示全部 {{ reportCounts[reportFilter] }} 份报告</span>
+        </div>
+      </div>
+
+      <div v-else-if="reportsLoading" class="report-list-skeleton" aria-label="正在加载报告">
+        <span v-for="index in 5" :key="index"></span>
+      </div>
+
+      <div v-else-if="reportsError" class="report-empty-list report-load-error">
+        <FileText :size="23" />
+        <strong>报告加载失败</strong>
+        <span>{{ reportsError }}</span>
+        <button class="secondary-button compact" type="button" @click="retryReportList">重新加载</button>
       </div>
 
       <div v-else class="report-empty-list">

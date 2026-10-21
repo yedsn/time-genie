@@ -91,6 +91,16 @@ import { completedTaskHistoryFallbackPage, isCurrentCompletedTaskHistoryRequest 
 import { canAcceptInlineTimerChild, inlineTimerParentUnavailableReason } from "./services/inlineTimerTaskCreationCore";
 import type { QuickPlanBatchRequest } from "./services/quickPlanTextCore";
 import { beginTodayPlanRequest, isCurrentTodayPlanRequest, resolveTodayPlanOutcome } from "./services/todayPlanRequestCore";
+import {
+  applyReportPage,
+  beginReportLoadMore,
+  beginReportRefresh,
+  beginReportReset,
+  createReportPaginationState,
+  failReportPage,
+  type ReportListFilters,
+  type ReportPageToken,
+} from "./services/reportPaginationCore";
 
 export type TaskStatus = "open" | "done";
 
@@ -260,6 +270,13 @@ export const useWorkdayStore = defineStore("workday", () => {
   const selectedTaskId = ref("");
   const selectedEntryId = ref("");
   const reports = ref<ReportRecord[]>([]);
+  const reportPagination = reactive(createReportPaginationState<ReportRecord>(20));
+  const reportTotal = computed(() => reportPagination.total);
+  const reportTypeCounts = computed(() => reportPagination.typeCounts);
+  const reportHasMore = computed(() => reportPagination.hasMore);
+  const reportsLoading = computed(() => reportPagination.loading);
+  const reportsLoadingMore = computed(() => reportPagination.loadingMore);
+  const reportsError = computed(() => reportPagination.error);
   const todayOverview = ref<TodayWorkOverviewRecord | null>(null);
   const todayOverviewLoading = ref(false);
   const todayOverviewSubjectId = ref("");
@@ -404,7 +421,7 @@ export const useWorkdayStore = defineStore("workday", () => {
 
   async function initializeWorkspace(trackUnassigned: boolean) {
     await refreshWorkspaceCalendar();
-    await Promise.all([loadWorkspaceData(), loadTimeData(), loadReports(), trackUnassigned ? loadUnassignedState() : Promise.resolve()]);
+    await Promise.all([loadWorkspaceData(), loadTimeData(), trackUnassigned ? loadUnassignedState() : Promise.resolve()]);
     await loadTodayOverview();
   }
 
@@ -663,13 +680,90 @@ export const useWorkdayStore = defineStore("workday", () => {
     await loadTodayOverview(subjectId);
   }
 
-  async function loadReports() {
+  async function requestReportPages(
+    token: ReportPageToken,
+    targetPage: number,
+    replace: boolean,
+  ) {
+    const filters = { ...reportPagination.filters };
+    const pageSize = reportPagination.pageSize;
     try {
-      const result = await listReports();
-      replaceRefIfChanged(reports, result.reports.map(toUiReport));
+      let mergedReports: ReportRecord[] = [];
+      let finalResult: Awaited<ReturnType<typeof listReports>> | undefined;
+      for (let page = 1; page <= targetPage; page += 1) {
+        const result = await listReports({
+          ...filters,
+          page,
+          pageSize,
+        });
+        if (token.requestSeq !== reportPagination.requestSeq) return false;
+        finalResult = result;
+        mergedReports.push(...result.reports.map(toUiReport));
+        if (!result.hasMore) break;
+      }
+      if (!finalResult) return false;
+      const applied = applyReportPage(reportPagination, token, {
+        reports: mergedReports,
+        page: finalResult.page,
+        pageSize: finalResult.pageSize,
+        total: finalResult.total,
+        hasMore: finalResult.hasMore,
+        typeCounts: finalResult.typeCounts,
+      }, replace);
+      if (applied) replaceRefIfChanged(reports, reportPagination.items);
+      return applied;
     } catch (error) {
       console.error("加载报告失败", error);
+      failReportPage(reportPagination, token, error instanceof Error ? error.message : String(error));
+      return false;
     }
+  }
+
+  async function loadReports(filters?: Partial<ReportListFilters>) {
+    if (!filters) return await refreshReports();
+    const token = beginReportReset(reportPagination, filters);
+    reports.value = [];
+    return await requestReportPages(token, 1, true);
+  }
+
+  async function loadMoreReports() {
+    const token = beginReportLoadMore(reportPagination);
+    if (!token) return false;
+    try {
+      const result = await listReports({
+        ...reportPagination.filters,
+        page: token.page,
+        pageSize: reportPagination.pageSize,
+      });
+      const applied = applyReportPage(reportPagination, token, {
+        reports: result.reports.map(toUiReport),
+        page: result.page,
+        pageSize: result.pageSize,
+        total: result.total,
+        hasMore: result.hasMore,
+        typeCounts: result.typeCounts,
+      }, false);
+      if (applied) replaceRefIfChanged(reports, reportPagination.items);
+      return applied;
+    } catch (error) {
+      console.error("加载更多报告失败", error);
+      failReportPage(reportPagination, token, error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }
+
+  async function refreshReports() {
+    const token = beginReportRefresh(reportPagination);
+    return await requestReportPages(token, Math.max(1, reportPagination.loadedPageDepth), true);
+  }
+
+  async function loadReportsThroughId(reportId: string, filters: Partial<ReportListFilters>) {
+    await loadReports(filters);
+    while (!reports.value.some((report) => report.id === reportId) && reportPagination.hasMore) {
+      const loaded = await loadMoreReports();
+      if (!loaded) break;
+    }
+    return reports.value.find((report) => report.id === reportId);
   }
 
   function toUiReport(report: ReportRecordDto): ReportRecord {
@@ -2371,8 +2465,8 @@ export const useWorkdayStore = defineStore("workday", () => {
       templateId: request.templateId,
     });
     const report = toUiReport(result);
-    reports.value.unshift(report);
-    return report;
+    await refreshReports();
+    return reports.value.find((item) => item.id === report.id) ?? report;
   }
 
   async function updateReportScope(report: ReportRecord, request: { type: ReportType; referenceDate: string; subjectId: string; taskIds: string[]; templateId?: string }) {
@@ -2385,29 +2479,25 @@ export const useWorkdayStore = defineStore("workday", () => {
       templateId: request.templateId,
       expectedVersion: report.version,
     }));
-    const index = reports.value.findIndex((item) => item.id === updated.id);
-    if (index >= 0) reports.value.splice(index, 1, updated);
-    return updated;
+    await refreshReports();
+    return reports.value.find((item) => item.id === updated.id) ?? updated;
   }
 
   async function saveReportContent(report: ReportRecord, markdown: string) {
     const updated = toUiReport(await saveReportContentRecord(report.id, markdown, report.version));
-    const index = reports.value.findIndex((item) => item.id === updated.id);
-    if (index >= 0) reports.value.splice(index, 1, updated);
-    return updated;
+    await refreshReports();
+    return reports.value.find((item) => item.id === updated.id) ?? updated;
   }
 
   async function regenerateReport(report: ReportRecord) {
     const updated = toUiReport(await regenerateReportRecord(report.id, report.version));
-    const index = reports.value.findIndex((item) => item.id === updated.id);
-    if (index >= 0) reports.value.splice(index, 1, updated);
-    return updated;
+    await refreshReports();
+    return reports.value.find((item) => item.id === updated.id) ?? updated;
   }
 
   async function deleteReport(report: ReportRecord) {
     await deleteReportRecord(report.id, report.version);
-    const index = reports.value.findIndex((item) => item.id === report.id);
-    if (index >= 0) reports.value.splice(index, 1);
+    await refreshReports();
   }
 
   async function getReportTemplate(type: ReportType, subjectId?: string) {
@@ -2529,13 +2619,13 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   return {
-    activePage, subjects, selectedSubjectId, selectedSubject, selectedSubjectTasks, tasks, todayTasks, todayPlanTasks, todayPlanLoading, todayPlanSubjectId, todayPlanError, visibleTasks, statusColors, entries, timeHistoryGroups, timeHistoryPage, timeHistoryTotalDays, timeHistoryTotalPages, timeHistoryLoading, timeHistoryRevision, reports, todayOverview, todayOverviewLoading, todayOverviewSubjectId, todayOverviewSubject, selectedTaskId, selectedEntryId, selectedEntry, runningEntry, timerStopConfirmationEntryId, timerStopConfirmationEntry, timerStopConfirmationSlices, timerStopConfirmation,
+    activePage, subjects, selectedSubjectId, selectedSubject, selectedSubjectTasks, tasks, todayTasks, todayPlanTasks, todayPlanLoading, todayPlanSubjectId, todayPlanError, visibleTasks, statusColors, entries, timeHistoryGroups, timeHistoryPage, timeHistoryTotalDays, timeHistoryTotalPages, timeHistoryLoading, timeHistoryRevision, reports, reportTotal, reportTypeCounts, reportHasMore, reportsLoading, reportsLoadingMore, reportsError, todayOverview, todayOverviewLoading, todayOverviewSubjectId, todayOverviewSubject, selectedTaskId, selectedEntryId, selectedEntry, runningEntry, timerStopConfirmationEntryId, timerStopConfirmationEntry, timerStopConfirmationSlices, timerStopConfirmation,
     planTaskTab, completedTasks, completedTasksSubjectId, completedTasksPage, completedTasksPageSize, completedTasksTotal, completedTasksTotalPages, completedTasksLoading, completedTasksError, completedTasksStale,
     workspaceTimezone, workspaceToday, workspaceDayStartAt, workspaceDayEndAt, refreshWorkspaceCalendar,
     now, todayMinutes, allocatedMinutes, pendingMinutes, doneCount, todayCompletionDoneCount, todayCompletionTotalCount, todayCompletionPercent, unassignedSeconds, unassignedStartedAt,
     unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen, unassignedWorkDate, unassignedSessionId, unassignedVersion,
     unassignedCurrentSession,
-    workspaceLoaded, workspaceLoading, executionSnapshots, executionSnapshotLoading, loadExecutionSnapshot, saveExecutionTaskTitle, saveExecutionTaskNote, saveExecutionTaskDetails, deleteExecutionTask, loadWorkspaceData, loadTodayPlan, setTodayPlanMembership, addTasksToToday, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addTaskSelectionDraft, addChildTask, addTaskRelative, createTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTodayImport, saveTaskPlanBatch, loadActualAdjustmentSnapshot, saveActualAdjustmentBatch, removeActualAdjustment, duplicateTask, duplicateSingleTask, deleteTask, moveTask, reorderTask, movePlanTask,
+    workspaceLoaded, workspaceLoading, executionSnapshots, executionSnapshotLoading, loadExecutionSnapshot, saveExecutionTaskTitle, saveExecutionTaskNote, saveExecutionTaskDetails, deleteExecutionTask, loadWorkspaceData, loadTodayPlan, setTodayPlanMembership, addTasksToToday, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadMoreReports, refreshReports, loadReportsThroughId, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addTaskSelectionDraft, addChildTask, addTaskRelative, createTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTodayImport, saveTaskPlanBatch, loadActualAdjustmentSnapshot, saveActualAdjustmentBatch, removeActualAdjustment, duplicateTask, duplicateSingleTask, deleteTask, moveTask, reorderTask, movePlanTask,
     addTodayTask, addTodayChildTask, addTodayTaskRelative, saveTodayTask, saveTodayTaskToFuture, deleteTodayTask, saveTodayTaskNote, saveTodayTaskNoteToFuture, saveTodayTaskTodayEstimate, commitTodayTaskToggle, toggleTodayTask, moveTodayTask, indentTodayTask, outdentTodayTask, duplicateTodayTask, duplicateSingleTodayTask,
     indentTask, outdentTask, moveExecutionTask, startTimer, transitionTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, loadReportTemplates, createReportTemplate, updateReportTemplate, duplicateReportTemplate, setDefaultReportTemplate, deleteReportTemplate, reorderReportTemplates, getReportTemplatePlaceholders, publicReportText, previewObsidianReport, writeObsidianReport,
     beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, dismissUnassignedResolution, resolveUnassignedTime

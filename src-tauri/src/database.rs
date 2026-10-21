@@ -140,6 +140,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "daily_report_collection_templates",
         sql: include_str!("../migrations/0025_daily_report_collection_templates.sql"),
     },
+    Migration {
+        version: 26,
+        name: "report_list_pagination_indexes",
+        sql: include_str!("../migrations/0026_report_list_pagination_indexes.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -642,6 +647,91 @@ mod tests {
             .unwrap();
         assert_eq!(migration_count, latest_migration_version());
         assert_eq!(workspace_count, 1);
+    }
+
+    #[test]
+    fn report_pagination_index_migration_preserves_existing_reports() {
+        let directory = tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("report-pagination-index-upgrade.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                   version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        for migration in &MIGRATIONS[..25] {
+            let transaction = connection.transaction().unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version,name,applied_at) VALUES (?1,?2,1)",
+                    params![migration.version, migration.name],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO workspaces(id,name,timezone,storage_mode,created_at,updated_at,version)
+                   VALUES ('pagination-ws','分页迁移','Asia/Shanghai','local',1,1,1);
+                 INSERT INTO devices(id,workspace_id,device_name,platform,app_version,last_seen_at,created_at)
+                   VALUES ('pagination-device','pagination-ws','旧设备','test','1',1,1);
+                 INSERT INTO subjects(id,workspace_id,name,sort_order,created_at,updated_at,version)
+                   VALUES ('pagination-subject','pagination-ws','旧主体',10,1,1,1);
+                 INSERT INTO reports(
+                   id,workspace_id,report_type,subject_id,period_start,period_end,reference_date,
+                   markdown_content,content_source,generation_count,created_at,updated_at,version,
+                   created_by_device_id,updated_by_device_id
+                 ) VALUES (
+                   'pagination-report','pagination-ws','daily','pagination-subject',
+                   '2026-10-20','2026-10-20','2026-10-20','# 历史正文','edited',3,2,3,4,
+                   'pagination-device','pagination-device'
+                 );
+                 INSERT INTO app_metadata(key,value) VALUES ('initial_demo_tasks_seeded','1');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::initialize_at(path).unwrap();
+        assert_eq!(
+            database.status().unwrap().schema_version,
+            latest_migration_version()
+        );
+        let connection = database.open().unwrap();
+        let report: (String, String, i64, i64) = connection
+            .query_row(
+                "SELECT markdown_content,content_source,generation_count,version
+                 FROM reports WHERE id='pagination-report'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            report,
+            ("# 历史正文".to_string(), "edited".to_string(), 3, 4)
+        );
+        let indexes = connection
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type='index' AND name LIKE 'idx_reports_list_%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            indexes,
+            vec![
+                "idx_reports_list_subject_type_updated".to_string(),
+                "idx_reports_list_subject_updated".to_string(),
+            ]
+        );
     }
 
     #[test]

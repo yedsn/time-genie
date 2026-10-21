@@ -2365,6 +2365,8 @@ fn isolated_supabase_planning_two_device_flow() {
                 report_type: None,
                 subject_id: None,
                 query: None,
+                page: None,
+                page_size: None,
             },
         )
         .unwrap()
@@ -4419,6 +4421,8 @@ fn isolated_named_report_templates_two_device_flow() {
             report_type: None,
             subject_id: None,
             query: None,
+            page: None,
+            page_size: None,
         },
     )
     .unwrap()

@@ -33,7 +33,21 @@ pub struct ReportDto {
 #[serde(rename_all = "camelCase")]
 pub struct ReportListResult {
     pub reports: Vec<ReportDto>,
+    pub page: i64,
+    pub page_size: i64,
+    pub total: i64,
+    pub has_more: bool,
+    pub type_counts: ReportTypeCountsDto,
     pub revision: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportTypeCountsDto {
+    pub all: i64,
+    pub daily: i64,
+    pub weekly: i64,
+    pub monthly: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +56,10 @@ pub struct ReportListRequest {
     pub report_type: Option<String>,
     pub subject_id: Option<String>,
     pub query: Option<String>,
+    #[serde(default)]
+    pub page: Option<i64>,
+    #[serde(default)]
+    pub page_size: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -260,36 +278,122 @@ pub fn list_reports(
 ) -> Result<ReportListResult, String> {
     let connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
-    let mut statement = connection
-        .prepare(
-            "SELECT r.id FROM reports r JOIN subjects s ON s.id = r.subject_id
+    let page = request.page.unwrap_or(1).max(1);
+    let page_size = request.page_size.unwrap_or(20).clamp(1, 100);
+    let offset = (page - 1) * page_size;
+    let report_type = request.report_type.as_deref().unwrap_or("all");
+    if report_type != "all" {
+        validate_report_type(report_type)?;
+    }
+    let subject_id = request.subject_id.as_deref();
+    let query = request.query.as_deref().map(str::trim).unwrap_or("");
+    let total: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM reports r JOIN subjects s ON s.id = r.subject_id
              WHERE r.workspace_id = ?1 AND r.deleted_at IS NULL
-               AND (?2 IS NULL OR ?2 = 'all' OR r.report_type = ?2)
+               AND (?2 = 'all' OR r.report_type = ?2)
                AND (?3 IS NULL OR r.subject_id = ?3)
-               AND (?4 IS NULL OR ?4 = '' OR r.period_start LIKE '%' || ?4 || '%'
-                    OR r.period_end LIKE '%' || ?4 || '%' OR s.name LIKE '%' || ?4 || '%')
-             ORDER BY r.updated_at DESC",
+               AND (?4 = '' OR r.period_start LIKE '%' || ?4 || '%'
+                    OR r.period_end LIKE '%' || ?4 || '%' OR s.name LIKE '%' || ?4 || '%')",
+            params![workspace_id, report_type, subject_id, query],
+            |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
-    let ids = statement
+    let type_counts = connection
+        .query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN r.report_type = 'daily' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN r.report_type = 'weekly' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN r.report_type = 'monthly' THEN 1 ELSE 0 END), 0)
+             FROM reports r JOIN subjects s ON s.id = r.subject_id
+             WHERE r.workspace_id = ?1 AND r.deleted_at IS NULL
+               AND (?2 IS NULL OR r.subject_id = ?2)
+               AND (?3 = '' OR r.period_start LIKE '%' || ?3 || '%'
+                    OR r.period_end LIKE '%' || ?3 || '%' OR s.name LIKE '%' || ?3 || '%')",
+            params![workspace_id, subject_id, query],
+            |row| {
+                Ok(ReportTypeCountsDto {
+                    all: row.get(0)?,
+                    daily: row.get(1)?,
+                    weekly: row.get(2)?,
+                    monthly: row.get(3)?,
+                })
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let mut statement = connection
+        .prepare(
+            "SELECT r.id, r.report_type, r.subject_id, s.name, r.period_start, r.period_end,
+                    r.reference_date, r.markdown_content, r.content_source, r.generation_count,
+                    r.updated_at, r.version, r.template_id, template.name,
+                    CASE WHEN template.deleted_at IS NULL THEN 0 ELSE 1 END,
+                    COALESCE((
+                      SELECT group_concat(task_id, char(31)) FROM (
+                        SELECT task_id FROM report_tasks
+                        WHERE report_id = r.id ORDER BY sort_order, task_id
+                      )
+                    ), '')
+             FROM reports r JOIN subjects s ON s.id = r.subject_id
+             LEFT JOIN report_templates template ON template.id = r.template_id
+             WHERE r.workspace_id = ?1 AND r.deleted_at IS NULL
+               AND (?2 = 'all' OR r.report_type = ?2)
+               AND (?3 IS NULL OR r.subject_id = ?3)
+               AND (?4 = '' OR r.period_start LIKE '%' || ?4 || '%'
+                    OR r.period_end LIKE '%' || ?4 || '%' OR s.name LIKE '%' || ?4 || '%')
+             ORDER BY r.updated_at DESC, r.id DESC
+             LIMIT ?5 OFFSET ?6",
+        )
+        .map_err(|error| error.to_string())?;
+    let reports = statement
         .query_map(
             params![
                 workspace_id,
-                request.report_type,
-                request.subject_id,
-                request.query
+                report_type,
+                subject_id,
+                query,
+                page_size,
+                offset
             ],
-            |row| row.get::<_, String>(0),
+            |row| {
+                let report_type: String = row.get(1)?;
+                let period_start: String = row.get(4)?;
+                let period_end: String = row.get(5)?;
+                let task_ids: String = row.get(15)?;
+                Ok(ReportDto {
+                    id: row.get(0)?,
+                    report_type,
+                    subject_id: row.get(2)?,
+                    subject_name: row.get(3)?,
+                    period: period_label(&period_start, &period_end),
+                    period_start,
+                    period_end,
+                    reference_date: row.get(6)?,
+                    task_ids: if task_ids.is_empty() {
+                        Vec::new()
+                    } else {
+                        task_ids.split('\u{1f}').map(ToOwned::to_owned).collect()
+                    },
+                    template_id: row.get(12)?,
+                    template_name: row.get(13)?,
+                    template_archived: row.get::<_, i64>(14)? == 1,
+                    markdown: row.get(7)?,
+                    content_source: row.get(8)?,
+                    generated_count: row.get(9)?,
+                    updated_at: row.get(10)?,
+                    version: row.get(11)?,
+                })
+            },
         )
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
-    let reports = ids
-        .iter()
-        .map(|id| load_report(&connection, id))
-        .collect::<Result<Vec<_>, _>>()?;
     Ok(ReportListResult {
         reports,
+        page,
+        page_size,
+        total,
+        has_more: offset + page_size < total,
+        type_counts,
         revision: current_revision(&connection)?,
     })
 }
@@ -3669,6 +3773,121 @@ mod tests {
         .unwrap()
     }
 
+    fn insert_paginated_report_fixture(
+        database: &Database,
+        subject_id: &str,
+        task_ids: &[String],
+        count: usize,
+        id_prefix: &str,
+        date_offset: i64,
+    ) -> Vec<String> {
+        let mut connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let active_template_id: String = connection
+            .query_row(
+                "SELECT id FROM report_templates
+                 WHERE workspace_id=?1 AND report_type='daily' AND deleted_at IS NULL
+                 ORDER BY is_default DESC, id LIMIT 1",
+                [&workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let archived_template_id = format!("{id_prefix}-archived-template");
+        connection
+            .execute(
+                "INSERT INTO report_templates(
+                   id,workspace_id,report_type,subject_id,content,is_builtin,created_at,updated_at,version,
+                   name,description,is_default,sort_order,deleted_at
+                 ) VALUES (?1,?2,'daily',NULL,'{{今日事项}}',0,1,1,1,'已归档模板',NULL,0,999,2)",
+                params![archived_template_id, workspace_id],
+            )
+            .unwrap();
+
+        let base_date = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let transaction = connection.transaction().unwrap();
+        let mut ids = Vec::with_capacity(count);
+        for index in 0..count {
+            let id = format!("{id_prefix}-{index:03}");
+            let report_type = match index % 3 {
+                0 => "daily",
+                1 => "weekly",
+                _ => "monthly",
+            };
+            let date = (base_date + Duration::days(date_offset + index as i64))
+                .format("%Y-%m-%d")
+                .to_string();
+            let template_id = if index == 0 {
+                Some(archived_template_id.as_str())
+            } else if report_type == "daily" {
+                Some(active_template_id.as_str())
+            } else {
+                None
+            };
+            transaction
+                .execute(
+                    "INSERT INTO reports(
+                       id,workspace_id,report_type,subject_id,period_start,period_end,reference_date,
+                       template_id,markdown_content,content_source,generation_count,generated_at,
+                       created_at,updated_at,version,created_by_device_id,updated_by_device_id
+                     ) VALUES (?1,?2,?3,?4,?5,?5,?5,?6,?7,'generated',?8,1000,1000,9000,1,?9,?9)",
+                    params![
+                        id,
+                        workspace_id,
+                        report_type,
+                        subject_id,
+                        date,
+                        template_id,
+                        format!("# 分页报告 {index}"),
+                        index as i64 + 1,
+                        device_id
+                    ],
+                )
+                .unwrap();
+            if index == 0 {
+                for (sort_order, task_id) in task_ids.iter().rev().enumerate() {
+                    transaction
+                        .execute(
+                            "INSERT INTO report_tasks(
+                               report_id,task_id,workspace_id,sort_order,title_snapshot,path_snapshot
+                             ) VALUES (?1,?2,?3,?4,?5,?5)",
+                            params![
+                                id,
+                                task_id,
+                                workspace_id,
+                                sort_order as i64,
+                                format!("事项 {sort_order}")
+                            ],
+                        )
+                        .unwrap();
+                }
+            }
+            ids.push(id);
+        }
+        transaction.commit().unwrap();
+        ids
+    }
+
+    fn pagination_request(
+        report_type: Option<&str>,
+        subject_id: Option<&str>,
+        query: Option<&str>,
+        page: Option<i64>,
+        page_size: Option<i64>,
+    ) -> ReportListRequest {
+        ReportListRequest {
+            report_type: report_type.map(str::to_string),
+            subject_id: subject_id.map(str::to_string),
+            query: query.map(str::to_string),
+            page,
+            page_size,
+        }
+    }
+
     #[test]
     fn creates_edits_and_regenerates_daily_report() {
         let (database, subject_id, task_id) = setup();
@@ -5685,6 +5904,247 @@ mod tests {
         )
         .unwrap();
         assert!(report.markdown.contains("待报销：¥128.50（2 项）"));
+    }
+
+    #[test]
+    fn report_list_paginates_filters_and_returns_complete_rows() {
+        let (database, subject_id, first_task_id) = setup();
+        let second_task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                day_instance_date: None,
+                parent_id: None,
+                title: "分页关联事项".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let task_ids = vec![first_task_id, second_task.id];
+        let ids =
+            insert_paginated_report_fixture(&database, &subject_id, &task_ids, 45, "page-main", 0);
+
+        let first = list_reports(
+            &database,
+            pagination_request(Some("all"), Some(&subject_id), None, None, None),
+        )
+        .unwrap();
+        let second = list_reports(
+            &database,
+            pagination_request(Some("all"), Some(&subject_id), None, Some(2), None),
+        )
+        .unwrap();
+        let third = list_reports(
+            &database,
+            pagination_request(Some("all"), Some(&subject_id), None, Some(3), None),
+        )
+        .unwrap();
+
+        assert_eq!((first.page, first.page_size, first.total), (1, 20, 45));
+        assert_eq!(first.reports.len(), 20);
+        assert!(first.has_more);
+        assert_eq!(second.reports.len(), 20);
+        assert!(second.has_more);
+        assert_eq!(third.reports.len(), 5);
+        assert!(!third.has_more);
+        assert_eq!(
+            (
+                first.type_counts.all,
+                first.type_counts.daily,
+                first.type_counts.weekly,
+                first.type_counts.monthly,
+            ),
+            (45, 15, 15, 15)
+        );
+
+        let listed_ids = first
+            .reports
+            .iter()
+            .chain(&second.reports)
+            .chain(&third.reports)
+            .map(|report| report.id.clone())
+            .collect::<Vec<_>>();
+        let mut expected_ids = ids.clone();
+        expected_ids.sort_by(|left, right| right.cmp(left));
+        assert_eq!(listed_ids, expected_ids);
+        assert_eq!(
+            listed_ids.iter().collect::<HashSet<_>>().len(),
+            listed_ids.len()
+        );
+
+        let archived = third
+            .reports
+            .iter()
+            .find(|report| report.id == "page-main-000")
+            .unwrap();
+        assert_eq!(archived.markdown, "# 分页报告 0");
+        assert_eq!(archived.content_source, "generated");
+        assert_eq!(archived.generated_count, 1);
+        assert_eq!(archived.template_name.as_deref(), Some("已归档模板"));
+        assert!(archived.template_archived);
+        assert_eq!(
+            archived.task_ids,
+            task_ids.iter().rev().cloned().collect::<Vec<_>>()
+        );
+
+        let normalized = list_reports(
+            &database,
+            pagination_request(Some("all"), Some(&subject_id), None, Some(0), Some(500)),
+        )
+        .unwrap();
+        assert_eq!((normalized.page, normalized.page_size), (1, 100));
+        assert_eq!(normalized.reports.len(), 45);
+        assert!(!normalized.has_more);
+
+        let daily = list_reports(
+            &database,
+            pagination_request(Some("daily"), Some(&subject_id), None, Some(1), Some(20)),
+        )
+        .unwrap();
+        assert_eq!(daily.total, 15);
+        assert!(daily
+            .reports
+            .iter()
+            .all(|report| report.report_type == "daily"));
+        assert_eq!(daily.type_counts.all, 45);
+        assert_eq!(daily.type_counts.weekly, 15);
+
+        let by_date = list_reports(
+            &database,
+            pagination_request(
+                Some("all"),
+                Some(&subject_id),
+                Some("2026-01-10"),
+                Some(1),
+                Some(20),
+            ),
+        )
+        .unwrap();
+        assert_eq!(by_date.total, 1);
+        assert_eq!(by_date.reports[0].period_start, "2026-01-10");
+        assert_eq!(by_date.type_counts.all, 1);
+    }
+
+    #[test]
+    fn report_list_subject_search_and_query_plan_use_pagination_index() {
+        let (database, subject_id, task_id) = setup();
+        let connection = database.open().unwrap();
+        connection
+            .execute(
+                "UPDATE subjects SET name='分页主体甲' WHERE id=?1",
+                [&subject_id],
+            )
+            .unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let other_subject_id = "pagination-subject-b".to_string();
+        connection
+            .execute(
+                "INSERT INTO subjects(id,workspace_id,name,sort_order,created_at,updated_at,version)
+                 VALUES (?1,?2,'分页主体乙',20,1,1,1)",
+                params![other_subject_id, workspace_id],
+            )
+            .unwrap();
+        drop(connection);
+        insert_paginated_report_fixture(&database, &subject_id, &[task_id], 9, "subject-a", 0);
+        insert_paginated_report_fixture(&database, &other_subject_id, &[], 6, "subject-b", 100);
+
+        let subject_b = list_reports(
+            &database,
+            pagination_request(
+                Some("weekly"),
+                Some(&other_subject_id),
+                None,
+                Some(1),
+                Some(20),
+            ),
+        )
+        .unwrap();
+        assert_eq!(subject_b.total, 2);
+        assert_eq!(subject_b.type_counts.all, 6);
+        assert_eq!(subject_b.type_counts.daily, 2);
+        assert_eq!(subject_b.type_counts.weekly, 2);
+        assert_eq!(subject_b.type_counts.monthly, 2);
+
+        let by_subject_name = list_reports(
+            &database,
+            pagination_request(Some("all"), None, Some("主体乙"), Some(1), Some(20)),
+        )
+        .unwrap();
+        assert_eq!(by_subject_name.total, 6);
+        assert!(by_subject_name
+            .reports
+            .iter()
+            .all(|report| report.subject_id == other_subject_id));
+
+        let connection = database.open().unwrap();
+        let plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT r.id FROM reports r
+                 WHERE r.workspace_id=?1 AND r.subject_id=?2 AND r.report_type='daily'
+                   AND r.deleted_at IS NULL
+                 ORDER BY r.updated_at DESC, r.id DESC LIMIT 20 OFFSET 0",
+            )
+            .unwrap()
+            .query_map(params![workspace_id, subject_id], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join(" | ");
+        assert!(
+            plan.contains("idx_reports_list_subject_type_updated"),
+            "unexpected query plan: {plan}"
+        );
+    }
+
+    #[test]
+    fn report_list_handles_one_year_of_daily_reports_without_duplicates() {
+        let (database, subject_id, task_id) = setup();
+        insert_paginated_report_fixture(&database, &subject_id, &[task_id], 365, "year-report", 0);
+
+        let mut page = 1;
+        let mut loaded_ids = Vec::new();
+        loop {
+            let result = list_reports(
+                &database,
+                pagination_request(Some("all"), Some(&subject_id), None, Some(page), Some(20)),
+            )
+            .unwrap();
+            if page == 1 {
+                assert_eq!(result.reports.len(), 20);
+                assert_eq!(result.total, 365);
+            }
+            loaded_ids.extend(result.reports.into_iter().map(|report| report.id));
+            if !result.has_more {
+                break;
+            }
+            page += 1;
+        }
+        assert_eq!(page, 19);
+        assert_eq!(loaded_ids.len(), 365);
+        assert_eq!(loaded_ids.iter().collect::<HashSet<_>>().len(), 365);
+
+        let searched = list_reports(
+            &database,
+            pagination_request(
+                Some("all"),
+                Some(&subject_id),
+                Some("2026-07-15"),
+                Some(1),
+                Some(20),
+            ),
+        )
+        .unwrap();
+        assert_eq!(searched.total, 1);
+        assert_eq!(searched.reports[0].period_start, "2026-07-15");
     }
 
     #[test]

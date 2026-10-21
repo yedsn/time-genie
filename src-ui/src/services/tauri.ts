@@ -761,6 +761,21 @@ export type ReportTemplateRecord = {
   version: number;
 };
 
+export type ReportListResultDto = {
+  reports: ReportRecordDto[];
+  page: number;
+  pageSize: number;
+  total: number;
+  hasMore: boolean;
+  typeCounts: {
+    all: number;
+    daily: number;
+    weekly: number;
+    monthly: number;
+  };
+  revision: number;
+};
+
 export type ReportTemplatePlaceholder = {
   token: string;
   label: string;
@@ -1325,11 +1340,15 @@ export async function listReports(request: {
   reportType?: "all" | "daily" | "weekly" | "monthly";
   subjectId?: string;
   query?: string;
-} = {}): Promise<{ reports: ReportRecordDto[]; revision: number }> {
-  return await invoke("report_list", { request: {
+  page?: number;
+  pageSize?: number;
+} = {}): Promise<ReportListResultDto> {
+  return await invoke<ReportListResultDto>("report_list", { request: {
     reportType: request.reportType ?? "all",
     subjectId: request.subjectId,
     query: request.query,
+    page: request.page ?? 1,
+    pageSize: request.pageSize ?? 20,
   } });
 }
 
