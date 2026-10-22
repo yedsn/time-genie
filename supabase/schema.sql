@@ -3815,3 +3815,7 @@ notify pgrst, 'reload schema';
 -- Full snapshots list task sources and parents before their dependents so
 -- cache rebuilds remain compatible with older desktop clients.
 \ir 20261022d_timegenie_snapshot_task_order.sql
+
+-- Old clients may enqueue a today-plan mapping for hierarchy-only context
+-- parents. Acknowledge that harmless legacy operation without storing it.
+\ir 20261022e_timegenie_ignore_context_day_plans.sql

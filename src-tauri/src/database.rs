@@ -150,6 +150,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "archived_task_parent_scope",
         sql: include_str!("../migrations/0027_archived_task_parent_scope.sql"),
     },
+    Migration {
+        version: 28,
+        name: "remove_context_day_plan_outbox",
+        sql: include_str!("../migrations/0028_remove_context_day_plan_outbox.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -1060,6 +1065,87 @@ mod tests {
             )
             .unwrap();
         assert_eq!(migration_count, 3);
+    }
+
+    #[test]
+    fn context_day_plan_cleanup_migration_removes_only_invalid_mapping() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("context-day-plan-cleanup.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                   version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        for migration in &MIGRATIONS[..27] {
+            let transaction = connection.transaction().unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version,name,applied_at) VALUES (?1,?2,1)",
+                    params![migration.version, migration.name],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        connection.execute_batch(
+            r#"INSERT INTO workspaces(id,name,storage_mode,created_at,updated_at) VALUES('ws','测试','cloud',1,1);
+             INSERT INTO devices(id,workspace_id,device_name,platform,app_version,last_seen_at,created_at)
+               VALUES('device','ws','测试设备','windows','0.4.6',1,1);
+             INSERT INTO subjects(id,workspace_id,name,sort_order,created_at,updated_at,version)
+               VALUES('subject','ws','测试主体',1,1,1,1);
+             INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version)
+               VALUES('source-context','ws','subject','上下文来源','open','manual',1,1,1,1),
+                     ('source-member','ws','subject','成员来源','open','manual',2,1,1,1);
+             INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version,day_instance_date,day_instance_kind,day_instance_source_task_id)
+               VALUES('context-instance','ws','subject','上下文实例','open','manual',1,1,1,1,'2026-10-22','context','source-context'),
+                     ('member-instance','ws','subject','成员实例','open','manual',2,1,1,1,'2026-10-22','member','source-member');
+             INSERT INTO task_day_plans(workspace_id,task_id,work_date,state,created_at,updated_at,version,instance_task_id)
+               VALUES('ws','source-context','2026-10-22','included',1,1,1,'context-instance'),
+                     ('ws','source-member','2026-10-22','included',1,1,1,'member-instance');
+             INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,payload_json,state,attempt_count,created_at)
+               VALUES('context-plan-op','ws','device','task_day_plan_materialize','task_day_plan','source-context|2026-10-22','{"task_id":"source-context","work_date":"2026-10-22","state":"included","instance_task_id":"context-instance","version":1}','failed',9,1),
+                     ('member-plan-op','ws','device','task_day_plan_materialize','task_day_plan','source-member|2026-10-22','{"task_id":"source-member","work_date":"2026-10-22","state":"included","instance_task_id":"member-instance","version":1}','pending',0,1);"#,
+        ).unwrap();
+        drop(connection);
+
+        let database = Database::initialize_at(path).unwrap();
+        let connection = database.open().unwrap();
+        let context_plan_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_day_plans WHERE task_id='source-context'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let context_queue_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE operation_id='context-plan-op'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let member_plan_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_day_plans WHERE task_id='source-member'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let member_queue_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE operation_id='member-plan-op'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(context_plan_count, 0);
+        assert_eq!(context_queue_count, 0);
+        assert_eq!(member_plan_count, 1);
+        assert_eq!(member_queue_count, 1);
     }
 
     #[test]

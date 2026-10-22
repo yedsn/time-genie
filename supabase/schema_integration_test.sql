@@ -104,6 +104,8 @@ end $$;
 \ir 20261022b_timegenie_today_instance_protocol.sql
 \ir 20261022d_timegenie_snapshot_task_order.sql
 \ir 20261022d_timegenie_snapshot_task_order.sql
+\ir 20261022e_timegenie_ignore_context_day_plans.sql
+\ir 20261022e_timegenie_ignore_context_day_plans.sql
 
 do $$
 begin
@@ -3533,7 +3535,7 @@ begin
   insert into timegenie.tasks(id,workspace_id,subject_id,parent_id,title,status,source_type,sort_order,day_instance_date,day_instance_kind,day_instance_source_task_id) values
     ('6d000000-0000-0000-0000-000000000001','20000000-0000-0000-0000-000000000001',target_subject,null,'快照排序源父事项','open','manual',901,null,null,null),
     ('6d000000-0000-0000-0000-000000000002','20000000-0000-0000-0000-000000000001',target_subject,'6d000000-0000-0000-0000-000000000001','快照排序源子事项','open','manual',902,null,null,null),
-    ('6d000000-0000-0000-0000-000000000003','20000000-0000-0000-0000-000000000001',target_subject,null,'快照排序实例父事项','open','manual',903,'2026-10-22','member','6d000000-0000-0000-0000-000000000001'),
+    ('6d000000-0000-0000-0000-000000000003','20000000-0000-0000-0000-000000000001',target_subject,null,'快照排序实例父事项','open','manual',903,'2026-10-22','context','6d000000-0000-0000-0000-000000000001'),
     ('6d000000-0000-0000-0000-000000000004','20000000-0000-0000-0000-000000000001',target_subject,'6d000000-0000-0000-0000-000000000003','快照排序实例子事项','open','manual',904,'2026-10-22','member','6d000000-0000-0000-0000-000000000002');
   perform set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
   perform set_config('request.headers','{"x-timegenie-workspace-epoch":"3","x-timegenie-client-schema-generation":"1"}',true);
@@ -3549,6 +3551,43 @@ begin
       source_parent_pos,source_child_pos,instance_parent_pos,instance_child_pos;
   end if;
 end $$;
+
+set local role authenticated;
+select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+select set_config('request.headers','{"x-timegenie-workspace-epoch":"3","x-timegenie-client-schema-generation":"1"}',true);
+do $$
+declare ignored jsonb; repeated jsonb; accepted jsonb;
+begin
+  ignored:=timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '4d000000-0000-0000-0000-000000000001','task_day_plan_materialize','task_day_plan',
+    '6d000000-0000-0000-0000-000000000001|2026-10-22',null,1,1,
+    jsonb_build_object('task_id','6d000000-0000-0000-0000-000000000001','work_date','2026-10-22','state','included','instance_task_id','6d000000-0000-0000-0000-000000000003','created_at',1792622400000,'updated_at',1792622400000,'version',1)
+  );
+  repeated:=timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '4d000000-0000-0000-0000-000000000001','task_day_plan_materialize','task_day_plan',
+    '6d000000-0000-0000-0000-000000000001|2026-10-22',null,1,1,
+    jsonb_build_object('task_id','6d000000-0000-0000-0000-000000000001','work_date','2026-10-22','state','included','instance_task_id','6d000000-0000-0000-0000-000000000003','created_at',1792622400000,'updated_at',1792622400000,'version',1)
+  );
+  if not coalesce((ignored->>'ignoredContextPlan')::boolean,false) or ignored is distinct from repeated then
+    raise exception 'legacy context day plan was not acknowledged idempotently: % / %',ignored,repeated;
+  end if;
+  if ignored->'authoritative' is distinct from 'null'::jsonb then
+    raise exception 'legacy context day plan was persisted';
+  end if;
+  accepted:=timegenie.cloud_apply_patch(
+    '20000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001',
+    '4d000000-0000-0000-0000-000000000002','task_day_plan_materialize','task_day_plan',
+    '6d000000-0000-0000-0000-000000000002|2026-10-22',null,1,1,
+    jsonb_build_object('task_id','6d000000-0000-0000-0000-000000000002','work_date','2026-10-22','state','included','instance_task_id','6d000000-0000-0000-0000-000000000004','created_at',1792622400000,'updated_at',1792622400000,'version',1)
+  );
+  if coalesce((accepted->>'ignoredContextPlan')::boolean,false)
+     or accepted->>'entityId' is distinct from '6d000000-0000-0000-0000-000000000002|2026-10-22' then
+    raise exception 'valid member day plan was not persisted: %',accepted;
+  end if;
+end $$;
+reset role;
 
 \ir 20261021c_timegenie_daily_report_collection_templates.sql
 \ir 20261021c_timegenie_daily_report_collection_templates.sql

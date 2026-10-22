@@ -45,6 +45,7 @@ const todayTaskInstancesPatchFile = path.join(repoRoot, "supabase", "20261021_ti
 const clientWriteGenerationPatchFile = path.join(repoRoot, "supabase", "20261021b_timegenie_client_write_generation.sql");
 const todayInstanceProtocolPatchFile = path.join(repoRoot, "supabase", "20261022b_timegenie_today_instance_protocol.sql");
 const snapshotTaskOrderPatchFile = path.join(repoRoot, "supabase", "20261022d_timegenie_snapshot_task_order.sql");
+const ignoreContextDayPlansPatchFile = path.join(repoRoot, "supabase", "20261022e_timegenie_ignore_context_day_plans.sql");
 const dailyReportCollectionTemplatesPatchFile = path.join(repoRoot, "supabase", "20261021c_timegenie_daily_report_collection_templates.sql");
 
 const binaryNames = process.platform === "win32"
@@ -138,6 +139,7 @@ function verifyStaticSchemaInvariants() {
   const clientWriteGenerationPatch = fs.readFileSync(clientWriteGenerationPatchFile, "utf8");
   const todayInstanceProtocolPatch = fs.readFileSync(todayInstanceProtocolPatchFile, "utf8");
   const snapshotTaskOrderPatch = fs.readFileSync(snapshotTaskOrderPatchFile, "utf8");
+  const ignoreContextDayPlansPatch = fs.readFileSync(ignoreContextDayPlansPatchFile, "utf8");
   const dailyReportCollectionTemplatesPatch = fs.readFileSync(dailyReportCollectionTemplatesPatchFile, "utf8");
   const schemaIntegrationTest = fs.readFileSync(schemaTestFile, "utf8");
   for (const expected of [
@@ -190,6 +192,17 @@ function verifyStaticSchemaInvariants() {
   }
   if ((schemaIntegrationTest.match(/\\ir 20261022d_timegenie_snapshot_task_order\.sql/g) ?? []).length < 2) {
     throw new Error("The schema integration test must prove the snapshot task-order patch is idempotent.");
+  }
+  for (const expected of ["apply_task_day_plan_pre_context_guard", "cloud_apply_patch_pre_context_day_plan_guard", "ignoredContextPlan", "day_instance_kind='context'"]) {
+    if (!ignoreContextDayPlansPatch.includes(expected)) {
+      throw new Error("The context day-plan compatibility patch is incomplete: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261022e_timegenie_ignore_context_day_plans.sql")) {
+    throw new Error("The source schema must acknowledge legacy context day-plan operations.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261022e_timegenie_ignore_context_day_plans\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the context day-plan patch is idempotent.");
   }
   if ((schemaIntegrationTest.match(/\\ir 20261022b_timegenie_today_instance_protocol\.sql/g) ?? []).length < 2) {
     throw new Error("The schema integration test must prove the today-instance protocol patch is idempotent.");

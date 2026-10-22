@@ -502,17 +502,19 @@ fn ensure_instance_recursive(
                 dependency_operation_id,
             )?;
         }
-        upsert_plan_mapping(
-            transaction,
-            workspace_id,
-            source_task_id,
-            work_date,
-            INCLUDED,
-            Some(&instance_id),
-            now,
-            cloud_state,
-            dependency_operation_id,
-        )?;
+        if expected_kind == "member" {
+            upsert_plan_mapping(
+                transaction,
+                workspace_id,
+                source_task_id,
+                work_date,
+                INCLUDED,
+                Some(&instance_id),
+                now,
+                cloud_state,
+                dependency_operation_id,
+            )?;
+        }
         return Ok(instance_id);
     }
 
@@ -598,17 +600,19 @@ fn ensure_instance_recursive(
             task_operation_id.as_deref().or(dependency_operation_id),
         )?;
     }
-    upsert_plan_mapping(
-        transaction,
-        workspace_id,
-        source_task_id,
-        work_date,
-        INCLUDED,
-        Some(&id),
-        now,
-        cloud_state,
-        task_operation_id.as_deref().or(dependency_operation_id),
-    )?;
+    if expected_kind == "member" {
+        upsert_plan_mapping(
+            transaction,
+            workspace_id,
+            source_task_id,
+            work_date,
+            INCLUDED,
+            Some(&id),
+            now,
+            cloud_state,
+            task_operation_id.as_deref().or(dependency_operation_id),
+        )?;
+    }
     Ok(id)
 }
 
@@ -1327,6 +1331,79 @@ mod tests {
         assert_ne!(child_row.id, child.id);
         assert!(child_row.today_member);
         assert!(!child_row.today_context);
+    }
+
+    #[test]
+    fn cloud_materialization_does_not_enqueue_day_plan_for_context_parent() {
+        let database = database();
+        let date = "2026-10-22";
+        let parent = create_task(&database, "云端上下文父事项", None);
+        let child = create_task(&database, "云端今日成员子事项", Some(parent.id.clone()));
+        let cloud_state = crate::supabase::StorageModeSnapshot {
+            mode: "cloud".to_string(),
+            workspace_id: Uuid::now_v7().to_string(),
+            device_id: Uuid::now_v7().to_string(),
+            online: true,
+            sync_state: "idle".to_string(),
+            pending_operations: 0,
+            conflict_count: 0,
+            last_change_seq: 0,
+            last_synced_at: None,
+            last_error: None,
+            auth_blocked: false,
+            auth_blocked_reason: None,
+            workspace_epoch: 1,
+            epoch_blocked: false,
+            epoch_blocked_reason: None,
+        };
+
+        set_day_plan_for_cloud_test(
+            &database,
+            TaskDayPlanSetRequest {
+                task_id: child.id.clone(),
+                work_date: date.to_string(),
+                state: INCLUDED.to_string(),
+                expected_version: None,
+            },
+            &cloud_state,
+        )
+        .unwrap();
+
+        let connection = database.open().unwrap();
+        let parent_plan_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_day_plans WHERE task_id=?1 AND work_date=?2",
+                params![parent.id, date],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let parent_outbox_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox
+                 WHERE entity_type='task_day_plan' AND entity_id=?1",
+                [format!("{}|{date}", parent.id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let child_plan_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_day_plans WHERE task_id=?1 AND work_date=?2 AND state='included'",
+                params![child.id, date],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let child_outbox_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox
+                 WHERE entity_type='task_day_plan' AND entity_id=?1",
+                [format!("{}|{date}", child.id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent_plan_count, 0);
+        assert_eq!(parent_outbox_count, 0);
+        assert_eq!(child_plan_count, 1);
+        assert_eq!(child_outbox_count, 1);
     }
 
     #[test]
