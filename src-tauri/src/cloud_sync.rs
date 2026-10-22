@@ -13975,6 +13975,61 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_import_restores_archived_day_instance_tree() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("cloud-snapshot-archived-day-instance.sqlite3"),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+
+        let parent_id = Uuid::now_v7().to_string();
+        let child_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        let snapshot = json!({
+            "subjects": [{
+                "id": subject_id, "name": "默认", "sort_order": 10,
+                "created_at": now, "updated_at": now, "version": 1, "deleted_at": null
+            }],
+            "tasks": [
+                {
+                    "id": child_id, "subject_id": subject_id, "parent_id": parent_id,
+                    "title": "已归档子项", "status": "open", "source_type": "manual",
+                    "sort_order": 20, "created_at": now, "updated_at": now, "version": 2,
+                    "deleted_at": now, "day_instance_date": "2026-10-21",
+                    "day_instance_kind": "member"
+                },
+                {
+                    "id": parent_id, "subject_id": subject_id, "parent_id": null,
+                    "title": "已归档父项", "status": "open", "source_type": "manual",
+                    "sort_order": 10, "created_at": now, "updated_at": now, "version": 2,
+                    "deleted_at": now, "day_instance_date": "2026-10-21",
+                    "day_instance_kind": "context"
+                }
+            ]
+        });
+
+        apply_snapshot(&database, &snapshot, None, None, None).unwrap();
+
+        let restored_parent: String = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT parent_id FROM tasks WHERE id = ?1",
+                [&child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored_parent, parent_id);
+    }
+
+    #[test]
     fn snapshot_import_advances_checkpoint_in_the_same_transaction() {
         let directory = tempdir().unwrap();
         let database =

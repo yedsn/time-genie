@@ -145,6 +145,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "report_list_pagination_indexes",
         sql: include_str!("../migrations/0026_report_list_pagination_indexes.sql"),
     },
+    Migration {
+        version: 27,
+        name: "archived_task_parent_scope",
+        sql: include_str!("../migrations/0027_archived_task_parent_scope.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -1032,14 +1037,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(archived_old_instance, 1);
+        connection
+            .execute(
+                "UPDATE tasks SET deleted_at=5,updated_at=5,version=version+1 WHERE id='context-1'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE tasks SET parent_id='context-1' WHERE id='member-1'",
+                [],
+            )
+            .unwrap();
+        let restore_child_under_archived_parent =
+            connection.execute("UPDATE tasks SET deleted_at=NULL WHERE id='member-1'", []);
+        assert!(restore_child_under_archived_parent.is_err());
         let migration_count: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (23,24)",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (23,24,27)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(migration_count, 2);
+        assert_eq!(migration_count, 3);
     }
 
     #[test]
