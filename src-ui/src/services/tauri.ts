@@ -194,6 +194,15 @@ export type StorageModeSnapshot = {
   epochBlockedReason?: string;
 };
 
+export type LocalCacheResetPreview = {
+  workspaceId: string;
+  pendingOperations: number;
+  conflictCount: number;
+  localTotal: number;
+  cloudTotal: number;
+  entities: Array<{ entity: string; localCount: number; cloudCount: number }>;
+};
+
 export type CloudDevice = {
   id: string;
   workspaceId: string;
@@ -1656,6 +1665,10 @@ export async function saveCloudSync(): Promise<CloudSyncPushResult> {
 
 export async function resetLocalCacheFromCloud(): Promise<StorageModeSnapshot> {
   return await invoke("cloud_sync_reset_local_cache");
+}
+
+export async function previewLocalCacheReset(): Promise<LocalCacheResetPreview> {
+  return await invoke("cloud_sync_reset_local_cache_preview");
 }
 
 export async function discardOldEpochChangesAndRedownload(): Promise<StorageModeSnapshot> {

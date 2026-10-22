@@ -623,6 +623,25 @@ pub struct CloudSyncStatus {
     pub epoch_blocked_reason: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalCacheResetCount {
+    pub entity: String,
+    pub local_count: i64,
+    pub cloud_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalCacheResetPreview {
+    pub workspace_id: String,
+    pub pending_operations: i64,
+    pub conflict_count: i64,
+    pub local_total: i64,
+    pub cloud_total: i64,
+    pub entities: Vec<LocalCacheResetCount>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudSyncPullRequest {
@@ -6087,6 +6106,64 @@ pub fn pull_snapshot(database: &Database) -> Result<i64, String> {
     pull_snapshot_for_epoch(database, state.workspace_epoch, false)
 }
 
+const LOCAL_CACHE_RESET_ENTITIES: &[(&str, &str)] = &[
+    ("subjects", "主题"),
+    ("tasks", "事项"),
+    ("task_day_plans", "今日计划"),
+    ("task_daily_estimates", "每日估时"),
+    ("task_recurrence_rules", "重复规则"),
+    ("time_entries", "时间记录"),
+    ("actual_time_adjustments", "实际用时调整"),
+    ("unassigned_sessions", "未归属时间"),
+    ("reports", "报告"),
+];
+
+pub fn preview_local_cache_reset(database: &Database) -> Result<LocalCacheResetPreview, String> {
+    let _operation_guard = cloud_sync_operation_guard();
+    let state = storage_mode(database)?;
+    if state.mode != "cloud" {
+        return Err("OFFLINE_RESTRICTED: 当前不是 Supabase 云端模式".to_string());
+    }
+    if !state.online {
+        return Err("AUTH_REQUIRED: 云端会话不可用".to_string());
+    }
+    let snapshot = load_cloud_snapshot(database, &state.workspace_id)?;
+    let local_workspace_id = local_cache_workspace_id(database)?;
+    let connection = database.open()?;
+    let mut entities = Vec::with_capacity(LOCAL_CACHE_RESET_ENTITIES.len());
+    let mut local_total = 0;
+    let mut cloud_total = 0;
+    for (table, label) in LOCAL_CACHE_RESET_ENTITIES {
+        let local_count = connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE workspace_id=?1"),
+                [&local_workspace_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let cloud_count = snapshot
+            .get(*table)
+            .and_then(Value::as_array)
+            .map(|rows| rows.len() as i64)
+            .unwrap_or_default();
+        local_total += local_count;
+        cloud_total += cloud_count;
+        entities.push(LocalCacheResetCount {
+            entity: (*label).to_string(),
+            local_count,
+            cloud_count,
+        });
+    }
+    Ok(LocalCacheResetPreview {
+        workspace_id: state.workspace_id,
+        pending_operations: state.pending_operations,
+        conflict_count: state.conflict_count,
+        local_total,
+        cloud_total,
+        entities,
+    })
+}
+
 fn pull_snapshot_for_epoch(
     database: &Database,
     expected_epoch: i64,
@@ -8096,7 +8173,12 @@ fn replace_snapshot_table(
                             "UPDATE tasks SET parent_id = ?1 WHERE workspace_id = ?2 AND id = ?3",
                             params![parent_id, workspace_id, text(&row, "id")],
                         )
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| {
+                            format!(
+                                "LOCAL_SNAPSHOT_APPLY_FAILED: tasks.parent_id: task={}, parent={parent_id}: {error}",
+                                text(&row, "id")
+                            )
+                        })?;
                 }
             }
         }
@@ -8503,6 +8585,13 @@ pub async fn cloud_sync_save(
             Err(error)
         }
     }
+}
+
+#[tauri::command]
+pub fn cloud_sync_reset_local_cache_preview(
+    database: tauri::State<'_, Database>,
+) -> Result<LocalCacheResetPreview, String> {
+    preview_local_cache_reset(&database)
 }
 
 #[tauri::command]
@@ -11763,6 +11852,75 @@ mod tests {
             );
             assert_eq!(subject_name, "云端名称");
         }
+    }
+
+    #[test]
+    fn reset_snapshot_restores_today_instance_parent_links_after_all_tasks_exist() {
+        let (_directory, database, workspace_id) =
+            cloud_database_with_outbox_state("cloud-reset-today-parent.sqlite3", "pending");
+        let connection = database.open().unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let source_parent_id = Uuid::now_v7().to_string();
+        let source_child_id = Uuid::now_v7().to_string();
+        let instance_parent_id = Uuid::now_v7().to_string();
+        let instance_child_id = Uuid::now_v7().to_string();
+        let now = now_millis();
+        let task = |id: &str,
+                    parent_id: Option<&str>,
+                    title: &str,
+                    day: Option<&str>,
+                    source: Option<&str>| {
+            json!({
+                "id":id,"subject_id":subject_id,"parent_id":parent_id,"title":title,"status":"open",
+                "planned_date":null,"planned_time":null,"estimate_minutes":null,"note":null,
+                "project_name":null,"solution_name":null,"source_type":"manual","source_ref":null,
+                "sort_order":1,"completed_at":null,"created_at":now,"updated_at":now,"version":1,
+                "deleted_at":null,"day_instance_date":day,"day_instance_kind":day.map(|_| "member"),
+                "day_instance_source_task_id":source
+            })
+        };
+        apply_snapshot_with_reset_options(
+            &database,
+            &json!({
+                "subjects":[{"id":subject_id,"name":"云端主题","sort_order":1,"created_at":now,"updated_at":now,"version":1,"deleted_at":null}],
+                "tasks":[
+                    task(&instance_child_id,Some(&instance_parent_id),"实例子事项",Some("2026-10-22"),Some(&source_child_id)),
+                    task(&source_child_id,Some(&source_parent_id),"源子事项",None,None),
+                    task(&instance_parent_id,None,"实例父事项",Some("2026-10-22"),Some(&source_parent_id)),
+                    task(&source_parent_id,None,"源父事项",None,None)
+                ],
+                "actual_time_adjustments":[]
+            }),
+            None,
+            Some(&workspace_id),
+            Some((&workspace_id, &device_id, 12, 1)),
+            false,
+            true,
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let restored_parent: String = connection
+            .query_row(
+                "SELECT parent_id FROM tasks WHERE id=?1",
+                [&instance_child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored_parent, instance_parent_id);
+        let source_parent: String = connection
+            .query_row(
+                "SELECT parent_id FROM tasks WHERE id=?1",
+                [&source_child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_parent, source_parent_id);
     }
 
     #[test]

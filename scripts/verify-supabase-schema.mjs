@@ -43,6 +43,8 @@ const timerTransitionPatchFile = path.join(repoRoot, "supabase", "20261016b_time
 const timerRecurringOccurrencePatchFile = path.join(repoRoot, "supabase", "20261019_timegenie_timer_recurring_occurrence.sql");
 const todayTaskInstancesPatchFile = path.join(repoRoot, "supabase", "20261021_timegenie_today_task_instances.sql");
 const clientWriteGenerationPatchFile = path.join(repoRoot, "supabase", "20261021b_timegenie_client_write_generation.sql");
+const todayInstanceProtocolPatchFile = path.join(repoRoot, "supabase", "20261022b_timegenie_today_instance_protocol.sql");
+const snapshotTaskOrderPatchFile = path.join(repoRoot, "supabase", "20261022d_timegenie_snapshot_task_order.sql");
 const dailyReportCollectionTemplatesPatchFile = path.join(repoRoot, "supabase", "20261021c_timegenie_daily_report_collection_templates.sql");
 
 const binaryNames = process.platform === "win32"
@@ -134,6 +136,8 @@ function verifyStaticSchemaInvariants() {
   const timerRecurringOccurrencePatch = fs.readFileSync(timerRecurringOccurrencePatchFile, "utf8");
   const todayTaskInstancesPatch = fs.readFileSync(todayTaskInstancesPatchFile, "utf8");
   const clientWriteGenerationPatch = fs.readFileSync(clientWriteGenerationPatchFile, "utf8");
+  const todayInstanceProtocolPatch = fs.readFileSync(todayInstanceProtocolPatchFile, "utf8");
+  const snapshotTaskOrderPatch = fs.readFileSync(snapshotTaskOrderPatchFile, "utf8");
   const dailyReportCollectionTemplatesPatch = fs.readFileSync(dailyReportCollectionTemplatesPatchFile, "utf8");
   const schemaIntegrationTest = fs.readFileSync(schemaTestFile, "utf8");
   for (const expected of [
@@ -161,6 +165,34 @@ function verifyStaticSchemaInvariants() {
   if (!schema.includes("\\ir 20261021_timegenie_today_task_instances.sql")
       || !schema.includes("\\ir 20261021b_timegenie_client_write_generation.sql")) {
     throw new Error("The source schema must apply today-task instances and the compatible-client write barrier.");
+  }
+  for (const expected of [
+    "apply_today_task_patch",
+    "day_instance_source_task_id",
+    "instance_task_id=excluded.instance_task_id",
+    "migration_import_snapshot_pre_today_instance_protocol",
+    "validate_task_day_plan_instance",
+  ]) {
+    if (!todayInstanceProtocolPatch.includes(expected)) {
+      throw new Error(`The today-instance protocol patch must include: ${expected}`);
+    }
+  }
+  if (!schema.includes("\\ir 20261022b_timegenie_today_instance_protocol.sql")) {
+    throw new Error("The source schema must finish with the complete today-instance protocol patch.");
+  }
+  for (const expected of ["cloud_snapshot_get_pre_task_order", "with recursive ordered_tasks", "tree_depth"]) {
+    if (!snapshotTaskOrderPatch.includes(expected)) {
+      throw new Error(`The snapshot task-order patch must include: ${expected}`);
+    }
+  }
+  if (!schema.includes("\\ir 20261022d_timegenie_snapshot_task_order.sql")) {
+    throw new Error("The source schema must finish with stable snapshot task ordering.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261022d_timegenie_snapshot_task_order\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the snapshot task-order patch is idempotent.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261022b_timegenie_today_instance_protocol\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the today-instance protocol patch is idempotent.");
   }
   if ((schemaIntegrationTest.match(/\\ir 20261021_timegenie_today_task_instances\.sql/g) ?? []).length < 2
       || (schemaIntegrationTest.match(/\\ir 20261021b_timegenie_client_write_generation\.sql/g) ?? []).length < 2) {

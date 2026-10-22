@@ -468,6 +468,7 @@ pub fn run() {
             cloud_sync::cloud_sync_refresh,
             cloud_sync::cloud_sync_catch_up,
             cloud_sync::cloud_sync_save,
+            cloud_sync::cloud_sync_reset_local_cache_preview,
             cloud_sync::cloud_sync_reset_local_cache,
             cloud_sync::cloud_sync_discard_old_epoch_changes,
             cloud_sync::cloud_sync_conflicts,

@@ -3,7 +3,7 @@ import { computed, h, nextTick, onMounted, onUnmounted, reactive, ref, watch } f
 import { AlertTriangle, CalendarDays, CheckCircle2, Clock3, Copy, Database, FileText, Folder, Home, LoaderCircle, Minus, Pencil, Plus, RefreshCw, Save, Settings, Square, UserRound, X } from "lucide-vue-next";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useWorkdayStore, type Task } from "../store";
-import { checkAppUpdate, closeMainWindow, confirmObsidianPlan, configureCloud, discardOldEpochChangesAndRedownload, downloadAndInstallUpdate, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listCloudSyncConflicts, listCloudSyncQueue, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onOpenTimerTaskSelection, onTimerFactFollowed, onTrayCheckUpdate, previewObsidianPlan, previewSeaTableTaskSync, previewStorageMigration, probeCloudProject, registerCloudDevice, resetLocalCacheFromCloud, resolveAllCloudSyncConflicts, restartApp, resumeCloudSyncAfterReauth, retryFailedSeaTableSync, revokeCloudDevice, saveCloudSync, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudProjectProbe, type CloudSessionSnapshot, type CloudSyncConflict, type CloudSyncQueueItem, type PlanImportPreviewResult, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
+import { checkAppUpdate, closeMainWindow, confirmObsidianPlan, configureCloud, discardOldEpochChangesAndRedownload, downloadAndInstallUpdate, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listCloudSyncConflicts, listCloudSyncQueue, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onOpenTimerTaskSelection, onTimerFactFollowed, onTrayCheckUpdate, previewLocalCacheReset, previewObsidianPlan, previewSeaTableTaskSync, previewStorageMigration, probeCloudProject, registerCloudDevice, resetLocalCacheFromCloud, resolveAllCloudSyncConflicts, restartApp, resumeCloudSyncAfterReauth, retryFailedSeaTableSync, revokeCloudDevice, saveCloudSync, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudProjectProbe, type CloudSessionSnapshot, type CloudSyncConflict, type CloudSyncQueueItem, type LocalCacheResetPreview, type PlanImportPreviewResult, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
 import PlanListEditor from "../components/PlanListEditor.vue";
 import CompletedTaskHistory from "../components/CompletedTaskHistory.vue";
 import GlobalTimerBar from "../components/GlobalTimerBar.vue";
@@ -90,6 +90,8 @@ const cloudQueueLoading = ref(false);
 const cloudQueueItems = ref<CloudSyncQueueItem[]>([]);
 const resetLocalCacheDialogOpen = ref(false);
 const resetLocalCacheWorking = ref(false);
+const resetLocalCachePreviewLoading = ref(false);
+const resetLocalCachePreview = ref<LocalCacheResetPreview>();
 const epochRecoveryWorking = ref(false);
 const importDialogOpen = ref(false);
 const importLoading = ref(false);
@@ -826,7 +828,7 @@ async function checkSeaTableConnection() {
   }
 }
 
-function openResetLocalCacheDialog() {
+async function openResetLocalCacheDialog() {
   if (storageState.value?.mode !== "cloud") {
     ElMessage.warning("当前不是 Supabase 云端模式");
     return;
@@ -839,12 +841,22 @@ function openResetLocalCacheDialog() {
     ElMessage.warning("Supabase 登录状态不可用，请先重新登录");
     return;
   }
+  resetLocalCachePreview.value = undefined;
   resetLocalCacheDialogOpen.value = true;
+  resetLocalCachePreviewLoading.value = true;
+  try {
+    resetLocalCachePreview.value = await previewLocalCacheReset();
+  } catch (error) {
+    resetLocalCacheDialogOpen.value = false;
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  } finally {
+    resetLocalCachePreviewLoading.value = false;
+  }
 }
 
 const resetLocalCacheDiscardWarning = computed(() => {
-  const pending = storageState.value?.pendingOperations ?? 0;
-  const conflicts = storageState.value?.conflictCount ?? 0;
+  const pending = resetLocalCachePreview.value?.pendingOperations ?? storageState.value?.pendingOperations ?? 0;
+  const conflicts = resetLocalCachePreview.value?.conflictCount ?? storageState.value?.conflictCount ?? 0;
   if (pending && conflicts) return `当前有 ${pending} 条待同步操作和 ${conflicts} 个冲突，将全部丢弃并以云端数据为准。`;
   if (pending) return `当前有 ${pending} 条待同步操作，将全部丢弃并以云端数据为准。`;
   if (conflicts) return `当前有 ${conflicts} 个同步冲突，将全部丢弃并以云端数据为准。`;
@@ -852,7 +864,7 @@ const resetLocalCacheDiscardWarning = computed(() => {
 });
 
 async function confirmResetLocalCacheFromCloud() {
-  if (resetLocalCacheWorking.value) return;
+  if (resetLocalCacheWorking.value || resetLocalCachePreviewLoading.value || !resetLocalCachePreview.value) return;
   resetLocalCacheWorking.value = true;
   cloudWorking.value = true;
   try {
@@ -2084,21 +2096,26 @@ async function handleCompletedTaskDelete(task: Task) {
       :close-on-click-modal="false"
       :close-on-press-escape="!resetLocalCacheWorking"
     >
-      <div v-if="resetLocalCacheWorking" class="reset-local-cache-loading" role="status" aria-live="polite">
+      <div v-if="resetLocalCacheWorking || resetLocalCachePreviewLoading" class="reset-local-cache-loading" role="status" aria-live="polite">
         <LoaderCircle class="sync-spin" :size="28" />
-        <div><strong>正在重置本地数据</strong><span>正在清空本机业务缓存并重新下载云端数据，请不要关闭应用。</span></div>
+        <div v-if="resetLocalCacheWorking"><strong>正在重置本地数据</strong><span>正在完整替换本机业务缓存并重新下载云端数据，请不要关闭应用。</span></div>
+        <div v-else><strong>正在读取重置统计</strong><span>正在核对本机缓存和云端快照，读取完成后再确认是否重置。</span></div>
       </div>
       <div v-else class="reset-local-cache-confirm">
         <span class="reset-local-cache-warning"><AlertTriangle :size="20" /></span>
         <div>
           <strong>确认清空本机缓存并重新下载？</strong>
           <p>事项、计时、未归属时间、报告和共享设置会以云端数据为准重新建立。</p>
+          <div v-if="resetLocalCachePreview" class="reset-local-cache-summary">
+            <div class="reset-local-cache-summary-total"><span><strong>{{ resetLocalCachePreview.localTotal }}</strong><small>本机现有记录</small></span><span><strong>{{ resetLocalCachePreview.cloudTotal }}</strong><small>云端将拉取记录</small></span></div>
+            <div class="reset-local-cache-summary-list"><span v-for="item in resetLocalCachePreview.entities" :key="item.entity"><small>{{ item.entity }}</small><strong>{{ item.localCount }} → {{ item.cloudCount }}</strong></span></div>
+          </div>
           <small>登录状态、Supabase 连接配置和本机路径会保留。{{ resetLocalCacheDiscardWarning }}</small>
         </div>
       </div>
       <template #footer>
-        <button class="secondary-button" type="button" :disabled="resetLocalCacheWorking" @click="resetLocalCacheDialogOpen = false">取消</button>
-        <button class="danger-button" type="button" :disabled="resetLocalCacheWorking" @click="confirmResetLocalCacheFromCloud"><LoaderCircle v-if="resetLocalCacheWorking" class="sync-spin" :size="14" />{{ resetLocalCacheWorking ? '正在重置...' : '确认重置' }}</button>
+        <button class="secondary-button" type="button" :disabled="resetLocalCacheWorking || resetLocalCachePreviewLoading" @click="resetLocalCacheDialogOpen = false">取消</button>
+        <button class="danger-button" type="button" :disabled="resetLocalCacheWorking || resetLocalCachePreviewLoading || !resetLocalCachePreview" @click="confirmResetLocalCacheFromCloud"><LoaderCircle v-if="resetLocalCacheWorking" class="sync-spin" :size="14" />{{ resetLocalCacheWorking ? '正在重置...' : '确认重置' }}</button>
       </template>
     </el-dialog>
     <el-dialog v-model="cloudConflictDialogOpen" class="cloud-conflict-dialog" title="处理云端同步冲突" width="min(700px, 94vw)" append-to-body :close-on-click-modal="false">

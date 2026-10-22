@@ -2875,6 +2875,15 @@ pre {
 .reset-local-cache-confirm strong { color: var(--text); font-size: 13px; font-weight: 650; }
 .reset-local-cache-confirm p { margin: 0; color: var(--text-soft); font-size: 12px; line-height: 1.6; }
 .reset-local-cache-confirm small { color: var(--muted); font-size: 11px; line-height: 1.55; }
+.reset-local-cache-summary { display: grid; gap: 7px; margin: 2px 0; }
+.reset-local-cache-summary-total { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.reset-local-cache-summary-total span { display: grid; gap: 2px; padding: 8px; border: 1px solid var(--line-soft); border-radius: 6px; background: var(--surface-soft); }
+.reset-local-cache-summary-total strong { font-size: 16px; }
+.reset-local-cache-summary-total small { font-size: 10px; }
+.reset-local-cache-summary-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; }
+.reset-local-cache-summary-list span { min-width: 0; display: grid; gap: 1px; padding: 6px; border-radius: 5px; background: color-mix(in srgb, var(--surface-soft) 72%, transparent); }
+.reset-local-cache-summary-list small { overflow: hidden; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.reset-local-cache-summary-list strong { color: var(--text-soft); font-size: 10px; font-weight: 600; }
 .reset-local-cache-loading { min-height: 112px; display: grid; grid-template-columns: 38px minmax(0, 1fr); align-items: center; gap: 14px; color: var(--accent); }
 .reset-local-cache-loading > div { min-width: 0; display: grid; gap: 6px; }
 .reset-local-cache-loading strong { color: var(--text); font-size: 13px; font-weight: 650; }

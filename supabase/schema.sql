@@ -3807,3 +3807,11 @@ notify pgrst, 'reload schema';
 
 -- Weekly and monthly built-in templates aggregate finalized daily reports.
 \ir 20261021c_timegenie_daily_report_collection_templates.sql
+
+-- Preserve today-instance identity in ordinary sync, day-plan sync, imports,
+-- timer-created tasks, and future full-cache rebuilds.
+\ir 20261022b_timegenie_today_instance_protocol.sql
+
+-- Full snapshots list task sources and parents before their dependents so
+-- cache rebuilds remain compatible with older desktop clients.
+\ir 20261022d_timegenie_snapshot_task_order.sql

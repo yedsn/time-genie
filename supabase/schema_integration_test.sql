@@ -100,6 +100,10 @@ end $$;
 \ir 20261021_timegenie_today_task_instances.sql
 \ir 20261021b_timegenie_client_write_generation.sql
 \ir 20261021b_timegenie_client_write_generation.sql
+\ir 20261022b_timegenie_today_instance_protocol.sql
+\ir 20261022b_timegenie_today_instance_protocol.sql
+\ir 20261022d_timegenie_snapshot_task_order.sql
+\ir 20261022d_timegenie_snapshot_task_order.sql
 
 do $$
 begin
@@ -3518,6 +3522,33 @@ begin
   end if;
 end $$;
 reset role;
+
+-- Full snapshots remain consumable by older clients that restore parent links
+-- while walking the task array: source tasks and parents must appear first.
+do $$
+declare target_subject uuid; snapshot jsonb; source_parent_pos bigint; source_child_pos bigint; instance_parent_pos bigint; instance_child_pos bigint;
+begin
+  select id into target_subject from timegenie.subjects
+  where workspace_id='20000000-0000-0000-0000-000000000001' and deleted_at is null order by id limit 1;
+  insert into timegenie.tasks(id,workspace_id,subject_id,parent_id,title,status,source_type,sort_order,day_instance_date,day_instance_kind,day_instance_source_task_id) values
+    ('6d000000-0000-0000-0000-000000000001','20000000-0000-0000-0000-000000000001',target_subject,null,'快照排序源父事项','open','manual',901,null,null,null),
+    ('6d000000-0000-0000-0000-000000000002','20000000-0000-0000-0000-000000000001',target_subject,'6d000000-0000-0000-0000-000000000001','快照排序源子事项','open','manual',902,null,null,null),
+    ('6d000000-0000-0000-0000-000000000003','20000000-0000-0000-0000-000000000001',target_subject,null,'快照排序实例父事项','open','manual',903,'2026-10-22','member','6d000000-0000-0000-0000-000000000001'),
+    ('6d000000-0000-0000-0000-000000000004','20000000-0000-0000-0000-000000000001',target_subject,'6d000000-0000-0000-0000-000000000003','快照排序实例子事项','open','manual',904,'2026-10-22','member','6d000000-0000-0000-0000-000000000002');
+  perform set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000001',true);
+  perform set_config('request.headers','{"x-timegenie-workspace-epoch":"3","x-timegenie-client-schema-generation":"1"}',true);
+  snapshot:=timegenie.cloud_snapshot_get('20000000-0000-0000-0000-000000000001');
+  select ordinality into source_parent_pos from jsonb_array_elements(snapshot->'tasks') with ordinality item where item.value->>'id'='6d000000-0000-0000-0000-000000000001';
+  select ordinality into source_child_pos from jsonb_array_elements(snapshot->'tasks') with ordinality item where item.value->>'id'='6d000000-0000-0000-0000-000000000002';
+  select ordinality into instance_parent_pos from jsonb_array_elements(snapshot->'tasks') with ordinality item where item.value->>'id'='6d000000-0000-0000-0000-000000000003';
+  select ordinality into instance_child_pos from jsonb_array_elements(snapshot->'tasks') with ordinality item where item.value->>'id'='6d000000-0000-0000-0000-000000000004';
+  if source_parent_pos is null or source_child_pos is null or instance_parent_pos is null or instance_child_pos is null
+     or source_parent_pos>=source_child_pos or instance_parent_pos>=instance_child_pos
+     or source_parent_pos>=instance_parent_pos or source_child_pos>=instance_child_pos then
+    raise exception 'cloud snapshot task dependency order is unsafe: source parent %, source child %, instance parent %, instance child %',
+      source_parent_pos,source_child_pos,instance_parent_pos,instance_child_pos;
+  end if;
+end $$;
 
 \ir 20261021c_timegenie_daily_report_collection_templates.sql
 \ir 20261021c_timegenie_daily_report_collection_templates.sql
