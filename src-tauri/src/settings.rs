@@ -532,6 +532,13 @@ fn validate_setting_key(scope: &SettingsScope, key: &str) -> Result<(), String> 
     {
         return Ok(());
     }
+    if matches!(scope, SettingsScope::Device)
+        && key
+            .strip_prefix("subject_daily_report_directory:")
+            .is_some_and(|subject_id| uuid::Uuid::parse_str(subject_id).is_ok())
+    {
+        return Ok(());
+    }
     let allowed = match scope {
         SettingsScope::Shared => [
             "user_name",
@@ -570,6 +577,9 @@ fn validate_setting_key(scope: &SettingsScope, key: &str) -> Result<(), String> 
 }
 
 fn validate_setting_value(key: &str, value: &Value) -> Result<(), String> {
+    if key.starts_with("subject_daily_report_directory:") && !value.is_string() {
+        return Err("主体日报目录必须是字符串".to_string());
+    }
     if (key == "salary_hourly_rate" || key.starts_with("subject_salary_hourly_rate:"))
         && value
             .as_f64()
@@ -1016,6 +1026,18 @@ mod tests {
             Some(&state),
         )
         .unwrap();
+        let subject_id = Uuid::now_v7().to_string();
+        let subject_daily_report_key = format!("subject_daily_report_directory:{subject_id}");
+        update_setting_with_cloud_operation(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: subject_daily_report_key.clone(),
+                value: serde_json::json!("D:/private-vault/daily"),
+            },
+            Some(&state),
+        )
+        .unwrap();
         for (key, value) in [
             ("tray_hover_enabled", serde_json::json!(false)),
             ("tray_menu_suppress_hover", serde_json::json!(false)),
@@ -1087,6 +1109,9 @@ mod tests {
         assert!(!rows
             .iter()
             .any(|(_, _, entity_id, _)| entity_id.as_deref() == Some("obsidian_root_path")));
+        assert!(!rows
+            .iter()
+            .any(|(_, _, entity_id, _)| entity_id.as_deref() == Some(&subject_daily_report_key)));
         for local_key in [
             "tray_hover_enabled",
             "tray_menu_suppress_hover",
@@ -1097,6 +1122,45 @@ mod tests {
                 .iter()
                 .any(|(_, _, entity_id, _)| entity_id.as_deref() == Some(local_key)));
         }
+    }
+
+    #[test]
+    fn subject_daily_report_directory_requires_valid_subject_uuid_and_string_value() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("subject-daily.sqlite3")).unwrap();
+        let key = format!("subject_daily_report_directory:{}", Uuid::now_v7());
+        update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: key.clone(),
+                value: serde_json::json!("D:/daily-a"),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            get_settings(&database).unwrap().device[&key],
+            serde_json::json!("D:/daily-a")
+        );
+        assert!(update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "subject_daily_report_directory:not-a-uuid".to_string(),
+                value: serde_json::json!("D:/daily-b"),
+            },
+        )
+        .is_err());
+        assert!(update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key,
+                value: serde_json::json!(42),
+            },
+        )
+        .is_err());
     }
 
     #[test]

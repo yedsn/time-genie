@@ -16,6 +16,7 @@ mod automation_hooks;
 #[cfg(test)]
 mod cloud_e2e;
 mod cloud_sync;
+mod daily_report_import;
 mod data_protection;
 #[cfg(target_os = "windows")]
 mod native_tray;
@@ -522,6 +523,8 @@ pub fn run() {
             tasks::plan_import_preview,
             obsidian::obsidian_plan_import_preview,
             obsidian::obsidian_plan_import_confirm,
+            daily_report_import::daily_report_import_preview,
+            daily_report_import::daily_report_import_confirm,
             obsidian::obsidian_report_write_preview,
             obsidian::obsidian_report_write_execute,
             time_tracking::timer_get_state,

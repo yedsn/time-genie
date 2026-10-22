@@ -142,6 +142,11 @@ pub fn day_bounds(timezone: Tz, work_date: &str) -> Result<DayBounds, String> {
     })
 }
 
+pub fn local_noon_millis(timezone: Tz, work_date: &str) -> Result<i64, String> {
+    let bounds = day_bounds(timezone, work_date)?;
+    Ok(bounds.start_at + (bounds.end_at - bounds.start_at) / 2)
+}
+
 pub fn boundaries_between(
     timezone: Tz,
     started_at: i64,

@@ -2030,9 +2030,9 @@ fn apply_incremental_entity(
         "time_entries" => apply_incremental_time_entry(transaction, workspace_id, data),
         "actual_time_adjustments" => transaction.execute(
             "INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,note,source_type,batch_id,created_at,updated_at,version,created_by_device_id,updated_by_device_id,deleted_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'quick_actual_adjustment',?10,?11,?12,?13,(SELECT id FROM devices WHERE id=?14 AND workspace_id=?2),(SELECT id FROM devices WHERE id=?15 AND workspace_id=?2),?16)
-             ON CONFLICT(id) DO UPDATE SET subject_id=excluded.subject_id,task_id=excluded.task_id,work_date=excluded.work_date,delta_minutes=excluded.delta_minutes,baseline_minutes=excluded.baseline_minutes,target_minutes=excluded.target_minutes,note=excluded.note,batch_id=excluded.batch_id,updated_at=excluded.updated_at,version=excluded.version,updated_by_device_id=excluded.updated_by_device_id,deleted_at=excluded.deleted_at",
-            params![text(data,"id"),workspace_id,text(data,"subject_id"),text(data,"task_id"),text(data,"work_date"),integer(data,"delta_minutes"),integer(data,"baseline_minutes"),integer(data,"target_minutes"),optional_text(data,"note"),text(data,"batch_id"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version"),optional_text(data,"created_by_device_id"),optional_text(data,"updated_by_device_id"),optional_millis(data,"deleted_at")],
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,(SELECT id FROM devices WHERE id=?15 AND workspace_id=?2),(SELECT id FROM devices WHERE id=?16 AND workspace_id=?2),?17)
+             ON CONFLICT(id) DO UPDATE SET subject_id=excluded.subject_id,task_id=excluded.task_id,work_date=excluded.work_date,delta_minutes=excluded.delta_minutes,baseline_minutes=excluded.baseline_minutes,target_minutes=excluded.target_minutes,note=excluded.note,source_type=excluded.source_type,batch_id=excluded.batch_id,updated_at=excluded.updated_at,version=excluded.version,updated_by_device_id=excluded.updated_by_device_id,deleted_at=excluded.deleted_at",
+            params![text(data,"id"),workspace_id,text(data,"subject_id"),text(data,"task_id"),text(data,"work_date"),integer(data,"delta_minutes"),integer(data,"baseline_minutes"),integer(data,"target_minutes"),optional_text(data,"note"),optional_text(data,"source_type").unwrap_or_else(|| "quick_actual_adjustment".to_string()),text(data,"batch_id"),millis(data,"created_at"),millis(data,"updated_at"),integer(data,"version"),optional_text(data,"created_by_device_id"),optional_text(data,"updated_by_device_id"),optional_millis(data,"deleted_at")],
         ),
         "report_templates" => {
             if boolean(data, "is_default") && optional_millis(data, "deleted_at").is_none() {
@@ -5034,6 +5034,11 @@ pub fn resolve_conflict(
     let state = require_cloud(database)?;
     let conflict = load_conflict(database, &state.workspace_id, &request.operation_id)?;
     resolve_loaded_conflict(database, &state, &conflict, &request.strategy, None)?;
+    if request.strategy == "keep_local"
+        && list_local_conflicts(database, &state.workspace_id)?.is_empty()
+    {
+        return finish_keep_local_conflict_resolution(database);
+    }
     signal_cloud_sync(SYNC_SIGNAL_MANUAL_RETRY | SYNC_SIGNAL_REMOTE_HINT, None);
     sync_status(database)
 }
@@ -5054,10 +5059,54 @@ pub fn resolve_all_conflicts(
             &mut attempts_by_operation,
         )?;
         if resolved == 0 {
-            signal_cloud_sync(SYNC_SIGNAL_MANUAL_RETRY | SYNC_SIGNAL_REMOTE_HINT, None);
-            return sync_status(database);
+            break;
         }
     }
+    if request.strategy == "keep_local" {
+        finish_keep_local_conflict_resolution(database)
+    } else {
+        signal_cloud_sync(SYNC_SIGNAL_MANUAL_RETRY | SYNC_SIGNAL_REMOTE_HINT, None);
+        sync_status(database)
+    }
+}
+
+fn finish_keep_local_conflict_resolution(database: &Database) -> Result<CloudSyncStatus, String> {
+    finish_keep_local_conflict_resolution_with(
+        database,
+        |database| push_outbox_with_retry_mode(database, true, true),
+        |database| catch_up_incremental(database).map(|_| ()),
+    )
+}
+
+fn finish_keep_local_conflict_resolution_with(
+    database: &Database,
+    push: impl FnOnce(&Database) -> Result<CloudSyncPushResult, String>,
+    pull: impl FnOnce(&Database) -> Result<(), String>,
+) -> Result<CloudSyncStatus, String> {
+    let pushed = push(database).map_err(|error| {
+        format!("KEEP_LOCAL_OVERWRITE_FAILED: 本地版本已重新排队，但覆盖云端失败：{error}")
+    })?;
+    let status = sync_status(database)?;
+    if pushed.conflicts > 0 || status.conflict_count > 0 {
+        return Err("KEEP_LOCAL_OVERWRITE_CONFLICT: 云端数据在处理期间再次变化，本地版本尚未完成覆盖，请重新确认冲突".to_string());
+    }
+    if pushed.pending > 0 || status.pending_operations > 0 {
+        return Err(format!(
+            "KEEP_LOCAL_OVERWRITE_PENDING: 本地版本尚未全部覆盖云端，仍有 {} 项等待同步",
+            pushed.pending.max(status.pending_operations)
+        ));
+    }
+    pull(database).map_err(|error| {
+        format!("KEEP_LOCAL_REFRESH_FAILED: 本地版本已覆盖云端，但刷新云端新版本失败：{error}")
+    })?;
+    let status = sync_status(database)?;
+    if status.conflict_count > 0 || status.pending_operations > 0 {
+        return Err(
+            "KEEP_LOCAL_NOT_CONVERGED: 本地版本覆盖后同步状态尚未收敛，请重新同步".to_string(),
+        );
+    }
+    signal_cloud_sync(SYNC_SIGNAL_REMOTE_HINT, None);
+    Ok(status)
 }
 
 fn resolve_current_conflicts(
@@ -5093,7 +5142,12 @@ fn resolve_current_conflicts(
                     .to_string(),
             );
         }
-        let conflict = load_conflict(database, &state.workspace_id, &listed_conflict.operation_id)?;
+        let conflict =
+            match load_conflict(database, &state.workspace_id, &listed_conflict.operation_id) {
+                Ok(conflict) => conflict,
+                Err(error) if error.starts_with("NOT_FOUND:") => continue,
+                Err(error) => return Err(error),
+            };
         resolve_loaded_conflict(
             database,
             state,
@@ -8253,7 +8307,7 @@ fn replace_snapshot_table(
         }
         "actual_time_adjustments" => {
             replace_simple_rows(transaction, table, workspace_id, rows, |tx, row, ws| {
-                tx.execute("INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,note,source_type,batch_id,created_at,updated_at,version,created_by_device_id,updated_by_device_id,deleted_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'quick_actual_adjustment',?10,?11,?12,?13,(SELECT id FROM devices WHERE id=?14 AND workspace_id=?2),(SELECT id FROM devices WHERE id=?15 AND workspace_id=?2),?16)", params![text(row,"id"),ws,text(row,"subject_id"),text(row,"task_id"),text(row,"work_date"),integer(row,"delta_minutes"),integer(row,"baseline_minutes"),integer(row,"target_minutes"),optional_text(row,"note"),text(row,"batch_id"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version"),optional_text(row,"created_by_device_id"),optional_text(row,"updated_by_device_id"),optional_millis(row,"deleted_at")])
+                tx.execute("INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,note,source_type,batch_id,created_at,updated_at,version,created_by_device_id,updated_by_device_id,deleted_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,(SELECT id FROM devices WHERE id=?15 AND workspace_id=?2),(SELECT id FROM devices WHERE id=?16 AND workspace_id=?2),?17)", params![text(row,"id"),ws,text(row,"subject_id"),text(row,"task_id"),text(row,"work_date"),integer(row,"delta_minutes"),integer(row,"baseline_minutes"),integer(row,"target_minutes"),optional_text(row,"note"),optional_text(row,"source_type").unwrap_or_else(|| "quick_actual_adjustment".to_string()),text(row,"batch_id"),millis(row,"created_at"),millis(row,"updated_at"),integer(row,"version"),optional_text(row,"created_by_device_id"),optional_text(row,"updated_by_device_id"),optional_millis(row,"deleted_at")])
             })?
         }
         "unassigned_sessions" => {
@@ -11970,6 +12024,67 @@ mod tests {
         assert_eq!(remaining, 1);
     }
 
+    #[test]
+    fn keep_local_resolution_reports_success_only_after_push_and_refresh_converge() {
+        let (_directory, database, workspace_id) =
+            cloud_database_with_outbox_state("keep-local-converged.sqlite3", "pending");
+        let pushed = std::cell::Cell::new(false);
+        let pulled = std::cell::Cell::new(false);
+        let status = finish_keep_local_conflict_resolution_with(
+            &database,
+            |database| {
+                pushed.set(true);
+                database
+                    .open()?
+                    .execute(
+                        "DELETE FROM sync_outbox WHERE workspace_id=?1",
+                        [&workspace_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(CloudSyncPushResult {
+                    pushed: 1,
+                    pending: 0,
+                    conflicts: 0,
+                })
+            },
+            |_| {
+                assert!(pushed.get());
+                pulled.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(pulled.get());
+        assert_eq!(status.pending_operations, 0);
+        assert_eq!(status.conflict_count, 0);
+    }
+
+    #[test]
+    fn keep_local_resolution_does_not_report_success_while_push_is_pending() {
+        let (_directory, database, _workspace_id) =
+            cloud_database_with_outbox_state("keep-local-pending.sqlite3", "pending");
+        let pull_called = std::cell::Cell::new(false);
+        let error = finish_keep_local_conflict_resolution_with(
+            &database,
+            |_| {
+                Ok(CloudSyncPushResult {
+                    pushed: 0,
+                    pending: 1,
+                    conflicts: 0,
+                })
+            },
+            |_| {
+                pull_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.starts_with("KEEP_LOCAL_OVERWRITE_PENDING:"));
+        assert!(!pull_called.get());
+    }
+
     fn cloud_database_with_outbox_state(
         file_name: &str,
         outbox_state: &str,
@@ -12875,6 +12990,67 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(remaining, vec![unrelated_id]);
+        assert_eq!(attempts.get(&first_conflict_id), Some(&1));
+        assert_eq!(attempts.get(&second_conflict_id), Some(&1));
+    }
+
+    #[test]
+    fn batch_conflict_resolution_skips_same_entity_conflicts_already_collapsed() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("cloud-batch-skips-collapsed-conflicts.sqlite3"),
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "cloud_workspace_id".to_string(),
+                value: json!(workspace_id),
+            },
+        )
+        .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("cloud"),
+            },
+        )
+        .unwrap();
+        let state = storage_mode(&database).unwrap();
+        let entity_id = Uuid::now_v7().to_string();
+        let first_conflict_id = Uuid::now_v7().to_string();
+        let second_conflict_id = Uuid::now_v7().to_string();
+        for (operation_id, created_at) in
+            [(&first_conflict_id, 1_i64), (&second_conflict_id, 2_i64)]
+        {
+            connection
+                .execute(
+                    "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at, error_json)
+                     VALUES (?1, ?2, ?3, 'task_update', 'task', ?4, 1, '{}', 'conflict', 0, ?5, '{}')",
+                    params![operation_id, &workspace_id, &device_id, &entity_id, created_at],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let mut attempts = HashMap::new();
+        let listed =
+            resolve_current_conflicts(&database, &state, "use_cloud", &mut attempts).unwrap();
+
+        assert_eq!(listed, 2);
+        assert!(list_conflicts(&database).unwrap().is_empty());
         assert_eq!(attempts.get(&first_conflict_id), Some(&1));
         assert_eq!(attempts.get(&second_conflict_id), Some(&1));
     }

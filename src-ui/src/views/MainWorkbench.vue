@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, h, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { open } from "@tauri-apps/plugin-dialog";
 import { AlertTriangle, CalendarDays, CheckCircle2, Clock3, Copy, Database, FileText, Folder, Home, LoaderCircle, Minus, Pencil, Plus, RefreshCw, Save, Settings, Square, UserRound, X } from "lucide-vue-next";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useWorkdayStore, type Task } from "../store";
-import { checkAppUpdate, closeMainWindow, confirmObsidianPlan, configureCloud, discardOldEpochChangesAndRedownload, downloadAndInstallUpdate, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listCloudSyncConflicts, listCloudSyncQueue, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onOpenTimerTaskSelection, onTimerFactFollowed, onTrayCheckUpdate, previewLocalCacheReset, previewObsidianPlan, previewSeaTableTaskSync, previewStorageMigration, probeCloudProject, registerCloudDevice, resetLocalCacheFromCloud, resolveAllCloudSyncConflicts, restartApp, resumeCloudSyncAfterReauth, retryFailedSeaTableSync, revokeCloudDevice, saveCloudSync, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudProjectProbe, type CloudSessionSnapshot, type CloudSyncConflict, type CloudSyncQueueItem, type LocalCacheResetPreview, type PlanImportPreviewResult, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
+import { checkAppUpdate, closeMainWindow, confirmDailyReportImport, configureCloud, discardOldEpochChangesAndRedownload, downloadAndInstallUpdate, executeSeaTableTaskSync, executeStorageMigration, getCloudSession, getCloudSyncStatus, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listCloudSyncConflicts, listCloudSyncQueue, listTodayTasks, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onOpenTimerTaskSelection, onTimerFactFollowed, onTrayCheckUpdate, previewDailyReportImport, previewLocalCacheReset, previewSeaTableTaskSync, previewStorageMigration, probeCloudProject, registerCloudDevice, resetLocalCacheFromCloud, resolveAllCloudSyncConflicts, restartApp, resumeCloudSyncAfterReauth, retryFailedSeaTableSync, revokeCloudDevice, saveCloudSync, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudProjectProbe, type CloudSessionSnapshot, type CloudSyncConflict, type CloudSyncQueueItem, type DailyReportImportPreviewItem, type DailyReportImportPreviewResult, type DailyReportImportTargetKind, type LocalCacheResetPreview, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
 import PlanListEditor from "../components/PlanListEditor.vue";
 import CompletedTaskHistory from "../components/CompletedTaskHistory.vue";
 import GlobalTimerBar from "../components/GlobalTimerBar.vue";
@@ -19,7 +20,7 @@ import TimerStopConfirmationDialog from "../components/TimerStopConfirmationDial
 import TimerTaskDialog from "../components/TimerTaskDialog.vue";
 import appIconUrl from "../../../src-tauri/icons/icon.svg";
 import { cloudSaveStatusLabel, cloudSyncPresentation } from "../services/cloudSyncPresentation";
-import { cloudSessionLabel, cloudSessionNeedsPassword } from "../services/cloudSessionPresentation";
+import { cloudSessionErrorNeedsRecovery, cloudSessionLabel, cloudSessionNeedsPassword } from "../services/cloudSessionPresentation";
 import { cloudDeviceActionDisabled, cloudDeviceActionLabel, cloudDeviceKind, runConfirmedCloudAction } from "../services/cloudDevicePresentation";
 import { timerSyncRecoveryDetail, timerSyncRecoveryLabel } from "../services/timerSyncRecoveryPresentation";
 import { isCompletionFeedbackEnabled, playCompletionFeedback, setCompletionFeedbackEnabled, setCompletionFeedbackSoundEnabled } from "../services/completionFeedback";
@@ -59,6 +60,7 @@ const subjectDialogOpen = ref(false);
 const subjectNameDraft = ref("");
 const editingSubjectId = ref("");
 const subjectSalaryHourlyRate = ref(0);
+const subjectDailyReportDirectory = ref("");
 const subjectDialogTitle = computed(() => editingSubjectId.value ? "主体设置" : "添加主体");
 const weekdayLabels = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
 const subjectScheduleDraft = ref<WorkScheduleDay[]>(createDefaultWorkSchedule());
@@ -96,8 +98,14 @@ const epochRecoveryWorking = ref(false);
 const importDialogOpen = ref(false);
 const importLoading = ref(false);
 const importSaving = ref(false);
-const importPreview = ref<PlanImportPreviewResult>();
-const importItems = ref<Array<{ importItemId: string; selected: boolean; title: string; estimateMinutes?: number; parentId?: string; sourceText: string; parseStatus: "recognized" | "unrecognized" }>>([]);
+const importPreview = ref<DailyReportImportPreviewResult>();
+const importItems = ref<Array<DailyReportImportPreviewItem & { selected: boolean }>>([]);
+const importTargetKind = ref<DailyReportImportTargetKind>("backlog");
+const importSubjectId = ref("");
+const importSourceDate = ref("");
+const importError = ref("");
+const importRequestId = ref("");
+const importSubject = computed(() => store.subjects.find((subject) => subject.id === importSubjectId.value));
 const seaTableDialogOpen = ref(false);
 const seaTableLoading = ref(false);
 const seaTableExecuting = ref(false);
@@ -795,10 +803,10 @@ async function resolveAllConflicts(strategy: "use_cloud" | "keep_local") {
   try {
     await ElMessageBox.confirm(
       keepLocal
-        ? `将对当前 ${conflictCount} 个冲突以及随后暴露的待同步冲突统一保留本地版本，并基于云端最新版本重新提交。`
+        ? `将对当前 ${conflictCount} 个冲突以及随后暴露的待同步冲突统一使用本地版本，立即覆盖云端并刷新本机版本。`
         : `将对当前 ${conflictCount} 个冲突以及随后暴露的待同步冲突统一使用云端版本，本机对应修改会被放弃。`,
-      keepLocal ? "全部保留本地" : "全部使用云端",
-      { type: "warning", confirmButtonText: keepLocal ? "全部保留本地" : "全部使用云端", cancelButtonText: "取消", closeOnClickModal: false, customClass: "work-confirm-dialog" },
+      keepLocal ? "以本地为准并覆盖云端" : "全部使用云端",
+      { type: "warning", confirmButtonText: keepLocal ? "覆盖云端" : "全部使用云端", cancelButtonText: "取消", closeOnClickModal: false, customClass: "work-confirm-dialog" },
     );
   } catch { return; }
   cloudSyncWorking.value = true;
@@ -807,9 +815,39 @@ async function resolveAllConflicts(strategy: "use_cloud" | "keep_local") {
     cloudConflicts.value = await listCloudSyncConflicts();
     await Promise.all([store.loadWorkspaceData(), store.loadTimeData(), store.loadReports(), store.loadUnassignedState()]);
     if (!cloudConflicts.value.length) cloudConflictDialogOpen.value = false;
-    ElMessage.success(keepLocal ? "冲突已统一保留本地版本" : "冲突已统一使用云端版本");
+    ElMessage.success(keepLocal ? "已以本地为准覆盖云端，版本已同步" : "冲突已统一使用云端版本");
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : String(error));
+    if (!cloudSessionErrorNeedsRecovery(error)) {
+      ElMessage.error(error instanceof Error ? error.message : String(error));
+      return;
+    }
+
+    const [sessionResult, statusResult, conflictsResult] = await Promise.allSettled([
+      getCloudSession(),
+      getCloudSyncStatus(),
+      listCloudSyncConflicts(),
+    ]);
+    if (sessionResult.status === "fulfilled") cloudSession.value = sessionResult.value;
+    if (statusResult.status === "fulfilled") storageState.value = statusResult.value;
+    if (conflictsResult.status === "fulfilled") cloudConflicts.value = conflictsResult.value;
+    if (!cloudConflicts.value.length) cloudConflictDialogOpen.value = false;
+    const stillHasConflicts = cloudConflicts.value.length > 0;
+    const retryGuidance = stillHasConflicts
+      ? "恢复连接后，请再次选择“以本地为准并覆盖云端”。"
+      : "恢复连接后请重试同步，系统会继续用本地版本覆盖云端。";
+
+    if (cloudSession.value?.status === "offline_saved") {
+      ElMessage.warning(`当前暂时无法连接云端，本地版本和同步状态均已保留。${retryGuidance}`);
+      return;
+    }
+
+    await ElMessageBox.alert(
+      `云端登录已失效，本地版本和同步状态均已保留，不会丢失。请重新登录${storageState.value?.authBlocked ? "，并在提示时确认恢复同步" : ""}。${retryGuidance}`,
+      "需要重新登录",
+      { type: "warning", confirmButtonText: "前往登录", closeOnClickModal: false, customClass: "work-confirm-dialog" },
+    ).catch(() => undefined);
+    cloudConflictDialogOpen.value = false;
+    await openCloudAccountSettings();
   } finally {
     cloudSyncWorking.value = false;
   }
@@ -1089,6 +1127,7 @@ function openSubjectDialog() {
   editingSubjectId.value = "";
   subjectNameDraft.value = "";
   subjectSalaryHourlyRate.value = 0;
+  subjectDailyReportDirectory.value = "";
   subjectScheduleDraft.value = createDefaultWorkSchedule();
   subjectScheduleError.value = "";
   subjectDialogOpen.value = true;
@@ -1103,8 +1142,11 @@ async function openSubjectEditor(subjectId: string) {
     const settings = await getSettings();
     const value = settings.shared[`subject_salary_hourly_rate:${subject.id}`];
     subjectSalaryHourlyRate.value = typeof value === "number" ? value : settingNumber("shared", "salary_hourly_rate");
+    const directory = settings.device[`subject_daily_report_directory:${subject.id}`];
+    subjectDailyReportDirectory.value = typeof directory === "string" ? directory : "";
   } catch {
     subjectSalaryHourlyRate.value = 0;
+    subjectDailyReportDirectory.value = "";
   }
   subjectScheduleError.value = "";
   subjectDialogOpen.value = true;
@@ -1185,6 +1227,7 @@ async function saveSubject() {
     }
     subjectScheduleDraft.value = await saveSubjectWorkSchedule(editingSubjectId.value, subjectScheduleDraft.value);
     await updateSetting("shared", `subject_salary_hourly_rate:${editingSubjectId.value}`, Math.max(0, Number(subjectSalaryHourlyRate.value) || 0));
+    await updateSetting("device", `subject_daily_report_directory:${editingSubjectId.value}`, subjectDailyReportDirectory.value.trim());
     subjectDialogOpen.value = false;
     ElMessage.success("主体设置已更新");
     return;
@@ -1198,8 +1241,14 @@ async function saveSubject() {
   const customized = defaults.map((day) => ({ ...day, enabled: subjectScheduleDraft.value[day.weekday].enabled, segments: subjectScheduleDraft.value[day.weekday].segments.map((segment) => ({ ...segment })) }));
   await saveSubjectWorkSchedule(subjectId, customized);
   await updateSetting("shared", `subject_salary_hourly_rate:${subjectId}`, Math.max(0, Number(subjectSalaryHourlyRate.value) || 0));
+  await updateSetting("device", `subject_daily_report_directory:${subjectId}`, subjectDailyReportDirectory.value.trim());
   subjectDialogOpen.value = false;
   ElMessage.success("主体已添加");
+}
+
+async function chooseSubjectDailyReportDirectory() {
+  const selected = await open({ directory: true, multiple: false, defaultPath: subjectDailyReportDirectory.value || undefined, title: "选择 Obsidian 日报目录" });
+  if (typeof selected === "string") subjectDailyReportDirectory.value = selected;
 }
 
 function subjectTaskCount(subjectId: string) {
@@ -1220,44 +1269,103 @@ function formatLocalDate(date: Date) {
   return `${year}-${month}-${day}`;
 }
 
-async function openPlanImport() {
-  if (!store.selectedSubjectId) return;
+function importItemDepth(item: DailyReportImportPreviewItem) {
+  let depth = 0;
+  let parentId = item.parentId;
+  const byId = new Map(importItems.value.map((candidate) => [candidate.id, candidate]));
+  while (parentId && depth < 8) {
+    depth += 1;
+    parentId = byId.get(parentId)?.parentId;
+  }
+  return depth;
+}
+
+function importSelectedWithAncestors() {
+  const selected = new Set(importItems.value.filter((item) => item.selected && !item.alreadyImported).map((item) => item.id));
+  const byId = new Map(importItems.value.map((item) => [item.id, item]));
+  for (const id of [...selected]) {
+    let parentId = byId.get(id)?.parentId;
+    while (parentId) {
+      selected.add(parentId);
+      parentId = byId.get(parentId)?.parentId;
+    }
+  }
+  return [...selected];
+}
+
+async function refreshDailyReportPreview() {
+  if (!importSubjectId.value || !importSourceDate.value || importLoading.value) return;
+  const subjectId = importSubjectId.value;
+  const sourceDate = importSourceDate.value;
+  const targetKind = importTargetKind.value;
   importLoading.value = true;
+  importError.value = "";
+  importPreview.value = undefined;
+  importItems.value = [];
+  importRequestId.value = crypto.randomUUID();
   try {
-    const target = new Date();
-    const source = new Date(target);
-    source.setDate(source.getDate() - 1);
-    const preview = await previewObsidianPlan(formatLocalDate(source), formatLocalDate(target), store.selectedSubjectId);
+    const [preview, todayTaskResult] = await Promise.all([
+      previewDailyReportImport(subjectId, sourceDate, targetKind),
+      targetKind === "day_instance" ? listTodayTasks(subjectId, sourceDate) : Promise.resolve(undefined),
+    ]);
+    const existingTodayTitles = new Set((todayTaskResult?.tasks ?? []).map((task) => task.title));
     importPreview.value = preview;
     importItems.value = preview.items.map((item) => ({
-      importItemId: item.id,
-      selected: item.parseStatus === "recognized",
-      title: item.title,
-      estimateMinutes: item.estimateMinutes,
-      parentId: item.parentId,
-      sourceText: item.sourceText,
-      parseStatus: item.parseStatus,
+      ...item,
+      selected: !item.alreadyImported && !(targetKind === "day_instance" && existingTodayTitles.has(item.title)),
     }));
-    importDialogOpen.value = true;
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : String(error));
+    importError.value = error instanceof Error ? error.message : String(error);
   } finally {
     importLoading.value = false;
   }
+}
+
+async function openPlanImport(targetKind: DailyReportImportTargetKind = "backlog", requestedSubjectId?: string) {
+  const subjectId = requestedSubjectId || store.selectedSubjectId;
+  if (!subjectId) {
+    ElMessage.warning("请先选择一个主体，再从日报导入");
+    return;
+  }
+  importTargetKind.value = targetKind;
+  importSubjectId.value = subjectId;
+  importSourceDate.value = store.workspaceToday || formatLocalDate(new Date());
+  importDialogOpen.value = true;
+  await refreshDailyReportPreview();
+}
+
+async function openDailyReportFromToday(subjectId?: string) {
+  if (!subjectId) {
+    ElMessage.warning("请先在今日页选择一个具体主体");
+    return;
+  }
+  await openPlanImport("day_instance", subjectId);
+}
+
+async function openImportSubjectSettings() {
+  importDialogOpen.value = false;
+  await openSubjectEditor(importSubjectId.value);
 }
 
 async function confirmPlanImport() {
   if (!importPreview.value || importSaving.value) return;
   importSaving.value = true;
   try {
-    const result = await confirmObsidianPlan(
-      importPreview.value.batchId,
-      importItems.value.map(({ importItemId, selected, title, estimateMinutes }) => ({ importItemId, selected, title, estimateMinutes })),
-      importPreview.value.version,
-    );
+    const selectedItemIds = importSelectedWithAncestors();
+    if (!selectedItemIds.length) return;
+    const result = await confirmDailyReportImport({
+      batchId: importPreview.value.batchId,
+      selectedItemIds,
+      expectedVersion: importPreview.value.version,
+      clientRequestId: importRequestId.value || crypto.randomUUID(),
+    });
     await store.loadWorkspaceData();
+    if (result.targetKind === "day_instance" && result.sourceDate === store.workspaceToday) {
+      await Promise.all([store.loadTodayPlan(importSubjectId.value), store.loadTodayOverview()]);
+    }
     importDialogOpen.value = false;
-    ElMessage.success(result.alreadyConfirmed ? "该计划已导入" : `已导入 ${result.tasks.length} 条事项`);
+    const suffix = result.targetKind === "day_instance" && result.sourceDate !== store.workspaceToday ? `，已写入 ${result.sourceDate}` : "";
+    ElMessage.success(result.alreadyConfirmed ? "该批日报已经确认过" : `已导入 ${result.createdCount} 条事项${suffix}`);
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : String(error));
   } finally {
@@ -1702,6 +1810,7 @@ async function handleCompletedTaskDelete(task: Task) {
           v-if="store.activePage === 'today'"
           @open-timer="openTimerTaskDialog"
           @open-plan="store.activePage = 'plan'"
+          @import-daily-report="openDailyReportFromToday"
           @resolve-unassigned="store.promptUnassignedResolution(true)"
         />
 
@@ -2147,7 +2256,7 @@ async function handleCompletedTaskDelete(task: Task) {
       <template #footer>
         <button class="secondary-button" type="button" :disabled="cloudSyncWorking" @click="cloudConflictDialogOpen = false">稍后处理</button>
         <button v-if="cloudConflicts.length" class="secondary-button" type="button" :disabled="cloudSyncWorking" @click="resolveAllConflicts('use_cloud')">全部使用云端</button>
-        <button v-if="cloudConflicts.length" class="primary-button" type="button" :disabled="cloudSyncWorking" @click="resolveAllConflicts('keep_local')"><LoaderCircle v-if="cloudSyncWorking" class="sync-spin" :size="14" />{{ cloudSyncWorking ? '处理中...' : '全部保留本地' }}</button>
+        <button v-if="cloudConflicts.length" class="primary-button" type="button" :disabled="cloudSyncWorking" @click="resolveAllConflicts('keep_local')"><LoaderCircle v-if="cloudSyncWorking" class="sync-spin" :size="14" />{{ cloudSyncWorking ? '覆盖云端中...' : '以本地为准并覆盖云端' }}</button>
       </template>
     </el-dialog>
     <el-dialog v-model="seaTableDialogOpen" class="seatable-sync-dialog" title="同步到 SeaTable" width="min(720px, 94vw)" append-to-body destroy-on-close>
@@ -2168,34 +2277,50 @@ async function handleCompletedTaskDelete(task: Task) {
       </div>
       <template #footer><button class="secondary-button" type="button" :disabled="seaTableExecuting" @click="seaTableDialogOpen = false">关闭</button><button v-if="seaTableResult?.failedCount" class="primary-button" type="button" :disabled="seaTableExecuting" @click="retrySeaTableFailures">{{ seaTableExecuting ? '重试中...' : '只重试失败项' }}</button><button v-else class="primary-button" type="button" :disabled="!seaTablePreview || seaTablePreview.conflictCount > 0 || seaTableExecuting" @click="confirmSeaTableSync">{{ seaTableExecuting ? '同步中...' : '确认同步' }}</button></template>
     </el-dialog>
-    <el-dialog v-model="importDialogOpen" class="subject-create-dialog plan-import-dialog" title="导入昨日计划" width="min(640px, 92vw)" append-to-body>
-      <div v-if="importPreview" class="plan-import-content">
-        <div class="plan-import-source"><span>来源</span><strong>{{ importPreview.sourcePath }}</strong></div>
-        <div v-if="importPreview.warnings.length" class="plan-import-warnings">
+    <el-dialog v-model="importDialogOpen" class="subject-create-dialog plan-import-dialog" title="从日报导入" width="min(760px, 94vw)" append-to-body :close-on-click-modal="false">
+      <div class="plan-import-content">
+        <div class="plan-import-summary">
+          <label><span>主体</span><strong>{{ importSubject?.name || '未选择' }}</strong></label>
+          <label><span>导入到</span><strong>{{ importTargetKind === 'backlog' ? '长期待办' : '今日实例' }}</strong></label>
+          <label><span>日报日期</span><input v-model="importSourceDate" type="date" :disabled="importLoading || importSaving" @change="refreshDailyReportPreview" /></label>
+        </div>
+        <div v-if="importPreview" class="plan-import-source"><span>实际文件</span><strong :title="importPreview.sourcePath">{{ importPreview.sourcePath }}</strong></div>
+        <div v-if="importError" class="plan-import-error">
+          <p>{{ importError }}</p>
+          <div><button class="secondary-button compact" type="button" @click="openImportSubjectSettings">打开主体设置</button><button class="secondary-button compact" type="button" @click="refreshDailyReportPreview">重试</button></div>
+        </div>
+        <div v-if="importPreview?.warnings.length" class="plan-import-warnings">
           <p v-for="warning in importPreview.warnings" :key="warning">{{ warning }}</p>
         </div>
-        <div class="plan-import-items">
-          <label v-for="item in importItems" :key="item.importItemId" class="plan-import-item" :class="{ unrecognized: item.parseStatus === 'unrecognized', child: item.parentId }">
-            <input v-model="item.selected" type="checkbox" :disabled="item.parseStatus === 'unrecognized'" />
+        <div v-if="importLoading" class="plan-import-empty">正在读取日报…</div>
+        <div v-else-if="importPreview" class="plan-import-items">
+          <label v-for="item in importItems" :key="item.id" class="plan-import-item" :class="{ imported: item.alreadyImported }" :style="{ paddingLeft: `${2 + importItemDepth(item) * 24}px` }">
+            <input v-model="item.selected" type="checkbox" :disabled="item.alreadyImported" />
             <span class="plan-import-item-main">
-              <input v-if="item.parseStatus === 'recognized'" v-model="item.title" />
-              <code v-else>{{ item.sourceText }}</code>
-              <small v-if="item.estimateMinutes">预计 {{ formatMinutes(item.estimateMinutes) }}</small>
-              <small v-else-if="item.parseStatus === 'unrecognized'">未识别，保留原文但不导入</small>
+              <strong>{{ item.title }}</strong>
+              <span class="plan-import-item-meta">
+                <small :class="item.status">{{ item.status === 'done' ? '已完成' : '未完成' }}</small>
+                <small v-if="item.estimateMinutes">预计 {{ formatMinutes(item.estimateMinutes) }}</small>
+                <small v-if="item.importActualMinutes">实际 {{ formatMinutes(item.importActualMinutes) }}</small>
+                <small v-if="item.alreadyImported">已导入</small>
+              </span>
+              <small v-if="item.warning" class="plan-import-row-warning">{{ item.warning }}</small>
             </span>
           </label>
-          <p v-if="!importItems.length" class="plan-import-empty">没有可导入的明日计划，可直接在列表末尾创建待办。</p>
+          <p v-if="!importItems.length" class="plan-import-empty">日报顶部没有可导入事项。</p>
         </div>
+        <p v-if="importItems.some((item) => item.selected && item.parentId)" class="plan-import-parent-note">选择子事项时，会自动补齐保持层级所需的父项。</p>
       </div>
       <template #footer>
         <button class="secondary-button" type="button" @click="importDialogOpen = false">取消</button>
-        <button class="primary-button" type="button" :disabled="importSaving || !importItems.some((item) => item.selected && item.title.trim())" @click="confirmPlanImport">{{ importSaving ? '导入中...' : '确认导入' }}</button>
+        <button class="primary-button" type="button" :disabled="importLoading || importSaving || !importPreview || !importItems.some((item) => item.selected && !item.alreadyImported)" @click="confirmPlanImport">{{ importSaving ? '导入中...' : '确认导入' }}</button>
       </template>
     </el-dialog>
     <el-dialog v-model="subjectDialogOpen" class="subject-create-dialog subject-settings-dialog" :title="subjectDialogTitle" width="min(720px, 94vw)" append-to-body>
       <div class="subject-settings-content">
         <label class="subject-name-field"><span>主体名称</span><input v-model="subjectNameDraft" autofocus placeholder="例如：研发支持、个人事项" /></label>
         <label class="subject-name-field subject-salary-field"><span>工资时薪（元/小时）</span><input v-model.number="subjectSalaryHourlyRate" min="0" step="0.01" type="number" placeholder="例如：145" /><small>周报、月报按这个主体的实际工时计算工资；0 表示不计算。</small></label>
+        <label class="subject-name-field subject-daily-report-field"><span>本机日报目录</span><div><input v-model="subjectDailyReportDirectory" placeholder="选择包含 YYYYMMDD.md 的目录" /><button class="secondary-button compact" type="button" @click="chooseSubjectDailyReportDirectory">选择文件夹</button><button class="secondary-button compact" type="button" :disabled="!subjectDailyReportDirectory" @click="subjectDailyReportDirectory = ''">清空</button></div><small>仅保存在当前设备；从日报导入时按日期读取，例如 20261022.md。</small></label>
         <section class="subject-schedule-editor">
           <header class="subject-schedule-head">
             <div><strong>每周工作时段</strong><span>日报会按主体和日期自动使用当天时段</span></div>

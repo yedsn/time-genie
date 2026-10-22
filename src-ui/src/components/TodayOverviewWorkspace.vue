@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { AlertCircle, Clock3, ListTodo, Play, RefreshCw } from "lucide-vue-next";
+import { AlertCircle, Clock3, FileInput, ListTodo, Play, RefreshCw } from "lucide-vue-next";
 import { useWorkdayStore } from "../store";
 import type { TodayWorkOverviewDayRecord, TodayWorkOverviewTaskRecord, TodayWorkOverviewTimelineItemRecord } from "../services/tauri";
 
 const emit = defineEmits<{
   openTimer: [subjectId?: string];
   openPlan: [];
+  importDailyReport: [subjectId?: string];
   resolveUnassigned: [];
 }>();
 
@@ -172,6 +173,7 @@ function taskTitle(task: TodayWorkOverviewTaskRecord) {
       </div>
       <div class="today-overview-actions">
         <button class="secondary-button compact" type="button" :disabled="store.todayOverviewLoading" @click="store.loadTodayOverview()"><RefreshCw :size="14" />刷新</button>
+        <button class="secondary-button compact" type="button" @click="emit('importDailyReport', store.todayOverviewSubjectId || undefined)"><FileInput :size="14" />从日报导入</button>
         <button class="secondary-button compact" type="button" @click="emit('openPlan')"><ListTodo :size="14" />待办</button>
         <button class="primary-button compact" type="button" @click="emit('openTimer', store.todayOverviewSubjectId || undefined)"><Clock3 :size="14" />{{ store.runningEntry ? '切换执行事项' : '开始执行事项' }}</button>
       </div>

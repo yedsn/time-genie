@@ -9,3 +9,8 @@ export function cloudSessionLabel(session?: CloudSessionView) {
 export function cloudSessionNeedsPassword(session?: CloudSessionView) {
   return !session || session.status === "reauth_required";
 }
+
+export function cloudSessionErrorNeedsRecovery(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /(?:AUTH_REQUIRED|AUTH_INVALID|AUTH_FAILED|AUTH_RETRY_REQUIRED|AUTH_BLOCKED|AUTH_UNVERIFIED|DEVICE_REVOKED|CREDENTIAL_UNAVAILABLE)\s*:/.test(message);
+}

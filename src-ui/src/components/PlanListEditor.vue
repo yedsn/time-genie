@@ -47,7 +47,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   select: [id: string];
   save: [id: string, field?: "title" | "plannedDate" | "estimate"];
-  importPlan: [];
+  importPlan: [targetKind: "backlog" | "day_instance"];
   syncSeaTable: [];
   add: [];
   addChild: [id: string];
@@ -1317,7 +1317,7 @@ onBeforeUnmount(() => {
         <button v-if="mode === 'today'" class="secondary-button quick-estimate-entry" type="button" title="选择今日事项并填写今日预计" @click="openTodayImport"><ListPlus :size="14" />配置今日事项</button>
         <button class="secondary-button quick-estimate-entry" type="button" :title="mode === 'today' ? '批量编辑今日计划' : '批量编辑全部进行中计划'" @click="openQuickPlan"><FilePenLine :size="14" />{{ mode === 'today' ? '编辑今日计划' : '编辑全部计划' }}</button>
         <button v-if="mode === 'active'" class="icon-button subtle" type="button" title="同步到 SeaTable" aria-label="同步到 SeaTable" @click="emit('syncSeaTable')"><DatabaseZap :size="15" /></button>
-        <button v-if="mode === 'active'" class="icon-button subtle plan-import-button" type="button" title="从昨日 Obsidian 日报导入计划" aria-label="导入计划" @click="emit('importPlan')"><FileInput :size="15" /></button>
+        <button class="icon-button subtle plan-import-button" type="button" title="从 Obsidian 日报导入" aria-label="从日报导入" @click="emit('importPlan', mode === 'today' ? 'day_instance' : 'backlog')"><FileInput :size="15" /></button>
       </div>
     </div>
 

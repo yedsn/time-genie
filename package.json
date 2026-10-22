@@ -21,6 +21,7 @@
         "test:completed-task-history": "tsc src-ui/src/services/completedTaskHistoryCore.ts --outDir .tmp-completed-task-history-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-completed-task-history.mjs",
         "test:task-status-tabs-ui": "node scripts/verify-task-status-tabs-ui.mjs",
         "test:today-plan-ui": "node scripts/verify-today-plan-ui.mjs",
+        "test:daily-report-import-ui": "node scripts/verify-daily-report-import-ui.mjs",
         "test:today-plan:local-acceptance": "node scripts/verify-today-plan-local-acceptance.mjs",
         "test:execution-dialog-ui": "node scripts/verify-execution-dialog-ui.mjs",
         "test:plan-task-interactions": "tsc src-ui/src/services/planTaskInteractionCore.ts --outDir .tmp-plan-task-interactions-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-plan-task-interactions.mjs && node scripts/verify-plan-task-interactions-ui.mjs",

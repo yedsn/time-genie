@@ -708,7 +708,7 @@ fn set_task_daily_estimate_with_cloud_operation(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_daily_estimate_in_transaction(
+pub(crate) fn write_daily_estimate_in_transaction(
     transaction: &Transaction<'_>,
     workspace_id: &str,
     task_id: &str,
@@ -3327,6 +3327,17 @@ fn load_task(connection: &rusqlite::Connection, id: &str) -> Result<TaskDto, Str
         .optional()
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "NOT_FOUND: 事项不存在".to_string())
+}
+
+pub(crate) fn load_task_for_import(
+    connection: &rusqlite::Connection,
+    id: &str,
+) -> Result<TaskDto, String> {
+    load_task(connection, id)
+}
+
+pub(crate) fn bump_revision_for_import(connection: &rusqlite::Connection) -> Result<(), String> {
+    bump_revision(connection)
 }
 
 fn ensure_subject(

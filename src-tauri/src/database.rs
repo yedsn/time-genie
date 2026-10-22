@@ -155,6 +155,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "remove_context_day_plan_outbox",
         sql: include_str!("../migrations/0028_remove_context_day_plan_outbox.sql"),
     },
+    Migration {
+        version: 29,
+        name: "daily_report_task_import",
+        sql: include_str!("../migrations/0029_daily_report_task_import.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -601,6 +606,10 @@ mod tests {
         "device_hooks",
         "device_hook_runs",
         "tracking_runtime_state",
+        "actual_time_adjustments",
+        "daily_report_import_batches",
+        "daily_report_import_items",
+        "daily_report_import_sources",
     ];
 
     fn latest_migration_version() -> i64 {
@@ -657,6 +666,86 @@ mod tests {
             .unwrap();
         assert_eq!(migration_count, latest_migration_version());
         assert_eq!(workspace_count, 1);
+    }
+
+    #[test]
+    fn daily_report_import_migration_preserves_legacy_import_tables_and_adjustments() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("daily-report-import-upgrade.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                   version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        for migration in &MIGRATIONS[..28] {
+            let transaction = connection.transaction().unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version,name,applied_at) VALUES (?1,?2,1)",
+                    params![migration.version, migration.name],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        connection.execute_batch(
+            r#"INSERT INTO workspaces(id,name,timezone,storage_mode,created_at,updated_at,version)
+                 VALUES('ws','迁移','Asia/Shanghai','local',1,1,1);
+               INSERT INTO devices(id,workspace_id,device_name,platform,app_version,last_seen_at,created_at)
+                 VALUES('device','ws','设备','windows','1',1,1);
+               INSERT INTO subjects(id,workspace_id,name,sort_order,created_at,updated_at,version)
+                 VALUES('subject','ws','主体',10,1,1,1);
+               INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version)
+                 VALUES('task','ws','subject','事项','open','manual',10,1,1,1);
+               INSERT INTO plan_import_batches(id,workspace_id,target_date,subject_id,source_path,source_mtime,source_content_hash,state,raw_markdown,warnings_json,created_at,updated_at,version)
+                 VALUES('old-batch','ws','2026-10-22','subject','D:/old.md',1,'hash','preview','# 旧','[]',1,1,1);
+               INSERT INTO plan_import_items(id,workspace_id,batch_id,title,sort_order,source_line_no,source_text,parse_status)
+                 VALUES('old-item','ws','old-batch','旧事项',10,1,'1. 旧事项','recognized');
+               INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,note,source_type,batch_id,created_at,updated_at,version)
+                 VALUES('adjustment','ws','subject','task','2026-10-22',15,0,15,'旧调整','quick_actual_adjustment','adjustment-batch',1,1,1);"#,
+        ).unwrap();
+        drop(connection);
+
+        let database = Database::initialize_at(path).unwrap();
+        let connection = database.open().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM plan_import_batches WHERE id='old-batch'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM plan_import_items WHERE id='old-item'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT source_type FROM actual_time_adjustments WHERE id='adjustment'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "quick_actual_adjustment"
+        );
+        connection.execute(
+            "INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,source_type,batch_id,created_at,updated_at,version) VALUES('daily-adjustment','ws','subject','task','2026-10-22',5,15,20,'daily_report_import','daily-batch',2,2,1)",
+            [],
+        ).unwrap();
     }
 
     #[test]

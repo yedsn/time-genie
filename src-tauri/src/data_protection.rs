@@ -253,6 +253,15 @@ pub const PROTECTED_ENTITIES: &[ProtectedEntity] = &[
         ],
     },
     ProtectedEntity {
+        table: "daily_report_import_sources",
+        sync_entity: None,
+        group: ProtectionGroup::Planning,
+        stable_order: "source_date,target_kind,source_fingerprint,id",
+        import_order: 155,
+        label_field: Some("source_date"),
+        log_fields: &["subject_id", "source_date", "target_kind", "task_id"],
+    },
+    ProtectedEntity {
         table: "report_templates",
         sync_entity: Some("report_templates"),
         group: ProtectionGroup::Reports,
@@ -349,6 +358,8 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     "actual_adjustment_batches",
     "plan_import_batches",
     "plan_import_items",
+    "daily_report_import_batches",
+    "daily_report_import_items",
 ];
 
 pub const EXCLUDED_FIELDS: &[&str] = &[
@@ -1356,6 +1367,8 @@ fn delete_workspace_data(transaction: &Transaction<'_>, workspace_id: &str) -> R
     for table in [
         "sync_items",
         "plan_import_items",
+        "daily_report_import_items",
+        "daily_report_import_sources",
         "subject_work_schedule_segments",
         "report_tasks",
         "time_allocations",
@@ -1370,6 +1383,7 @@ fn delete_workspace_data(transaction: &Transaction<'_>, workspace_id: &str) -> R
         "task_occurrences",
         "sync_runs",
         "plan_import_batches",
+        "daily_report_import_batches",
         "reports",
         "report_templates",
         "unassigned_sessions",
@@ -1631,6 +1645,14 @@ fn validate_references(tables: &BTreeMap<String, Vec<Value>>) -> Result<(), Stri
     }
     for row in tables.get("actual_time_adjustments").into_iter().flatten() {
         ensure_ref(row, "subject_id", &subjects, "实际工时调整")?;
+    }
+    for row in tables
+        .get("daily_report_import_sources")
+        .into_iter()
+        .flatten()
+    {
+        ensure_ref(row, "subject_id", &subjects, "日报导入来源")?;
+        ensure_ref(row, "task_id", &tasks, "日报导入来源")?;
     }
     Ok(())
 }
@@ -2043,7 +2065,7 @@ mod tests {
 
     #[test]
     fn standard_export_excludes_secrets_device_state_automation_and_outbox() {
-        let (directory, database, workspace_id, _) = test_database();
+        let (directory, database, workspace_id, subject_id) = test_database();
         let connection = database.open().unwrap();
         connection
             .execute(
@@ -2063,6 +2085,11 @@ mod tests {
             json!("https://secret.supabase.co"),
         );
         set_device_setting(&database, "supabase_anon_key", json!("actual-anon-secret"));
+        set_device_setting(
+            &database,
+            &format!("subject_daily_report_directory:{subject_id}"),
+            json!("D:/secret/daily-report-directory"),
+        );
         let device_id: String = connection
             .query_row(
                 "SELECT id FROM devices WHERE workspace_id=?1",
@@ -2097,6 +2124,7 @@ mod tests {
             "secret.exe",
             "hook-secret",
             "op-secret",
+            "D:/secret/daily-report-directory",
         ] {
             assert!(!text.contains(forbidden), "archive leaked {forbidden}");
         }
@@ -2105,6 +2133,44 @@ mod tests {
         assert!(integration.get("secret_ref").is_none());
         assert!(!validated.tables.contains_key("devices"));
         assert!(!validated.tables.contains_key("sync_outbox"));
+    }
+
+    #[test]
+    fn daily_report_import_source_is_backed_up_without_absolute_path() {
+        let (directory, database, workspace_id, subject_id) = test_database();
+        let connection = database.open().unwrap();
+        let task_id: String = connection
+            .query_row(
+                "SELECT id FROM tasks WHERE workspace_id=?1 AND subject_id=?2 LIMIT 1",
+                params![workspace_id, subject_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection.execute(
+            "INSERT INTO daily_report_import_sources(id,workspace_id,subject_id,source_device_id,source_path_hash,source_date,target_kind,source_fingerprint,task_id,batch_id,created_at) VALUES('daily-source',?1,?2,'old-device','path-hash','2026-10-22','backlog','item-hash',?3,'batch',1)",
+            params![workspace_id, subject_id, task_id],
+        ).unwrap();
+        drop(connection);
+        set_device_setting(
+            &database,
+            &format!("subject_daily_report_directory:{subject_id}"),
+            json!("D:/secret/daily-report-directory"),
+        );
+        let path = directory.path().join("daily-source.timegenie-backup");
+        export_backup(
+            &database,
+            BackupExportRequest {
+                path: path.display().to_string(),
+                rescue: false,
+            },
+        )
+        .unwrap();
+        assert!(!String::from_utf8_lossy(&fs::read(&path).unwrap())
+            .contains("D:/secret/daily-report-directory"));
+        let validated = validate_backup_path(&path).unwrap();
+        let source = &validated.tables["daily_report_import_sources"][0];
+        assert_eq!(source["task_id"], json!(task_id));
+        assert_eq!(source["source_path_hash"], json!("path-hash"));
     }
 
     #[test]

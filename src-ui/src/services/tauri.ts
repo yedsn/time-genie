@@ -514,29 +514,6 @@ export type CompletedTaskPageResult = {
   totalPages: number;
 };
 
-export type PlanImportPreviewItem = {
-  id: string;
-  parentId?: string;
-  title: string;
-  estimateMinutes?: number;
-  sortOrder: number;
-  sourceLineNo: number;
-  sourceText: string;
-  parseStatus: "recognized" | "unrecognized";
-};
-
-export type PlanImportPreviewResult = {
-  batchId: string;
-  sourcePath: string;
-  sourceExists: boolean;
-  sourceMtime?: number;
-  sourceContentHash?: string;
-  rawMarkdown: string;
-  items: PlanImportPreviewItem[];
-  warnings: string[];
-  version: number;
-};
-
 export type TimeAllocationRecord = {
   id: string;
   taskId: string;
@@ -566,6 +543,47 @@ export type TimeEntryRecord = {
   previousEntryId?: string;
   splitBoundaryAt?: number;
   allocations: TimeAllocationRecord[];
+};
+
+export type DailyReportImportTargetKind = "backlog" | "day_instance";
+
+export type DailyReportImportPreviewItem = {
+  id: string;
+  parentId?: string;
+  title: string;
+  status: "done" | "open";
+  estimateMinutes?: number;
+  rawActualMinutes?: number;
+  importActualMinutes?: number;
+  sortOrder: number;
+  sourceLineNo: number;
+  sourceText: string;
+  warning?: string;
+  alreadyImported: boolean;
+};
+
+export type DailyReportImportPreviewResult = {
+  batchId: string;
+  subjectId: string;
+  sourceDate: string;
+  targetKind: DailyReportImportTargetKind;
+  sourcePath: string;
+  sourceMtime: number;
+  sourceContentHash: string;
+  items: DailyReportImportPreviewItem[];
+  warnings: string[];
+  version: number;
+};
+
+export type DailyReportImportConfirmResult = {
+  batchId: string;
+  targetKind: DailyReportImportTargetKind;
+  sourceDate: string;
+  tasks: TaskRecord[];
+  createdCount: number;
+  skippedCount: number;
+  adjustmentCount: number;
+  alreadyConfirmed: boolean;
 };
 
 export type TimerStopResultRecord = {
@@ -1039,19 +1057,26 @@ export async function duplicateTaskSubtree(id: string, expectedVersion: number):
   return result;
 }
 
-export async function previewObsidianPlan(sourceDate: string, targetDate: string, subjectId: string): Promise<PlanImportPreviewResult> {
-  return await invoke<PlanImportPreviewResult>("obsidian_plan_import_preview", {
-    request: { sourceDate, targetDate, subjectId },
+export async function previewDailyReportImport(
+  subjectId: string,
+  sourceDate: string,
+  targetKind: DailyReportImportTargetKind,
+): Promise<DailyReportImportPreviewResult> {
+  return await invoke<DailyReportImportPreviewResult>("daily_report_import_preview", {
+    request: { subjectId, sourceDate, targetKind },
   });
 }
 
-export async function confirmObsidianPlan(
-  batchId: string,
-  items: Array<{ importItemId: string; selected: boolean; title: string; estimateMinutes?: number }>,
-  expectedVersion: number,
-): Promise<{ batchId: string; tasks: TaskRecord[]; alreadyConfirmed: boolean }> {
-  const result = await invoke<{ batchId: string; tasks: TaskRecord[]; alreadyConfirmed: boolean }>("obsidian_plan_import_confirm", { request: { batchId, items, expectedVersion } });
-  if (!result.alreadyConfirmed) await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-plan-import");
+export async function confirmDailyReportImport(request: {
+  batchId: string;
+  selectedItemIds: string[];
+  expectedVersion: number;
+  clientRequestId: string;
+}): Promise<DailyReportImportConfirmResult> {
+  const result = await invoke<DailyReportImportConfirmResult>("daily_report_import_confirm", { request });
+  if (!result.alreadyConfirmed && result.createdCount) {
+    await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "daily-report-task-import");
+  }
   return result;
 }
 
