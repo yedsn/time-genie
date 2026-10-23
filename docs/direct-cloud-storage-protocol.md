@@ -14,12 +14,28 @@
 ## 部署顺序
 
 1. 在 Supabase 项目备份并确认当前 schema 版本。
-2. 新项目直接执行 `supabase/schema.sql`；已有项目按顺序执行以下增量文件：
+2. 新项目直接执行 `supabase/schema.sql`；已有项目按顺序补齐尚未执行的直连增量：
    - `supabase/20261022f_timegenie_direct_cloud_storage_protocol.sql`
    - `supabase/20261022g_timegenie_direct_cloud_subject_task_mutations.sql`
    - `supabase/20261022h_timegenie_direct_cloud_task_planning_mutations.sql`
    - `supabase/20261022i_timegenie_direct_cloud_recurrence_mutations.sql`
    - `supabase/20261022j_timegenie_direct_cloud_task_domain_routing.sql`
+   - `supabase/20261022k_timegenie_direct_cloud_timer_mutations.sql`
+   - `supabase/20261022l_timegenie_direct_cloud_timer_recovery.sql`
+   - `supabase/20261022m_timegenie_direct_cloud_unassigned_mutations.sql`
+   - `supabase/20261022n_timegenie_direct_cloud_manual_actual_mutations.sql`
+   - `supabase/20261022o_timegenie_direct_cloud_time_entry_mutations.sql`
+   - `supabase/20261023a_timegenie_direct_cloud_report_mutations.sql`
+   - `supabase/20261023b_timegenie_direct_cloud_report_template_mutations.sql`
+   - `supabase/20261023c_timegenie_direct_cloud_shared_settings_mutations.sql`
+   - `supabase/20261023d_timegenie_direct_cloud_integration_mutations.sql`
+   - `supabase/20261023e_timegenie_direct_cloud_plan_import.sql`
+   - `supabase/20261023f_timegenie_data_copy_staging.sql`
+   - `supabase/20261023g_timegenie_data_copy_replace.sql`
+   - `supabase/20261023h_timegenie_data_copy_export.sql`
+   - `supabase/20261023i_timegenie_direct_cloud_today_overview.sql`
+   - `supabase/20261023j_timegenie_direct_cloud_import_export.sql`
+   - `supabase/20261023k_timegenie_direct_cloud_release_guard.sql`
 3. 执行后确认 `timegenie.workspaces.storage_protocol` 列为 `text not null default 'sync_v1'`，且约束只允许 `sync_v1` 和 `direct_v2`。
 4. 在仓库根目录运行 `npm run test:supabase:schema`。该命令会启动临时 PostgreSQL，部署 schema、重复执行协议补丁并运行权限及协议屏障集成测试。
 
@@ -58,7 +74,7 @@
 
 - `p_operation_id` 是稳定幂等键。响应丢失时，使用相同 operation ID、相同 `p_expected_epoch` 和完全相同的 `p_payload` 重试；同一 operation ID 对应不同请求时返回 `IDEMPOTENCY_CONFLICT`。
 - 写入响应为 `{ operationId, metadata, data }`。`metadata.domains` 是需要重新查询的领域，`metadata.changeSeq`、`metadata.serverTime` 和 `metadata.workspaceEpoch` 用于判断是否刷新。
-- 桌面端仍需发送 `Authorization`、`apikey`、`x-timegenie-workspace-epoch` 和 `x-timegenie-client-schema-generation`。业务请求不直接写表，也不使用 `service_role`。
+- 桌面端发送 `Authorization`、`apikey` 和需要时的 `x-timegenie-workspace-epoch`。日常业务请求不发送客户端 schema generation，不直接写表，也不使用 `service_role`。
 - Tauri 命令在本地模式走 SQLite，在 `direct_v2` 模式走下表 RPC；同一命令不会同时写两边。
 
 ### 查询
@@ -246,10 +262,12 @@ Rust 只读适配器分别对应工作台、事项列表/详情/已完成分页�
 
 ## 协议切换
 
-1. 客户端先调用 `storage_protocol_upgrade_preflight` 获取当前协议、epoch、schema generation、设备状态以及必需的队列处置选项。
+1. 客户端先调用 `storage_protocol_upgrade_preflight` 获取当前协议、epoch、设备状态以及必需的队列处置选项。
 2. 客户端检查本机旧队列。队列为空时使用 `queue_drained`；已完成救援备份并明确放弃旧修改时使用 `abandoned_with_rescue`。
 3. 使用稳定 operation ID 调用 `upgrade_storage_protocol`。服务端在同一事务内校验设备与 epoch、按需创建安全快照、切换 `direct_v2`、写入 `workspace_reset` 变化记录和操作历史。
-4. 切换后的工作空间拒绝旧补丁、增量拉取、租约、旧计时入口、旧未归属入口、旧实际工时批次、快照导入和旧恢复入口，并返回 `CLIENT_UPGRADE_REQUIRED`。
+4. 切换后的工作空间拒绝旧补丁、增量拉取、租约、旧计时入口、旧未归属入口、旧实际工时批次、快照导入和旧恢复入口，并返回 `CLOUD_PROTOCOL_UNSUPPORTED`。
+
+直连查询和 mutation 不发送客户端 schema generation，也不按应用版本号限制读写。服务端仅校验 Auth 用户、设备授权、`direct_v2`、workspace epoch 和业务实体 expected version。数据包格式版本只用于用户显式执行的一次性复制，不影响日常云端使用。
 
 协议切换后不得降回 `sync_v1`。旧客户端只能升级后读取最新云端数据，或导出旧本地修改用于人工救援。
 
@@ -266,7 +284,7 @@ Rust 只读适配器分别对应工作台、事项列表/详情/已完成分页�
 - `LEASE_LOST`：当前设备已失去写入资格。
 - `WORKSPACE_EPOCH_STALE`：工作空间世代已变化，必须刷新权威数据。
 - `DEVICE_REVOKED`：当前设备授权失效，需要重新授权。
-- `CLIENT_UPGRADE_REQUIRED`：客户端或存储协议版本不兼容。
+- `CLOUD_PROTOCOL_UNSUPPORTED`：调用了与当前工作空间存储协议不匹配的旧入口。
 
 ## 发布检查
 
@@ -274,3 +292,47 @@ Rust 只读适配器分别对应工作台、事项列表/详情/已完成分页�
 - 确认旧同步入口只授予 `authenticated`，内部实现函数不对客户端授权。
 - 使用两个设备验证升级前队列受阻、空队列升级、升级后旧客户端写入被拒绝和幂等重试。
 - 验证多设备升级后直接读取 Supabase，SQLite 业务表、`sync_outbox` 和 `local_sync_state` 不再增长。
+
+## 快照恢复与紧急只读
+
+- `workspace_snapshot_create` 直接读取 Supabase 权威业务表；它不等待客户端 push/pull，也不读取 SQLite 业务表。
+- `workspace_restore_prepare` 与 `workspace_restore_commit` 在云端持锁、创建恢复前安全快照、原子恢复并提升 workspace epoch。提交成功后客户端仅更新设备检查点、清空进程内领域数据并重新查询；不得调用 `cloud_snapshot_get` 回填本地业务缓存。
+- 紧急只读开关只允许关闭 `direct_cloud_*` mutation 的写入资格，必须继续允许登录校验、只读查询、操作记录、快照与数据导出。客户端收到只读结果后展示已加载数据并禁用全部 mutation。
+- 解除紧急只读后，客户端先执行上下文与可见领域查询，确认 `online_writable` 后再开放编辑。无论停写或恢复，都不得重新启用 `sync_v1` outbox、增量写或缓存回填。
+- 运维应记录开关变化、mutation 错误率、协议拒绝、查询延迟、Realtime 重连和复制失败；开关演练与观测验证属于发布前必测项。
+
+### 开启与解除紧急停写
+
+紧急开关保存在 `timegenie.workspaces`，由项目管理员在 Supabase SQL Editor 中执行。不要向桌面端的 anon/authenticated 角色授予直接修改工作空间开关的权限。
+
+    update timegenie.workspaces
+    set emergency_read_only = true,
+        emergency_read_only_reason = '发布保护演练'
+    where id = '20000000-0000-0000-0000-00000000000a';
+
+执行后，`direct_cloud_context` 和所有直连查询的 `metadata` 会返回 `writable: false` 与 `readOnlyReason`。只读查询、快照导出和操作记录仍可用；所有业务 mutation、旧同步写、租约与 processed-operation 写会在数据库触发器处返回 `EMERGENCY_READ_ONLY`。该拒绝不会转入 SQLite outbox。
+
+确认升级或故障处理完成后解除停写：
+
+    update timegenie.workspaces
+    set emergency_read_only = false,
+        emergency_read_only_reason = null
+    where id = '20000000-0000-0000-0000-00000000000a';
+
+客户端只有在下一次只读查询成功且返回 `writable: true` 后才会重新开放编辑。禁止通过切回 `sync_v1`、恢复旧 outbox 写入或重建 SQLite 业务缓存来绕过紧急开关。
+
+### 发布观测指标
+
+桌面端 Tauri 命令 `direct_cloud_release_metrics_get`（前端封装 `getDirectCloudReleaseMetrics()`）返回当前工作空间本次进程内的脱敏累计指标：
+
+| 字段 | 用途 |
+| --- | --- |
+| `queryCount`、`queryErrorCount` | 云端查询总量与失败数。 |
+| `queryLatencyTotalMs`、`queryLatencyMaxMs`、`averageQueryLatencyMs` | 查询总耗时、最大耗时与平均耗时；只累计成功查询的端到端客户端耗时。 |
+| `mutationCount`、`mutationErrorCount` | 云端 mutation 最终结果总数与失败数；网络重试只按最终结果计数。 |
+| `protocolRejectionCount` | `CLOUD_PROTOCOL_UNSUPPORTED`、`WORKSPACE_EPOCH_STALE` 和 `EMERGENCY_READ_ONLY` 等协议拒绝。 |
+| `realtimeReconnectCount` | Realtime 连接结束后的重连次数。 |
+| `copyFailureCount` | 复制预览、导出、上传或完整替换失败次数。 |
+| `lastErrorCode` | 最近一次失败的错误码，不含业务正文或凭据。 |
+
+指标只用于发布观察和故障定位，不改变业务数据，也不持久化查询内容。发布后应持续关注查询错误、mutation 错误、协议拒绝与复制失败；出现异常增长时优先启用紧急只读并重新查询权威状态。

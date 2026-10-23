@@ -3888,3 +3888,19 @@ notify pgrst, 'reload schema';
 -- Consistent cloud-to-local export packages. Shared business rows are frozen,
 -- recursively sanitized and downloaded in hash-verified chunks.
 \ir 20261023h_timegenie_data_copy_export.sql
+
+-- Direct-v2 today overview aggregation. The dashboard reads one authoritative
+-- cloud projection instead of joining local SQLite business tables.
+\ir 20261023i_timegenie_direct_cloud_today_overview.sql
+
+-- Direct-v2 device-local daily-report import and authoritative cloud export.
+\ir 20261023j_timegenie_direct_cloud_import_export.sql
+
+-- Emergency server-side write barrier for direct-v2 rollout. Queries stay
+-- readable while all authoritative business and legacy sync writes stop.
+\ir 20261023k_timegenie_direct_cloud_release_guard.sql
+\ir 20261023l_timegenie_direct_cloud_workspace_restore.sql
+
+-- Remove the numeric client-generation gate. Direct cloud authorization now
+-- depends on identity, device, storage protocol and workspace epoch only.
+\ir 20261023m_timegenie_remove_client_generation_gate.sql

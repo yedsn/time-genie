@@ -160,6 +160,8 @@ fn read_device_string(connection: &Connection, key: &str) -> Result<Option<Strin
 mod tests {
     use super::*;
     use rusqlite::params;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     fn test_database() -> Database {
@@ -202,6 +204,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(legacy, "sqlite");
+    }
+
+    #[test]
+    fn local_mode_never_dispatches_any_business_domain_to_supabase() {
+        let database = test_database();
+        let cloud_requests = Arc::new(AtomicUsize::new(0));
+        for domain in [
+            BusinessDomain::Tasks,
+            BusinessDomain::Planning,
+            BusinessDomain::Time,
+            BusinessDomain::Reports,
+            BusinessDomain::SharedSettingsIntegrations,
+            BusinessDomain::DataProtection,
+        ] {
+            for operation in [StorageOperation::Query, StorageOperation::Mutation] {
+                let cloud_requests_for_route = Arc::clone(&cloud_requests);
+                let result = route(
+                    &database,
+                    domain,
+                    operation,
+                    |_| Ok("sqlite"),
+                    |_| {
+                        cloud_requests_for_route.fetch_add(1, Ordering::SeqCst);
+                        Ok("supabase")
+                    },
+                )
+                .unwrap();
+                assert_eq!(result, "sqlite");
+            }
+        }
+        assert_eq!(cloud_requests.load(Ordering::SeqCst), 0);
     }
 
     #[test]

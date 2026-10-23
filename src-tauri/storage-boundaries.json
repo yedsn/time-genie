@@ -21,6 +21,58 @@
     "database",
     "supabase"
   ],
+  "directCloudCommandBoundaries": {
+    "runtimeModules": [
+      "subjects",
+      "tasks",
+      "today_plans",
+      "today_overview",
+      "recurring",
+      "time_tracking",
+      "unassigned",
+      "actual_time_adjustments",
+      "time_allocation_export",
+      "reports",
+      "daily_report_import",
+      "settings",
+      "work_calendar",
+      "subject_work_schedules",
+      "seatable",
+      "obsidian"
+    ],
+    "explicitCommandExceptions": {
+      "pureComputation": [
+        "tasks::plan_import_preview",
+        "reports::report_template_placeholders"
+      ],
+      "routedStorageHelpers": [
+        "time_tracking::timer_start",
+        "time_tracking::timer_pause",
+        "time_tracking::timer_resume",
+        "time_tracking::timer_stop"
+      ],
+      "dataProtection": [
+        "data_protection::data_backup_export",
+        "data_protection::data_backup_export_rescue",
+        "data_protection::data_backup_preview",
+        "data_protection::data_backup_import",
+        "data_protection::data_backup_history_list",
+        "data_protection::data_backup_open"
+      ]
+    },
+    "exceptionReasons": {
+      "pureComputation": "仅解析用户输入或返回静态模板元数据，不读取或写入业务存储。",
+      "routedStorageHelpers": "命令只负责更新托盘展示，业务读写由同模块的 *_for_storage 辅助函数统一路由。",
+      "dataProtection": "本地备份、显式双向复制和升级救援按用户确认跨越存储空间，不属于日常 direct_v2 业务读写。"
+    },
+    "forbiddenDirectV2References": [
+      "push_outbox",
+      "pull_incremental",
+      "cloud_snapshot_get",
+      "rebuild_local_cache_after_workspace_restore_locked",
+      "reset_local_cache_from_cloud"
+    ]
+  },
   "rootInfrastructureCommands": [
     "window_show",
     "window_hide",
@@ -78,6 +130,7 @@
       "device_hooks",
       "device_settings",
       "devices",
+      "legacy_sync_cleanup_diagnostics",
       "local_backup_history",
       "local_report_outputs",
       "schema_migrations"
@@ -89,9 +142,7 @@
       "processed_operations",
       "sync_items",
       "sync_outbox",
-      "sync_runs",
-      "tracking_leases",
-      "workspace_changes"
+      "sync_runs"
     ]
   }
 }

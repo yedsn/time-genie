@@ -152,7 +152,7 @@ async function main() {
   });
 
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
-  await page.locator(".nav-list button", { hasText: "计时" }).click();
+  await page.locator(".nav-list button", { hasText: "时间记录" }).click();
   await page.locator(".time-history-head").waitFor({ state: "visible" });
   await page.locator(".time-history-actions button", { hasText: "导出" }).click();
   const dialog = page.locator(".time-export-dialog");
@@ -201,7 +201,7 @@ async function main() {
   if (!(await dialog.isVisible())) throw new Error("写入失败后应保留弹框和输入");
   if (await dateInputs.nth(0).inputValue() !== "2026-10-01") throw new Error("写入失败后开始日期丢失");
 
-  const clockBefore = await page.locator(".time-focus-overview > time").textContent();
+  const clockBefore = await page.locator(".global-timer-main time").textContent();
   await page.evaluate(() => {
     window.__TEST_EXPORT_MODE = "delay";
     window.__TEST_EXECUTE_CALLS = 0;
@@ -211,8 +211,8 @@ async function main() {
   if (!(await dialog.getByRole("button", { name: /正在导出/ }).isDisabled())) {
     throw new Error("导出执行期间按钮未禁用");
   }
-  await page.waitForTimeout(1_100);
-  const clockAfter = await page.locator(".time-focus-overview > time").textContent();
+  await page.waitForFunction((previousClock) => document.querySelector(".global-timer-main time")?.textContent !== previousClock, clockBefore);
+  const clockAfter = await page.locator(".global-timer-main time").textContent();
   if (clockBefore === clockAfter) throw new Error("导出执行期间计时器没有继续刷新");
   await page.getByText(/已导出 3 行、90 分钟/).waitFor({ state: "visible" });
   await dialog.waitFor({ state: "hidden" });

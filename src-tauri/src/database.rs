@@ -165,6 +165,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "legacy_abandoned_outbox",
         sql: include_str!("../migrations/0030_legacy_abandoned_outbox.sql"),
     },
+    Migration {
+        version: 31,
+        name: "remove_unused_legacy_cloud_mirrors",
+        sql: include_str!("../migrations/0031_remove_unused_legacy_cloud_mirrors.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -615,6 +620,7 @@ mod tests {
         "daily_report_import_batches",
         "daily_report_import_items",
         "daily_report_import_sources",
+        "legacy_sync_cleanup_diagnostics",
     ];
 
     fn latest_migration_version() -> i64 {
@@ -671,6 +677,88 @@ mod tests {
             .unwrap();
         assert_eq!(migration_count, latest_migration_version());
         assert_eq!(workspace_count, 1);
+    }
+
+    #[test]
+    fn legacy_cloud_mirror_cleanup_preserves_business_and_device_data() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("legacy-cloud-mirror-cleanup.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                   version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        for migration in &MIGRATIONS[..30] {
+            let transaction = connection.transaction().unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version,name,applied_at) VALUES (?1,?2,1)",
+                    params![migration.version, migration.name],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        connection
+            .execute_batch(
+                r#"INSERT INTO workspaces(id,name,timezone,storage_mode,created_at,updated_at,version)
+                     VALUES('workspace','保留工作区','Asia/Shanghai','local',1,1,1);
+                   INSERT INTO devices(id,workspace_id,device_name,platform,app_version,last_seen_at,created_at)
+                     VALUES('device','workspace','保留设备','windows','1',1,1);
+                   INSERT INTO subjects(id,workspace_id,name,sort_order,created_at,updated_at,version)
+                     VALUES('subject','workspace','保留主体',10,1,1,1);
+                   INSERT INTO device_settings(key,value_json,updated_at)
+                     VALUES('tray_hover_enabled','true',1);
+                   INSERT INTO tracking_leases(workspace_id,holder_device_id,lease_token,expires_at,updated_at,version)
+                     VALUES('workspace','device','legacy-token',2,1,1);
+                   INSERT INTO workspace_changes(workspace_id,entity_type,entity_id,operation,entity_version,changed_by_device_id,changed_at)
+                     VALUES('workspace','task','legacy-task','update',2,'device',1);"#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::initialize_at(path).unwrap();
+        let connection = database.open().unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT name FROM subjects WHERE id='subject'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "保留主体"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value_json FROM device_settings WHERE key='tray_hover_enabled'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "true"
+        );
+        for removed in ["tracking_leases", "workspace_changes"] {
+            let exists: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [removed],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 0, "legacy table {removed} should be removed");
+            let recorded: i64 = connection
+                .query_row(
+                    "SELECT row_count FROM legacy_sync_cleanup_diagnostics WHERE table_name=?1",
+                    [removed],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(recorded, 1);
+        }
     }
 
     #[test]

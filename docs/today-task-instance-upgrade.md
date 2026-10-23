@@ -4,12 +4,12 @@
 
 ## Supabase 升级顺序
 
-1. 升级并退出账号下所有仍在运行的旧版 TimeGenie。
+1. 备份 Supabase 工作空间。
 2. 先备份 Supabase 工作空间。
-3. 在 Supabase SQL Editor 依次执行 `20261021_timegenie_today_task_instances.sql` 和 `20261021b_timegenie_client_write_generation.sql`，或对新项目执行完整 `schema.sql`。
-4. 将所有设备升级到支持今日独立实例的数据协议版本，再恢复云端编辑与同步。
+3. 在 Supabase SQL Editor 执行完整 `schema.sql`，或在已有结构上依次执行今日实例迁移及 `20261023m_timegenie_remove_client_generation_gate.sql`。
+4. 重新打开应用并刷新云端数据。
 
-第二个脚本会把工作空间最低客户端数据协议代数设为 `1`。新版会在每个 Supabase 请求中发送协议代数；没有该握手信息的旧客户端仍可保留本地数据，但云端业务写入会被明确拒绝并返回 `CLIENT_UPGRADE_REQUIRED`。这样旧版不会把今日实例误当成长期事项继续修改。
+当前直连云端模式不再发送或校验客户端数字版本号。旧同步客户端仍会被 `sync_v1`/`direct_v2` 存储协议屏障拒绝，避免旧 outbox 覆盖直连数据；新版直连客户端只按身份、设备授权、workspace epoch 和实体 expected version 校验。
 
 ## 数据边界
 

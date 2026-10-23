@@ -69,7 +69,7 @@ declare package_id_value uuid;
 begin
   perform timegenie.assert_direct_v2_workspace(p_workspace_id,p_device_id,p_expected_epoch);
   if p_package_version<>1 then raise exception 'DATA_PACKAGE_VERSION_UNSUPPORTED'; end if;
-  if p_schema_generation<>1 then raise exception 'CLIENT_UPGRADE_REQUIRED: data package schema generation mismatch'; end if;
+  if p_schema_generation<>1 then raise exception 'DATA_PACKAGE_VERSION_UNSUPPORTED: data package format mismatch'; end if;
   if p_expected_chunk_count<22 or p_expected_chunk_count>256 then raise exception 'DATA_PACKAGE_CHUNK_COUNT_INVALID'; end if;
   if coalesce(p_expected_content_hash,'')!~'^[0-9a-f]{64}$' then raise exception 'DATA_PACKAGE_HASH_INVALID'; end if;
   delete from timegenie.data_copy_staging_packages where expires_at<=now();

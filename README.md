@@ -102,6 +102,8 @@ SeaTable Token、Supabase 会话等敏感内容会保存到系统凭据库，不
 - 旧 Supabase 项目升级时不需要重跑完整 schema；按发布时间顺序执行 [`supabase/20261003_timegenie_recurring_migration_patch.sql`](supabase/20261003_timegenie_recurring_migration_patch.sql)、[`supabase/20261004_timegenie_cloud_sync_patch.sql`](supabase/20261004_timegenie_cloud_sync_patch.sql)、[`supabase/20261004b_timegenie_migration_target_guard_patch.sql`](supabase/20261004b_timegenie_migration_target_guard_patch.sql)、[`supabase/20261004c_timegenie_work_day_version_guard_patch.sql`](supabase/20261004c_timegenie_work_day_version_guard_patch.sql)、[`supabase/20261004d_timegenie_session_revocation_patch.sql`](supabase/20261004d_timegenie_session_revocation_patch.sql) 和 [`supabase/20261005_timegenie_timer_sync_coordination_patch.sql`](supabase/20261005_timegenie_timer_sync_coordination_patch.sql)，用于补齐周期事项、同步实体身份、未归属会话同步、迁移目标保护、工作日版本冲突保护、长期登录与设备撤销，以及计时队列协调。
 - Realtime 订阅 `timegenie.workspace_changes`，客户端按领域标脏并重新查询 Supabase；通知 payload 不作为业务数据落地。
 - 现有 `sync_v1` 云端工作空间可在“设置 → 数据存储”执行单向升级：界面先显示其他已登记设备及旧队列状态；正常路径会完成最后一次 push/pull 后切换，受阻队列可先导出救援备份、输入“放弃旧修改”后二次确认。工作空间一旦进入 `direct_v2` 不能降回旧同步协议，旧客户端的补丁、增量拉取和租约写会返回 `CLIENT_UPGRADE_REQUIRED`，升级客户端后直接读取最新 Supabase 数据。
+- 云端快照和恢复直接作用于 Supabase 权威数据。恢复成功后客户端清空当前进程数据并重新查询新的 workspace epoch，不重建 SQLite 业务缓存，也不处理旧 outbox。
+- 运维紧急停写时，`direct_v2` 保持查询、快照与导出可用，所有 mutation 进入只读；恢复服务后先重新查询再开放编辑，绝不回退到旧同步队列。
 
 正式启用前，建议在两台设备上完成登录、迁移、冲突和计时互斥验证。已执行旧项目增量补丁后，可在 Supabase SQL Editor 中运行只读脚本 [`supabase/20261004_verify_timegenie_cloud_guards.sql`](supabase/20261004_verify_timegenie_cloud_guards.sql)，确认迁移目标保护、未归属会话同步和工作日版本保护函数已经部署生效。
 
@@ -117,7 +119,7 @@ npm run test:supabase:schema
 
 ### 双设备端到端验证
 
-仓库提供一个默认跳过的真实 Supabase 验证。它使用两个独立 SQLite 数据库模拟两台设备，并依次验证邮箱密码登录、工作空间和设备注册、本地数据迁移、Realtime 通知与增量拉取、离线 outbox、版本冲突、全局单计时器和后台采集租约。
+仓库提供一个默认跳过的真实 Supabase 验证。它使用两个独立设备实例验证邮箱密码登录、工作空间和设备注册、`direct_v2` 在线直读直写、即时版本冲突、全局单计时器、Realtime 失效重查、工作空间恢复及本机 SQLite 无云端业务副本写入；旧 `sync_v1` 队列只在协议升级兼容用例中出现。
 
 该验证会删除测试账号名下现有工作空间，并在完成后再次清理。请使用专门的可丢弃测试账号，不要使用正式账号。
 运行入口会先检查下列环境变量；缺少变量或未设置 `TG_SUPABASE_E2E_ALLOW_RESET=1` 时会直接拒绝执行，不会连接或清理 Supabase 数据。

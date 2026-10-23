@@ -134,6 +134,16 @@ end $$;
 \ir 20261023c_timegenie_direct_cloud_shared_settings_mutations.sql
 \ir 20261023d_timegenie_direct_cloud_integration_mutations.sql
 \ir 20261023d_timegenie_direct_cloud_integration_mutations.sql
+\ir 20261023i_timegenie_direct_cloud_today_overview.sql
+\ir 20261023i_timegenie_direct_cloud_today_overview.sql
+\ir 20261023j_timegenie_direct_cloud_import_export.sql
+\ir 20261023j_timegenie_direct_cloud_import_export.sql
+\ir 20261023k_timegenie_direct_cloud_release_guard.sql
+\ir 20261023l_timegenie_direct_cloud_workspace_restore.sql
+\ir 20261023l_timegenie_direct_cloud_workspace_restore.sql
+\ir 20261023k_timegenie_direct_cloud_release_guard.sql
+\ir 20261023m_timegenie_remove_client_generation_gate.sql
+\ir 20261023m_timegenie_remove_client_generation_gate.sql
 
 do $$
 begin
@@ -153,6 +163,7 @@ begin
      or has_function_privilege('anon', 'timegenie.direct_cloud_completed_tasks(uuid, uuid, bigint, uuid, timestamptz, uuid, integer)', 'execute')
      or has_function_privilege('anon', 'timegenie.direct_cloud_task_detail(uuid, uuid, uuid, bigint)', 'execute')
      or has_function_privilege('anon', 'timegenie.direct_cloud_today_plan(uuid, uuid, uuid, date, bigint)', 'execute')
+     or has_function_privilege('anon', 'timegenie.direct_cloud_today_overview(uuid, uuid, uuid, date, integer, integer, bigint)', 'execute')
      or has_function_privilege('anon', 'timegenie.direct_cloud_time_state(uuid, uuid, date, bigint)', 'execute')
      or has_function_privilege('anon', 'timegenie.direct_cloud_time_history(uuid, uuid, bigint, date, integer, boolean)', 'execute')
      or has_function_privilege('anon', 'timegenie.direct_cloud_time_history_page(uuid, uuid, integer, boolean, bigint)', 'execute')
@@ -235,6 +246,7 @@ begin
      or not has_function_privilege('authenticated', 'timegenie.direct_cloud_completed_tasks(uuid, uuid, bigint, uuid, timestamptz, uuid, integer)', 'execute')
      or not has_function_privilege('authenticated', 'timegenie.direct_cloud_task_detail(uuid, uuid, uuid, bigint)', 'execute')
      or not has_function_privilege('authenticated', 'timegenie.direct_cloud_today_plan(uuid, uuid, uuid, date, bigint)', 'execute')
+     or not has_function_privilege('authenticated', 'timegenie.direct_cloud_today_overview(uuid, uuid, uuid, date, integer, integer, bigint)', 'execute')
      or not has_function_privilege('authenticated', 'timegenie.direct_cloud_time_state(uuid, uuid, date, bigint)', 'execute')
      or not has_function_privilege('authenticated', 'timegenie.direct_cloud_time_history(uuid, uuid, bigint, date, integer, boolean)', 'execute')
      or not has_function_privilege('authenticated', 'timegenie.direct_cloud_time_history_page(uuid, uuid, integer, boolean, bigint)', 'execute')
@@ -460,7 +472,7 @@ begin
 end $$;
 
 begin;
-select set_config('request.headers', '{"x-timegenie-client-schema-generation":"1"}', true);
+select set_config('request.headers', '{}', true);
 
 insert into auth.users(id) values
   ('10000000-0000-0000-0000-000000000001'),
@@ -477,23 +489,22 @@ insert into timegenie.workspaces(id, owner_user_id, name) values
 
 select timegenie.device_authorize('20000000-0000-0000-0000-000000000002', '30000000-0000-0000-0000-000000000003', '设备 C', 'windows', '0.1.0');
 
-select set_config('request.headers', '{}', true);
-do $$
-begin
-  begin
-    perform timegenie.cloud_apply_patch(
-      '20000000-0000-0000-0000-000000000002',
-      '30000000-0000-0000-0000-000000000003',
-      '40000000-0000-0000-0000-000000000098',
-      'app_setting.update','app_setting','old_client_write_probe',null,
-      jsonb_build_object('key','old_client_write_probe','value_json','true'::jsonb,'updated_at',1792271999000,'version',1)
-    );
-    raise exception 'old client write was accepted';
-  exception when others then
-    if sqlerrm not like '%CLIENT_UPGRADE_REQUIRED%' then raise; end if;
-  end;
+select timegenie.cloud_apply_patch(
+  '20000000-0000-0000-0000-000000000002',
+  '30000000-0000-0000-0000-000000000003',
+  '40000000-0000-0000-0000-000000000098',
+  'app_setting.update','app_setting','generation_free_write_probe',null,
+  jsonb_build_object('key','generation_free_write_probe','value_json','true'::jsonb,'updated_at',1792271999000,'version',1)
+);
+do $$ begin
+  if not exists(
+    select 1
+    from jsonb_array_elements(
+      timegenie.cloud_snapshot_get('20000000-0000-0000-0000-000000000002')->'app_settings'
+    ) item
+    where item->>'key'='generation_free_write_probe'
+  ) then raise exception 'write without client generation header was not persisted'; end if;
 end $$;
-select set_config('request.headers', '{"x-timegenie-client-schema-generation":"1"}', true);
 
 select timegenie.cloud_apply_patch(
   '20000000-0000-0000-0000-000000000002',
@@ -5392,7 +5403,7 @@ select timegenie.device_authorize('20000000-0000-0000-0000-00000000000a','300000
 do $$
 declare protocol_value jsonb; context_value jsonb; upgraded jsonb; repeated jsonb;
   operation_value jsonb; operation_request jsonb; preflight_value jsonb; response_value jsonb; old_client_bootstrap jsonb;
-  bootstrap_value jsonb; expected_work_date text; task_list_value jsonb; task_detail_value jsonb;
+  bootstrap_value jsonb; today_overview_value jsonb; expected_work_date text; task_list_value jsonb; task_detail_value jsonb;
   completed_page_one jsonb; completed_page_two jsonb; today_plan_value jsonb; tomorrow_plan_value jsonb;
   today_plan_repeat jsonb; tomorrow_plan_repeat jsonb; time_state_value jsonb; history_one jsonb; history_two jsonb;
   report_page_one jsonb; report_page_two jsonb; report_detail_value jsonb; report_templates_value jsonb; report_preview_value jsonb; weekly_preview_value jsonb;
@@ -5443,8 +5454,8 @@ begin
   end if;
   protocol_value:=timegenie.storage_protocol_get('20000000-0000-0000-0000-00000000000a');
   if protocol_value->>'storageProtocol' is distinct from 'sync_v1'
-     or (protocol_value->>'schemaGeneration')::bigint<>(select minimum_client_schema_generation from timegenie.workspaces where id='20000000-0000-0000-0000-00000000000a') then
-    raise exception 'storage protocol status is missing sync_v1 or the schema generation: %',protocol_value;
+     or protocol_value ? 'schemaGeneration' then
+    raise exception 'storage protocol status is invalid or still exposes client generation: %',protocol_value;
   end if;
   preflight_value:=timegenie.storage_protocol_upgrade_preflight(
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a'
@@ -6397,7 +6408,7 @@ begin
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',1
   );
   if context_value->>'storageProtocol' is distinct from 'direct_v2'
-     or (context_value->>'schemaGeneration')::bigint<>(select minimum_client_schema_generation from timegenie.workspaces where id='20000000-0000-0000-0000-00000000000a') then
+     or context_value ? 'schemaGeneration' then
     raise exception 'direct cloud context is invalid: %',context_value;
   end if;
   response_value:=timegenie.direct_cloud_query_response(
@@ -6409,7 +6420,7 @@ begin
      or response_value->'metadata'->>'storageProtocol' is distinct from 'direct_v2'
      or jsonb_typeof(response_value->'metadata'->'workspaceEpoch') is distinct from 'number'
      or jsonb_typeof(response_value->'metadata'->'changeSeq') is distinct from 'number'
-     or jsonb_typeof(response_value->'metadata'->'schemaGeneration') is distinct from 'number'
+     or response_value->'metadata' ? 'schemaGeneration'
      or jsonb_typeof(response_value->'metadata'->'serverTime') is distinct from 'string'
      or response_value->'metadata'->'domains' is distinct from '["tasks","time"]'::jsonb
      or (response_value->'metadata'->'diagnostics'->>'responseBytes')::integer<=0
@@ -6438,6 +6449,17 @@ begin
      or bootstrap_value->'data'->'device'->>'id' is distinct from '30000000-0000-0000-0000-00000000000a'
      or not coalesce((bootstrap_value->'data'->'device'->>'writable')::boolean,false) then
     raise exception 'direct workbench bootstrap contract is invalid: %',bootstrap_value;
+  end if;
+  today_overview_value:=timegenie.direct_cloud_today_overview(
+    '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
+    null,expected_work_date::date,30,14,1
+  );
+  if today_overview_value->'metadata'->>'storageProtocol' is distinct from 'direct_v2'
+     or today_overview_value->'data'->'scope'->>'todayDate' is distinct from expected_work_date
+     or jsonb_typeof(today_overview_value->'data'->'revision') is distinct from 'number'
+     or jsonb_typeof(today_overview_value->'data'->'days') is distinct from 'array'
+     or jsonb_typeof(today_overview_value->'data'->'tasks') is distinct from 'array' then
+    raise exception 'direct today overview contract is invalid: %',today_overview_value;
   end if;
   task_list_value:=timegenie.direct_cloud_task_list(
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',1,
@@ -7483,7 +7505,7 @@ begin
     );
     raise exception 'direct context accepted a sync_v1 workspace';
   exception when others then
-    if sqlerrm not like '%CLIENT_UPGRADE_REQUIRED%' then raise; end if;
+    if sqlerrm not like '%CLOUD_PROTOCOL_UNSUPPORTED%' then raise; end if;
   end;
   perform set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000003',true);
   perform timegenie.device_authorize(
@@ -7517,16 +7539,12 @@ begin
   exception when others then
     if sqlerrm not like '%DEVICE_REVOKED%' then raise; end if;
   end;
-  perform set_config('request.headers','{"x-timegenie-client-schema-generation":"0"}',true);
-  begin
-    perform timegenie.direct_cloud_context(
-      '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',1
-    );
-    raise exception 'direct context accepted an outdated client schema generation';
-  exception when others then
-    if sqlerrm not like '%CLIENT_UPGRADE_REQUIRED%' then raise; end if;
-  end;
-  perform set_config('request.headers','{"x-timegenie-client-schema-generation":"1"}',true);
+  perform set_config('request.headers','{}',true);
+  if timegenie.direct_cloud_context(
+       '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',1
+     ) ? 'schemaGeneration' then
+    raise exception 'direct context still exposed client schema generation';
+  end if;
   begin
     perform timegenie.cloud_apply_patch(
       '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-0000000000be',
@@ -7535,7 +7553,7 @@ begin
     );
     raise exception 'legacy sync write was accepted after direct protocol upgrade';
   exception when others then
-    if sqlerrm not like '%CLIENT_UPGRADE_REQUIRED%' then raise; end if;
+    if sqlerrm not like '%CLOUD_PROTOCOL_UNSUPPORTED%' then raise; end if;
   end;
   begin
     perform timegenie.tracking_lease_acquire(
@@ -7544,7 +7562,7 @@ begin
     );
     raise exception 'legacy tracking lease was accepted after direct protocol upgrade';
   exception when others then
-    if sqlerrm not like '%CLIENT_UPGRADE_REQUIRED%' then raise; end if;
+    if sqlerrm not like '%CLOUD_PROTOCOL_UNSUPPORTED%' then raise; end if;
   end;
   begin
     perform timegenie.tracking_lease_takeover_for_timer_write(
@@ -7553,7 +7571,7 @@ begin
     );
     raise exception 'legacy timer-write lease takeover was accepted after direct protocol upgrade';
   exception when others then
-    if sqlerrm not like '%CLIENT_UPGRADE_REQUIRED%' then raise; end if;
+    if sqlerrm not like '%CLOUD_PROTOCOL_UNSUPPORTED%' then raise; end if;
   end;
   begin
     perform timegenie.unassigned_get_or_create_shared(
@@ -7561,7 +7579,7 @@ begin
     );
     raise exception 'legacy unassigned anchor creation was accepted after direct protocol upgrade';
   exception when others then
-    if sqlerrm not like '%CLIENT_UPGRADE_REQUIRED%' then raise; end if;
+    if sqlerrm not like '%CLOUD_PROTOCOL_UNSUPPORTED%' then raise; end if;
   end;
   begin
     perform timegenie.unassigned_resolve_shared(
@@ -7571,7 +7589,7 @@ begin
     );
     raise exception 'legacy unassigned resolution was accepted after direct protocol upgrade';
   exception when others then
-    if sqlerrm not like '%CLIENT_UPGRADE_REQUIRED%' then raise; end if;
+    if sqlerrm not like '%CLOUD_PROTOCOL_UNSUPPORTED%' then raise; end if;
   end;
   begin
     perform timegenie.unassigned_anchor_reset(
@@ -7581,7 +7599,7 @@ begin
     );
     raise exception 'legacy unassigned anchor reset was accepted after direct protocol upgrade';
   exception when others then
-    if sqlerrm not like '%CLIENT_UPGRADE_REQUIRED%' then raise; end if;
+    if sqlerrm not like '%CLOUD_PROTOCOL_UNSUPPORTED%' then raise; end if;
   end;
   begin
     perform timegenie.actual_adjustment_batch_apply(
@@ -7590,7 +7608,7 @@ begin
     );
     raise exception 'legacy actual adjustment batch was accepted after direct protocol upgrade';
   exception when others then
-    if sqlerrm not like '%CLIENT_UPGRADE_REQUIRED%' then raise; end if;
+    if sqlerrm not like '%CLOUD_PROTOCOL_UNSUPPORTED%' then raise; end if;
   end;
   begin
     perform timegenie.timer_transition_apply(
@@ -7599,7 +7617,7 @@ begin
     );
     raise exception 'legacy timer transition was accepted after direct protocol upgrade';
   exception when others then
-    if sqlerrm not like '%CLIENT_UPGRADE_REQUIRED%' then raise; end if;
+    if sqlerrm not like '%CLOUD_PROTOCOL_UNSUPPORTED%' then raise; end if;
   end;
   begin
     perform timegenie.migration_import_snapshot(
@@ -7608,7 +7626,7 @@ begin
     );
     raise exception 'legacy migration import was accepted after direct protocol upgrade';
   exception when others then
-    if sqlerrm not like '%CLIENT_UPGRADE_REQUIRED%' then raise; end if;
+    if sqlerrm not like '%CLOUD_PROTOCOL_UNSUPPORTED%' then raise; end if;
   end;
   begin
     perform timegenie.workspace_restore_prepare(
@@ -7617,7 +7635,7 @@ begin
     );
     raise exception 'legacy restore prepare was accepted after direct protocol upgrade';
   exception when others then
-    if sqlerrm not like '%CLIENT_UPGRADE_REQUIRED%' then raise; end if;
+    if sqlerrm not like '%CLOUD_PROTOCOL_UNSUPPORTED%' then raise; end if;
   end;
   begin
     perform timegenie.workspace_restore_prepare(
@@ -7626,7 +7644,7 @@ begin
     );
     raise exception 'legacy restore prepare with safety snapshot was accepted after direct protocol upgrade';
   exception when others then
-    if sqlerrm not like '%CLIENT_UPGRADE_REQUIRED%' then raise; end if;
+    if sqlerrm not like '%CLOUD_PROTOCOL_UNSUPPORTED%' then raise; end if;
   end;
   begin
     perform timegenie.workspace_restore_commit(
@@ -7636,7 +7654,7 @@ begin
     );
     raise exception 'legacy restore commit was accepted after direct protocol upgrade';
   exception when others then
-    if sqlerrm not like '%CLIENT_UPGRADE_REQUIRED%' then raise; end if;
+    if sqlerrm not like '%CLOUD_PROTOCOL_UNSUPPORTED%' then raise; end if;
   end;
   begin
     perform timegenie.cloud_incremental_pull(
@@ -7644,7 +7662,7 @@ begin
     );
     raise exception 'legacy incremental pull was accepted after direct protocol upgrade';
   exception when others then
-    if sqlerrm not like '%CLIENT_UPGRADE_REQUIRED%' then raise; end if;
+    if sqlerrm not like '%CLOUD_PROTOCOL_UNSUPPORTED%' then raise; end if;
   end;
   old_client_bootstrap:=timegenie.direct_cloud_workbench_bootstrap(
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-0000000000be',1
@@ -7763,7 +7781,7 @@ declare
 begin
   content_hash_value:='41d3dc79d2110e88cb8d7b4b6d3ca559e70c6ee0b7da4964a1284ba815878cd5';
 
-  begin_value:=timegenie.data_copy_stage_begin(workspace_value,device_value,1,1,1,22,content_hash_value);
+  begin_value:=timegenie.data_copy_stage_begin(workspace_value,device_value,1,1,22,content_hash_value);
   package_value:=(begin_value->>'packageId')::uuid; chunk_index_value:=0;
   for catalog_row in select * from data_copy_test_catalog order by sort_order loop
     perform timegenie.data_copy_stage_chunk_put(workspace_value,device_value,1,package_value,chunk_index_value,catalog_row.entity_name,'[]',empty_hash,0);
@@ -7772,7 +7790,7 @@ begin
   validated_value:=timegenie.data_copy_stage_validate(workspace_value,device_value,1,package_value);
   if validated_value->>'status' is distinct from 'validated' then raise exception 'complete staging package was not validated'; end if;
 
-  begin_value:=timegenie.data_copy_stage_begin(workspace_value,device_value,1,1,1,22,content_hash_value);
+  begin_value:=timegenie.data_copy_stage_begin(workspace_value,device_value,1,1,22,content_hash_value);
   package_value:=(begin_value->>'packageId')::uuid; chunk_index_value:=0;
   for catalog_row in select * from data_copy_test_catalog order by sort_order limit 21 loop
     perform timegenie.data_copy_stage_chunk_put(workspace_value,device_value,1,package_value,chunk_index_value,catalog_row.entity_name,'[]',empty_hash,0);
@@ -7781,18 +7799,18 @@ begin
   begin perform timegenie.data_copy_stage_validate(workspace_value,device_value,1,package_value); raise exception 'missing staging chunk was accepted';
   exception when others then if sqlerrm not like '%DATA_PACKAGE_CHUNK_MISSING%' then raise; end if; end;
 
-  begin_value:=timegenie.data_copy_stage_begin(workspace_value,device_value,1,1,1,22,content_hash_value);
+  begin_value:=timegenie.data_copy_stage_begin(workspace_value,device_value,1,1,22,content_hash_value);
   package_value:=(begin_value->>'packageId')::uuid;
   begin perform timegenie.data_copy_stage_chunk_put(workspace_value,device_value,1,package_value,0,'subjects','[]',repeat('0',64),0); raise exception 'damaged staging chunk was accepted';
   exception when others then if sqlerrm not like '%DATA_PACKAGE_CHUNK_HASH_MISMATCH%' then raise; end if; end;
 
-  begin perform timegenie.data_copy_stage_begin(workspace_value,device_value,1,2,1,22,content_hash_value); raise exception 'unsupported package version was accepted';
+  begin perform timegenie.data_copy_stage_begin(workspace_value,device_value,1,2,22,content_hash_value); raise exception 'unsupported package version was accepted';
   exception when others then if sqlerrm not like '%DATA_PACKAGE_VERSION_UNSUPPORTED%' then raise; end if; end;
 
   tasks_text:='[{"id":"90000000-0000-0000-0000-000000000001","subject_id":"90000000-0000-0000-0000-000000000099"}]';
   tasks_hash:='5aed44403b0b0018cf3c1c577eeec3322df9864a56eef499665f77929dbe309b';
   content_hash_value:='2724e6aec79d3360343435c8807544d1bfb710e44cc6d4761a4d5a653b18ab67';
-  begin_value:=timegenie.data_copy_stage_begin(workspace_value,device_value,1,1,1,22,content_hash_value);
+  begin_value:=timegenie.data_copy_stage_begin(workspace_value,device_value,1,1,22,content_hash_value);
   package_value:=(begin_value->>'packageId')::uuid; chunk_index_value:=0;
   for catalog_row in select * from data_copy_test_catalog order by sort_order loop
     if catalog_row.entity_name='tasks' then
@@ -7843,7 +7861,7 @@ declare
   content_hash_value text:='41d3dc79d2110e88cb8d7b4b6d3ca559e70c6ee0b7da4964a1284ba815878cd5';
 begin
   begin_value:=timegenie.data_copy_stage_begin(
-    workspace_value,device_value,1,1,1,22,content_hash_value
+    workspace_value,device_value,1,1,22,content_hash_value
   );
   package_value:=(begin_value->>'packageId')::uuid;
   for catalog_row in select * from data_copy_test_catalog order by sort_order loop
@@ -7931,7 +7949,7 @@ declare
   content_hash_value text:='3f5b6dec9932dd43a5074a9c7464591242282a8169131dec60fd31b0755cc0cf';
 begin
   begin_value:=timegenie.data_copy_stage_begin(
-    workspace_value,device_value,2,1,1,22,content_hash_value
+    workspace_value,device_value,2,1,22,content_hash_value
   );
   package_value:=(begin_value->>'packageId')::uuid;
   for catalog_row in select * from data_copy_test_catalog order by sort_order loop
@@ -8048,6 +8066,99 @@ begin
 end $$;
 reset role;
 drop function timegenie.test_only_data_copy_sha256(text);
+
+-- Direct-v2 local-file import and spreadsheet export use cloud authority, are
+-- idempotent, and keep duplicate-source detection in Supabase.
+insert into timegenie.subjects(id,workspace_id,name,sort_order) values(
+  '90000000-0000-0000-0000-000000000031',
+  '20000000-0000-0000-0000-00000000000a',
+  '导入导出验收主体',31
+);
+set role authenticated;
+select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000003',true);
+select set_config('request.jwt.claim.session_id','80000000-0000-0000-0000-00000000000a',true);
+do $$
+declare workspace_value uuid:='20000000-0000-0000-0000-00000000000a';
+declare device_value uuid:='30000000-0000-0000-0000-00000000000a';
+declare import_value jsonb; retry_value jsonb; duplicate_value jsonb; export_value jsonb;
+declare payload_value jsonb:=jsonb_build_object(
+  'batchId','90000000-0000-0000-0000-000000000032',
+  'subjectId','90000000-0000-0000-0000-000000000031',
+  'sourceDate','2026-10-23','targetKind','day_instance','sourcePathHash','path-hash',
+  'items',jsonb_build_array(
+    jsonb_build_object('id','90000000-0000-0000-0000-000000000033','parentId',null,'title','日报父项','status','open','estimateMinutes',null,'importActualMinutes',null,'sortOrder',0,'sourceFingerprint','parent-fingerprint','selected',false),
+    jsonb_build_object('id','90000000-0000-0000-0000-000000000034','parentId','90000000-0000-0000-0000-000000000033','title','日报完成项','status','done','estimateMinutes',30,'importActualMinutes',25,'sortOrder',1,'sourceFingerprint','child-fingerprint','selected',true)
+  )
+);
+begin
+  import_value:=timegenie.direct_cloud_daily_report_import_confirm(
+    workspace_value,device_value,'90000000-0000-0000-0000-000000000035',2,payload_value);
+  retry_value:=timegenie.direct_cloud_daily_report_import_confirm(
+    workspace_value,device_value,'90000000-0000-0000-0000-000000000035',2,payload_value);
+  if import_value is distinct from retry_value
+     or (import_value->'data'->>'createdCount')::integer<>2
+     or (import_value->'data'->>'adjustmentCount')::integer<>1
+     or import_value->'data'->'tasks'->1->>'status' is distinct from 'done' then
+    raise exception 'direct daily-report import was not atomic/idempotent: %',import_value;
+  end if;
+  duplicate_value:=timegenie.direct_cloud_daily_report_imported_fingerprints(
+    workspace_value,device_value,'90000000-0000-0000-0000-000000000031','2026-10-23','day_instance',
+    'path-hash',array['missing','child-fingerprint'],2);
+  if duplicate_value->'data'->'fingerprints' is distinct from '["child-fingerprint"]'::jsonb then
+    raise exception 'direct daily-report duplicate query is invalid: %',duplicate_value;
+  end if;
+  export_value:=timegenie.direct_cloud_time_allocation_export(
+    workspace_value,device_value,'2026-10-23','2026-10-23',false,2);
+  if jsonb_array_length(export_value->'data'->'rows')<>1
+     or (export_value->'data'->'rows'->0->>'minutes')::integer<>25
+     or export_value->'data'->'rows'->0->>'task' is distinct from '日报父项 / 日报完成项' then
+    raise exception 'direct time-allocation export did not use cloud authority: %',export_value;
+  end if;
+end $$;
+reset role;
+
+-- Emergency read-only keeps authoritative queries available while rejecting
+-- direct mutations, legacy sync writes and lease updates at the database layer.
+update timegenie.workspaces
+set emergency_read_only=true,emergency_read_only_reason='发布保护演练'
+where id='20000000-0000-0000-0000-00000000000a';
+set role authenticated;
+select set_config('request.jwt.claim.sub','10000000-0000-0000-0000-000000000003',true);
+select set_config('request.jwt.claim.session_id','80000000-0000-0000-0000-00000000000a',true);
+do $$
+declare context_value jsonb; query_value jsonb; rejected boolean:=false;
+begin
+  context_value:=timegenie.direct_cloud_context(
+    '20000000-0000-0000-0000-00000000000a',
+    '30000000-0000-0000-0000-00000000000a',2
+  );
+  if coalesce((context_value->>'writable')::boolean,true)
+     or context_value->>'readOnlyReason' is distinct from '发布保护演练' then
+    raise exception 'emergency read-only was not exposed by direct context: %',context_value;
+  end if;
+  query_value:=timegenie.direct_cloud_task_list(
+    '20000000-0000-0000-0000-00000000000a',
+    '30000000-0000-0000-0000-00000000000a',2,null,false,null,null
+  );
+  if query_value->'metadata'->>'writable' is distinct from 'false' then
+    raise exception 'emergency read-only blocked or mislabeled queries: %',query_value;
+  end if;
+  begin
+    perform timegenie.direct_cloud_subject_create(
+      '20000000-0000-0000-0000-00000000000a',
+      '30000000-0000-0000-0000-00000000000a',
+      '4e000000-0000-0000-0000-00000000f001',2,
+      '{"id":"51000000-0000-0000-0000-00000000f001","name":"不应写入"}'::jsonb
+    );
+  exception when others then
+    rejected:=sqlerrm like 'EMERGENCY_READ_ONLY:%';
+  end;
+  if not rejected then raise exception 'emergency read-only accepted a direct mutation'; end if;
+end $$;
+reset role;
+update timegenie.workspaces
+set emergency_read_only=false,emergency_read_only_reason=null
+where id='20000000-0000-0000-0000-00000000000a';
 
 select 'Supabase schema integration tests passed' as result;
 

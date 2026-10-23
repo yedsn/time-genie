@@ -13,6 +13,7 @@ TimeGenie 当前的 Supabase 云端模式仍以 SQLite 为业务读写源，通�
 - 本地模式继续只读写 SQLite、完全离线可用且不连接 Supabase；本地空间与云端空间保持独立，切换模式不自动覆盖或合并。
 - 提供显式的一次性“本地复制到云端”和“云端复制到本地”；复制完成后源与目标独立演进，不建立后续同步关系。
 - 将真实多设备并发收敛到提交边界：普通更新使用期望版本即时拒绝陈旧写入，计时、计划、实际工时调整、报告等复合操作使用原子 RPC 返回最新权威上下文。
+- 云端日常读写不再发送或校验客户端 schema generation，也不再因为数字版本门槛阻止读取或修改；仅按 `sync_v1`/`direct_v2` 存储协议隔离旧同步入口。
 - 移除云端模式的待同步队列、同步冲突处理、本地/云端版本选择、重置本地缓存、离线待上传和历史队列修复等用户能力。
 - 保留本机的登录凭据、Supabase 连接配置、设备身份和设备级偏好；云端操作记录、云端快照以及本地数据备份继续按各自存储模式工作。
 
@@ -30,7 +31,7 @@ TimeGenie 当前的 Supabase 云端模式仍以 SQLite 为业务读写源，通�
 
 - Rust 业务模块：`tasks.rs`、`time_tracking.rs`、`today_plans.rs`、`recurring.rs`、`reports.rs`、`settings.rs`、`actual_time_adjustments.rs`、`subject_work_schedules.rs` 等需要通过统一存储边界选择 SQLite 实现或 Supabase 实现。
 - Rust 云端模块：`supabase.rs` 增加面向业务页面的查询和写入调用；`cloud_sync.rs`、outbox 协调、快照回填、冲突恢复和本地云端缓存逻辑将在迁移完成后退出日常业务路径并最终删除。
-- Supabase：`supabase/schema.sql` 及版本化增量 SQL 需要补齐列表、聚合读取和原子业务写 RPC，保留 RLS、设备授权、幂等、版本校验、操作记录、云端快照和工作空间恢复能力。
+- Supabase：`supabase/schema.sql` 及版本化增量 SQL 需要补齐列表、聚合读取和原子业务写 RPC，保留 RLS、设备授权、幂等、实体并发版本校验、操作记录、云端快照和工作空间恢复能力，但不再设置客户端 schema generation 门槛。
 - Vue：`src-ui/src/services/tauri.ts`、共享状态和各业务页面需要识别在线可写/离线只读状态；数据存储设置移除同步队列、冲突和本地缓存重置入口，增加两种显式复制入口。
 - SQLite：继续承载本地模式业务数据和设备级元数据；云端模式不得依赖其中的业务实体表作为读取或写入来源。
 - 兼容与迁移：现有云端用户升级前必须先处理或显式选择如何处置旧 outbox；切换到新模式后，SQLite 中旧云端缓存只能作为迁移/救援输入，不得继续参与业务运行。

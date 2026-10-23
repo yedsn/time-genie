@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { rmSync } from "node:fs";
 
 const modulePath = resolve(".tmp-cloud-sync-presentation-test/cloudSyncPresentation.js");
-const { cloudSaveStatusLabel, cloudSyncPresentation, cloudSyncRetryFeedback } = await import(pathToFileURL(modulePath));
+const { cloudSaveStatusLabel, cloudSyncPresentation, directCloudMutationFeedback } = await import(pathToFileURL(modulePath));
 
 const formatSyncTime = (value) => `time:${value}`;
 const cloud = {
@@ -40,7 +40,7 @@ assert.equal(cloudSaveStatusLabel(cloud), "所有更改均已保存");
 assert.equal(cloudSaveStatusLabel({ ...cloud, syncing: true }), "所有更改均已保存");
 assert.equal(cloudSaveStatusLabel({ ...cloud, syncing: true, pendingOperations: 3 }), "还有 3 项待保存");
 assert.equal(cloudSaveStatusLabel({ ...cloud, storageProtocol: "direct_v2", cloudAccessState: "connecting", cloudWritable: false }), "正在连接云端");
-assert.equal(cloudSaveStatusLabel({ ...cloud, storageProtocol: "direct_v2", cloudAccessState: "online_writable", cloudWritable: true }), "已直接保存到云端");
+assert.equal(cloudSaveStatusLabel({ ...cloud, storageProtocol: "direct_v2", cloudAccessState: "online_writable", cloudWritable: true }), "已直接保存到 Supabase");
 assert.equal(cloudSaveStatusLabel({ ...cloud, storageProtocol: "direct_v2", cloudAccessState: "offline_readonly", cloudWritable: false }), "云端只读");
 assert.equal(cloudSaveStatusLabel({ ...cloud, storageProtocol: "direct_v2", cloudAccessState: "reauth_required", cloudWritable: false }), "需要重新登录");
 
@@ -69,6 +69,37 @@ const directReauth = cloudSyncPresentation({
 }, formatSyncTime);
 assert.equal(directReauth.label, "需要重新登录");
 assert.equal(directReauth.attentionLevel, "critical");
+
+const directOfflineDefault = cloudSyncPresentation({
+  ...cloud, storageProtocol: "direct_v2", cloudAccessState: "offline_readonly", cloudWritable: false,
+}, formatSyncTime);
+assert.equal(directOfflineDefault.detail, "云端离线，只能查看已加载数据；不会保存到本机等待同步");
+
+const directReauthDefault = cloudSyncPresentation({
+  ...cloud, storageProtocol: "direct_v2", cloudAccessState: "reauth_required", cloudWritable: false,
+}, formatSyncTime);
+assert.equal(directReauthDefault.detail, "登录已失效，请重新登录 Supabase");
+
+assert.deepEqual(directCloudMutationFeedback(new Error("VERSION_CONFLICT: stale version")), {
+  level: "warning",
+  message: "数据已在其他设备变化，正在重新查询最新云端数据",
+  shouldRefresh: true,
+});
+assert.deepEqual(directCloudMutationFeedback("ENTITY_DELETED: task missing"), {
+  level: "warning",
+  message: "数据已在其他设备变化，正在重新查询最新云端数据",
+  shouldRefresh: true,
+});
+assert.deepEqual(directCloudMutationFeedback(new Error("DEVICE_REVOKED: revoked")), {
+  level: "error",
+  message: "登录已失效，请重新登录 Supabase",
+  shouldRefresh: false,
+});
+assert.deepEqual(directCloudMutationFeedback(new Error("CLOUD_OFFLINE: offline")), {
+  level: "warning",
+  message: "云端离线，只能查看已加载数据；不会保存到本机等待同步",
+  shouldRefresh: false,
+});
 
 const syncing = cloudSyncPresentation({ ...cloud, syncing: true, pendingOperations: 3 }, formatSyncTime);
 assert.equal(syncing.label, "还有 3 项待保存");
@@ -120,21 +151,6 @@ assert.equal(synced.label, "实时同步");
 assert.equal(synced.detail, "已实时同步 · 最近更新 time:1234");
 assert.equal(synced.needsAttention, false);
 assert.equal(synced.attentionLevel, "");
-
-assert.deepEqual(cloudSyncRetryFeedback({ pushed: 2, pending: 0, conflicts: 0 }, { ...cloud }), {
-  level: "success",
-  message: "已同步 2 项修改",
-});
-
-assert.deepEqual(cloudSyncRetryFeedback({ pushed: 0, pending: 3, conflicts: 0 }, { ...cloud, pendingOperations: 3 }), {
-  level: "warning",
-  message: "本机修改已保存，仍有 3 项等待同步",
-});
-
-assert.deepEqual(cloudSyncRetryFeedback({ pushed: 1, pending: 0, conflicts: 1 }, { ...cloud, conflictCount: 1 }), {
-  level: "warning",
-  message: "同步遇到版本冲突，请选择要保留的版本",
-});
 
 const temporaryOutput = resolve(".tmp-cloud-sync-presentation-test");
 if (temporaryOutput.startsWith(resolve("."))) rmSync(temporaryOutput, { recursive: true, force: true });

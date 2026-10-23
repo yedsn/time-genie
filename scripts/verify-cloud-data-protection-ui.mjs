@@ -38,7 +38,7 @@ for (const expected of [
   "未保护快照最长保留", "不自动清理",
   'type="time"', "automaticSnapshotEnabled", "automaticSnapshotTime",
   "automaticSnapshotTimezone", "scheduleStatusText", "schedulerActive",
-  '@click="beginRestore(item)"', "当前设备数据已重新下载",
+  '@click="beginRestore(item)"', "已重新读取云端权威数据",
   "创建时已完成完整性校验", "preview.groupCounts", "previewEntities",
   "createPreRestoreSnapshot", "恢复前创建一份备份快照",
   "直接恢复，不额外创建快照", "prepareCloudWorkspaceRestore(selected.value.id, createPreRestoreSnapshot.value)",

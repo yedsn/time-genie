@@ -116,10 +116,10 @@ fn cleanup_owned_workspaces(database: &Database) -> Result<(), String> {
         .send()
         .map_err(|error| error.to_string())?;
     if !response.status().is_success() {
-        return Err(format!(
-            "无法清理专用 Supabase 测试工作空间: {}",
-            response.text().unwrap_or_default()
-        ));
+        let detail = response.text().unwrap_or_default();
+        if !detail.contains("WORKSPACE_NOT_FOUND") {
+            return Err(format!("无法清理专用 Supabase 测试工作空间: {detail}"));
+        }
     }
     Ok(())
 }
@@ -147,6 +147,65 @@ fn register_device(database: &Database, name: &str) {
         },
     )
     .unwrap();
+}
+
+fn enter_direct_cloud_mode_for_real_e2e(
+    database: &Database,
+    workspace_id: &str,
+    workspace_epoch: i64,
+) {
+    let connection = database.open().unwrap();
+    connection
+        .execute(
+            "INSERT INTO device_settings(key,value_json,updated_at) VALUES('cloud_storage_protocol','\"direct_v2\"',1)\n             ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO device_settings(key,value_json,updated_at) VALUES('storage_mode','\"cloud\"',1)\n             ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO local_sync_state(workspace_id,device_id,last_change_seq,workspace_epoch)\n             SELECT ?1,json_extract(value_json,'$'),0,?2 FROM device_settings WHERE key='device_id'\n             ON CONFLICT(workspace_id) DO UPDATE SET device_id=excluded.device_id,workspace_epoch=excluded.workspace_epoch",
+            rusqlite::params![workspace_id, workspace_epoch],
+        )
+        .unwrap();
+    drop(connection);
+    crate::cloud_sync::enter_direct_cloud_mode();
+    supabase::direct_cloud_workbench_bootstrap(database).unwrap();
+}
+
+fn provision_direct_cloud_workspace_for_real_e2e(
+    database: &Database,
+    workspace_id: &str,
+) -> Result<(), String> {
+    let session = supabase::current_session(database)?;
+    let device_id = {
+        let connection = database.open()?;
+        connection
+            .query_row(
+                "SELECT json_extract(value_json,'$') FROM device_settings WHERE key='device_id'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?
+    };
+    let _: Value = serde_json::from_value(supabase::client(database)?.rpc_for_database(
+        database,
+        "provision_direct_v2_workspace",
+        json!({
+            "p_workspace_id": workspace_id,
+            "p_device_id": device_id,
+            "p_operation_id": Uuid::now_v7().to_string(),
+        }),
+        &session,
+    )?)
+    .map_err(|error| error.to_string())?;
+    enter_direct_cloud_mode_for_real_e2e(database, workspace_id, 1);
+    Ok(())
 }
 
 fn migrate(database: &Database, direction: &str) {
@@ -2852,7 +2911,7 @@ fn isolated_supabase_today_plan_two_device_flow() {
             task_id: manual.id.clone(),
             work_date: today_text.clone(),
             state: "included".to_string(),
-            expected_version: None,
+            expected_version: Some(0),
         },
         &state_a,
     )
@@ -5305,6 +5364,335 @@ fn real_supabase_unassigned_two_device_flow() {
     reset_owned_workspaces(&device_a);
     let _ = supabase::sign_out(&device_a);
     let _ = supabase::sign_out(&device_b);
+}
+
+#[test]
+#[ignore = "需要专用 Supabase 测试账号和显式的工作空间清理授权"]
+fn real_supabase_direct_v2_two_device_flow() {
+    let config = TestConfig::from_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let device_a =
+        Database::initialize_at(directory.path().join("direct-device-a.sqlite3")).unwrap();
+    let device_b =
+        Database::initialize_at(directory.path().join("direct-device-b.sqlite3")).unwrap();
+
+    configure_and_sign_in(&device_a, &config);
+    let _cleanup = CleanupGuard {
+        database: device_a.clone(),
+    };
+    reset_owned_workspaces(&device_a);
+    let workspace = supabase::workspace_bootstrap(&device_a).unwrap();
+    register_device(&device_a, "Direct V2 E2E 设备 A");
+
+    configure_and_sign_in(&device_b, &config);
+    let workspace_b = supabase::workspace_bootstrap(&device_b).unwrap();
+    assert_eq!(workspace_b.id, workspace.id);
+    register_device(&device_b, "Direct V2 E2E 设备 B");
+
+    provision_direct_cloud_workspace_for_real_e2e(&device_a, &workspace.id).unwrap();
+    enter_direct_cloud_mode_for_real_e2e(&device_b, &workspace.id, 1);
+
+    let before_a = crate::storage_contract::business_data_fingerprint(&device_a).unwrap();
+    let before_b = crate::storage_contract::business_data_fingerprint(&device_b).unwrap();
+    let subject = supabase::direct_cloud_subject_create(
+        &device_a,
+        crate::subjects::SubjectCreateRequest {
+            name: "Direct V2 验收主体".to_string(),
+        },
+    )
+    .unwrap()
+    .subject;
+    let task = supabase::direct_cloud_task_create_for_command(
+        &device_a,
+        TaskCreateRequest {
+            subject_id: subject.id.clone(),
+            parent_id: None,
+            day_instance_date: None,
+            title: "Direct V2 双设备事项".to_string(),
+            planned_date: None,
+            estimate_minutes: Some(25),
+            note: None,
+            project_name: None,
+            solution_name: None,
+        },
+        "manual",
+    )
+    .unwrap();
+    let tasks_b = supabase::direct_cloud_task_list_for_command(
+        &device_b,
+        TaskListRequest {
+            subject_id: Some(subject.id.clone()),
+            include_completed: Some(true),
+            planned_date: None,
+            today_date: None,
+            today_only: Some(false),
+            daily_estimate_date: None,
+            query: None,
+        },
+    )
+    .unwrap();
+    assert!(tasks_b.tasks.iter().any(|item| item.id == task.id));
+
+    let updated = supabase::direct_cloud_task_update_for_command(
+        &device_a,
+        TaskUpdateRequest {
+            id: task.id.clone(),
+            expected_version: task.version,
+            title: Some("Direct V2 设备 A 已更新".to_string()),
+            parent_id: None,
+            planned_date: None,
+            estimate_minutes: None,
+            note: None,
+            project_name: None,
+            solution_name: None,
+        },
+    )
+    .unwrap();
+    let stale = supabase::direct_cloud_task_update_for_command(
+        &device_b,
+        TaskUpdateRequest {
+            id: task.id.clone(),
+            expected_version: task.version,
+            title: Some("Direct V2 设备 B 陈旧提交".to_string()),
+            parent_id: None,
+            planned_date: None,
+            estimate_minutes: None,
+            note: None,
+            project_name: None,
+            solution_name: None,
+        },
+    )
+    .unwrap_err();
+    assert!(stale.starts_with("VERSION_CONFLICT:"), "{stale}");
+    let refreshed = supabase::direct_cloud_task_list_for_command(
+        &device_b,
+        TaskListRequest {
+            subject_id: Some(subject.id.clone()),
+            include_completed: Some(true),
+            planned_date: None,
+            today_date: None,
+            today_only: Some(false),
+            daily_estimate_date: None,
+            query: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        refreshed
+            .tasks
+            .iter()
+            .find(|item| item.id == task.id)
+            .unwrap()
+            .title,
+        updated.title
+    );
+
+    let operation_id = Uuid::now_v7().to_string();
+    let plan_a = supabase::direct_cloud_day_plan_set_for_command(
+        &device_a,
+        TaskDayPlanSetRequest {
+            task_id: task.id.clone(),
+            work_date: "2026-10-23".to_string(),
+            state: "included".to_string(),
+            expected_version: None,
+        },
+    )
+    .unwrap();
+    let plan_retry = supabase::direct_cloud_mutation::<serde_json::Value>(
+        &device_a,
+        "direct_cloud_task_day_plan_set",
+        Some(operation_id.clone()),
+        json!({"taskId": task.id, "workDate": "2026-10-23", "state": "excluded", "expectedVersion": plan_a.version}),
+    )
+    .unwrap();
+    let plan_retry_again = supabase::direct_cloud_mutation::<serde_json::Value>(
+        &device_a,
+        "direct_cloud_task_day_plan_set",
+        Some(operation_id),
+        json!({"taskId": task.id, "workDate": "2026-10-23", "state": "excluded", "expectedVersion": plan_a.version}),
+    )
+    .unwrap();
+    assert_eq!(plan_retry.data, plan_retry_again.data);
+    assert!(plan_a.version >= 1);
+
+    let report = reports::direct_report_create_for_command(
+        &device_a,
+        ReportCreateRequest {
+            report_type: "daily".to_string(),
+            reference_date: "2026-10-23".to_string(),
+            subject_id: subject.id.clone(),
+            task_ids: vec![task.id.clone()],
+            template_id: None,
+            client_request_id: Uuid::now_v7().to_string(),
+        },
+    )
+    .unwrap();
+    assert!(!report.id.is_empty());
+    let report_saved = reports::direct_report_content_save_for_command(
+        &device_a,
+        crate::reports::ReportContentSaveRequest {
+            report_id: report.id.clone(),
+            markdown: "# Direct V2 设备 A 报告".to_string(),
+            expected_version: report.version,
+        },
+    )
+    .unwrap();
+    let stale_report = reports::direct_report_content_save_for_command(
+        &device_b,
+        crate::reports::ReportContentSaveRequest {
+            report_id: report.id.clone(),
+            markdown: "# Direct V2 设备 B 陈旧报告".to_string(),
+            expected_version: report.version,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        stale_report.starts_with("VERSION_CONFLICT:"),
+        "{stale_report}"
+    );
+    assert!(report_saved.version > report.version);
+
+    let realtime_config = realtime_test_config(&device_b);
+    let realtime_workspace_id = workspace.id.clone();
+    let (realtime_ready_tx, realtime_ready_rx) = std::sync::mpsc::sync_channel(0);
+    let realtime_listener = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let mut socket =
+                subscribe_to_workspace_changes(realtime_config, &realtime_workspace_id).await;
+            realtime_ready_tx.send(()).unwrap();
+            wait_for_postgres_change(&mut socket).await;
+        });
+    });
+    realtime_ready_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("Direct V2 Realtime 监听器未就绪");
+    supabase::direct_cloud_workbench_bootstrap(&device_a).unwrap();
+    supabase::direct_cloud_subject_rename(
+        &device_a,
+        crate::subjects::SubjectRenameRequest {
+            subject_id: subject.id.clone(),
+            name: "Direct V2 Realtime 已更新".to_string(),
+            expected_version: subject.version,
+        },
+    )
+    .unwrap();
+    realtime_listener
+        .join()
+        .expect("Direct V2 Realtime 未收到失效通知");
+    let subjects_after_reconnect = supabase::direct_cloud_subject_list(&device_b).unwrap();
+    assert!(subjects_after_reconnect
+        .iter()
+        .any(|item| item.id == subject.id && item.name == "Direct V2 Realtime 已更新"));
+
+    let timer = supabase::direct_cloud_timer_start(
+        &device_a,
+        crate::time_tracking::TimerStartRequest {
+            task_id: Some(task.id.clone()),
+            note: None,
+            client_request_id: Uuid::now_v7().to_string(),
+        },
+    )
+    .unwrap();
+    let early_takeover = supabase::direct_cloud_timer_takeover(
+        &device_b,
+        crate::time_tracking::TimerTakeoverRequest {
+            entry_id: timer.id.clone(),
+            expected_version: timer.version,
+            lease_token: Uuid::now_v7().to_string(),
+            client_request_id: Uuid::now_v7().to_string(),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        early_takeover.starts_with("LEASE_LOST:"),
+        "{early_takeover}"
+    );
+    thread::sleep(Duration::from_secs(46));
+    let takeover = supabase::direct_cloud_timer_takeover(
+        &device_b,
+        crate::time_tracking::TimerTakeoverRequest {
+            entry_id: timer.id.clone(),
+            expected_version: timer.version,
+            lease_token: Uuid::now_v7().to_string(),
+            client_request_id: Uuid::now_v7().to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(takeover.active_entry.id, timer.id);
+    supabase::direct_cloud_timer_stop(
+        &device_b,
+        crate::time_tracking::TimerStopRequest {
+            entry_id: takeover.active_entry.id.clone(),
+            expected_version: takeover.active_entry.version,
+            create_default_allocation: false,
+        },
+    )
+    .unwrap();
+
+    let snapshot = supabase::workspace_snapshot_create(
+        &device_a,
+        CloudWorkspaceSnapshotCreateRequest {
+            name: "Direct V2 E2E 恢复点".to_string(),
+            note: None,
+            snapshot_type: Some("manual".to_string()),
+            lazy: Some(false),
+        },
+    )
+    .unwrap();
+    let _after_snapshot = supabase::direct_cloud_subject_create(
+        &device_a,
+        crate::subjects::SubjectCreateRequest {
+            name: "恢复后应消失".to_string(),
+        },
+    )
+    .unwrap();
+    let prepared = supabase::workspace_restore_prepare(
+        &device_a,
+        CloudWorkspaceRestorePrepareRequest {
+            snapshot_id: snapshot.id.clone(),
+            create_safety_snapshot: true,
+        },
+    )
+    .unwrap();
+    let restored = supabase::workspace_restore_commit(
+        &device_a,
+        CloudWorkspaceRestoreCommitRequest {
+            lock_token: prepared.lock_token,
+            target_snapshot_id: prepared.target_snapshot_id,
+            target_content_hash: prepared.target_content_hash,
+            prepared_epoch: prepared.prepared_epoch,
+        },
+    )
+    .unwrap();
+    assert!(restored.workspace_epoch > restored.previous_epoch);
+
+    let old_client = cloud_sync::push_outbox(&device_b).unwrap_err();
+    assert!(
+        old_client.contains("direct_v2") || old_client.contains("CLOUD_PROTOCOL_UNSUPPORTED"),
+        "{old_client}"
+    );
+    enter_direct_cloud_mode_for_real_e2e(&device_b, &workspace.id, restored.workspace_epoch);
+    assert!(supabase::direct_cloud_active_timer(&device_b).is_ok());
+
+    assert_eq!(
+        before_a,
+        crate::storage_contract::business_data_fingerprint(&device_a).unwrap()
+    );
+    assert_eq!(
+        before_b,
+        crate::storage_contract::business_data_fingerprint(&device_b).unwrap()
+    );
+    for database in [&device_a, &device_b] {
+        let connection = database.open().unwrap();
+        let outbox: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(outbox, 0);
+    }
 }
 
 #[test]

@@ -65,7 +65,7 @@ TimeGenie 的 `direct_v2` 云端模式把 Supabase 作为计时、未归属时�
 | `ENTITY_DELETED` | 提示目标记录已删除，关闭当前编辑并刷新 |
 | `WORKSPACE_EPOCH_STALE` | 清空当前进程内相关状态并按新 epoch 重查 |
 | `DEVICE_REVOKED` | 进入重新认证/重新授权流程，禁止继续写入 |
-| `CLIENT_UPGRADE_REQUIRED` | 阻止旧协议写入并提示升级客户端 |
+| `CLOUD_PROTOCOL_UNSUPPORTED` | 阻止旧同步入口写入直连工作空间 |
 
 网络错误或超时不能证明操作未提交。客户端会先以稳定 operation ID 幂等重试；仍无法确认时保持只读并通过后续权威查询收敛，不创建本地冲突。
 

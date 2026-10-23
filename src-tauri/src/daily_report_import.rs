@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, OptionalExtension};
@@ -108,6 +109,20 @@ struct ImportItemRow {
     import_actual_minutes: Option<i64>,
     source_fingerprint: String,
     already_imported: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DirectDailyReportImportState {
+    preview: DailyReportImportPreviewResult,
+    source_path_hash: String,
+    fingerprints: HashMap<String, String>,
+    confirmed: Option<DailyReportImportConfirmResult>,
+}
+
+fn direct_daily_report_imports() -> &'static Mutex<HashMap<String, DirectDailyReportImportState>> {
+    static IMPORTS: OnceLock<Mutex<HashMap<String, DirectDailyReportImportState>>> =
+        OnceLock::new();
+    IMPORTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub fn preview(
@@ -219,6 +234,115 @@ pub fn preview(
         warnings: parsed.warnings,
         version: 1,
     })
+}
+
+fn direct_preview(
+    database: &Database,
+    request: DailyReportImportPreviewRequest,
+) -> Result<DailyReportImportPreviewResult, String> {
+    validate_date(&request.source_date)?;
+    validate_target_kind(&request.target_kind)?;
+    crate::supabase::direct_cloud_subject_list(database)?
+        .into_iter()
+        .find(|subject| subject.id == request.subject_id)
+        .ok_or_else(|| "NOT_FOUND: 主体不存在".to_string())?;
+    let connection = database.open()?;
+    let directory = subject_directory(&connection, &request.subject_id)?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "INTEGRATION_NOT_CONFIGURED: 请先在主体设置中配置日报目录".to_string())?;
+    let path = report_path(&directory, &request.source_date);
+    if !path.is_file() {
+        return Err(format!(
+            "SOURCE_NOT_FOUND: 日报文件不存在：{}",
+            path.display()
+        ));
+    }
+    let metadata = fs::metadata(&path)
+        .map_err(|error| format!("无法读取日报文件信息 {}: {error}", path.display()))?;
+    let raw_markdown = fs::read_to_string(&path)
+        .map_err(|error| format!("无法读取日报文件 {}: {error}", path.display()))?;
+    let source_mtime = metadata
+        .modified()
+        .ok()
+        .map(system_time_millis)
+        .unwrap_or(0);
+    let source_content_hash = content_hash(&raw_markdown);
+    let source_path_hash = content_hash(&normalize_path(&path));
+    let parsed = parse_daily_report(&raw_markdown);
+    let fingerprints = parsed
+        .items
+        .iter()
+        .map(|item| item.source_fingerprint.clone())
+        .collect::<Vec<_>>();
+    let imported = crate::supabase::direct_cloud_daily_report_imported_fingerprints(
+        database,
+        request.subject_id.clone(),
+        request.source_date.clone(),
+        request.target_kind.clone(),
+        source_path_hash.clone(),
+        fingerprints,
+    )?
+    .into_iter()
+    .collect::<HashSet<_>>();
+    let batch_id = Uuid::now_v7().to_string();
+    let mut client_to_id = HashMap::new();
+    let mut item_fingerprints = HashMap::new();
+    let mut items = Vec::new();
+    for parsed_item in parsed.items {
+        let id = Uuid::now_v7().to_string();
+        let parent_id = parsed_item
+            .parent_client_id
+            .as_ref()
+            .and_then(|value| client_to_id.get(value))
+            .cloned();
+        client_to_id.insert(parsed_item.client_id, id.clone());
+        item_fingerprints.insert(id.clone(), parsed_item.source_fingerprint.clone());
+        items.push(DailyReportImportPreviewItem {
+            id,
+            parent_id,
+            title: parsed_item.title,
+            status: parsed_item.status,
+            estimate_minutes: parsed_item.estimate_minutes,
+            raw_actual_minutes: parsed_item.raw_actual_minutes,
+            import_actual_minutes: parsed_item.import_actual_minutes,
+            sort_order: parsed_item.sort_order,
+            source_line_no: parsed_item.source_line_no,
+            source_text: parsed_item.source_text,
+            warning: parsed_item.warning,
+            already_imported: imported.contains(&parsed_item.source_fingerprint),
+        });
+    }
+    let preview = DailyReportImportPreviewResult {
+        batch_id: batch_id.clone(),
+        subject_id: request.subject_id,
+        source_date: request.source_date,
+        target_kind: request.target_kind,
+        source_path: path.display().to_string(),
+        source_mtime,
+        source_content_hash,
+        items,
+        warnings: parsed.warnings,
+        version: 1,
+    };
+    let mut registry = direct_daily_report_imports()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    while registry.len() >= 32 {
+        let Some(key) = registry.keys().next().cloned() else {
+            break;
+        };
+        registry.remove(&key);
+    }
+    registry.insert(
+        batch_id,
+        DirectDailyReportImportState {
+            preview: preview.clone(),
+            source_path_hash,
+            fingerprints: item_fingerprints,
+            confirmed: None,
+        },
+    );
+    Ok(preview)
 }
 
 pub fn confirm(
@@ -505,6 +629,144 @@ pub fn confirm(
     transaction.commit().map_err(|error| error.to_string())?;
     crate::cloud_sync::flush_if_online(database)?;
     result.already_confirmed = false;
+    Ok(result)
+}
+
+fn direct_confirm(
+    database: &Database,
+    request: DailyReportImportConfirmRequest,
+) -> Result<DailyReportImportConfirmResult, String> {
+    Uuid::parse_str(&request.client_request_id)
+        .map_err(|_| "VALIDATION_ERROR: 请求标识必须是 UUID".to_string())?;
+    let (preview, source_path_hash, fingerprints) = {
+        let registry = direct_daily_report_imports()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let state = registry
+            .get(&request.batch_id)
+            .ok_or_else(|| "NOT_FOUND: 日报导入预览不存在或应用已重启，请重新预览".to_string())?;
+        if let Some(result) = &state.confirmed {
+            let mut result = result.clone();
+            result.already_confirmed = true;
+            return Ok(result);
+        }
+        if state.preview.version != request.expected_version {
+            return Err("VERSION_CONFLICT: 日报导入预览已变化".to_string());
+        }
+        (
+            state.preview.clone(),
+            state.source_path_hash.clone(),
+            state.fingerprints.clone(),
+        )
+    };
+    let current_metadata = fs::metadata(&preview.source_path)
+        .map_err(|_| "EXTERNAL_FILE_CHANGED: 日报文件已被移动或删除，请重新预览".to_string())?;
+    let current_markdown = fs::read_to_string(&preview.source_path)
+        .map_err(|_| "EXTERNAL_FILE_CHANGED: 日报文件无法读取，请重新预览".to_string())?;
+    let current_mtime = current_metadata
+        .modified()
+        .ok()
+        .map(system_time_millis)
+        .unwrap_or(0);
+    if current_mtime != preview.source_mtime
+        || content_hash(&current_markdown) != preview.source_content_hash
+    {
+        return Err("EXTERNAL_FILE_CHANGED: 日报在预览后已变化，请重新预览".to_string());
+    }
+    let selected = request
+        .selected_item_ids
+        .into_iter()
+        .collect::<HashSet<_>>();
+    if selected.is_empty() {
+        return Err("VALIDATION_ERROR: 请至少选择一条可导入事项".to_string());
+    }
+    let item_by_id = preview
+        .items
+        .iter()
+        .map(|item| (item.id.clone(), item))
+        .collect::<HashMap<_, _>>();
+    if selected.iter().any(|id| !item_by_id.contains_key(id)) {
+        return Err("VALIDATION_ERROR: 选择中包含无效候选".to_string());
+    }
+    let mut required = selected.clone();
+    for id in &selected {
+        let mut cursor = item_by_id.get(id).and_then(|item| item.parent_id.clone());
+        while let Some(parent_id) = cursor {
+            required.insert(parent_id.clone());
+            cursor = item_by_id
+                .get(&parent_id)
+                .and_then(|item| item.parent_id.clone());
+        }
+    }
+    let items = preview
+        .items
+        .iter()
+        .filter(|item| required.contains(&item.id))
+        .map(|item| {
+            let explicitly_selected = selected.contains(&item.id);
+            serde_json::json!({
+                "id": item.id,
+                "parentId": item.parent_id,
+                "title": item.title,
+                "status": item.status,
+                "estimateMinutes": explicitly_selected.then_some(item.estimate_minutes).flatten(),
+                "importActualMinutes": explicitly_selected.then_some(item.import_actual_minutes).flatten(),
+                "sortOrder": item.sort_order,
+                "sourceFingerprint": fingerprints.get(&item.id),
+                "selected": explicitly_selected,
+                "alreadyImported": item.already_imported,
+            })
+        })
+        .collect::<Vec<_>>();
+    let response = crate::supabase::direct_cloud_daily_report_import_confirm_mutation(
+        database,
+        request.client_request_id,
+        serde_json::json!({
+            "batchId": request.batch_id,
+            "subjectId": preview.subject_id,
+            "sourceDate": preview.source_date,
+            "targetKind": preview.target_kind,
+            "sourcePathHash": source_path_hash,
+            "items": items,
+        }),
+    )?;
+    let tasks = response
+        .get("tasks")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|value| {
+            serde_json::from_value::<crate::supabase::DirectCloudTaskData>(value)
+                .map(TaskDto::from)
+                .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 日报导入事项响应无效: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let result = DailyReportImportConfirmResult {
+        batch_id: preview.batch_id.clone(),
+        target_kind: preview.target_kind,
+        source_date: preview.source_date,
+        created_count: response
+            .get("createdCount")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(tasks.len() as u64) as usize,
+        skipped_count: response
+            .get("skippedCount")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize,
+        adjustment_count: response
+            .get("adjustmentCount")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize,
+        tasks,
+        already_confirmed: false,
+    };
+    let mut registry = direct_daily_report_imports()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(state) = registry.get_mut(&preview.batch_id) {
+        state.confirmed = Some(result.clone());
+    }
     Ok(result)
 }
 
@@ -798,14 +1060,28 @@ pub fn daily_report_import_preview(
     database: tauri::State<'_, Database>,
     request: DailyReportImportPreviewRequest,
 ) -> Result<DailyReportImportPreviewResult, String> {
-    preview(&database, request)
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Query,
+        |database| preview(database, request),
+        |database| direct_preview(database, direct_request),
+    )
 }
 #[tauri::command]
 pub fn daily_report_import_confirm(
     database: tauri::State<'_, Database>,
     request: DailyReportImportConfirmRequest,
 ) -> Result<DailyReportImportConfirmResult, String> {
-    confirm(&database, request)
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| confirm(database, request),
+        |database| direct_confirm(database, direct_request),
+    )
 }
 
 #[cfg(test)]

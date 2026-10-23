@@ -15,7 +15,7 @@ pub struct TodayWorkOverviewRequest {
     pub trend_days: Option<i64>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TodayWorkOverviewScopeDto {
     pub subject_id: Option<String>,
@@ -23,7 +23,7 @@ pub struct TodayWorkOverviewScopeDto {
     pub today_date: String,
 }
 
-#[derive(Debug, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TodayWorkOverviewSummaryDto {
     pub actual_minutes: i64,
@@ -35,7 +35,7 @@ pub struct TodayWorkOverviewSummaryDto {
     pub completion_rate: f64,
 }
 
-#[derive(Debug, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TodayWorkOverviewDayDto {
     pub date: String,
@@ -46,7 +46,7 @@ pub struct TodayWorkOverviewDayDto {
     pub unassigned_minutes: i64,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TodayWorkOverviewTimelineItemDto {
     pub id: String,
@@ -61,7 +61,7 @@ pub struct TodayWorkOverviewTimelineItemDto {
     pub state: Option<String>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TodayWorkOverviewTaskDto {
     pub task_id: String,
@@ -77,7 +77,7 @@ pub struct TodayWorkOverviewTaskDto {
     pub selectable: bool,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TodayWorkOverviewDto {
     pub scope: TodayWorkOverviewScopeDto,
@@ -880,7 +880,19 @@ pub fn today_work_overview_get(
     database: tauri::State<'_, Database>,
     request: TodayWorkOverviewRequest,
 ) -> Result<TodayWorkOverviewDto, String> {
-    get_today_work_overview(&database, request)
+    let direct_request = TodayWorkOverviewRequest {
+        subject_id: request.subject_id.clone(),
+        today_date: request.today_date.clone(),
+        history_days: request.history_days,
+        trend_days: request.trend_days,
+    };
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Planning,
+        crate::storage_contract::StorageOperation::Query,
+        |database| get_today_work_overview(database, request),
+        |database| crate::supabase::direct_cloud_today_overview(database, direct_request),
+    )
 }
 
 #[cfg(test)]

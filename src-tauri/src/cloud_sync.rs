@@ -10,10 +10,15 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Notify;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use url::Url;
 use uuid::Uuid;
 
 use crate::database::Database;
+use crate::direct_cloud_realtime::{
+    realtime_change_seq, realtime_reconnect_delay, realtime_url, realtime_workspace_invalidation,
+    WorkspaceInvalidation,
+};
+#[cfg(test)]
+use crate::direct_cloud_realtime::{realtime_refresh_domains, REALTIME_RECONNECT_MAX_SECONDS};
 use crate::supabase::{
     client, current_session, direct_cloud_workbench_bootstrap, ensure_current_device_authorized,
     mark_auth_blocked, storage_mode, CLOUD_SCHEMA,
@@ -21,7 +26,6 @@ use crate::supabase::{
 
 const REALTIME_HEARTBEAT_SECONDS: u64 = 25;
 const REALTIME_RECONNECT_SECONDS: u64 = 5;
-const REALTIME_RECONNECT_MAX_SECONDS: u64 = 60;
 const OUTBOX_SENDING_STALE_AFTER_MILLIS: i64 = 5 * 60 * 1000;
 const OUTBOX_RETRY_MAX_BACKOFF_MILLIS: i64 = 60 * 1000;
 const SYNC_SETTLE_GRACE_MILLIS: u64 = 1_500;
@@ -267,6 +271,7 @@ fn spawn_tracking_lease_maintainer(database: Database, app: AppHandle) {
 
 fn acquire_or_renew_tracking_lease(database: &Database) -> Result<Value, String> {
     let _operation_guard = cloud_sync_operation_guard();
+    reject_direct_cloud_legacy_sync_api(database, "旧计时租约维护")?;
     let token = current_tracking_lease_token(database);
     let result = if let Some(token) = token {
         match renew_lease_locked(
@@ -421,6 +426,7 @@ fn spawn_realtime_listener(database: Database, app: AppHandle) {
                 reconnect_attempt = 0;
                 continue;
             }
+            crate::direct_cloud_observability::record_realtime_reconnect(&workspace_id);
             let delay = realtime_reconnect_delay(reconnect_attempt, now_millis() as u64);
             reconnect_attempt = reconnect_attempt.saturating_add(1);
             tokio::select! {
@@ -429,18 +435,6 @@ fn spawn_realtime_listener(database: Database, app: AppHandle) {
             }
         }
     });
-}
-
-fn realtime_reconnect_delay(attempt: u32, jitter_seed: u64) -> Duration {
-    let exponent = attempt.min(4);
-    let base_millis = REALTIME_RECONNECT_SECONDS
-        .saturating_mul(1_u64 << exponent)
-        .saturating_mul(1_000)
-        .min(REALTIME_RECONNECT_MAX_SECONDS * 1_000);
-    let jitter_window = (base_millis / 5).max(1);
-    Duration::from_millis(
-        (base_millis + jitter_seed % jitter_window).min(REALTIME_RECONNECT_MAX_SECONDS * 1_000),
-    )
 }
 
 async fn run_realtime_connection(
@@ -580,79 +574,6 @@ async fn run_realtime_connection(
     }
 }
 
-fn realtime_change_seq(message: &Value) -> Option<i64> {
-    message
-        .pointer("/payload/data/record/change_seq")
-        .or_else(|| message.pointer("/payload/record/change_seq"))
-        .or_else(|| message.pointer("/payload/data/new/change_seq"))
-        .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WorkspaceInvalidation {
-    workspace_id: String,
-    change_seq: i64,
-    workspace_epoch: i64,
-    domains: Vec<String>,
-    source: String,
-}
-
-fn realtime_workspace_invalidation(
-    message: &Value,
-    expected_workspace_id: &str,
-    workspace_epoch: i64,
-) -> Option<WorkspaceInvalidation> {
-    let record = message
-        .pointer("/payload/data/record")
-        .or_else(|| message.pointer("/payload/record"))
-        .or_else(|| message.pointer("/payload/data/new"))?;
-    let change_seq = record
-        .get("change_seq")
-        .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))?;
-    let workspace_id = record
-        .get("workspace_id")
-        .and_then(Value::as_str)
-        .filter(|value| *value == expected_workspace_id)?;
-    let domains = record
-        .get("entity_type")
-        .and_then(Value::as_str)
-        .map(realtime_refresh_domains)
-        .unwrap_or_default();
-    if domains.is_empty() {
-        return None;
-    }
-    Some(WorkspaceInvalidation {
-        workspace_id: workspace_id.to_string(),
-        change_seq,
-        workspace_epoch,
-        domains: domains.into_iter().map(str::to_string).collect(),
-        source: "realtime".to_string(),
-    })
-}
-
-fn realtime_refresh_domains(entity_type: &str) -> Vec<&'static str> {
-    match entity_type {
-        "subjects" | "subject_work_schedules" => vec!["subjects"],
-        "tasks"
-        | "task_status_events"
-        | "task_daily_estimates"
-        | "task_day_plans"
-        | "task_recurrence_rules"
-        | "task_occurrences" => vec!["tasks"],
-        "work_days"
-        | "time_entries"
-        | "time_segments"
-        | "time_allocations"
-        | "actual_time_adjustments"
-        | "actual_adjustment_batches" => vec!["time"],
-        "unassigned_sessions" | "unassigned_segments" => vec!["unassigned"],
-        "report_templates" | "reports" | "report_tasks" => vec!["reports"],
-        "app_settings" | "integration_configs" | "external_bindings" => vec!["settings"],
-        _ => Vec::new(),
-    }
-}
-
 fn current_workspace_epoch(database: &Database, workspace_id: &str) -> Result<i64, String> {
     database
         .open()?
@@ -664,24 +585,6 @@ fn current_workspace_epoch(database: &Database, workspace_id: &str) -> Result<i6
         .optional()
         .map(|value| value.unwrap_or(1))
         .map_err(|error| error.to_string())
-}
-
-fn realtime_url(project_url: &str, anon_key: &str) -> Result<Url, String> {
-    let mut url = Url::parse(project_url)
-        .map_err(|_| "CLOUD_NOT_CONFIGURED: Supabase Project URL 无效".to_string())?;
-    let websocket_scheme = match url.scheme() {
-        "https" => "wss",
-        "http" => "ws",
-        _ => return Err("CLOUD_NOT_CONFIGURED: Supabase Realtime 地址无效".to_string()),
-    };
-    url.set_scheme(websocket_scheme)
-        .map_err(|_| "CLOUD_NOT_CONFIGURED: Supabase Realtime 地址无效".to_string())?;
-    url.set_path("/realtime/v1/websocket");
-    url.set_query(None);
-    url.query_pairs_mut()
-        .append_pair("apikey", anon_key)
-        .append_pair("vsn", "1.0.0");
-    Ok(url)
 }
 
 fn emit_cloud_refresh_domains(
@@ -1549,6 +1452,7 @@ fn pull_locked(
     database: &Database,
     request: CloudSyncPullRequest,
 ) -> Result<CloudSyncPullResult, String> {
+    reject_direct_cloud_legacy_sync_api(database, "增量同步拉取")?;
     let state = storage_mode(database)?;
     if state.mode != "cloud" {
         return Err("OFFLINE_RESTRICTED: 只有云端模式可以拉取 Supabase 增量".to_string());
@@ -3613,7 +3517,10 @@ fn ensure_supported_cloud_entity_type(entity_type: &str) -> Result<(), String> {
 
 fn flush_if_online_with_signal_result(database: &Database) -> Result<bool, String> {
     if CLOUD_SYNC_ENABLED.load(Ordering::Acquire) {
-        if storage_mode(database).is_ok_and(|state| state.mode != "cloud") {
+        if storage_mode(database).is_ok_and(|state| {
+            state.mode != "cloud"
+                || state.storage_protocol == crate::storage_contract::DIRECT_CLOUD_PROTOCOL
+        }) {
             return Ok(false);
         }
         signal_cloud_sync(SYNC_SIGNAL_LOCAL_DIRTY, None);
@@ -3665,6 +3572,7 @@ fn push_outbox_locked(
     retry_immediately: bool,
     drain_queue: bool,
 ) -> Result<CloudSyncPushResult, String> {
+    reject_direct_cloud_legacy_sync_api(database, "旧同步队列提交")?;
     let state = require_cloud(database)?;
     recover_interrupted_sending_operations(database, &state.workspace_id)?;
     mark_historical_timer_recovery_candidates(database, &state.workspace_id)?;
@@ -4118,7 +4026,7 @@ fn drain_legacy_queue_locked(database: &Database) -> Result<LegacyQueueDrainResu
         return Err("CLOUD_MODE_REQUIRED: 只有云端模式可以处理旧同步队列".to_string());
     }
     if state.storage_protocol != crate::storage_contract::LEGACY_SYNC_PROTOCOL {
-        return Err("CLIENT_UPGRADE_REQUIRED: 当前工作空间已不是旧同步协议".to_string());
+        return Err("CLOUD_PROTOCOL_UNSUPPORTED: 当前工作空间已不是旧同步协议".to_string());
     }
     if !state.online {
         return Err("AUTH_REQUIRED: 云端会话不可用，无法完成旧同步队列".to_string());
@@ -5254,7 +5162,9 @@ fn rollback_losing_unassigned_dependent(
 
 pub fn list_conflicts(database: &Database) -> Result<Vec<CloudSyncConflict>, String> {
     let state = storage_mode(database)?;
-    if state.mode != "cloud" {
+    if state.mode != "cloud"
+        || state.storage_protocol == crate::storage_contract::DIRECT_CLOUD_PROTOCOL
+    {
         return Ok(Vec::new());
     }
     let mut conflicts = list_local_conflicts(database, &state.workspace_id)?;
@@ -5357,6 +5267,7 @@ pub fn resolve_conflict(
     database: &Database,
     request: CloudConflictResolveRequest,
 ) -> Result<CloudSyncStatus, String> {
+    reject_direct_cloud_legacy_sync_api(database, "同步冲突处理")?;
     let state = require_cloud(database)?;
     let conflict = load_conflict(database, &state.workspace_id, &request.operation_id)?;
     resolve_loaded_conflict(database, &state, &conflict, &request.strategy, None)?;
@@ -5373,6 +5284,7 @@ pub fn resolve_all_conflicts(
     database: &Database,
     request: CloudConflictResolveAllRequest,
 ) -> Result<CloudSyncStatus, String> {
+    reject_direct_cloud_legacy_sync_api(database, "批量同步冲突处理")?;
     let state = require_cloud(database)?;
     validate_conflict_strategy(&request.strategy)?;
     let mut attempts_by_operation = HashMap::<String, usize>::new();
@@ -6478,6 +6390,7 @@ fn cloud_entity_payload<'a>(
 }
 
 pub fn pull_snapshot(database: &Database) -> Result<i64, String> {
+    reject_direct_cloud_legacy_sync_api(database, "本地业务缓存快照下载")?;
     let state = storage_mode(database)?;
     if state.mode != "cloud" {
         return Err("OFFLINE_RESTRICTED: 当前不是 Supabase 云端模式".to_string());
@@ -6500,6 +6413,7 @@ const LOCAL_CACHE_RESET_ENTITIES: &[(&str, &str)] = &[
 
 pub fn preview_local_cache_reset(database: &Database) -> Result<LocalCacheResetPreview, String> {
     let _operation_guard = cloud_sync_operation_guard();
+    reject_direct_cloud_legacy_sync_api(database, "本地业务缓存重置预览")?;
     let state = storage_mode(database)?;
     if state.mode != "cloud" {
         return Err("OFFLINE_RESTRICTED: 当前不是 Supabase 云端模式".to_string());
@@ -6594,6 +6508,7 @@ fn pull_snapshot_for_epoch(
 
 pub fn reset_local_cache_from_cloud(database: &Database) -> Result<CloudSyncStatus, String> {
     let _operation_guard = cloud_sync_operation_guard();
+    reject_direct_cloud_legacy_sync_api(database, "本地业务缓存重置")?;
     let state = storage_mode(database)?;
     if state.mode != "cloud" {
         return Err("OFFLINE_RESTRICTED: 当前不是 Supabase 云端模式".to_string());
@@ -6640,6 +6555,7 @@ pub(crate) fn rebuild_local_cache_after_workspace_restore_locked(
     restored_epoch: i64,
     reset_change_seq: i64,
 ) -> Result<CloudSyncStatus, String> {
+    reject_direct_cloud_legacy_sync_api(database, "云端恢复后的本地业务缓存重建")?;
     let state = storage_mode(database)?;
     if state.mode != "cloud" {
         return Err("OFFLINE_RESTRICTED: 当前不是 Supabase 云端模式".to_string());
@@ -6694,6 +6610,7 @@ pub fn discard_old_epoch_changes_and_redownload(
     database: &Database,
 ) -> Result<CloudSyncStatus, String> {
     let _operation_guard = cloud_sync_operation_guard();
+    reject_direct_cloud_legacy_sync_api(database, "旧世代队列放弃和本地缓存重建")?;
     let state = storage_mode(database)?;
     if state.mode != "cloud" || !state.epoch_blocked {
         return Err("WORKSPACE_EPOCH_NOT_BLOCKED: 当前设备没有待处理的旧世代修改".to_string());
@@ -6786,6 +6703,7 @@ fn finish_cache_rebuild_sync_with(
 
 pub fn acquire_lease(database: &Database) -> Result<Value, String> {
     let _operation_guard = cloud_sync_operation_guard();
+    reject_direct_cloud_legacy_sync_api(database, "旧计时租约获取")?;
     acquire_lease_locked(database)
 }
 
@@ -6807,6 +6725,7 @@ fn acquire_lease_locked(database: &Database) -> Result<Value, String> {
 
 pub fn renew_lease(database: &Database, request: TrackingLeaseRequest) -> Result<Value, String> {
     let _operation_guard = cloud_sync_operation_guard();
+    reject_direct_cloud_legacy_sync_api(database, "旧计时租约续期")?;
     renew_lease_locked(database, request)
 }
 
@@ -6826,6 +6745,7 @@ fn renew_lease_locked(database: &Database, request: TrackingLeaseRequest) -> Res
 
 pub fn release_lease(database: &Database, request: TrackingLeaseRequest) -> Result<Value, String> {
     let _operation_guard = cloud_sync_operation_guard();
+    reject_direct_cloud_legacy_sync_api(database, "旧计时租约释放")?;
     release_lease_locked(database, request)
 }
 
@@ -6847,6 +6767,7 @@ fn release_lease_locked(
 }
 
 pub fn get_lease(database: &Database) -> Result<Value, String> {
+    reject_direct_cloud_legacy_sync_api(database, "旧计时租约查询")?;
     let state = require_cloud(database)?;
     let session = current_session(database)?;
     let api = client(database)?;
@@ -6867,6 +6788,7 @@ pub fn legacy_cloud_timer_start_local_first(
     database: &Database,
     request: CloudTimerStartRequest,
 ) -> Result<crate::time_tracking::TimeEntryDto, String> {
+    reject_direct_cloud_legacy_sync_api(database, "旧版本地优先计时开始")?;
     crate::time_tracking::start_timer_with_hooks_for_sync(
         database,
         crate::time_tracking::TimerStartRequest {
@@ -6881,6 +6803,7 @@ pub fn legacy_cloud_timer_pause_local_first(
     database: &Database,
     request: CloudTimerVersionRequest,
 ) -> Result<crate::time_tracking::TimeEntryDto, String> {
+    reject_direct_cloud_legacy_sync_api(database, "旧版本地优先计时暂停")?;
     crate::time_tracking::pause_timer_for_sync(
         database,
         crate::time_tracking::TimerVersionRequest {
@@ -6894,6 +6817,7 @@ pub fn legacy_cloud_timer_resume_local_first(
     database: &Database,
     request: CloudTimerVersionRequest,
 ) -> Result<crate::time_tracking::TimeEntryDto, String> {
+    reject_direct_cloud_legacy_sync_api(database, "旧版本地优先计时继续")?;
     crate::time_tracking::resume_timer_for_sync(
         database,
         crate::time_tracking::TimerResumeRequest {
@@ -6908,6 +6832,7 @@ pub fn legacy_cloud_timer_stop_local_first(
     database: &Database,
     request: CloudTimerVersionRequest,
 ) -> Result<crate::time_tracking::TimeEntryDto, String> {
+    reject_direct_cloud_legacy_sync_api(database, "旧版本地优先计时停止")?;
     crate::time_tracking::stop_timer_with_hooks_for_sync(
         database,
         crate::time_tracking::TimerStopRequest {
@@ -6927,6 +6852,21 @@ fn require_cloud(database: &Database) -> Result<crate::supabase::StorageModeSnap
         return Err("AUTH_REQUIRED: 云端会话不可用".to_string());
     }
     Ok(state)
+}
+
+fn reject_direct_cloud_legacy_sync_api(
+    database: &Database,
+    capability: &str,
+) -> Result<(), String> {
+    let state = storage_mode(database)?;
+    if state.mode == "cloud"
+        && state.storage_protocol == crate::storage_contract::DIRECT_CLOUD_PROTOCOL
+    {
+        return Err(format!(
+            "DIRECT_CLOUD_LEGACY_SYNC_DISABLED: direct_v2 不支持{capability}"
+        ));
+    }
+    Ok(())
 }
 
 fn entity_payload(
@@ -8901,14 +8841,19 @@ pub fn cloud_sync_queue(
     database: tauri::State<'_, Database>,
 ) -> Result<Vec<CloudSyncQueueItem>, String> {
     let state = storage_mode(&database)?;
-    if state.mode != "cloud" {
+    if state.mode != "cloud"
+        || state.storage_protocol == crate::storage_contract::DIRECT_CLOUD_PROTOCOL
+    {
         return Ok(Vec::new());
     }
     list_sync_queue(&database, &state.workspace_id)
 }
 
 #[tauri::command]
-pub fn cloud_sync_refresh(_database: tauri::State<'_, Database>) -> Result<(), String> {
+pub fn cloud_sync_refresh(database: tauri::State<'_, Database>) -> Result<(), String> {
+    if storage_mode(&database)?.storage_protocol == crate::storage_contract::DIRECT_CLOUD_PROTOCOL {
+        return Ok(());
+    }
     signal_cloud_sync(SYNC_SIGNAL_MANUAL_RETRY, None);
     Ok(())
 }
@@ -9012,6 +8957,7 @@ pub fn refresh_unassigned_state_for_cloud_mode(
     if state.mode != "cloud" {
         return crate::unassigned::get_state(database);
     }
+    reject_direct_cloud_legacy_sync_api(database, "旧版未归属时间本地缓存刷新")?;
     let (result, sync_changed) =
         crate::unassigned::get_state_with_cloud_context_and_sync_change(database, Some(&state))?;
     if sync_changed {
@@ -9084,6 +9030,7 @@ pub fn cloud_timer_start(
 pub fn cloud_timer_get_state(
     database: tauri::State<'_, Database>,
 ) -> Result<Option<crate::time_tracking::TimeEntryDto>, String> {
+    reject_direct_cloud_legacy_sync_api(&database, "旧版计时本地缓存读取")?;
     crate::time_tracking::get_timer_state(&database)
 }
 
@@ -9092,6 +9039,7 @@ pub fn cloud_time_entry_list(
     database: tauri::State<'_, Database>,
     work_date: String,
 ) -> Result<crate::time_tracking::TimeEntryListResult, String> {
+    reject_direct_cloud_legacy_sync_api(&database, "旧版时间记录本地缓存读取")?;
     crate::time_tracking::list_time_entries(
         &database,
         crate::time_tracking::TimeEntryListRequest {
@@ -9146,6 +9094,7 @@ pub fn cloud_unassigned_resolve_work(
     database: tauri::State<'_, Database>,
     request: CloudUnassignedResolveRequest,
 ) -> Result<crate::unassigned::UnassignedResolveResult, String> {
+    reject_direct_cloud_legacy_sync_api(&database, "旧版未归属时间本地写入")?;
     let allocations = request
         .allocations
         .unwrap_or_default()
@@ -9169,6 +9118,7 @@ pub fn cloud_unassigned_resolve_break(
     database: tauri::State<'_, Database>,
     request: CloudUnassignedResolveRequest,
 ) -> Result<crate::unassigned::UnassignedResolveResult, String> {
+    reject_direct_cloud_legacy_sync_api(&database, "旧版未归属休息本地写入")?;
     crate::unassigned::resolve_break_for_sync(
         &database,
         crate::unassigned::ResolveSessionRequest {
@@ -9184,6 +9134,7 @@ pub fn cloud_unassigned_discard(
     database: tauri::State<'_, Database>,
     request: CloudUnassignedResolveRequest,
 ) -> Result<crate::unassigned::UnassignedResolveResult, String> {
+    reject_direct_cloud_legacy_sync_api(&database, "旧版未归属时间本地丢弃")?;
     crate::unassigned::discard_for_sync(
         &database,
         crate::unassigned::ResolveSessionRequest {
@@ -12611,6 +12562,85 @@ mod tests {
             )
             .unwrap();
         (directory, database, cloud_workspace_id)
+    }
+
+    fn switch_test_database_to_direct_v2(database: &Database) {
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "INSERT INTO device_settings(key, value_json, updated_at)
+                 VALUES('cloud_storage_protocol', '\"direct_v2\"', 1)
+                 ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+                [],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn direct_v2_legacy_sync_entrypoints_are_disabled_without_local_writes() {
+        let (_directory, database, workspace_id) =
+            cloud_database_with_outbox_state("direct-v2-legacy-disabled.sqlite3", "pending");
+        switch_test_database_to_direct_v2(&database);
+        let before = crate::storage_contract::business_data_fingerprint(&database).unwrap();
+
+        for error in [
+            push_outbox_with_retry_mode(&database, true, true).unwrap_err(),
+            pull(
+                &database,
+                CloudSyncPullRequest {
+                    after_change_seq: None,
+                    limit: None,
+                },
+            )
+            .unwrap_err(),
+            pull_snapshot(&database).unwrap_err(),
+            preview_local_cache_reset(&database).unwrap_err(),
+            reset_local_cache_from_cloud(&database).unwrap_err(),
+            discard_old_epoch_changes_and_redownload(&database).unwrap_err(),
+            acquire_lease(&database).unwrap_err(),
+            get_lease(&database).unwrap_err(),
+        ] {
+            assert!(
+                error.starts_with("DIRECT_CLOUD_LEGACY_SYNC_DISABLED:"),
+                "unexpected error: {error}"
+            );
+        }
+
+        assert!(list_conflicts(&database).unwrap().is_empty());
+        assert_eq!(
+            list_sync_queue(&database, &workspace_id).unwrap().len(),
+            1,
+            "legacy queue remains available for explicit upgrade rescue diagnostics"
+        );
+        assert_eq!(
+            before,
+            crate::storage_contract::business_data_fingerprint(&database).unwrap()
+        );
+    }
+
+    #[test]
+    fn direct_v2_rejects_legacy_local_first_timer_before_creating_outbox() {
+        let (_directory, database, _) =
+            cloud_database_with_outbox_state("direct-v2-legacy-timer.sqlite3", "pending");
+        switch_test_database_to_direct_v2(&database);
+        let before = crate::storage_contract::business_data_fingerprint(&database).unwrap();
+
+        let error = legacy_cloud_timer_start_local_first(
+            &database,
+            CloudTimerStartRequest {
+                task_id: None,
+                note: Some("must not be stored locally".to_string()),
+                operation_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.starts_with("DIRECT_CLOUD_LEGACY_SYNC_DISABLED:"));
+        assert_eq!(
+            before,
+            crate::storage_contract::business_data_fingerprint(&database).unwrap()
+        );
     }
 
     #[test]

@@ -3,11 +3,13 @@
 > 日期：2026-09-24  
 > 对应 OpenSpec change：`create-work-report-assistant-desktop-app`  
 > 阶段：UI 确认后的正式实现设计，不执行建库和数据写入
+>
+> 2026-10-23 更新：本文早期章节保留了 `sync_v1` 的历史设计，供旧工作空间升级与救援时参考；当前云端正式模型以文末“`direct_v2` 当前数据边界”为准。
 
 ## 1. 设计结论
 
 - 正式版本支持两种数据模式：`local` 本地模式和 `cloud` Supabase 云端模式。用户可以只使用本地模式，也可以登录 Supabase 在多台机器间共享同一份数据。
-- 本地模式以 SQLite 为唯一主数据源；云端模式以 Supabase PostgreSQL 为最终权威主数据源，SQLite 作为本机缓存、离线读取、同步状态和待同步操作队列。
+- 本地模式以 SQLite 为唯一主数据源；`direct_v2` 云端模式以 Supabase PostgreSQL 为唯一业务主数据源，本机只保留连接、会话引用、设备身份和刷新检查点等设备元数据。旧 `sync_v1` 才使用 SQLite 业务缓存、同步状态和待同步队列。
 - 同一个数据空间在任一时刻只能选择一种权威模式，不允许 SQLite 与 Supabase 同时各自接受无约束写入。
 - Vue 当前使用的 `localStorage`、页面内 mock 数组和 `BroadcastChannel` 仅用于 UI 阶段，正式实现后不得继续作为业务事实来源。
 - “主体”是普通可编辑实体。名称为“默认”的主体与其他主体数据结构相同，默认选择由设置项引用，不在 UI 中显示特殊标识。
@@ -62,8 +64,8 @@ report_templates 1 ── n reports(generator reference, logical)
 plan_import_batches 1 ── n plan_import_items 0..1 ── 1 tasks
 sync_runs 1 ── n sync_items
 
-本地 SQLite（仅云端模式缓存）：
-local_sync_state 1 ── n sync_outbox
+本机设备元数据：`device_settings`、设备身份、凭据库引用、`local_sync_state` 刷新检查点
+旧 `sync_v1` 兼容数据：`local_sync_state` 1 ── n `sync_outbox`
 ```
 
 ## 4. 通用约定
@@ -98,12 +100,12 @@ SQLite 中 `created_at/updated_at/deleted_at` 使用 UTC 毫秒；Supabase 中�
 ### 4.3 双模式与离线规则
 
 - `storage_mode='local'`：全部业务读写直接进入 SQLite，不需要网络或账号。
-- `storage_mode='cloud'`：Supabase 是最终权威数据源。业务写操作先在本机 SQLite 事务中保存并写入 `sync_outbox`；在线时立即尝试推送，断网、失败或冲突时保留本机结果并在界面明确标识“等待同步”或“需处理冲突”。
-- 云端模式的 SQLite 缓存在 outbox 清空后可以从 Supabase 重新构建；有待同步、失败或冲突操作时不得用云端快照覆盖本机编辑。
-- 所有离线操作携带 `operation_id`、`device_id`、`base_version` 和完整业务参数。Supabase 以 `operation_id` 幂等，避免重试造成重复数据。
-- Realtime 只作为变更通知，不作为唯一数据传输渠道。客户端收到通知后按 `workspace_changes.change_seq` 增量拉取。
-- 云端删除使用软删除并写入变更日志，离线设备才能收到删除墓碑。
-- 本地切换云端必须走显式迁移预览；云端切换本地会创建一份独立快照，之后不再自动同步，避免形成双主。
+- `storage_mode='cloud'` 且 `storage_protocol='direct_v2'`：查询直接读取 Supabase，mutation 在云端事务中提交成功后才算成功；不得写 SQLite 业务表或创建 `sync_outbox`。
+- 云端网络、会话或服务不可用时进入只读。当前进程已加载的数据可以查看，但不在本机暂存修改；重新查询云端成功后才恢复可写。
+- `operation_id` 是云端 mutation 的稳定幂等键，用于响应丢失后的结果查询或原样重试，不代表本地离线队列。
+- Realtime 只携带 workspace、`change_seq`、epoch 和领域失效信息；客户端按领域重新查询权威数据，不把消息实体落入 SQLite。
+- 本地空间与云端空间独立。切换模式不复制、合并或覆盖数据；只有用户明确执行的一次性双向复制可以完整替换目标空间。
+- `sync_v1` 的本地缓存、outbox、增量拉取和冲突处理只在升级兼容与救援章节中有效。
 
 ### 4.4 派生字段
 
@@ -662,9 +664,9 @@ Supabase `anon` key 可以随应用配置或连接配置保存，不属于管理
 
 SeaTable Token、Supabase refresh token 等敏感值应使用 Windows Credential Manager 或等价系统凭据存储。普通数据库导出、报告和日志不得包含完整凭据。
 
-### 5.17 云端模式本地同步表
+### 5.17 旧 `sync_v1` 本地同步表
 
-这些表只存在于设备 SQLite，不上传 Supabase。
+这些表只存在于设备 SQLite，不上传 Supabase。`direct_v2` 日常业务不得读取或写入它们；其中 `local_sync_state` 只允许保留 workspace epoch、change sequence 等设备级刷新检查点。
 
 #### `local_sync_state`
 
@@ -913,13 +915,13 @@ preview ──确认──> running ──全部成功──> succeeded
 4. 写入日报、周报、月报三份内置模板。
 5. 写入 `unassigned_prompt_seconds=300` 和当前时区。
 
-云端模式首次登录初始化：
+`direct_v2` 云端模式首次登录初始化：
 
 1. 使用 Supabase Auth 登录并创建/读取当前用户唯一工作空间。
 2. 注册当前设备。
 3. 工作空间为空时创建“默认”主体、内置模板和默认共享设置。
-4. 全量下载云端数据到本机 SQLite 缓存，记录最大 `change_seq`。
-5. 启动 Realtime 订阅和后台采集租约竞争。
+4. 直接查询 Supabase 工作台数据，只在设备元数据中记录 workspace epoch 与最大 `change_seq`。
+5. 启动 Realtime 失效通知和云端计时写资格协调，不创建本地业务缓存或 outbox。
 
 本地数据切换云端时必须先显示迁移预览，包括实体数量、重复工作空间状态和冲突项。迁移通过幂等操作批次写入；全部成功后才把设备 `storage_mode` 切换为 `cloud`。云端导出本地时创建新的本地工作空间快照，之后不再与原云端空间同步。
 
@@ -960,3 +962,12 @@ UI mock 数据只用于开发演示，不应自动写入用户正式数据库。
 - `legacySync`：`sync_v1` 兼容期使用的 outbox、增量状态、冲突与租约数据；直连模式不得把它们作为日常业务数据源。
 
 本地空间和云端空间互相独立，只有显式的一次性复制流程可以读取源空间并完整替换目标空间；切换存储模式本身不会合并或覆盖业务数据。
+
+## `direct_v2` 当前数据边界
+
+- `timegenie.workspaces.storage_protocol` 只允许 `sync_v1` 与 `direct_v2`；已有工作空间默认保持 `sync_v1`，必须完成队列处置后显式升级。
+- 云端业务表、`processed_operations`、`workspace_changes`、操作记录和工作空间快照都保存在 Supabase；快照直接从同一云端一致性边界读取。
+- 本机允许持久化 `storage_mode`、Supabase URL、anon/publishable key、凭据库引用、设备 ID、workspace epoch、change sequence、本机路径和界面偏好，不允许持久化 access token、密码、`service_role` 或云端业务页面副本。
+- 云端快照恢复由 `workspace_restore_prepare` 与 `workspace_restore_commit` 原子提升 workspace epoch；客户端清空进程内领域数据并重新查询，不重建 SQLite 业务缓存。
+- 升级后的工作空间拒绝旧 outbox、增量写、租约写和旧恢复入口，统一返回 `CLOUD_PROTOCOL_UNSUPPORTED`；协议不得降回 `sync_v1`。日常直连请求不使用客户端数字版本门槛。
+- 紧急只读期间保留 Auth、RLS、查询、快照和导出，拒绝全部直连 mutation；恢复后客户端必须先重新查询，禁止回退到旧 outbox。

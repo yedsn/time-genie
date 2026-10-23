@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workbench = fs.readFileSync(path.join(root, "src-ui/src/views/MainWorkbench.vue"), "utf8");
 const snapshots = fs.readFileSync(path.join(root, "src-ui/src/components/CloudSnapshotsSettings.vue"), "utf8");
+const presentation = fs.readFileSync(path.join(root, "src-ui/src/services/cloudSyncPresentation.ts"), "utf8");
 const service = fs.readFileSync(path.join(root, "src-ui/src/services/tauri.ts"), "utf8");
 const rust = fs.readFileSync(path.join(root, "src-tauri/src/supabase.rs"), "utf8");
 const lib = fs.readFileSync(path.join(root, "src-tauri/src/lib.rs"), "utf8");
@@ -18,13 +19,10 @@ for (const expected of [
   "cloudBusinessReadOnly", "cloudReadOnlyReason", "data-cloud-readonly-banner",
   "rejectCloudReadonlyMutation", "if (rejectCloudReadonlyMutation()) return;",
   `:disabled="cloudBusinessReadOnly && store.activePage !== 'settings'"`,
-  "directCloudEnabled &&", "!directCloudEnabled && storageState.pendingOperations",
-  "storageState?.mode === 'cloud' && !directCloudEnabled",
-  "升级为 Supabase 直连云端", "工作空间切换后不能降回旧同步协议",
-  "受影响的其他设备", "完成旧队列后升级", "救援后放弃旧修改",
-  "CLIENT_UPGRADE_REQUIRED", "放弃旧修改并升级",
-  "getStorageProtocolUpgradePreflight", "upgradeStorageProtocolWithDrainedQueue",
-  "exportRescueDataBackup", "upgradeStorageProtocolAfterRescue",
+  "directCloudEnabled &&",
+  "直接使用 Supabase 云端数据", "独立的本地存储数据不会被删除",
+  "放弃本机旧数据，直接使用云端", "resetLegacyCloudAndUseAuthority",
+  "resetLegacyCloudToAuthority",
 ]) {
   if (!workbench.includes(expected)) throw new Error(`直连云端设置界面缺少：${expected}`);
 }
@@ -51,25 +49,43 @@ for (const expected of [
     throw new Error(`直连云端复制/切换服务缺少：${expected}`);
   }
 }
-if (!workbench.includes('v-if="!directCloudEnabled && storageState.conflictCount"')) {
-  throw new Error("direct_v2 下仍会展示同步冲突入口");
-}
-if (!workbench.includes(`v-if="storageState?.mode === 'cloud' && !directCloudEnabled" class="storage-section local-cache-section"`)) {
-  throw new Error("direct_v2 下仍会展示本地缓存重置入口");
+for (const forbidden of [
+  "cloudQueueDialogOpen", "cloudConflictDialogOpen", "resetLocalCacheDialogOpen",
+  "listCloudSyncQueue", "listCloudSyncConflicts", "resetLocalCacheFromCloud",
+  `title="同步队列"`, `title="处理云端同步冲突"`, `title="重置本地数据"`,
+]) {
+  if (workbench.includes(forbidden)) throw new Error(`前端仍包含旧同步入口或对话框：${forbidden}`);
 }
 for (const expected of [
   `v-if="directCloudEnabled" class="secondary-button compact"`,
   "data-direct-cloud-refresh",
   "刷新云端数据",
-  `v-if="!directCloudEnabled && storageState.pendingOperations && !storageState.conflictCount"`,
-  `v-if="!directCloudEnabled && storageState.conflictCount"`,
 ]) {
   if (!workbench.includes(expected)) throw new Error(`direct_v2 设置页能力边界缺少：${expected}`);
 }
 for (const expected of [
-  "queue.total ? '完成旧队列后升级' : '旧队列为空，直接升级'",
-  "protocolUpgradePreflight.blockedReasons",
-  "protocolUpgradeConfirmation !== '放弃旧修改'",
+  "cloudStatePillTitle", "点击查看云端状态", "cloudDockWorkingLabel",
+  "directCloudEnabled.value ? \"刷新中\" : \"保存中\"",
+  "云端离线，只能查看已加载数据；不会保存到本机等待同步",
+  "登录已失效，请重新登录 Supabase",
+  "主体设置已直接保存到 Supabase",
+  "保存后会直接提交到 Supabase，不会写入本机等待同步",
+]) {
+  if (!workbench.includes(expected)) throw new Error(`direct_v2 主工作台语义缺少：${expected}`);
+}
+for (const expected of [
+  "已直接保存到 Supabase",
+  "数据已在其他设备变化，正在重新查询最新云端数据",
+  "云端离线，只能查看已加载数据；不会保存到本机等待同步",
+  "登录已失效，请重新登录 Supabase",
+]) {
+  if (!presentation.includes(expected)) throw new Error(`direct_v2 状态或提交提示缺少：${expected}`);
+}
+for (const expected of [
+  "直接使用 Supabase 云端数据？",
+  "放弃本机旧云端副本和未上传修改",
+  "store.clearCloudBusinessMemory();",
+  "救援备份已自动保存",
 ]) {
   if (!workbench.includes(expected)) throw new Error(`协议升级路径自动化缺少：${expected}`);
 }

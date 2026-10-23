@@ -229,13 +229,19 @@ export type StorageModeSnapshot = {
   epochBlockedReason?: string;
 };
 
-export type LocalCacheResetPreview = {
+export type DirectCloudReleaseMetrics = {
   workspaceId: string;
-  pendingOperations: number;
-  conflictCount: number;
-  localTotal: number;
-  cloudTotal: number;
-  entities: Array<{ entity: string; localCount: number; cloudCount: number }>;
+  queryCount: number;
+  queryErrorCount: number;
+  queryLatencyTotalMs: number;
+  queryLatencyMaxMs: number;
+  averageQueryLatencyMs: number;
+  mutationCount: number;
+  mutationErrorCount: number;
+  protocolRejectionCount: number;
+  realtimeReconnectCount: number;
+  copyFailureCount: number;
+  lastErrorCode?: string;
 };
 
 export type CloudDevice = {
@@ -258,7 +264,6 @@ export type StorageProtocolUpgradePreflight = {
   localProtocol: string;
   workspaceEpoch: number;
   localWorkspaceEpoch: number;
-  schemaGeneration: number;
   serverUpgradeAllowed: boolean;
   alreadyDirect: boolean;
   requiresLocalQueueDisposition: boolean;
@@ -437,7 +442,6 @@ export type StorageMigrationPreview = {
   sourceWorkspaceId: string;
   targetWorkspaceId?: string;
   packageVersion: number;
-  schemaGeneration: number;
   entities: Array<{ entity: string; localCount: number; cloudCount?: number }>;
   sourceEntityCount: number;
   targetEntityCount: number;
@@ -470,7 +474,6 @@ export type DataCopyReplaceResult = {
 export type DataCopyExportManifest = {
   packageId: string;
   packageVersion: number;
-  schemaGeneration: number;
   workspaceEpoch: number;
   changeSeq: number;
   entityCounts: Record<string, number>;
@@ -495,47 +498,6 @@ export type DataCopyReplaceLocalResult = {
   safetyBackupPath: string;
   workspaceId: string;
   entityCounts: Record<string, number>;
-};
-
-export type CloudSyncConflict = {
-  operationId: string;
-  operationType: string;
-  entityType: string;
-  entityId?: string;
-  baseVersion?: number;
-  localPayload: Record<string, unknown> | null;
-  cloudPayload?: Record<string, unknown> | null;
-  cloudPayloadError?: string;
-  error?: string;
-  conflictReason?: string;
-  attemptCount: number;
-  createdAt: number;
-  lastAttemptAt?: number;
-};
-
-export type CloudSyncQueueItem = {
-  operationId: string;
-  operationType: string;
-  entityType: string;
-  entityId?: string;
-  state: "pending" | "sending" | "failed" | "conflict" | string;
-  payload: Record<string, unknown> | null;
-  attemptCount: number;
-  error?: string;
-  coalescedCount: number;
-  baseVersion?: number;
-  payloadVersion?: number;
-  dependsOnOperationId?: string;
-  recoveryKind?: string;
-  recoveryContext?: Record<string, unknown> | null;
-  createdAt: number;
-  lastAttemptAt?: number;
-};
-
-export type CloudSyncPushResult = {
-  pushed: number;
-  pending: number;
-  conflicts: number;
 };
 
 export type SubjectRecord = {
@@ -1735,6 +1697,10 @@ export async function getStorageMode(): Promise<StorageModeSnapshot> {
   return await invoke("storage_mode_get");
 }
 
+export async function getDirectCloudReleaseMetrics(): Promise<DirectCloudReleaseMetrics> {
+  return await invoke("direct_cloud_release_metrics_get");
+}
+
 export async function setLocalStorageMode(): Promise<StorageModeSnapshot> {
   return await invoke("storage_mode_set_local");
 }
@@ -1858,8 +1824,13 @@ export async function upgradeStorageProtocolAfterRescue(
   });
 }
 
-export async function listCloudSyncQueue(): Promise<CloudSyncQueueItem[]> {
-  return await invoke("cloud_sync_queue");
+export async function resetLegacyCloudToAuthority(
+  operationId = crypto.randomUUID(),
+  createSafetySnapshot = true,
+): Promise<StorageProtocolAbandonResult> {
+  return await invoke("storage_protocol_reset_to_cloud_authority_command", {
+    request: { operationId, confirmed: true, createSafetySnapshot },
+  });
 }
 
 export async function listCloudDevices(): Promise<CloudDevice[]> {
@@ -1882,37 +1853,8 @@ export async function catchUpCloudSync(): Promise<void> {
   await invoke("cloud_sync_catch_up");
 }
 
-export async function saveCloudSync(): Promise<CloudSyncPushResult> {
-  return await invoke("cloud_sync_save");
-}
-
-export async function resetLocalCacheFromCloud(): Promise<StorageModeSnapshot> {
-  return await invoke("cloud_sync_reset_local_cache");
-}
-
-export async function previewLocalCacheReset(): Promise<LocalCacheResetPreview> {
-  return await invoke("cloud_sync_reset_local_cache_preview");
-}
-
 export async function discardOldEpochChangesAndRedownload(): Promise<StorageModeSnapshot> {
   return await invoke("cloud_sync_discard_old_epoch_changes");
-}
-
-export async function listCloudSyncConflicts(): Promise<CloudSyncConflict[]> {
-  return await invoke("cloud_sync_conflicts");
-}
-
-export async function resolveCloudSyncConflict(
-  operationId: string,
-  strategy: "use_cloud" | "keep_local",
-): Promise<StorageModeSnapshot> {
-  return await invoke("cloud_sync_resolve_conflict", { request: { operationId, strategy } });
-}
-
-export async function resolveAllCloudSyncConflicts(
-  strategy: "use_cloud" | "keep_local",
-): Promise<StorageModeSnapshot> {
-  return await invoke("cloud_sync_resolve_all_conflicts", { request: { strategy } });
 }
 
 export async function testSeaTableConnection(): Promise<SeaTableConnectionResult> {

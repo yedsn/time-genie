@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 use url::Url;
 use uuid::Uuid;
 
@@ -25,7 +26,6 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 12;
 const SNAPSHOT_TIMEOUT_SECONDS: u64 = 150;
 const RESTORE_TIMEOUT_SECONDS: u64 = 630;
 pub(crate) const CLOUD_SCHEMA: &str = "timegenie";
-pub(crate) const CLIENT_SCHEMA_GENERATION: i64 = 1;
 static SESSION_CACHE: OnceLock<Mutex<HashMap<String, CloudSession>>> = OnceLock::new();
 static SESSION_REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static DIRECT_TRACKING_LEASE_TOKENS: OnceLock<Mutex<HashMap<(String, String), String>>> =
@@ -105,7 +105,6 @@ struct StorageProtocolUpgradeServerPreflight {
     device_id: String,
     storage_protocol: String,
     workspace_epoch: i64,
-    schema_generation: i64,
     server_upgrade_allowed: bool,
     already_direct: bool,
     requires_local_queue_disposition: bool,
@@ -122,7 +121,6 @@ pub struct StorageProtocolUpgradePreflight {
     pub local_protocol: String,
     pub workspace_epoch: i64,
     pub local_workspace_epoch: i64,
-    pub schema_generation: i64,
     pub server_upgrade_allowed: bool,
     pub already_direct: bool,
     pub requires_local_queue_disposition: bool,
@@ -163,6 +161,15 @@ pub struct StorageProtocolAbandonRequest {
     pub rescue_backup_path: String,
     pub confirmed: bool,
     pub confirmation_text: String,
+    #[serde(default)]
+    pub create_safety_snapshot: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageProtocolAuthorityResetRequest {
+    pub operation_id: String,
+    pub confirmed: bool,
     #[serde(default)]
     pub create_safety_snapshot: Option<bool>,
 }
@@ -284,7 +291,6 @@ pub struct MigrationPreview {
     pub source_workspace_id: String,
     pub target_workspace_id: Option<String>,
     pub package_version: u32,
-    pub schema_generation: i64,
     pub entities: Vec<MigrationEntityCount>,
     pub source_entity_count: i64,
     pub target_entity_count: i64,
@@ -334,7 +340,6 @@ pub struct DataCopyReplaceResult {
 pub struct DataCopyExportManifest {
     pub package_id: String,
     pub package_version: u32,
-    pub schema_generation: i64,
     pub workspace_epoch: i64,
     pub change_seq: i64,
     pub entity_counts: HashMap<String, i64>,
@@ -389,7 +394,6 @@ pub struct DataCopyReplaceLocalResult {
 struct DataCopyExportPreviewResponse {
     workspace_id: String,
     package_version: u32,
-    schema_generation: i64,
     workspace_epoch: i64,
     change_seq: i64,
     entity_counts: HashMap<String, i64>,
@@ -566,7 +570,8 @@ impl CloudStorageError {
                 | "LEASE_LOST"
                 | "WORKSPACE_EPOCH_STALE"
                 | "DEVICE_REVOKED"
-                | "CLIENT_UPGRADE_REQUIRED"
+                | "CLOUD_PROTOCOL_UNSUPPORTED"
+                | "EMERGENCY_READ_ONLY"
                 | "IDEMPOTENCY_CONFLICT"
         ) {
             return None;
@@ -602,9 +607,12 @@ pub struct DirectCloudQueryMetadata {
     pub storage_protocol: String,
     pub workspace_epoch: i64,
     pub change_seq: i64,
-    pub schema_generation: i64,
     pub server_time: String,
     pub domains: Vec<String>,
+    #[serde(default)]
+    pub writable: Option<bool>,
+    #[serde(default)]
+    pub read_only_reason: Option<String>,
     #[serde(default)]
     pub diagnostics: Option<DirectCloudQueryDiagnostics>,
 }
@@ -679,7 +687,6 @@ pub struct DirectCloudWorkbenchData {
 }
 
 pub type DirectCloudWorkbenchResponse = DirectCloudQueryResponse<DirectCloudWorkbenchData>;
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirectCloudTaskQuery {
@@ -2262,6 +2269,16 @@ pub fn storage_mode(database: &Database) -> Result<StorageModeSnapshot, String> 
     storage_mode_from_connection(&connection, current_session(database).is_ok())
 }
 
+#[tauri::command]
+pub fn direct_cloud_release_metrics_get(
+    database: tauri::State<'_, Database>,
+) -> Result<crate::direct_cloud_observability::DirectCloudReleaseMetricsSnapshot, String> {
+    let state = storage_mode(&database)?;
+    Ok(crate::direct_cloud_observability::snapshot(
+        &state.workspace_id,
+    ))
+}
+
 pub fn operation_history_list(
     database: &Database,
     request: CloudOperationHistoryListRequest,
@@ -2393,7 +2410,7 @@ fn direct_cloud_read_context(database: &Database) -> Result<DirectCloudReadConte
     let protocol = read_device_setting_string(&connection, "cloud_storage_protocol")?
         .unwrap_or_else(|| crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string());
     if protocol != crate::storage_contract::DIRECT_CLOUD_PROTOCOL {
-        return Err("CLIENT_UPGRADE_REQUIRED: 当前工作空间尚未启用直连云端存储".to_string());
+        return Err("CLOUD_PROTOCOL_UNSUPPORTED: 当前工作空间尚未启用直连云端存储".to_string());
     }
     let workspace_id = read_device_setting_string(&connection, "cloud_workspace_id")?
         .filter(|value| !value.trim().is_empty())
@@ -2435,7 +2452,7 @@ fn data_copy_target_context(database: &Database) -> Result<DirectCloudReadContex
     let protocol = read_device_setting_string(&connection, "cloud_storage_protocol")?
         .unwrap_or_else(|| crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string());
     if protocol != crate::storage_contract::DIRECT_CLOUD_PROTOCOL {
-        return Err("CLIENT_UPGRADE_REQUIRED: 云端目标尚未启用直连存储协议".to_string());
+        return Err("CLOUD_PROTOCOL_UNSUPPORTED: 云端目标尚未启用直连存储协议".to_string());
     }
     let workspace_id = read_device_setting_string(&connection, "cloud_workspace_id")?
         .filter(|value| !value.trim().is_empty())
@@ -2514,15 +2531,20 @@ fn direct_cloud_access_state_for_error(error: &str) -> (DirectCloudAccessState, 
         );
     }
     if error.starts_with("CLOUD_TIMEOUT:")
+        || error.starts_with("EMERGENCY_READ_ONLY:")
         || error.starts_with("CLOUD_SERVICE_UNAVAILABLE:")
         || error.starts_with("CLOUD_REQUEST_FAILED:")
         || error.starts_with("CLOUD_RESPONSE_INVALID:")
         || error.starts_with("CLOUD_SCHEMA_")
         || error.starts_with("CLOUD_PERMISSION_DENIED:")
     {
+        let code = error
+            .split_once(':')
+            .map(|(code, _)| code)
+            .unwrap_or("CLOUD_ERROR");
         return (
             DirectCloudAccessState::DegradedReadonly,
-            "Supabase 服务暂时异常，云端数据已切换为只读".to_string(),
+            format!("云端请求异常，当前暂时只读（{code}）；刷新云端数据后会自动恢复"),
         );
     }
     (
@@ -2537,6 +2559,7 @@ fn direct_cloud_query<T: for<'de> Deserialize<'de>>(
     context: &DirectCloudReadContext,
     mut body: Value,
 ) -> Result<DirectCloudQueryResponse<T>, String> {
+    let started_at = Instant::now();
     let body_object = body
         .as_object_mut()
         .ok_or_else(|| "CLOUD_REQUEST_INVALID: 云端查询参数必须是对象".to_string())?;
@@ -2556,16 +2579,34 @@ fn direct_cloud_query<T: for<'de> Deserialize<'de>>(
         Ok(value) => value,
         Err(error) => {
             record_direct_cloud_access_error(&context.workspace_id, &error);
+            crate::direct_cloud_observability::record_query_error(&context.workspace_id, &error);
             return Err(error);
         }
     };
     let response: DirectCloudQueryResponse<T> = serde_json::from_value(value).map_err(|error| {
         let error = format!("CLOUD_RESPONSE_INVALID: {function} 响应无效: {error}");
         record_direct_cloud_access_error(&context.workspace_id, &error);
+        crate::direct_cloud_observability::record_query_error(&context.workspace_id, &error);
         error
     })?;
     record_direct_cloud_checkpoint(database, &response.metadata)?;
-    record_direct_cloud_access_success(&context.workspace_id);
+    if response.metadata.writable == Some(false) {
+        set_direct_cloud_access_runtime(
+            &context.workspace_id,
+            DirectCloudAccessState::DegradedReadonly,
+            response
+                .metadata
+                .read_only_reason
+                .clone()
+                .or_else(|| Some("Supabase 已启用紧急只读，业务修改暂时停用".to_string())),
+        );
+    } else {
+        record_direct_cloud_access_success(&context.workspace_id);
+    }
+    crate::direct_cloud_observability::record_query(
+        &context.workspace_id,
+        started_at.elapsed().as_secs_f64() * 1000.0,
+    );
     Ok(response)
 }
 
@@ -2576,7 +2617,6 @@ pub fn direct_cloud_mutation<T: for<'de> Deserialize<'de>>(
     payload: Value,
 ) -> Result<DirectCloudMutationResponse<T>, String> {
     let context = direct_cloud_read_context(database)?;
-    ensure_direct_cloud_writable(database, &context.workspace_id)?;
     direct_cloud_mutation_with_context(database, &context, function, operation_id, payload)
 }
 
@@ -2612,7 +2652,10 @@ fn direct_cloud_mutation_with_context<T: for<'de> Deserialize<'de>>(
     operation_id: Option<String>,
     payload: Value,
 ) -> Result<DirectCloudMutationResponse<T>, String> {
-    ensure_direct_cloud_writable(database, &context.workspace_id)?;
+    if let Err(error) = ensure_direct_cloud_writable(database, &context.workspace_id) {
+        crate::direct_cloud_observability::record_mutation_error(&context.workspace_id, &error);
+        return Err(error);
+    }
     let operation_id = operation_id
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| Uuid::now_v7().to_string());
@@ -2635,7 +2678,9 @@ fn direct_cloud_mutation_with_context<T: for<'de> Deserialize<'de>>(
     ) {
         Ok(value) => value,
         Err(error)
-            if error.starts_with("NETWORK_ERROR:") || error.starts_with("CLOUD_TIMEOUT:") =>
+            if error.starts_with("NETWORK_ERROR:")
+                || error.starts_with("CLOUD_TIMEOUT:")
+                || error.starts_with("CLOUD_SERVICE_UNAVAILABLE:") =>
         {
             match api.rpc_for_database_with_epoch(
                 database,
@@ -2647,12 +2692,17 @@ fn direct_cloud_mutation_with_context<T: for<'de> Deserialize<'de>>(
                 Ok(value) => value,
                 Err(retry_error) => {
                     record_direct_cloud_access_error(&context.workspace_id, &retry_error);
+                    crate::direct_cloud_observability::record_mutation_error(
+                        &context.workspace_id,
+                        &retry_error,
+                    );
                     return Err(retry_error);
                 }
             }
         }
         Err(error) => {
             record_direct_cloud_access_error(&context.workspace_id, &error);
+            crate::direct_cloud_observability::record_mutation_error(&context.workspace_id, &error);
             return Err(error);
         }
     };
@@ -2660,10 +2710,12 @@ fn direct_cloud_mutation_with_context<T: for<'de> Deserialize<'de>>(
         serde_json::from_value(value).map_err(|error| {
             let error = format!("CLOUD_RESPONSE_INVALID: {function} 响应无效: {error}");
             record_direct_cloud_access_error(&context.workspace_id, &error);
+            crate::direct_cloud_observability::record_mutation_error(&context.workspace_id, &error);
             error
         })?;
     record_direct_cloud_checkpoint(database, &response.metadata)?;
     record_direct_cloud_access_success(&context.workspace_id);
+    crate::direct_cloud_observability::record_mutation(&context.workspace_id);
     Ok(response)
 }
 
@@ -2855,6 +2907,26 @@ pub fn direct_cloud_today_plan(
         &context,
         json!({"p_subject_id": subject_id, "p_work_date": work_date}),
     )
+}
+
+pub fn direct_cloud_today_overview(
+    database: &Database,
+    request: crate::today_overview::TodayWorkOverviewRequest,
+) -> Result<crate::today_overview::TodayWorkOverviewDto, String> {
+    let context = direct_cloud_read_context(database)?;
+    let history_days = request.history_days.unwrap_or(30).clamp(1, 90);
+    let response = direct_cloud_query::<crate::today_overview::TodayWorkOverviewDto>(
+        database,
+        "direct_cloud_today_overview",
+        &context,
+        json!({
+            "p_subject_id": request.subject_id,
+            "p_today_date": request.today_date,
+            "p_history_days": history_days,
+            "p_trend_days": request.trend_days.unwrap_or(14).clamp(1, history_days),
+        }),
+    )?;
+    Ok(response.data)
 }
 
 pub fn direct_cloud_time_state(
@@ -3405,6 +3477,72 @@ pub fn direct_cloud_plan_import_confirm_mutation(
     )
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectCloudDailyReportImportedFingerprints {
+    fingerprints: Vec<String>,
+}
+
+pub fn direct_cloud_daily_report_imported_fingerprints(
+    database: &Database,
+    subject_id: String,
+    source_date: String,
+    target_kind: String,
+    source_path_hash: String,
+    fingerprints: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let context = direct_cloud_read_context(database)?;
+    let response = direct_cloud_query::<DirectCloudDailyReportImportedFingerprints>(
+        database,
+        "direct_cloud_daily_report_imported_fingerprints",
+        &context,
+        json!({
+            "p_subject_id": subject_id,
+            "p_source_date": source_date,
+            "p_target_kind": target_kind,
+            "p_source_path_hash": source_path_hash,
+            "p_fingerprints": fingerprints,
+        }),
+    )?;
+    Ok(response.data.fingerprints)
+}
+
+pub fn direct_cloud_daily_report_import_confirm_mutation(
+    database: &Database,
+    operation_id: String,
+    payload: Value,
+) -> Result<Value, String> {
+    direct_cloud_json_mutation(
+        database,
+        "direct_cloud_daily_report_import_confirm",
+        operation_id,
+        payload,
+    )
+}
+
+pub fn direct_cloud_time_allocation_export(
+    database: &Database,
+    request: crate::time_allocation_export::TimeAllocationExportRequest,
+) -> Result<Vec<crate::time_allocation_export::TimeAllocationExportRow>, String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ExportData {
+        rows: Vec<crate::time_allocation_export::TimeAllocationExportRow>,
+    }
+    let context = direct_cloud_read_context(database)?;
+    let response = direct_cloud_query::<ExportData>(
+        database,
+        "direct_cloud_time_allocation_export",
+        &context,
+        json!({
+            "p_start_date": request.start_date,
+            "p_end_date": request.end_date,
+            "p_include_special_time": request.include_special_time,
+        }),
+    )?;
+    Ok(response.data.rows)
+}
+
 pub fn direct_cloud_shared_configuration(
     database: &Database,
 ) -> Result<DirectCloudSharedConfigurationResponse, String> {
@@ -3638,9 +3776,10 @@ fn ensure_local_restore_gate(database: &Database, workspace_id: &str) -> Result<
 
 fn uses_direct_cloud_protocol(database: &Database) -> Result<bool, String> {
     let connection = database.open()?;
-    Ok(read_device_setting_string(&connection, "cloud_storage_protocol")?
-        .as_deref()
-        == Some(crate::storage_contract::DIRECT_CLOUD_PROTOCOL))
+    Ok(
+        read_device_setting_string(&connection, "cloud_storage_protocol")?.as_deref()
+            == Some(crate::storage_contract::DIRECT_CLOUD_PROTOCOL),
+    )
 }
 
 fn record_direct_restore_checkpoint(
@@ -3672,7 +3811,9 @@ fn record_direct_restore_checkpoint(
                  epoch_blocked_at=NULL",
             params![workspace_id, device_id, reset_change_seq, workspace_epoch],
         )
-        .map_err(|error| format!("RESTORE_CHECKPOINT_UPDATE_FAILED: 无法保存恢复后的云端世代: {error}"))?;
+        .map_err(|error| {
+            format!("RESTORE_CHECKPOINT_UPDATE_FAILED: 无法保存恢复后的云端世代: {error}")
+        })?;
     record_direct_cloud_access_success(workspace_id);
     Ok(())
 }
@@ -3685,7 +3826,13 @@ pub fn workspace_restore_prepare(
     if !uses_direct_cloud_protocol(database)? {
         ensure_local_restore_gate(database, &state.workspace_id)?;
     }
-    let value = client(database)?.rpc_for_database_with_epoch_and_timeout(database, "workspace_restore_prepare", json!({
+    let direct_cloud = uses_direct_cloud_protocol(database)?;
+    let function = if direct_cloud {
+        "direct_cloud_workspace_restore_prepare"
+    } else {
+        "workspace_restore_prepare"
+    };
+    let value = client(database)?.rpc_for_database_with_epoch_and_timeout(database, function, json!({
         "p_workspace_id":state.workspace_id,"p_device_id":state.device_id,"p_target_snapshot_id":request.snapshot_id,"p_expected_epoch":state.workspace_epoch,
         "p_create_safety_snapshot":request.create_safety_snapshot
     }), &session, state.workspace_epoch, RESTORE_TIMEOUT_SECONDS)?;
@@ -3711,7 +3858,12 @@ fn workspace_restore_commit_locked(
     if !direct_cloud {
         ensure_local_restore_gate(database, &state.workspace_id)?;
     }
-    let value = client(database)?.rpc_for_database_with_epoch_and_timeout(database, "workspace_restore_commit", json!({
+    let function = if direct_cloud {
+        "direct_cloud_workspace_restore_commit"
+    } else {
+        "workspace_restore_commit"
+    };
+    let value = client(database)?.rpc_for_database_with_epoch_and_timeout(database, function, json!({
         "p_workspace_id":state.workspace_id,"p_device_id":state.device_id,"p_lock_token":request.lock_token,
         "p_target_snapshot_id":request.target_snapshot_id,"p_target_content_hash":request.target_content_hash,
         "p_prepared_epoch":request.prepared_epoch,"p_operation_id":Uuid::now_v7().to_string(),"p_confirmed":true
@@ -4047,7 +4199,10 @@ fn classify_probe_response(status: StatusCode, body: &str) -> CloudProjectProbe 
         CLOUD_PROJECT_SCHEMA_MISSING
     } else if classified.starts_with("CLOUD_SCHEMA_NOT_EXPOSED") {
         CLOUD_PROJECT_SCHEMA_NOT_EXPOSED
-    } else if classified.starts_with("NETWORK_ERROR") || classified.starts_with("CLOUD_TIMEOUT") {
+    } else if classified.starts_with("NETWORK_ERROR")
+        || classified.starts_with("CLOUD_TIMEOUT")
+        || classified.starts_with("CLOUD_SERVICE_UNAVAILABLE")
+    {
         CLOUD_PROJECT_UNREACHABLE
     } else {
         CLOUD_PROJECT_READY
@@ -4684,7 +4839,6 @@ fn build_storage_protocol_upgrade_preflight(
         local_protocol,
         workspace_epoch: server.workspace_epoch,
         local_workspace_epoch,
-        schema_generation: server.schema_generation,
         server_upgrade_allowed: server.server_upgrade_allowed,
         already_direct: server.already_direct,
         requires_local_queue_disposition: server.requires_local_queue_disposition,
@@ -4702,7 +4856,7 @@ fn ensure_upgrade_preflight_can_drain(
 ) -> Result<(), String> {
     if preflight.already_direct {
         return Err(
-            "CLIENT_UPGRADE_REQUIRED: 云端工作空间已启用直连协议，请重新打开应用加载直连数据"
+            "CLOUD_PROTOCOL_UNSUPPORTED: 云端工作空间已启用直连协议，请重新打开应用加载直连数据"
                 .to_string(),
         );
     }
@@ -5164,6 +5318,154 @@ pub fn storage_protocol_upgrade_after_rescue(
     })
 }
 
+pub fn storage_protocol_reset_to_cloud_authority(
+    database: &Database,
+    request: StorageProtocolAuthorityResetRequest,
+) -> Result<StorageProtocolAbandonResult, String> {
+    if !request.confirmed {
+        return Err("CLOUD_AUTHORITY_RESET_NOT_CONFIRMED: 必须确认放弃本机旧云端修改".to_string());
+    }
+    Uuid::parse_str(request.operation_id.trim())
+        .map_err(|_| "VALIDATION_ERROR: 云端切换操作标识无效".to_string())?;
+    let preflight = storage_protocol_upgrade_preflight(database)?;
+    let create_safety_snapshot = request.create_safety_snapshot.unwrap_or(true);
+    if preflight.queue.total == 0 {
+        if preflight.local_protocol != crate::storage_contract::LEGACY_SYNC_PROTOCOL {
+            return Err("CLOUD_PROTOCOL_UNSUPPORTED: 本机当前协议不允许重置旧云端数据".to_string());
+        }
+        let switched = if preflight.already_direct {
+            StorageProtocolUpgradeServerResult {
+                upgraded: false,
+                already_direct: true,
+                workspace_epoch: preflight.workspace_epoch,
+                storage_protocol: Some(crate::storage_contract::DIRECT_CLOUD_PROTOCOL.to_string()),
+                change_seq: Some(storage_mode(database)?.last_change_seq),
+                safety_snapshot_id: None,
+            }
+        } else {
+            if preflight.storage_protocol != crate::storage_contract::LEGACY_SYNC_PROTOCOL
+                || !preflight.server_upgrade_allowed
+            {
+                return Err(
+                    "CLOUD_PROTOCOL_UNSUPPORTED: 云端当前协议不允许切换为直连模式".to_string(),
+                );
+            }
+            let session = current_session(database)?;
+            let value = client(database)?.rpc_for_database(
+                database,
+                "upgrade_storage_protocol",
+                json!({
+                    "p_workspace_id": preflight.workspace_id,
+                    "p_device_id": preflight.device_id,
+                    "p_operation_id": request.operation_id,
+                    "p_expected_epoch": preflight.workspace_epoch,
+                    "p_old_sync_disposition": "queue_drained",
+                    "p_create_safety_snapshot": create_safety_snapshot,
+                }),
+                &session,
+            )?;
+            serde_json::from_value(value)
+                .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 协议切换响应无效: {error}"))?
+        };
+        let protocol = switched.storage_protocol.as_deref().unwrap_or_else(|| {
+            if switched.already_direct {
+                crate::storage_contract::DIRECT_CLOUD_PROTOCOL
+            } else {
+                ""
+            }
+        });
+        if (!switched.upgraded && !switched.already_direct)
+            || protocol != crate::storage_contract::DIRECT_CLOUD_PROTOCOL
+        {
+            return Err("CLOUD_RESPONSE_INVALID: 云端未确认切换为直连模式".to_string());
+        }
+        let final_change_seq = switched
+            .change_seq
+            .unwrap_or(0)
+            .max(storage_mode(database)?.last_change_seq);
+        persist_direct_protocol_state(
+            database,
+            &preflight.workspace_id,
+            switched.workspace_epoch,
+            final_change_seq,
+        )?;
+        return Ok(StorageProtocolAbandonResult {
+            upgraded: switched.upgraded,
+            already_direct: switched.already_direct,
+            workspace_epoch: switched.workspace_epoch,
+            storage_protocol: crate::storage_contract::DIRECT_CLOUD_PROTOCOL.to_string(),
+            change_seq: switched.change_seq,
+            safety_snapshot_id: switched.safety_snapshot_id,
+            quarantined_operations: 0,
+            rescue_backup_path: String::new(),
+            rescue_backup_checksum: String::new(),
+            last_change_seq: final_change_seq,
+        });
+    }
+
+    let backup = crate::data_protection::export_automatic_legacy_rescue_backup(
+        database,
+        "用户确认放弃本机旧云端数据并直接使用 Supabase 权威数据",
+    )?;
+    if preflight.already_direct {
+        let backup_path = std::path::PathBuf::from(&backup.path);
+        let validated = crate::data_protection::validate_rescue_backup_for_abandon(&backup_path)?;
+        return crate::cloud_sync::with_cloud_sync_operation_lock(|| {
+            let refreshed = storage_protocol_upgrade_preflight(database)?;
+            if !refreshed.already_direct {
+                return Err("CLOUD_PROTOCOL_CHANGED: 云端协议状态发生变化，请重新执行".to_string());
+            }
+            validate_rescue_backup_matches_upgrade(&validated, &refreshed)?;
+            let reason = format!(
+                "云端已是 direct_v2；用户确认放弃本机旧修改；救援备份校验通过（{}）",
+                validated.created_at
+            );
+            let (batch_id, quarantined) = quarantine_legacy_queue(
+                database,
+                &refreshed.workspace_id,
+                &validated.checksum,
+                &reason,
+            )?;
+            let final_change_seq = storage_mode(database)?.last_change_seq;
+            if let Err(error) = persist_direct_protocol_state(
+                database,
+                &refreshed.workspace_id,
+                refreshed.workspace_epoch,
+                final_change_seq,
+            ) {
+                return match restore_quarantined_legacy_queue(database, &batch_id) {
+                    Ok(()) => Err(format!("{error}；本机旧队列已恢复")),
+                    Err(restore_error) => Err(format!(
+                        "{error}；本机旧队列恢复失败，已保留隔离区 {batch_id}: {restore_error}"
+                    )),
+                };
+            }
+            Ok(StorageProtocolAbandonResult {
+                upgraded: false,
+                already_direct: true,
+                workspace_epoch: refreshed.workspace_epoch,
+                storage_protocol: crate::storage_contract::DIRECT_CLOUD_PROTOCOL.to_string(),
+                change_seq: Some(final_change_seq),
+                safety_snapshot_id: None,
+                quarantined_operations: quarantined,
+                rescue_backup_path: backup_path.display().to_string(),
+                rescue_backup_checksum: validated.checksum,
+                last_change_seq: final_change_seq,
+            })
+        });
+    }
+    storage_protocol_upgrade_after_rescue(
+        database,
+        StorageProtocolAbandonRequest {
+            operation_id: request.operation_id,
+            rescue_backup_path: backup.path,
+            confirmed: true,
+            confirmation_text: "放弃旧修改".to_string(),
+            create_safety_snapshot: Some(create_safety_snapshot),
+        },
+    )
+}
+
 fn auth_blocked_reason(database: &Database) -> Result<Option<String>, String> {
     let state = storage_mode(database)?;
     if state.mode != "cloud" {
@@ -5257,7 +5559,6 @@ pub fn migration_preview(
                 .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 云端复制预览无效: {error}"))?;
             if preview.workspace_id != workspace.id
                 || preview.package_version != crate::data_protection::DATA_PACKAGE_FORMAT_VERSION
-                || preview.schema_generation != CLIENT_SCHEMA_GENERATION
                 || preview.workspace_epoch != context.workspace_epoch
                 || preview.change_seq < 0
             {
@@ -5338,7 +5639,6 @@ pub fn migration_preview(
         source_workspace_id: preview_source_workspace_id,
         target_workspace_id: preview_target_workspace_id,
         package_version: crate::data_protection::DATA_PACKAGE_FORMAT_VERSION,
-        schema_generation: CLIENT_SCHEMA_GENERATION,
         entities,
         source_entity_count,
         target_entity_count,
@@ -5457,7 +5757,6 @@ pub fn stage_local_data_copy(database: &Database) -> Result<DataCopyStageResult,
             "p_device_id": context.device_id,
             "p_expected_epoch": context.workspace_epoch,
             "p_package_version": crate::data_protection::DATA_PACKAGE_FORMAT_VERSION,
-            "p_schema_generation": CLIENT_SCHEMA_GENERATION,
             "p_expected_chunk_count": chunks.len(),
             "p_expected_content_hash": content_hash,
         }),
@@ -5585,7 +5884,9 @@ fn replace_staged_local_data_copy_locked(
     ) {
         Ok(value) => value,
         Err(error)
-            if error.starts_with("NETWORK_ERROR:") || error.starts_with("CLOUD_TIMEOUT:") =>
+            if error.starts_with("NETWORK_ERROR:")
+                || error.starts_with("CLOUD_TIMEOUT:")
+                || error.starts_with("CLOUD_SERVICE_UNAVAILABLE:") =>
         {
             api.rpc_for_database_with_epoch_and_timeout(
                 database,
@@ -5858,7 +6159,6 @@ fn validate_data_copy_export_manifest(
     Uuid::parse_str(&manifest.package_id)
         .map_err(|_| "CLOUD_RESPONSE_INVALID: 云端导出 packageId 无效".to_string())?;
     if manifest.package_version != crate::data_protection::DATA_PACKAGE_FORMAT_VERSION
-        || manifest.schema_generation != CLIENT_SCHEMA_GENERATION
         || manifest.workspace_epoch != expected_epoch
         || manifest.change_seq < 0
         || !(22..=256).contains(&manifest.chunk_count)
@@ -6085,10 +6385,6 @@ impl SupabaseClient {
         self.http
             .get(url)
             .header("apikey", &self.anon_key)
-            .header(
-                "x-timegenie-client-schema-generation",
-                CLIENT_SCHEMA_GENERATION.to_string(),
-            )
             .header("Accept-Profile", CLOUD_SCHEMA)
             .header("Content-Profile", CLOUD_SCHEMA)
     }
@@ -6097,10 +6393,6 @@ impl SupabaseClient {
         self.http
             .post(url)
             .header("apikey", &self.anon_key)
-            .header(
-                "x-timegenie-client-schema-generation",
-                CLIENT_SCHEMA_GENERATION.to_string(),
-            )
             .header("Accept-Profile", CLOUD_SCHEMA)
             .header("Content-Profile", CLOUD_SCHEMA)
     }
@@ -7129,8 +7421,10 @@ fn classify_http_error(status: StatusCode, body: &str, fallback: &str) -> String
         return "CLOUD_SCHEMA_MISSING: 云端数据库版本过旧，请部署 TimeGenie 事项规划同步补丁"
             .to_string();
     }
-    let code = if matches!(remote_code, "PGRST202" | "PGRST205" | "42P01" | "42883")
-        || lower_message.contains("could not find the function")
+    let code = if matches!(
+        remote_code,
+        "PGRST202" | "PGRST205" | "42P01" | "42703" | "42883"
+    ) || lower_message.contains("could not find the function")
         || lower_message.contains("could not find the table")
         || lower_message.contains("does not exist")
     {
@@ -7145,13 +7439,14 @@ fn classify_http_error(status: StatusCode, body: &str, fallback: &str) -> String
         "AUTH_FAILED"
     } else if status == StatusCode::CONFLICT || status == StatusCode::PRECONDITION_FAILED {
         "VERSION_CONFLICT"
-    } else if status.is_server_error()
-        || matches!(
-            status,
-            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
-        )
-    {
-        "NETWORK_ERROR"
+    } else if status == StatusCode::REQUEST_TIMEOUT {
+        "CLOUD_TIMEOUT"
+    } else if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+        if fallback.starts_with("AUTH_") {
+            "NETWORK_ERROR"
+        } else {
+            "CLOUD_SERVICE_UNAVAILABLE"
+        }
     } else {
         fallback
     };
@@ -7328,7 +7623,7 @@ pub fn storage_mode_set_cloud(
         .ok_or_else(|| "CLOUD_NOT_CONFIGURED: 尚未初始化 Supabase 工作空间".to_string())?;
     drop(connection);
     if protocol != crate::storage_contract::DIRECT_CLOUD_PROTOCOL {
-        return Err("CLIENT_UPGRADE_REQUIRED: 当前云端工作空间尚未启用直连存储协议".to_string());
+        return Err("CLOUD_PROTOCOL_UNSUPPORTED: 当前云端工作空间尚未启用直连存储协议".to_string());
     }
     current_session(&database)?;
     ensure_no_pending_cloud_work(&database)?;
@@ -7483,6 +7778,14 @@ pub fn storage_protocol_upgrade_after_rescue_command(
 }
 
 #[tauri::command]
+pub fn storage_protocol_reset_to_cloud_authority_command(
+    database: tauri::State<'_, Database>,
+    request: StorageProtocolAuthorityResetRequest,
+) -> Result<StorageProtocolAbandonResult, String> {
+    storage_protocol_reset_to_cloud_authority(&database, request)
+}
+
+#[tauri::command]
 pub fn cloud_operation_history_list(
     database: tauri::State<'_, Database>,
     request: CloudOperationHistoryListRequest,
@@ -7588,7 +7891,11 @@ pub fn storage_migration_preview(
 pub fn storage_copy_stage_local_to_cloud(
     database: tauri::State<'_, Database>,
 ) -> Result<DataCopyStageResult, String> {
-    stage_local_data_copy(&database)
+    let workspace_id = storage_mode(&database)?.workspace_id;
+    stage_local_data_copy(&database).map_err(|error| {
+        crate::direct_cloud_observability::record_copy_failure(&workspace_id, &error);
+        error
+    })
 }
 
 #[tauri::command]
@@ -7596,14 +7903,22 @@ pub fn storage_copy_replace_cloud(
     database: tauri::State<'_, Database>,
     request: DataCopyReplaceRequest,
 ) -> Result<DataCopyReplaceResult, String> {
-    replace_staged_local_data_copy(&database, request)
+    let workspace_id = storage_mode(&database)?.workspace_id;
+    replace_staged_local_data_copy(&database, request).map_err(|error| {
+        crate::direct_cloud_observability::record_copy_failure(&workspace_id, &error);
+        error
+    })
 }
 
 #[tauri::command]
 pub fn storage_copy_export_cloud_begin(
     database: tauri::State<'_, Database>,
 ) -> Result<DataCopyExportManifest, String> {
-    begin_cloud_data_copy_export(&database)
+    let workspace_id = storage_mode(&database)?.workspace_id;
+    begin_cloud_data_copy_export(&database).map_err(|error| {
+        crate::direct_cloud_observability::record_copy_failure(&workspace_id, &error);
+        error
+    })
 }
 
 #[tauri::command]
@@ -7627,7 +7942,11 @@ pub fn storage_copy_replace_local(
     database: tauri::State<'_, Database>,
     request: DataCopyReplaceLocalRequest,
 ) -> Result<DataCopyReplaceLocalResult, String> {
-    replace_local_with_cloud_data_copy(&database, request)
+    let workspace_id = storage_mode(&database)?.workspace_id;
+    replace_local_with_cloud_data_copy(&database, request).map_err(|error| {
+        crate::direct_cloud_observability::record_copy_failure(&workspace_id, &error);
+        error
+    })
 }
 
 #[tauri::command]
@@ -7830,7 +8149,7 @@ mod tests {
     }
 
     #[test]
-    fn supabase_business_requests_advertise_client_schema_generation() {
+    fn supabase_business_requests_do_not_advertise_client_schema_generation() {
         let server = TestHttpServer::start(vec![TestHttpResponse {
             path: "/rest/v1/rpc/handshake_probe",
             status: 200,
@@ -7848,11 +8167,9 @@ mod tests {
         )
         .unwrap();
         let requests = server.finish();
-        assert!(requests[0].lines().any(|line| {
-            line.eq_ignore_ascii_case(&format!(
-                "x-timegenie-client-schema-generation: {CLIENT_SCHEMA_GENERATION}"
-            ))
-        }));
+        assert!(!requests[0].lines().any(|line| line
+            .to_ascii_lowercase()
+            .starts_with("x-timegenie-client-schema-generation:")));
     }
 
     fn lock_test_session_state() -> std::sync::MutexGuard<'static, ()> {
@@ -8458,6 +8775,13 @@ mod tests {
         assert!(missing.contains("supabase/schema.sql"));
         assert!(!missing.contains("schema cache"));
 
+        let invalid_function_column = classify_http_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"code":"42703","message":"column change_seq does not exist"}"#,
+            "CLOUD_REQUEST_FAILED",
+        );
+        assert!(invalid_function_column.starts_with("CLOUD_SCHEMA_MISSING:"));
+
         let unexposed = classify_http_error(
             StatusCode::NOT_ACCEPTABLE,
             r#"{"code":"PGRST106","message":"The schema must be one of the following: public, graphql_public"}"#,
@@ -8543,7 +8867,7 @@ mod tests {
             "LEASE_LOST",
             "WORKSPACE_EPOCH_STALE",
             "DEVICE_REVOKED",
-            "CLIENT_UPGRADE_REQUIRED",
+            "CLOUD_PROTOCOL_UNSUPPORTED",
         ] {
             let body = format!(r#"{{"code":"P0001","message":"{}: 中文错误说明"}}"#, code);
             let parsed = CloudStorageError::from_http_body(&body).expect("structured error");
@@ -8576,7 +8900,6 @@ mod tests {
                 "storageProtocol": "direct_v2",
                 "workspaceEpoch": 3,
                 "changeSeq": 42,
-                "schemaGeneration": 1,
                 "serverTime": "2026-10-22T18:00:00+08:00",
                 "domains": ["tasks", "time"],
                 "diagnostics": {"responseBytes": 512, "rpcCount": 1, "durationMs": 2.5}
@@ -8588,7 +8911,6 @@ mod tests {
         assert_eq!(response.metadata.storage_protocol, "direct_v2");
         assert_eq!(response.metadata.workspace_epoch, 3);
         assert_eq!(response.metadata.change_seq, 42);
-        assert_eq!(response.metadata.schema_generation, 1);
         assert_eq!(response.metadata.domains, vec!["tasks", "time"]);
         assert_eq!(response.metadata.diagnostics.as_ref().unwrap().rpc_count, 1);
         assert_eq!(
@@ -8615,9 +8937,10 @@ mod tests {
             storage_protocol: crate::storage_contract::DIRECT_CLOUD_PROTOCOL.to_string(),
             workspace_epoch,
             change_seq,
-            schema_generation: CLIENT_SCHEMA_GENERATION,
             server_time: "2026-10-23T12:00:00+08:00".to_string(),
             domains: vec!["tasks".to_string()],
+            writable: None,
+            read_only_reason: None,
             diagnostics: None,
         };
 
@@ -8681,8 +9004,8 @@ mod tests {
             body: Box::leak(response_body.into_boxed_str()),
         }]);
         let directory = tempdir().unwrap();
-        let database = Database::initialize_at(directory.path().join("direct-snapshot.sqlite3"))
-            .unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("direct-snapshot.sqlite3")).unwrap();
         let cloud_workspace_id = "20000000-0000-0000-0000-0000000000f2";
         configure_test_cloud_state(&database, &server.base_url(), cloud_workspace_id);
         database
@@ -8793,8 +9116,8 @@ mod tests {
             },
         ]);
         let directory = tempdir().unwrap();
-        let database = Database::initialize_at(directory.path().join("direct-restore.sqlite3"))
-            .unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("direct-restore.sqlite3")).unwrap();
         let cloud_workspace_id = "20000000-0000-0000-0000-0000000000f3";
         configure_test_cloud_state(&database, &server.base_url(), cloud_workspace_id);
         let device_id = read_device_setting_string(&database.open().unwrap(), "device_id")
@@ -8884,7 +9207,9 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[0].contains("workspace_restore_prepare"));
         assert!(requests[1].contains("workspace_restore_commit"));
-        assert!(!requests.iter().any(|request| request.contains("cloud_snapshot_get")));
+        assert!(!requests
+            .iter()
+            .any(|request| request.contains("cloud_snapshot_get")));
     }
 
     #[test]
@@ -8905,6 +9230,11 @@ mod tests {
         assert_eq!(
             direct_cloud_access_state_for_error("DEVICE_REVOKED: revoked").0,
             DirectCloudAccessState::ReauthRequired
+        );
+        assert!(
+            direct_cloud_access_state_for_error("CLOUD_SCHEMA_MISSING: missing")
+                .1
+                .contains("CLOUD_SCHEMA_MISSING")
         );
 
         record_direct_cloud_access_error(&workspace_id, "NETWORK_ERROR: dns failed");
@@ -8986,13 +9316,284 @@ mod tests {
             r#"{"message":"upstream unavailable"}"#,
             "CLOUD_REQUEST_FAILED",
         )
-        .starts_with("NETWORK_ERROR:"));
+        .starts_with("CLOUD_SERVICE_UNAVAILABLE:"));
         assert!(classify_http_error(
             StatusCode::REQUEST_TIMEOUT,
             r#"{"message":"request timeout"}"#,
             "CLOUD_REQUEST_FAILED",
         )
+        .starts_with("CLOUD_TIMEOUT:"));
+    }
+
+    #[test]
+    fn direct_cloud_faults_never_create_pending_work_and_only_requery_restores_writes() {
+        let _guard = lock_test_session_state();
+        reset_test_credentials();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("direct-fault-injection.sqlite3"))
+                .unwrap();
+
+        let unavailable = TestHttpServer::start(vec![TestHttpResponse {
+            path: "/rest/v1/rpc/direct_cloud_workbench_bootstrap",
+            status: 503,
+            body: r#"{"message":"upstream unavailable"}"#,
+        }]);
+        let (device_id, _) =
+            configure_test_cloud_state(&database, &unavailable.base_url(), &cloud_workspace_id);
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "INSERT INTO device_settings(key,value_json,updated_at) VALUES('cloud_storage_protocol',?1,1) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+                [serde_json::to_string(crate::storage_contract::DIRECT_CLOUD_PROTOCOL).unwrap()],
+            )
+            .unwrap();
+        save_session(
+            &database,
+            &test_session("direct-faults", Some(now_seconds() + 3600)),
+        )
+        .unwrap();
+        let context = direct_cloud_read_context(&database).unwrap();
+        let before = crate::storage_contract::business_data_fingerprint(&database).unwrap();
+
+        let error = direct_cloud_query::<Value>(
+            &database,
+            "direct_cloud_workbench_bootstrap",
+            &context,
+            json!({}),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("CLOUD_SERVICE_UNAVAILABLE:"));
+        assert_eq!(
+            direct_cloud_access_runtime(&cloud_workspace_id)
+                .unwrap()
+                .state,
+            DirectCloudAccessState::DegradedReadonly
+        );
+        assert!(direct_cloud_mutation_with_context::<Value>(
+            &database,
+            &context,
+            "direct_cloud_subject_create",
+            Some(Uuid::now_v7().to_string()),
+            json!({"id": Uuid::now_v7().to_string(), "name": "故障期间不应写入"}),
+        )
+        .unwrap_err()
+        .starts_with("CLOUD_READ_ONLY:"));
+        assert_eq!(
+            before,
+            crate::storage_contract::business_data_fingerprint(&database).unwrap()
+        );
+        unavailable.finish();
+
+        let timeout = TestHttpServer::start(vec![TestHttpResponse {
+            path: "/rest/v1/rpc/direct_cloud_workbench_bootstrap",
+            status: 408,
+            body: r#"{"message":"request timeout"}"#,
+        }]);
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "supabase_project_url".to_string(),
+                value: json!(timeout.base_url()),
+            },
+        )
+        .unwrap();
+        assert!(direct_cloud_query::<Value>(
+            &database,
+            "direct_cloud_workbench_bootstrap",
+            &context,
+            json!({}),
+        )
+        .unwrap_err()
+        .starts_with("CLOUD_TIMEOUT:"));
+        assert_eq!(
+            direct_cloud_access_runtime(&cloud_workspace_id)
+                .unwrap()
+                .state,
+            DirectCloudAccessState::DegradedReadonly
+        );
+        assert!(direct_cloud_mutation_with_context::<Value>(
+            &database,
+            &context,
+            "direct_cloud_subject_create",
+            Some(Uuid::now_v7().to_string()),
+            json!({"id": Uuid::now_v7().to_string(), "name": "超时期间不应写入"}),
+        )
+        .unwrap_err()
+        .starts_with("CLOUD_READ_ONLY:"));
+        assert_eq!(
+            before,
+            crate::storage_contract::business_data_fingerprint(&database).unwrap()
+        );
+        timeout.finish();
+
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "supabase_project_url".to_string(),
+                value: json!("http://127.0.0.1:9"),
+            },
+        )
+        .unwrap();
+        assert!(direct_cloud_query::<Value>(
+            &database,
+            "direct_cloud_workbench_bootstrap",
+            &context,
+            json!({}),
+        )
+        .unwrap_err()
         .starts_with("NETWORK_ERROR:"));
+        assert_eq!(
+            direct_cloud_access_runtime(&cloud_workspace_id)
+                .unwrap()
+                .state,
+            DirectCloudAccessState::OfflineReadonly
+        );
+        assert!(direct_cloud_mutation_with_context::<Value>(
+            &database,
+            &context,
+            "direct_cloud_subject_create",
+            Some(Uuid::now_v7().to_string()),
+            json!({"id": Uuid::now_v7().to_string(), "name": "断网期间不应写入"}),
+        )
+        .unwrap_err()
+        .starts_with("CLOUD_READ_ONLY:"));
+        assert_eq!(
+            before,
+            crate::storage_contract::business_data_fingerprint(&database).unwrap()
+        );
+
+        assert_eq!(
+            direct_cloud_access_state_for_error("NETWORK_ERROR: dns lookup failed").0,
+            DirectCloudAccessState::OfflineReadonly
+        );
+        record_direct_cloud_access_error(
+            &cloud_workspace_id,
+            "AUTH_INVALID: refresh token revoked",
+        );
+        assert_eq!(
+            direct_cloud_access_runtime(&cloud_workspace_id)
+                .unwrap()
+                .state,
+            DirectCloudAccessState::ReauthRequired
+        );
+        assert!(direct_cloud_mutation_with_context::<Value>(
+            &database,
+            &context,
+            "direct_cloud_subject_create",
+            Some(Uuid::now_v7().to_string()),
+            json!({"id": Uuid::now_v7().to_string(), "name": "会话失效期间不应写入"}),
+        )
+        .unwrap_err()
+        .starts_with("CLOUD_READ_ONLY:"));
+        assert_eq!(
+            before,
+            crate::storage_contract::business_data_fingerprint(&database).unwrap()
+        );
+
+        let recovery_value = json!({
+            "metadata": {
+                "workspaceId": cloud_workspace_id,
+                "deviceId": device_id,
+                "storageProtocol": crate::storage_contract::DIRECT_CLOUD_PROTOCOL,
+                "workspaceEpoch": context.workspace_epoch,
+                "changeSeq": 7,
+                "serverTime": "2026-10-23T10:00:00Z",
+                "domains": []
+            },
+            "data": {}
+        });
+        let mut emergency_value = recovery_value.clone();
+        emergency_value["metadata"]["writable"] = json!(false);
+        emergency_value["metadata"]["readOnlyReason"] = json!("发布保护演练");
+        let emergency_body = Box::leak(emergency_value.to_string().into_boxed_str());
+        let recovery_body = Box::leak(recovery_value.to_string().into_boxed_str());
+        let recovery = TestHttpServer::start(vec![
+            TestHttpResponse {
+                path: "/rest/v1/rpc/direct_cloud_workbench_bootstrap",
+                status: 200,
+                body: emergency_body,
+            },
+            TestHttpResponse {
+                path: "/rest/v1/rpc/direct_cloud_workbench_bootstrap",
+                status: 200,
+                body: recovery_body,
+            },
+        ]);
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "supabase_project_url".to_string(),
+                value: json!(recovery.base_url()),
+            },
+        )
+        .unwrap();
+        assert!(direct_cloud_mutation_with_context::<Value>(
+            &database,
+            &context,
+            "direct_cloud_subject_create",
+            Some(Uuid::now_v7().to_string()),
+            json!({"id": Uuid::now_v7().to_string(), "name": "重查前仍不应写入"}),
+        )
+        .is_err());
+        assert_eq!(
+            before,
+            crate::storage_contract::business_data_fingerprint(&database).unwrap()
+        );
+        direct_cloud_query::<Value>(
+            &database,
+            "direct_cloud_workbench_bootstrap",
+            &context,
+            json!({}),
+        )
+        .unwrap();
+        let emergency = direct_cloud_access_runtime(&cloud_workspace_id).unwrap();
+        assert_eq!(emergency.state, DirectCloudAccessState::DegradedReadonly);
+        assert_eq!(emergency.reason.as_deref(), Some("发布保护演练"));
+        assert!(direct_cloud_mutation_with_context::<Value>(
+            &database,
+            &context,
+            "direct_cloud_subject_create",
+            Some(Uuid::now_v7().to_string()),
+            json!({"id": Uuid::now_v7().to_string(), "name": "紧急停写期间不应写入"}),
+        )
+        .unwrap_err()
+        .contains("发布保护演练"));
+        assert_eq!(
+            before,
+            crate::storage_contract::business_data_fingerprint(&database).unwrap()
+        );
+        direct_cloud_query::<Value>(
+            &database,
+            "direct_cloud_workbench_bootstrap",
+            &context,
+            json!({}),
+        )
+        .unwrap();
+        recovery.finish();
+        assert_eq!(
+            direct_cloud_access_runtime(&cloud_workspace_id)
+                .unwrap()
+                .state,
+            DirectCloudAccessState::OnlineWritable
+        );
+        ensure_direct_cloud_writable(&database, &cloud_workspace_id).unwrap();
+        assert_eq!(
+            before,
+            crate::storage_contract::business_data_fingerprint(&database).unwrap()
+        );
+
+        let metrics = crate::direct_cloud_observability::snapshot(&cloud_workspace_id);
+        assert_eq!(metrics.metrics.query_count, 5);
+        assert_eq!(metrics.metrics.query_error_count, 3);
+        assert_eq!(metrics.metrics.mutation_error_count, 6);
+        assert!(metrics.metrics.query_latency_max_ms > 0.0);
+        assert!(metrics.average_query_latency_ms > 0.0);
     }
 
     #[test]
@@ -9004,7 +9605,6 @@ mod tests {
                 "storageProtocol": "direct_v2",
                 "workspaceEpoch": 4,
                 "changeSeq": 101,
-                "schemaGeneration": 1,
                 "serverTime": "2026-10-23T08:00:00+14:00",
                 "domains": ["subjects", "tasks"],
                 "diagnostics": {"responseBytes": 2048, "rpcCount": 1, "durationMs": 4.0}
@@ -9104,7 +9704,6 @@ mod tests {
                 "storageProtocol": "direct_v2",
                 "workspaceEpoch": 1,
                 "changeSeq": local_fixture.revision,
-                "schemaGeneration": CLIENT_SCHEMA_GENERATION,
                 "serverTime": "2026-10-22T18:00:00+08:00",
                 "domains": domains,
                 "diagnostics": {"responseBytes": 1024, "rpcCount": 1, "durationMs": 1.0},
@@ -9374,7 +9973,6 @@ mod tests {
                 "storageProtocol": "direct_v2",
                 "workspaceEpoch": 1,
                 "changeSeq": 21,
-                "schemaGeneration": CLIENT_SCHEMA_GENERATION,
                 "serverTime": "2026-10-23T18:00:00+08:00",
                 "domains": domains,
                 "diagnostics": {"responseBytes": 512, "rpcCount": 1, "durationMs": 1.0},
@@ -9542,7 +10140,6 @@ mod tests {
                 "storageProtocol": "direct_v2",
                 "workspaceEpoch": 1,
                 "changeSeq": 22,
-                "schemaGeneration": CLIENT_SCHEMA_GENERATION,
                 "serverTime": "2026-10-23T18:00:00+08:00",
                 "domains": domains,
                 "diagnostics": {"responseBytes": 512, "rpcCount": 1, "durationMs": 1.0},
@@ -9711,7 +10308,6 @@ mod tests {
                 "storageProtocol": "direct_v2",
                 "workspaceEpoch": 1,
                 "changeSeq": 12,
-                "schemaGeneration": CLIENT_SCHEMA_GENERATION,
                 "serverTime": "2026-10-23T18:00:00+08:00",
                 "domains": domains,
                 "diagnostics": {"responseBytes": 512, "rpcCount": 1, "durationMs": 1.0},
@@ -10064,7 +10660,6 @@ mod tests {
             "storageProtocol": "direct_v2",
             "workspaceEpoch": 1,
             "changeSeq": 7,
-            "schemaGeneration": CLIENT_SCHEMA_GENERATION,
             "serverTime": "2026-10-22T18:00:00+08:00",
             "domains": ["time"],
             "diagnostics": {"responseBytes": 512, "rpcCount": 1, "durationMs": 1.0},
@@ -10176,7 +10771,6 @@ mod tests {
                 "storageProtocol": "direct_v2",
                 "workspaceEpoch": 1,
                 "changeSeq": 7,
-                "schemaGeneration": CLIENT_SCHEMA_GENERATION,
                 "serverTime": "2026-10-22T18:00:00+08:00",
                 "domains": domains,
                 "diagnostics": {"responseBytes": 512, "rpcCount": 1, "durationMs": 1.0},
@@ -10464,7 +11058,6 @@ mod tests {
                 "storageProtocol": "direct_v2",
                 "workspaceEpoch": 1,
                 "changeSeq": 27,
-                "schemaGeneration": CLIENT_SCHEMA_GENERATION,
                 "serverTime": "2026-10-22T18:00:00+08:00",
                 "domains": domains,
                 "diagnostics": {"responseBytes": 512, "rpcCount": 1, "durationMs": 1.0},
@@ -10856,7 +11449,7 @@ mod tests {
                 "metadata": {
                     "workspaceId":workspace_id,"deviceId":"device-placeholder",
                     "storageProtocol":"direct_v2","workspaceEpoch":1,"changeSeq":99,
-                    "schemaGeneration":CLIENT_SCHEMA_GENERATION,"serverTime":"2026-10-23T09:00:00+08:00",
+                    "serverTime":"2026-10-23T09:00:00+08:00",
                     "domains":["time"],"diagnostics":{"responseBytes":256,"rpcCount":1,"durationMs":1.0}
                 },
                 "data": {"entry": {
@@ -10941,7 +11534,7 @@ mod tests {
         let metadata = json!({
             "workspaceId":workspace_id,"deviceId":"device-placeholder",
             "storageProtocol":"direct_v2","workspaceEpoch":1,"changeSeq":101,
-            "schemaGeneration":CLIENT_SCHEMA_GENERATION,"serverTime":"2026-10-23T10:00:00+08:00",
+            "serverTime":"2026-10-23T10:00:00+08:00",
             "domains":["time"],"diagnostics":{"responseBytes":256,"rpcCount":1,"durationMs":1.0}
         });
         let state_body = Box::leak(
@@ -11028,7 +11621,6 @@ mod tests {
                 "storageProtocol": "direct_v2",
                 "workspaceEpoch": 1,
                 "changeSeq": 9,
-                "schemaGeneration": CLIENT_SCHEMA_GENERATION,
                 "serverTime": "2026-10-22T18:00:00+08:00",
                 "domains": domains,
                 "diagnostics": {"responseBytes": 512, "rpcCount": 1, "durationMs": 1.0},
@@ -12074,7 +12666,6 @@ mod tests {
             preview.package_version,
             crate::data_protection::DATA_PACKAGE_FORMAT_VERSION
         );
-        assert_eq!(preview.schema_generation, CLIENT_SCHEMA_GENERATION);
         assert!(preview.source_entity_count > 0);
         assert_eq!(preview.target_entity_count, 0);
         assert!(preview.target_is_empty);
@@ -12127,7 +12718,6 @@ mod tests {
             json!({
                 "workspaceId": cloud_workspace_id,
                 "packageVersion": crate::data_protection::DATA_PACKAGE_FORMAT_VERSION,
-                "schemaGeneration": CLIENT_SCHEMA_GENERATION,
                 "workspaceEpoch": 1,
                 "changeSeq": 17,
                 "entityCounts": entity_counts
@@ -12276,7 +12866,6 @@ mod tests {
         let manifest = DataCopyExportManifest {
             package_id: Uuid::now_v7().to_string(),
             package_version: crate::data_protection::DATA_PACKAGE_FORMAT_VERSION,
-            schema_generation: CLIENT_SCHEMA_GENERATION,
             workspace_epoch: 3,
             change_seq: 9,
             entity_counts: entities.iter().map(|entity| (entity.clone(), 0)).collect(),
@@ -12338,7 +12927,6 @@ mod tests {
             DataCopyExportManifest {
                 package_id,
                 package_version: crate::data_protection::DATA_PACKAGE_FORMAT_VERSION,
-                schema_generation: CLIENT_SCHEMA_GENERATION,
                 workspace_epoch: 1,
                 change_seq: 9,
                 entity_counts,
@@ -12508,6 +13096,303 @@ mod tests {
         }
     }
 
+    fn local_snapshot_content_hash(database: &Database, workspace_id: &str) -> String {
+        let snapshot = local_snapshot(database, workspace_id).unwrap();
+        crate::data_protection::sha256_hex(
+            &crate::data_protection::canonical_json_bytes(&snapshot).unwrap(),
+        )
+    }
+
+    fn local_subject_name(database: &Database, workspace_id: &str) -> String {
+        database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT name FROM subjects WHERE workspace_id=?1 ORDER BY sort_order,id LIMIT 1",
+                [workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn storage_switches_and_full_copies_keep_local_and_cloud_spaces_independent() {
+        let local_directory = tempdir().unwrap();
+        let cloud_directory = tempdir().unwrap();
+        let local =
+            Database::initialize_at(local_directory.path().join("independent-local.sqlite3"))
+                .unwrap();
+        let cloud =
+            Database::initialize_at(cloud_directory.path().join("independent-cloud.sqlite3"))
+                .unwrap();
+        let local_workspace_id = test_workspace_id(&local);
+        let cloud_workspace_id = test_workspace_id(&cloud);
+        local
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE subjects SET name='本地空间保留事项' WHERE workspace_id=?1",
+                [&local_workspace_id],
+            )
+            .unwrap();
+        cloud
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE subjects SET name='云端空间保留事项' WHERE workspace_id=?1",
+                [&cloud_workspace_id],
+            )
+            .unwrap();
+        let local_before = local_snapshot_content_hash(&local, &local_workspace_id);
+        let cloud_before = local_snapshot_content_hash(&cloud, &cloud_workspace_id);
+
+        for mode in ["cloud", "local", "cloud", "local"] {
+            settings::update_setting(
+                &local,
+                SettingsUpdate {
+                    scope: SettingsScope::Device,
+                    key: "storage_mode".to_string(),
+                    value: json!(mode),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                local_before,
+                local_snapshot_content_hash(&local, &local_workspace_id)
+            );
+            assert_eq!(
+                cloud_before,
+                local_snapshot_content_hash(&cloud, &cloud_workspace_id)
+            );
+        }
+
+        let local_snapshot_value = local_snapshot(&local, &local_workspace_id).unwrap();
+        let (local_manifest, local_chunks) = test_export_package(&local_snapshot_value);
+        let downloaded_local =
+            download_data_copy_from_fetch(&local_manifest, |index| Ok(local_chunks[index].clone()))
+                .unwrap();
+        replace_local_with_downloaded_data_copy(&cloud, &local_manifest, downloaded_local).unwrap();
+        let local_after_copy = local_snapshot_content_hash(&local, &local_workspace_id);
+        assert_eq!(
+            local_subject_name(&cloud, &cloud_workspace_id),
+            "本地空间保留事项"
+        );
+        assert_eq!(
+            local_after_copy,
+            local_snapshot_content_hash(&local, &local_workspace_id)
+        );
+
+        cloud
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE subjects SET name='复制后云端独立修改' WHERE workspace_id=?1",
+                [&cloud_workspace_id],
+            )
+            .unwrap();
+        assert_eq!(
+            local_after_copy,
+            local_snapshot_content_hash(&local, &local_workspace_id)
+        );
+        let cloud_after_edit = local_snapshot_content_hash(&cloud, &cloud_workspace_id);
+        assert_eq!(
+            local_subject_name(&cloud, &cloud_workspace_id),
+            "复制后云端独立修改"
+        );
+        local
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE subjects SET name='复制后本地独立修改' WHERE workspace_id=?1",
+                [&local_workspace_id],
+            )
+            .unwrap();
+        assert_eq!(
+            local_subject_name(&cloud, &cloud_workspace_id),
+            "复制后云端独立修改"
+        );
+        assert_eq!(
+            cloud_after_edit,
+            local_snapshot_content_hash(&cloud, &cloud_workspace_id)
+        );
+
+        let cloud_snapshot_value = local_snapshot(&cloud, &cloud_workspace_id).unwrap();
+        let (cloud_manifest, cloud_chunks) = test_export_package(&cloud_snapshot_value);
+        let downloaded_cloud =
+            download_data_copy_from_fetch(&cloud_manifest, |index| Ok(cloud_chunks[index].clone()))
+                .unwrap();
+        replace_local_with_downloaded_data_copy(&local, &cloud_manifest, downloaded_cloud).unwrap();
+        assert_eq!(
+            local_subject_name(&local, &local_workspace_id),
+            "复制后云端独立修改"
+        );
+        assert_eq!(
+            local_subject_name(&cloud, &cloud_workspace_id),
+            "复制后云端独立修改"
+        );
+    }
+
+    #[test]
+    fn both_copy_directions_require_explicit_confirmation() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("copy-confirmation.sqlite3")).unwrap();
+        let local_error = replace_staged_local_data_copy(
+            &database,
+            DataCopyReplaceRequest {
+                package_id: Uuid::now_v7().to_string(),
+                content_hash: "ab".repeat(32),
+                operation_id: Uuid::now_v7().to_string(),
+                confirmed: false,
+            },
+        )
+        .unwrap_err();
+        assert!(local_error.starts_with("DATA_COPY_REPLACE_CONFIRMATION_REQUIRED:"));
+
+        let cloud_error = replace_local_with_cloud_data_copy(
+            &database,
+            DataCopyReplaceLocalRequest { confirmed: false },
+        )
+        .unwrap_err();
+        assert!(cloud_error.starts_with("DATA_COPY_REPLACE_CONFIRMATION_REQUIRED:"));
+    }
+
+    #[test]
+    fn local_to_cloud_copy_preserves_the_local_space_and_creates_no_sync_work() {
+        let _guard = lock_test_session_state();
+        reset_test_credentials();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        let package_id = Uuid::now_v7().to_string();
+        let operation_id = Uuid::now_v7().to_string();
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("local-to-cloud-copy.sqlite3")).unwrap();
+        let source_workspace_id = test_workspace_id(&database);
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE subjects SET name='本地复制源事项' WHERE workspace_id=?1",
+                [&source_workspace_id],
+            )
+            .unwrap();
+        let source_snapshot = local_snapshot(&database, &source_workspace_id).unwrap();
+        let (chunks, content_hash) = build_data_copy_chunks(&source_snapshot).unwrap();
+        let entity_counts = source_snapshot
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(entity, rows)| {
+                (
+                    entity.clone(),
+                    json!(rows.as_array().map(Vec::len).unwrap_or(0)),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let begin_body = Box::leak(
+            json!({"packageId": package_id})
+                .to_string()
+                .into_boxed_str(),
+        );
+        let validated_body = Box::leak(
+            json!({"status": "validated", "entityCounts": entity_counts})
+                .to_string()
+                .into_boxed_str(),
+        );
+        let commit_body = Box::leak(
+            json!({
+                "replaced": true,
+                "packageId": package_id,
+                "contentHash": content_hash,
+                "safetySnapshotId": Uuid::now_v7().to_string(),
+                "previousEpoch": 1,
+                "workspaceEpoch": 2,
+                "resetChangeSeq": 41,
+                "entityCounts": entity_counts
+            })
+            .to_string()
+            .into_boxed_str(),
+        );
+        let mut responses = vec![TestHttpResponse {
+            path: "/rest/v1/rpc/data_copy_stage_begin",
+            status: 200,
+            body: begin_body,
+        }];
+        for _ in &chunks {
+            responses.push(TestHttpResponse {
+                path: "/rest/v1/rpc/data_copy_stage_chunk_put",
+                status: 200,
+                body: "{}",
+            });
+        }
+        responses.push(TestHttpResponse {
+            path: "/rest/v1/rpc/data_copy_stage_validate",
+            status: 200,
+            body: validated_body,
+        });
+        responses.push(TestHttpResponse {
+            path: "/rest/v1/rpc/data_copy_replace_commit",
+            status: 200,
+            body: commit_body,
+        });
+        let server = TestHttpServer::start(responses);
+        configure_test_cloud_state(&database, &server.base_url(), &cloud_workspace_id);
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "INSERT INTO device_settings(key,value_json,updated_at) VALUES('cloud_storage_protocol',?1,1) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+                [serde_json::to_string(crate::storage_contract::DIRECT_CLOUD_PROTOCOL).unwrap()],
+            )
+            .unwrap();
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("local"),
+            },
+        )
+        .unwrap();
+        save_session(
+            &database,
+            &test_session("local-to-cloud-copy", Some(now_seconds() + 3600)),
+        )
+        .unwrap();
+        let before_hash = local_snapshot_content_hash(&database, &source_workspace_id);
+
+        let staged = stage_local_data_copy(&database).unwrap();
+        assert_eq!(staged.package_id, package_id);
+        assert_eq!(staged.content_hash, content_hash);
+        let replaced = replace_staged_local_data_copy(
+            &database,
+            DataCopyReplaceRequest {
+                package_id,
+                content_hash,
+                operation_id,
+                confirmed: true,
+            },
+        )
+        .unwrap();
+        assert!(replaced.replaced);
+        assert_eq!(storage_mode(&database).unwrap().mode, "local");
+        assert_eq!(
+            before_hash,
+            local_snapshot_content_hash(&database, &source_workspace_id)
+        );
+        assert_eq!(
+            database
+                .open()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let requests = server.finish();
+        assert_eq!(requests.len(), 3 + chunks.len());
+    }
+
     #[test]
     fn local_cloud_local_data_copy_round_trip_preserves_counts_and_content_hash() {
         let directory = tempdir().unwrap();
@@ -12581,7 +13466,6 @@ mod tests {
             device_id: "30000000-0000-0000-0000-000000000001".to_string(),
             storage_protocol: "sync_v1".to_string(),
             workspace_epoch,
-            schema_generation: CLIENT_SCHEMA_GENERATION,
             server_upgrade_allowed: true,
             already_direct: false,
             requires_local_queue_disposition: true,
@@ -12636,7 +13520,6 @@ mod tests {
             local_protocol: "sync_v1".to_string(),
             workspace_epoch: 4,
             local_workspace_epoch: 4,
-            schema_generation: CLIENT_SCHEMA_GENERATION,
             server_upgrade_allowed: true,
             already_direct: false,
             requires_local_queue_disposition: true,
@@ -12830,6 +13713,27 @@ mod tests {
         let wrong_text =
             storage_protocol_upgrade_after_rescue(&database, request(true, "确认")).unwrap_err();
         assert!(wrong_text.starts_with("ABANDON_CONFIRMATION_MISMATCH:"));
+    }
+
+    #[test]
+    fn cloud_authority_reset_requires_confirmation_before_any_remote_check() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("authority-reset-confirmation.sqlite3"),
+        )
+        .unwrap();
+        let error = storage_protocol_reset_to_cloud_authority(
+            &database,
+            StorageProtocolAuthorityResetRequest {
+                operation_id: Uuid::now_v7().to_string(),
+                confirmed: false,
+                create_safety_snapshot: Some(true),
+            },
+        )
+        .unwrap_err();
+        assert!(error.starts_with("CLOUD_AUTHORITY_RESET_NOT_CONFIRMED:"));
     }
 
     #[test]

@@ -96,7 +96,7 @@ reauth_required
 
 定义稳定、版本化的数据包格式，覆盖所有共享业务实体与安全的共享设置，不包含凭据、设备授权、outbox、操作记录、自动化命令和本机路径。现有本地备份实体清单与云端快照实体清单应收敛为同一个可测试目录，防止后续新增表只进入一侧。
 
-本地到云端：先从本地一致性事务导出并校验数据包；若云端非空，先创建并验证 `pre_replace` 安全快照；上传至服务端 staging，完成引用、计数、哈希和 schema generation 校验后，在恢复锁保护下单事务替换云端业务表、提升 epoch 并发布 reset 通知。
+本地到云端：先从本地一致性事务导出并校验数据包；若云端非空，先创建并验证 `pre_replace` 安全快照；上传至服务端 staging，完成引用、计数、哈希和数据包格式版本校验后，在恢复锁保护下单事务替换云端业务表、提升 epoch 并发布 reset 通知。
 
 云端到本地：服务端从一致性边界导出数据包；客户端完整下载和校验，先创建本地安全备份，再在单个 SQLite 事务中替换本地业务空间。下载失败或校验失败不得打开替换事务。
 
@@ -104,7 +104,7 @@ reauth_required
 
 ### 9. 使用工作空间存储协议代际阻止旧客户端写入
 
-在云端工作空间增加 `storage_protocol` 或等价代际字段，至少区分 `sync_v1` 与 `direct_v2`。所有旧同步写 RPC、增量补丁和租约入口在写入前检查协议；工作空间切到 `direct_v2` 后拒绝旧协议写入并返回 `CLIENT_UPGRADE_REQUIRED`。所有新直连 RPC 只接受 `direct_v2`。
+在云端工作空间增加 `storage_protocol` 或等价代际字段，至少区分 `sync_v1` 与 `direct_v2`。所有旧同步写 RPC、增量补丁和租约入口在写入前检查协议；工作空间切到 `direct_v2` 后拒绝旧协议写入并返回 `CLOUD_PROTOCOL_UNSUPPORTED`。所有新直连 RPC 只接受 `direct_v2`。
 
 不能只依靠桌面端版本判断，因为离线旧客户端可能在迁移完成后重新上线。服务端屏障是避免旧 outbox 覆盖直连数据的正确性条件。读取和显式升级/救援 RPC 可在受控范围兼容 `sync_v1`。
 
@@ -132,6 +132,14 @@ reauth_required
 现有操作记录、快照、恢复锁和 workspace epoch 继续保留。自动快照由云端调度或成功业务写触发的服务端逻辑创建，不依赖本机同步完成。恢复 commit 完成后通过 epoch/reset 通知所有在线客户端清空内存数据并重新查询。
 
 本地备份组件仅对本地空间工作；云端模式如需文件导出，应调用云端一致性导出 API，而不是读取 SQLite。现有“本地缓存重置”能力删除，因为云端模式没有持久化业务缓存。
+
+### 13. 取消客户端 schema generation 门槛，保留协议与数据并发边界
+
+客户端数字 generation 与直连云端模式的职责重复，并会让一次正常的服务端结构调整演变为所有设备必须同时升级。直连请求不再发送 `x-timegenie-client-schema-generation`，服务端删除业务表 generation 写屏障，并从 `assert_direct_v2_workspace` 和协议升级预检中移除 generation 校验；历史 `minimum_client_schema_generation` 列和 helper 一并删除。
+
+旧同步入口仍必须通过 `storage_protocol` 被 `direct_v2` 拒绝，这是防止旧 outbox 覆盖云端权威数据的协议隔离，不是客户端版本比较。错误语义改为 `CLOUD_PROTOCOL_UNSUPPORTED`。业务实体的 `version` 和 `workspace_epoch` 继续保留：前者在提交时发现真实多设备陈旧写入，后者隔离恢复或完整替换之前的请求。二者都不会形成后台冲突队列。
+
+显式数据复制继续使用独立的数据包格式版本。该版本只保护用户主动执行的导入/导出兼容性，命名和错误码不得再使用客户端 schema generation 或 `CLIENT_UPGRADE_REQUIRED`，也不得影响日常云端读取和修改。
 
 ## Risks / Trade-offs
 

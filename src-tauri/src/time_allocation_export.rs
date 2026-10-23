@@ -44,7 +44,7 @@ impl From<&TimeAllocationExportExecuteRequest> for TimeAllocationExportRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TimeAllocationExportRow {
     pub work_date: String,
@@ -402,6 +402,19 @@ fn preview_with_snapshot(
     })
 }
 
+fn preview_direct(
+    database: &Database,
+    request: &TimeAllocationExportRequest,
+) -> Result<TimeAllocationExportPreview, String> {
+    validate_request(request)?;
+    let rows = crate::supabase::direct_cloud_time_allocation_export(database, request.clone())?;
+    Ok(TimeAllocationExportPreview {
+        row_count: rows.len(),
+        total_minutes: rows.iter().map(|row| row.minutes).sum(),
+        default_file_name: default_file_name(request),
+    })
+}
+
 fn workbook_bytes(rows: &[TimeAllocationExportRow], total_minutes: i64) -> Result<Vec<u8>, String> {
     let mut workbook = Workbook::new();
     let header_format = Format::new()
@@ -585,6 +598,33 @@ fn execute_with_snapshot(
     })
 }
 
+fn execute_direct(
+    database: &Database,
+    request: &TimeAllocationExportExecuteRequest,
+) -> Result<TimeAllocationExportResult, String> {
+    let export_request = TimeAllocationExportRequest::from(request);
+    validate_request(&export_request)?;
+    let path = PathBuf::from(request.target_path.trim());
+    if !path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("xlsx"))
+    {
+        return Err("VALIDATION_ERROR: 保存文件必须使用 .xlsx 扩展名".to_string());
+    }
+    let rows = crate::supabase::direct_cloud_time_allocation_export(database, export_request)?;
+    if rows.is_empty() {
+        return Err("NO_EXPORT_ROWS: 所选范围没有可导出的工时".to_string());
+    }
+    let total_minutes = rows.iter().map(|row| row.minutes).sum();
+    safe_write(&path, &workbook_bytes(&rows, total_minutes)?)?;
+    Ok(TimeAllocationExportResult {
+        row_count: rows.len(),
+        total_minutes,
+        path: path.to_string_lossy().into_owned(),
+    })
+}
+
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -599,7 +639,14 @@ pub async fn time_allocation_export_preview(
 ) -> Result<TimeAllocationExportPreview, String> {
     let database = database.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        preview_with_snapshot(&database, &request, now_millis())
+        let direct_request = request.clone();
+        crate::storage_contract::route(
+            &database,
+            crate::storage_contract::BusinessDomain::Time,
+            crate::storage_contract::StorageOperation::Query,
+            |database| preview_with_snapshot(database, &request, now_millis()),
+            |database| preview_direct(database, &direct_request),
+        )
     })
     .await
     .map_err(|error| format!("导出预览任务失败: {error}"))?
@@ -612,7 +659,19 @@ pub async fn time_allocation_export_execute(
 ) -> Result<TimeAllocationExportResult, String> {
     let database = database.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        execute_with_snapshot(&database, &request, now_millis())
+        let direct_request = TimeAllocationExportExecuteRequest {
+            start_date: request.start_date.clone(),
+            end_date: request.end_date.clone(),
+            include_special_time: request.include_special_time,
+            target_path: request.target_path.clone(),
+        };
+        crate::storage_contract::route(
+            &database,
+            crate::storage_contract::BusinessDomain::Time,
+            crate::storage_contract::StorageOperation::Query,
+            |database| execute_with_snapshot(database, &request, now_millis()),
+            |database| execute_direct(database, &direct_request),
+        )
     })
     .await
     .map_err(|error| format!("Excel 导出任务失败: {error}"))?

@@ -18,6 +18,8 @@ mod cloud_e2e;
 mod cloud_sync;
 mod daily_report_import;
 mod data_protection;
+mod direct_cloud_observability;
+mod direct_cloud_realtime;
 #[cfg(target_os = "windows")]
 mod native_tray;
 mod obsidian;
@@ -441,6 +443,7 @@ pub fn run() {
             settings::integration_secret_set,
             settings::integration_secret_clear,
             supabase::storage_mode_get,
+            supabase::direct_cloud_release_metrics_get,
             supabase::storage_mode_set_local,
             supabase::storage_mode_set_cloud,
             supabase::cloud_configure,
@@ -457,6 +460,7 @@ pub fn run() {
             supabase::storage_protocol_upgrade_preflight_get,
             supabase::storage_protocol_upgrade_with_drained_queue_command,
             supabase::storage_protocol_upgrade_after_rescue_command,
+            supabase::storage_protocol_reset_to_cloud_authority_command,
             supabase::cloud_operation_history_list,
             supabase::cloud_operation_history_detail,
             supabase::cloud_workspace_snapshot_create,

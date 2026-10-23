@@ -369,10 +369,9 @@ pub const PROTECTED_ENTITIES: &[ProtectedEntity] = &[
 #[cfg(test)]
 pub const EXCLUDED_TABLES: &[&str] = &[
     "devices",
-    "tracking_leases",
-    "workspace_changes",
     "processed_operations",
     "device_settings",
+    "legacy_sync_cleanup_diagnostics",
     "local_sync_state",
     "sync_outbox",
     "legacy_abandoned_outbox",
@@ -765,6 +764,25 @@ pub(crate) fn export_automatic_safety_backup(
         },
         true,
         None,
+    )
+}
+
+pub(crate) fn export_automatic_legacy_rescue_backup(
+    database: &crate::database::Database,
+    disposition_reason: &str,
+) -> Result<BackupExportResult, String> {
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
+    let path = database.data_directory().join("backups").join(format!(
+        "timegenie-before-cloud-authority-reset-{timestamp}.timegenie-backup"
+    ));
+    export_backup_with_policy(
+        database,
+        BackupExportRequest {
+            path: path.display().to_string(),
+            rescue: false,
+        },
+        true,
+        Some(disposition_reason.to_string()),
     )
 }
 
@@ -1546,7 +1564,7 @@ fn diagnostic_error_code(raw: Option<&str>) -> Option<String> {
         .unwrap_or("");
     const SAFE_CODES: &[&str] = &[
         "AUTH_REQUIRED",
-        "CLIENT_UPGRADE_REQUIRED",
+        "CLOUD_PROTOCOL_UNSUPPORTED",
         "DEVICE_REVOKED",
         "ENTITY_DELETED",
         "IDEMPOTENCY_CONFLICT",
@@ -1971,9 +1989,7 @@ fn delete_workspace_data(transaction: &Transaction<'_>, workspace_id: &str) -> R
         "sync_outbox",
         "local_sync_state",
         "processed_operations",
-        "workspace_changes",
         "tracking_runtime_state",
-        "tracking_leases",
         "subjects",
         "devices",
     ] {
@@ -2827,6 +2843,12 @@ mod tests {
                 params![workspace_id, device_id],
             )
             .unwrap();
+        connection
+            .execute(
+                "UPDATE legacy_sync_cleanup_diagnostics SET cleanup_reason='password=cleanup-diagnostic-secret' WHERE table_name='tracking_leases'",
+                [],
+            )
+            .unwrap();
         drop(connection);
 
         let path = directory.path().join("standard.timegenie-backup");
@@ -2848,6 +2870,7 @@ mod tests {
             "secret.exe",
             "hook-secret",
             "op-secret",
+            "cleanup-diagnostic-secret",
             "D:/secret/daily-report-directory",
         ] {
             assert!(!text.contains(forbidden), "archive leaked {forbidden}");
@@ -2857,6 +2880,9 @@ mod tests {
         assert!(integration.get("secret_ref").is_none());
         assert!(!validated.tables.contains_key("devices"));
         assert!(!validated.tables.contains_key("sync_outbox"));
+        assert!(!validated
+            .tables
+            .contains_key("legacy_sync_cleanup_diagnostics"));
     }
 
     #[test]
@@ -2992,6 +3018,41 @@ mod tests {
                 .disposition_reason,
             "用户确认导出后放弃旧修改"
         );
+    }
+
+    #[test]
+    fn automatic_cloud_authority_reset_backup_handles_pending_legacy_queue() {
+        let (directory, database, workspace_id, _) = test_database();
+        let cloud_workspace_id = "cloud-authority-reset-workspace";
+        let connection = database.open().unwrap();
+        let device_id: String = connection
+            .query_row(
+                "SELECT id FROM devices WHERE workspace_id=?1",
+                [&workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection.execute(
+            "INSERT INTO local_sync_state(workspace_id,device_id,last_change_seq,workspace_epoch) VALUES(?1,?2,0,1)",
+            params![cloud_workspace_id, device_id],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,payload_json,state,attempt_count,created_at,workspace_epoch) VALUES('authority-reset-op',?1,?2,'task_update','task','{}','pending',0,1,1)",
+            params![cloud_workspace_id, device_id],
+        ).unwrap();
+        drop(connection);
+        set_device_setting(&database, "storage_mode", json!("cloud"));
+        set_device_setting(&database, "cloud_workspace_id", json!(cloud_workspace_id));
+
+        let result =
+            export_automatic_legacy_rescue_backup(&database, "用户确认放弃本机旧云端数据").unwrap();
+        let backup_path = PathBuf::from(&result.path);
+        assert!(backup_path.starts_with(directory.path().join("backups")));
+        let validated = validate_rescue_backup_for_abandon(&backup_path).unwrap();
+        assert_eq!(validated.pending_operation_count, 1);
+        assert_eq!(validated.legacy_queue_operation_count, 1);
+        let history = backup_history_list(&database).unwrap();
+        assert_eq!(history[0].origin, "safety");
     }
 
     #[test]
@@ -3144,7 +3205,7 @@ mod tests {
                 "device_hooks",
                 "local_sync_state",
                 "sync_outbox",
-                "tracking_leases",
+                "legacy_sync_cleanup_diagnostics",
             ] {
                 assert!(
                     !validated.tables.contains_key(excluded),

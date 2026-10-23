@@ -85,7 +85,7 @@ begin
   for update;
   if not found then raise exception 'DATA_COPY_STAGE_NOT_VALIDATED'; end if;
   if package_row.package_version<>1 then raise exception 'DATA_PACKAGE_VERSION_UNSUPPORTED'; end if;
-  if package_row.schema_generation<>1 then raise exception 'CLIENT_UPGRADE_REQUIRED: data package schema generation mismatch'; end if;
+  if package_row.schema_generation<>1 then raise exception 'DATA_PACKAGE_VERSION_UNSUPPORTED: data package format mismatch'; end if;
   if package_row.expected_content_hash<>coalesce(p_expected_content_hash,'') then
     raise exception 'DATA_PACKAGE_CONTENT_HASH_MISMATCH';
   end if;
@@ -120,10 +120,7 @@ begin
   perform set_config('timegenie.restore_lock_token',lock_token_value::text,true);
   perform set_config(
     'request.headers',
-    jsonb_build_object(
-      'x-timegenie-workspace-epoch',current_epoch::text,
-      'x-timegenie-client-schema-generation','1'
-    )::text,
+    jsonb_build_object('x-timegenie-workspace-epoch',current_epoch::text)::text,
     true
   );
   safety_result:=timegenie.workspace_snapshot_create(

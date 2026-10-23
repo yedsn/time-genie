@@ -216,7 +216,7 @@ assert.ok(subjectPreference.includes("timegenie:execution-panel-subject"));
 assert.ok(subjectPreference.includes("localStorage"));
 assert.ok(subjectPreference.includes("onRememberedPanelSubjectChange"));
 assert.ok(reports.includes('aria-label="报告主体筛选"'));
-assert.ok(reports.includes("report.subjectId !== reportSubjectId.value"));
+assert.ok(reports.includes("store.loadReports({ subjectId, reportType, query: query || undefined })"));
 assert.ok(reports.includes("rememberPanelSubjectId(subjectId)"));
 assert.ok(reports.includes("readRememberedPanelSubjectId()"));
 assert.ok(reports.includes("onRememberedPanelSubjectChange"));

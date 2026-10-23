@@ -124,6 +124,7 @@ try {
   await page.goto(`http://${host}:${port}`, { waitUntil: "networkidle" });
   await page.waitForSelector(".topbar-title h1");
   await page.getByRole("navigation").getByRole("button", { name: "待办", exact: true }).click();
+  await page.getByRole("tab", { name: /进行中/ }).click();
   const timerButton = page.locator(`.reminder-row[data-task-id="${taskId}"] .task-timer-action`);
   await timerButton.waitFor({ state: "visible" });
   await timerButton.click();

@@ -57,10 +57,19 @@ for (const table of domainTableNames) {
 }
 const migrationDir = path.join(repoRoot, "src-tauri", "migrations");
 const migrationTables = new Set();
-for (const fileName of fs.readdirSync(migrationDir).filter((name) => name.endsWith(".sql"))) {
+const removedTables = new Set();
+for (const fileName of fs.readdirSync(migrationDir).filter((name) => name.endsWith(".sql")).sort()) {
   const sql = fs.readFileSync(path.join(migrationDir, fileName), "utf8");
   const pattern = /CREATE\s+(?:VIRTUAL\s+)?TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+["']?([a-zA-Z0-9_]+)/gim;
-  for (const match of sql.matchAll(pattern)) migrationTables.add(match[1]);
+  for (const match of sql.matchAll(pattern)) {
+    migrationTables.add(match[1]);
+    removedTables.delete(match[1]);
+  }
+  const dropPattern = /DROP\s+TABLE(?:\s+IF\s+EXISTS)?\s+["']?([a-zA-Z0-9_]+)/gim;
+  for (const match of sql.matchAll(dropPattern)) {
+    migrationTables.delete(match[1]);
+    removedTables.add(match[1]);
+  }
 }
 migrationTables.add("schema_migrations");
 const missingTables = [...migrationTables].filter((table) => !classifiedTables.has(table)).sort();

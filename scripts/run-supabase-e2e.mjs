@@ -21,6 +21,7 @@ if (process.env.TG_SUPABASE_E2E_ALLOW_RESET !== "1") {
 }
 
 const tests = [
+  "cloud_e2e::real_supabase_direct_v2_two_device_flow",
   "cloud_e2e::real_supabase_two_device_flow",
   "cloud_e2e::real_supabase_unassigned_two_device_flow",
 ];

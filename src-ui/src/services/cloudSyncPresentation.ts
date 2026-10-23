@@ -23,22 +23,51 @@ export type CloudSyncPresentation = {
   attentionLevel: CloudSyncAttentionLevel;
 };
 
-export type CloudSyncPushResult = {
-  pushed: number;
-  pending: number;
-  conflicts: number;
+export type DirectCloudMutationFeedback = {
+  level: "warning" | "error";
+  message: string;
+  shouldRefresh: boolean;
 };
 
-export type CloudSyncRetryFeedback = {
-  level: "success" | "warning";
-  message: string;
-};
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error ?? "");
+}
+
+export function directCloudMutationFeedback(error: unknown): DirectCloudMutationFeedback {
+  const message = errorMessage(error);
+  if (/(?:VERSION_CONFLICT|ENTITY_DELETED)\s*:/.test(message)) {
+    return {
+      level: "warning",
+      message: "数据已在其他设备变化，正在重新查询最新云端数据",
+      shouldRefresh: true,
+    };
+  }
+  if (/(?:DEVICE_REVOKED|AUTH_REQUIRED|AUTH_INVALID|AUTH_FAILED|AUTH_RETRY_REQUIRED|AUTH_BLOCKED|AUTH_UNVERIFIED|CREDENTIAL_UNAVAILABLE)\s*:/.test(message)) {
+    return {
+      level: "error",
+      message: "登录已失效，请重新登录 Supabase",
+      shouldRefresh: false,
+    };
+  }
+  if (/(?:CLOUD_READ_ONLY|CLOUD_OFFLINE|NETWORK_UNAVAILABLE|REQUEST_TIMEOUT|SERVICE_UNAVAILABLE)\s*:/.test(message)) {
+    return {
+      level: "warning",
+      message: "云端离线，只能查看已加载数据；不会保存到本机等待同步",
+      shouldRefresh: false,
+    };
+  }
+  return {
+    level: "error",
+    message: message.replace(/^[A-Z][A-Z_]*:\s*/, "") || "云端保存失败，请重试查询最新数据",
+    shouldRefresh: false,
+  };
+}
 
 export function cloudSaveStatusLabel(state: CloudSyncPresentationState | undefined): string {
   if (!state || state.mode !== "cloud") return "仅保存在本机";
   if (state.storageProtocol === "direct_v2") {
     if (state.cloudAccessState === "connecting") return "正在连接云端";
-    if (state.cloudAccessState === "online_writable" && state.cloudWritable) return "已直接保存到云端";
+    if (state.cloudAccessState === "online_writable" && state.cloudWritable) return "已直接保存到 Supabase";
     if (state.cloudAccessState === "reauth_required") return "需要重新登录";
     return "云端只读";
   }
@@ -83,11 +112,19 @@ export function cloudSyncPresentation(
         attentionLevel: "",
       };
     }
+    if (accessState === "reauth_required") {
+      return {
+        label: "需要重新登录",
+        detail: state.readOnlyReason || "登录已失效，请重新登录 Supabase",
+        needsAttention: true,
+        attentionLevel: "critical",
+      };
+    }
     return {
-      label: accessState === "reauth_required" ? "需要重新登录" : "云端只读",
-      detail: state.readOnlyReason || "Supabase 当前不可用，已加载内容可查看但不能修改",
+      label: "云端只读",
+      detail: state.readOnlyReason || "云端离线，只能查看已加载数据；不会保存到本机等待同步",
       needsAttention: true,
-      attentionLevel: accessState === "reauth_required" ? "critical" : "offline",
+      attentionLevel: "offline",
     };
   }
 
@@ -153,30 +190,5 @@ export function cloudSyncPresentation(
       : "实时同步已连接，云端变化会自动更新",
     needsAttention: false,
     attentionLevel: "",
-  };
-}
-
-export function cloudSyncRetryFeedback(
-  result: CloudSyncPushResult,
-  state: CloudSyncPresentationState | undefined,
-): CloudSyncRetryFeedback {
-  if (result.conflicts > 0 || (state?.conflictCount ?? 0) > 0) {
-    return {
-      level: "warning",
-      message: "同步遇到版本冲突，请选择要保留的版本",
-    };
-  }
-
-  const pending = Math.max(result.pending, state?.pendingOperations ?? 0);
-  if (pending > 0) {
-    return {
-      level: "warning",
-      message: `本机修改已保存，仍有 ${pending} 项等待同步`,
-    };
-  }
-
-  return {
-    level: "success",
-    message: result.pushed > 0 ? `已同步 ${result.pushed} 项修改` : "当前没有待同步修改",
   };
 }

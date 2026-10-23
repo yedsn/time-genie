@@ -3,12 +3,14 @@
 > 日期：2026-09-24  
 > 对应 OpenSpec change：`create-work-report-assistant-desktop-app`  
 > 接口形态：Tauri 2 Rust commands + Supabase Auth/PostgREST/RPC/Realtime + 应用事件，不设计自建本地 HTTP 服务
+>
+> 2026-10-23 更新：第 1–14 章中的同步队列描述仅用于旧 `sync_v1` 兼容；当前云端调用边界以第 15 章及文末“`direct_v2` 当前接口契约”为准。
 
 ## 1. 设计结论
 
 - 后端支持 `local` 本地模式和 `cloud` Supabase 云端模式。前端始终通过 `invoke(command, payload)` 调用 Rust 服务层，不直接在 Vue 组件中区分存储模式。
-- 本地模式由 Rust 服务层执行 SQLite 事务；云端模式由 Rust 服务层先提交本机 SQLite 事务并写入同步队列，再通过 Supabase Auth、PostgREST、PostgreSQL RPC 和 Realtime 推送、拉取和解决冲突。
-- 云端模式以 Supabase PostgreSQL 为最终权威数据源，SQLite 保存本机缓存、待同步队列和同步状态；有待同步或冲突操作时不得用云端快照覆盖本地编辑，不允许形成双主。
+- 本地模式由 Rust 服务层执行 SQLite 事务；`direct_v2` 云端模式由 Rust 服务层直接调用 Supabase 查询/RPC，不先写 SQLite，也不创建同步队列。
+- `direct_v2` 以 Supabase PostgreSQL 为唯一业务权威；SQLite 只保存设备元数据和刷新检查点。旧 `sync_v1` 的缓存、队列与冲突接口只服务升级兼容和救援。
 - 主窗口、托盘窗口和悬浮窗口使用同一套命令，不允许各自维护业务副本。
 - Rust 服务层每次本地或云端写入确认后广播领域事件。其他设备通过 Supabase Realtime 收到变更序号，再做增量拉取。
 - 前端每秒只更新显示时钟，不每秒写数据库。运行时长以服务端保存的开放分段开始时间计算。
@@ -1136,5 +1138,16 @@ TimeGenie 将业务接口划分为六个领域：事项、计划与重复、计�
 - 本地模式由 SQLite 适配器实现全部业务查询与修改，并保持完全离线可用。
 - `sync_v1` 是升级兼容协议，暂时继续使用 SQLite 与同步队列，不代表目标架构。
 - `direct_v2` 由 Supabase 适配器直接执行查询和 mutation；云端不落本地业务副本，也不创建待同步业务操作。
+- mutation 成功后前端显示“已直接保存到 Supabase”；`VERSION_CONFLICT` 或 `ENTITY_DELETED` 立即提示数据已在其他设备变化并重新查询，不能进入后台冲突队列。
+- `offline_readonly`、`degraded_readonly` 与 `reauth_required` 会在 Rust mutation 入口统一拒绝写入；前端明确说明不会保存到本机等待同步。
+
+## `direct_v2` 当前接口契约
+
+- 存储协议：`storage_protocol_get`、`storage_protocol_upgrade_preflight`、`upgrade_storage_protocol`。切换到 `direct_v2` 后，旧写入口返回 `CLOUD_PROTOCOL_UNSUPPORTED`，不能降回 `sync_v1`。
+- 页面查询：`direct_cloud_workbench_bootstrap` 及各领域 `direct_cloud_*` 查询直接返回 `{ metadata, data }`；`metadata` 包含 `serverTime`、`workspaceEpoch`、`changeSeq`、`domains` 和诊断信息。
+- 业务写入：所有 `direct_cloud_*` mutation 携带 `p_workspace_id`、`p_device_id`、`p_operation_id`、`p_expected_epoch` 与 `p_payload`，并校验设备授权、存储协议、workspace epoch 和实体 expected version；不发送或校验客户端 schema generation。
+- 快照与恢复：快照直接读取 Supabase 权威数据；`workspace_restore_prepare`/`workspace_restore_commit` 成功后客户端清空内存数据并重新查询，不调用 `cloud_snapshot_get` 重建 SQLite。
+- 紧急只读：运维开关关闭直连写入时，查询、快照、操作记录和导出保持可用，mutation 返回稳定只读错误；客户端不得改走 `cloud_apply_patch`、`sync_outbox` 或任何旧同步入口。
+- 本地模式：所有业务命令只访问 SQLite，不发送 Supabase 业务请求，并保持完全离线可用。
 - 登录凭据、连接配置、设备身份和设备偏好属于设备元数据，可继续保存在本机；共享设置仍属于业务数据。
 - 前端继续调用稳定的 Tauri DTO，由 Rust 存储路由选择适配器，前端不直接持有 Supabase 数据库写权限。

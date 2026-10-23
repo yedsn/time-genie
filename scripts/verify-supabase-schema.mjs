@@ -61,6 +61,11 @@ const directReportMutationPatchFile = path.join(repoRoot, "supabase", "20261023a
 const directReportTemplateMutationPatchFile = path.join(repoRoot, "supabase", "20261023b_timegenie_direct_cloud_report_template_mutations.sql");
 const directSharedSettingsMutationPatchFile = path.join(repoRoot, "supabase", "20261023c_timegenie_direct_cloud_shared_settings_mutations.sql");
 const directIntegrationMutationPatchFile = path.join(repoRoot, "supabase", "20261023d_timegenie_direct_cloud_integration_mutations.sql");
+const directTodayOverviewPatchFile = path.join(repoRoot, "supabase", "20261023i_timegenie_direct_cloud_today_overview.sql");
+const directImportExportPatchFile = path.join(repoRoot, "supabase", "20261023j_timegenie_direct_cloud_import_export.sql");
+const directReleaseGuardPatchFile = path.join(repoRoot, "supabase", "20261023k_timegenie_direct_cloud_release_guard.sql");
+const directWorkspaceRestorePatchFile = path.join(repoRoot, "supabase", "20261023l_timegenie_direct_cloud_workspace_restore.sql");
+const removeClientGenerationGatePatchFile = path.join(repoRoot, "supabase", "20261023m_timegenie_remove_client_generation_gate.sql");
 
 const binaryNames = process.platform === "win32"
   ? {
@@ -651,6 +656,103 @@ function verifyStaticSchemaInvariants() {
   if (/grant\s+execute\s+on\s+function[^;]*\bto\s+(anon|service_role)/i.test(directIntegrationMutationPatch)) {
     throw new Error("Direct integration mutations must only be executable by authenticated clients.");
   }
+  const directTodayOverviewPatch = fs.readFileSync(directTodayOverviewPatchFile, "utf8");
+  for (const expected of [
+    "create or replace function timegenie.direct_cloud_today_overview",
+    "assert_direct_v2_workspace",
+    "direct_cloud_query_response",
+    "grant execute on function timegenie.direct_cloud_today_overview",
+  ]) {
+    if (!directTodayOverviewPatch.toLowerCase().includes(expected.toLowerCase())) {
+      throw new Error("The direct today-overview patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261023i_timegenie_direct_cloud_today_overview.sql")) {
+    throw new Error("The source schema must include the direct today-overview patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261023i_timegenie_direct_cloud_today_overview\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the direct today-overview patch is idempotent.");
+  }
+  const directImportExportPatch = fs.readFileSync(directImportExportPatchFile, "utf8");
+  for (const expected of [
+    "create or replace function timegenie.direct_cloud_daily_report_imported_fingerprints",
+    "create or replace function timegenie.direct_cloud_daily_report_import_confirm",
+    "create or replace function timegenie.direct_cloud_time_allocation_export",
+    "assert_direct_v2_workspace",
+    "direct_cloud_query_response",
+    "direct_cloud_mutation_response",
+  ]) {
+    if (!directImportExportPatch.toLowerCase().includes(expected.toLowerCase())) {
+      throw new Error("The direct import/export patch is missing: " + expected);
+    }
+  }
+  if (/grant\s+execute\s+on\s+function[^;]*\bto\s+(anon|service_role)/i.test(directImportExportPatch)) {
+    throw new Error("Direct import/export RPCs must only be executable by authenticated clients.");
+  }
+  if (!schema.includes("\\ir 20261023j_timegenie_direct_cloud_import_export.sql")) {
+    throw new Error("The source schema must include the direct import/export patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261023j_timegenie_direct_cloud_import_export\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the direct import/export patch is idempotent.");
+  }
+  const directReleaseGuardPatch = fs.readFileSync(directReleaseGuardPatchFile, "utf8");
+  for (const expected of [
+    "emergency_read_only boolean not null default false",
+    "create or replace function timegenie.emergency_read_only_assert",
+    "create or replace function timegenie.emergency_read_only_before_business_write",
+    "emergency_read_only_write_barrier",
+    "'writable',not workspace_row.emergency_read_only",
+    "'readOnlyReason'",
+  ]) {
+    if (!directReleaseGuardPatch.toLowerCase().includes(expected.toLowerCase())) {
+      throw new Error("The direct release guard patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261023k_timegenie_direct_cloud_release_guard.sql")) {
+    throw new Error("The source schema must include the direct release guard patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261023k_timegenie_direct_cloud_release_guard\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the direct release guard patch is idempotent.");
+  }
+  if (!schemaIntegrationTest.includes("emergency read-only accepted a direct mutation")) {
+    throw new Error("The schema integration test must exercise the emergency write barrier.");
+  }
+  const directWorkspaceRestorePatch = fs.readFileSync(directWorkspaceRestorePatchFile, "utf8");
+  for (const expected of [
+    "create or replace function timegenie.direct_cloud_workspace_restore_prepare",
+    "create or replace function timegenie.direct_cloud_workspace_restore_commit",
+    "assert_direct_v2_workspace",
+    "workspace_restore_prepare_pre_direct_v2",
+    "workspace_restore_commit_pre_direct_v2",
+  ]) {
+    if (!directWorkspaceRestorePatch.toLowerCase().includes(expected.toLowerCase())) {
+      throw new Error("The direct workspace-restore patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261023l_timegenie_direct_cloud_workspace_restore.sql")) {
+    throw new Error("The source schema must include the direct workspace-restore patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261023l_timegenie_direct_cloud_workspace_restore\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the direct workspace-restore patch is idempotent.");
+  }
+  const removeClientGenerationGatePatch = fs.readFileSync(removeClientGenerationGatePatchFile, "utf8");
+  for (const expected of [
+    "drop trigger if exists client_schema_generation_write_barrier",
+    "drop column if exists minimum_client_schema_generation",
+    "CLOUD_PROTOCOL_UNSUPPORTED",
+    "data_copy_stage_begin(uuid,uuid,bigint,integer,integer,text)",
+    "- 'schemaGeneration'",
+  ]) {
+    if (!removeClientGenerationGatePatch.includes(expected)) {
+      throw new Error("The client-generation removal patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261023m_timegenie_remove_client_generation_gate.sql")) {
+    throw new Error("The source schema must remove the numeric client-generation gate.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261023m_timegenie_remove_client_generation_gate\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the client-generation removal patch is idempotent.");
+  }
   for (const expected of [
     "direct report create was not authoritative/idempotent",
     "failed report scope update left partial data",
@@ -772,7 +874,8 @@ function verifyStaticSchemaInvariants() {
     "rejected legacy lease changed coordination state",
     "direct context exposed another account workspace",
     "direct context accepted a revoked device",
-    "direct context accepted an outdated client schema generation",
+    "direct context still exposed client schema generation",
+    "write without client generation header was not persisted",
     "direct shared configuration contract or credential boundary is invalid",
     "direct shared configuration exposed another account workspace",
     "direct shared configuration accepted a revoked device",
@@ -799,9 +902,9 @@ function verifyStaticSchemaInvariants() {
       throw new Error(`The schema integration test is missing direct protocol coverage: ${expected}`);
     }
   }
-  if (!schemaIntegrationTest.includes("old client write was accepted")
-      || !schemaIntegrationTest.includes("CLIENT_UPGRADE_REQUIRED")) {
-    throw new Error("The schema integration test must reject a write without the compatible-client handshake.");
+  if (!schemaIntegrationTest.includes("legacy sync write was accepted after direct protocol upgrade")
+      || !schemaIntegrationTest.includes("CLOUD_PROTOCOL_UNSUPPORTED")) {
+    throw new Error("The schema integration test must reject legacy writes by storage protocol.");
   }
   for (const expected of [
     "occurrence_row:=p_payload->'occurrence'",
