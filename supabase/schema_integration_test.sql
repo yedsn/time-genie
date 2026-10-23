@@ -144,6 +144,10 @@ end $$;
 \ir 20261023k_timegenie_direct_cloud_release_guard.sql
 \ir 20261023m_timegenie_remove_client_generation_gate.sql
 \ir 20261023m_timegenie_remove_client_generation_gate.sql
+\ir 20261023n_timegenie_direct_cloud_interaction_performance.sql
+\ir 20261023n_timegenie_direct_cloud_interaction_performance.sql
+\ir 20261024_timegenie_unassigned_next_session_idempotency.sql
+\ir 20261024_timegenie_unassigned_next_session_idempotency.sql
 
 do $$
 begin
@@ -8159,6 +8163,78 @@ reset role;
 update timegenie.workspaces
 set emergency_read_only=false,emergency_read_only_reason=null
 where id='20000000-0000-0000-0000-00000000000a';
+
+-- A resolved current-day successor must become the predecessor of the next
+-- anchor. Reusing the older awaiting-resolution session would violate
+-- uq_unassigned_next_session and used to surface as VERSION_CONFLICT.
+reset role;
+insert into auth.users(id) values('f1000000-0000-0000-0000-000000000001')
+on conflict(id) do nothing;
+insert into timegenie.workspaces(id,owner_user_id,name,timezone) values(
+  'f2000000-0000-0000-0000-000000000001',
+  'f1000000-0000-0000-0000-000000000001',
+  '未归属后继幂等测试','Asia/Shanghai'
+);
+insert into timegenie.devices(id,workspace_id,device_name,platform,app_version) values(
+  'f3000000-0000-0000-0000-000000000001',
+  'f2000000-0000-0000-0000-000000000001',
+  '未归属后继设备','windows','test'
+);
+select set_config(
+  'request.headers',
+  '{"x-timegenie-workspace-epoch":"1","x-timegenie-client-schema-generation":"1"}',
+  true
+);
+insert into timegenie.unassigned_sessions(
+  id,workspace_id,work_date,state,threshold_seconds,duration_seconds,
+  first_started_at,last_ended_at,prompted_at,resolution_type,generated_entry_id,
+  resolved_at,shared_source,predecessor_session_id,migration_state,created_at,
+  updated_at,version,last_continuous_at
+) values
+  (
+    'f7100000-0000-0000-0000-000000000001',
+    'f2000000-0000-0000-0000-000000000001','2026-10-23',
+    'awaiting_resolution',300,3600,'2026-10-23 08:00:00+08',
+    '2026-10-23 09:00:00+08','2026-10-23 09:00:00+08',null,null,null,
+    'cloud',null,'adopted','2026-10-23 08:00:00+08',
+    '2026-10-23 09:00:00+08',2,'2026-10-23 09:00:00+08'
+  ),
+  (
+    'f7100000-0000-0000-0000-000000000002',
+    'f2000000-0000-0000-0000-000000000001','2026-10-24',
+    'resolved',300,600,'2026-10-24 00:00:00+08',
+    '2026-10-24 00:10:00+08',null,'break',null,
+    '2026-10-24 00:10:00+08','cloud',
+    'f7100000-0000-0000-0000-000000000001','adopted',
+    '2026-10-24 00:00:00+08','2026-10-24 00:10:00+08',2,
+    '2026-10-24 00:10:00+08'
+  );
+do $$
+declare first_result jsonb; retry_result jsonb;
+begin
+  first_result:=timegenie.direct_cloud_unassigned_anchor_ensure_locked(
+    'f2000000-0000-0000-0000-000000000001',
+    'f3000000-0000-0000-0000-000000000001',
+    '2026-10-24 10:00:00+08'
+  );
+  retry_result:=timegenie.direct_cloud_unassigned_anchor_ensure_locked(
+    'f2000000-0000-0000-0000-000000000001',
+    'f3000000-0000-0000-0000-000000000001',
+    '2026-10-24 10:00:01+08'
+  );
+  if first_result->>'created' is distinct from 'true'
+     or retry_result->>'created' is distinct from 'false'
+     or first_result->>'sessionId' is distinct from retry_result->>'sessionId'
+     or (select count(*) from timegenie.unassigned_sessions
+         where workspace_id='f2000000-0000-0000-0000-000000000001'
+           and predecessor_session_id='f7100000-0000-0000-0000-000000000001')<>1
+     or (select count(*) from timegenie.unassigned_sessions
+         where workspace_id='f2000000-0000-0000-0000-000000000001'
+           and predecessor_session_id='f7100000-0000-0000-0000-000000000002')<>1 then
+    raise exception 'unassigned successor ensure was not idempotent: % / %',
+      first_result,retry_result;
+  end if;
+end $$;
 
 select 'Supabase schema integration tests passed' as result;
 

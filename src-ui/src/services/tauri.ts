@@ -238,6 +238,16 @@ export type DirectCloudReleaseMetrics = {
   averageQueryLatencyMs: number;
   mutationCount: number;
   mutationErrorCount: number;
+  mutationLatencyTotalMs: number;
+  mutationLatencyMaxMs: number;
+  averageMutationLatencyMs: number;
+  clientApplyLatencyTotalMs: number;
+  clientApplyCount: number;
+  averageClientApplyLatencyMs: number;
+  refreshStartedCount: number;
+  refreshReusedCount: number;
+  refreshSuppressedCount: number;
+  refreshFollowupCount: number;
   protocolRejectionCount: number;
   realtimeReconnectCount: number;
   copyFailureCount: number;
@@ -1041,9 +1051,10 @@ export async function listTodayTasks(subjectId?: string, todayDate?: string): Pr
   });
 }
 
-export async function setTaskDailyEstimate(taskId: string, workDate: string, estimateMinutes?: number, expectedDailyEstimateVersion?: number): Promise<void> {
-  await invoke("task_daily_estimate_set", { request: { taskId, workDate, estimateMinutes }, expectedDailyEstimateVersion });
+export async function setTaskDailyEstimate(taskId: string, workDate: string, estimateMinutes?: number, expectedDailyEstimateVersion?: number): Promise<{ taskId: string; workDate: string; estimateMinutes?: number; version?: number }> {
+  const result = await invoke<{ taskId: string; workDate: string; estimateMinutes?: number; version?: number }>("task_daily_estimate_set", { request: { taskId, workDate, estimateMinutes }, expectedDailyEstimateVersion });
   await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-daily-estimate");
+  return result;
 }
 
 export async function createQuickTask(request: {
@@ -1701,6 +1712,10 @@ export async function getDirectCloudReleaseMetrics(): Promise<DirectCloudRelease
   return await invoke("direct_cloud_release_metrics_get");
 }
 
+export async function recordDirectCloudClientMetric(metric: "client_apply" | "started" | "reused" | "suppressed" | "followup", durationMs?: number) {
+  await invoke("direct_cloud_client_metric_record", { metric, durationMs });
+}
+
 export async function setLocalStorageMode(): Promise<StorageModeSnapshot> {
   return await invoke("storage_mode_set_local");
 }
@@ -1978,6 +1993,12 @@ export async function onWorkDataChanged(handler: (payload: {
   domains: string[];
   source: "realtime" | "poll" | string;
   timerStoppedEntryId?: string;
+  sourceWindowLabel?: string;
+  operationId?: string;
+  correlationId?: string;
+  coveredDomains?: string[];
+  coveredQueryKeys?: string[];
+  changedByDeviceId?: string;
 }) => void) {
   try {
     return await listen("work-data-changed", ({ payload }) => handler(payload as {
@@ -1988,6 +2009,12 @@ export async function onWorkDataChanged(handler: (payload: {
       domains: string[];
       source: string;
       timerStoppedEntryId?: string;
+      sourceWindowLabel?: string;
+      operationId?: string;
+      correlationId?: string;
+      coveredDomains?: string[];
+      coveredQueryKeys?: string[];
+      changedByDeviceId?: string;
     }));
   } catch {
     return () => {};
@@ -2042,9 +2069,23 @@ export async function onOpenTimerTaskSelection(handler: () => void) {
   }
 }
 
-export async function notifyWorkDataChanged(domains: string[], source = "frontend") {
+export async function notifyWorkDataChanged(
+  domains: string[],
+  source = "frontend",
+  options: { operationId?: string; correlationId?: string; coveredDomains?: string[]; coveredQueryKeys?: string[] } = {},
+) {
   try {
-    await emit("work-data-changed", { revision: 0, domains, source });
+    const sourceWindowLabel = getCurrentWindow().label;
+    await emit("work-data-changed", {
+      revision: 0,
+      domains,
+      source,
+      sourceWindowLabel,
+      correlationId: options.correlationId ?? options.operationId ?? crypto.randomUUID(),
+      operationId: options.operationId,
+      coveredDomains: options.coveredDomains ?? domains,
+      coveredQueryKeys: options.coveredQueryKeys ?? [],
+    });
   } catch {
     // The calling window already owns the successful mutation; synchronization is best-effort.
   }
@@ -2052,11 +2093,16 @@ export async function notifyWorkDataChanged(domains: string[], source = "fronten
 
 export async function notifyTimerStopConfirmation(entryId: string, source = "frontend") {
   try {
+    const sourceWindowLabel = getCurrentWindow().label;
     await emit("work-data-changed", {
       revision: 0,
       domains: ["tasks", "time", "unassigned"],
       source,
       timerStoppedEntryId: entryId,
+      sourceWindowLabel,
+      correlationId: crypto.randomUUID(),
+      coveredDomains: ["tasks", "time", "unassigned"],
+      coveredQueryKeys: [],
     });
   } catch {
     // The local store already has the stopped entry; cross-window refresh is best-effort.

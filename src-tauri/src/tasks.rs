@@ -106,6 +106,7 @@ pub struct TaskDailyEstimateDto {
     pub task_id: String,
     pub work_date: String,
     pub estimate_minutes: Option<i64>,
+    pub version: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -704,6 +705,7 @@ fn set_task_daily_estimate_with_cloud_operation(
         task_id: request.task_id,
         work_date: request.work_date,
         estimate_minutes: request.estimate_minutes,
+        version: None,
     })
 }
 

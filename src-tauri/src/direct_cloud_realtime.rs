@@ -15,6 +15,7 @@ pub(crate) struct WorkspaceInvalidation {
     pub(crate) workspace_epoch: i64,
     pub(crate) domains: Vec<String>,
     pub(crate) source: String,
+    pub(crate) changed_by_device_id: Option<String>,
 }
 
 pub(crate) fn realtime_change_seq(message: &Value) -> Option<i64> {
@@ -46,6 +47,10 @@ pub(crate) fn realtime_workspace_invalidation(
         .and_then(Value::as_str)
         .map(realtime_refresh_domains)
         .unwrap_or_default();
+    let changed_by_device_id = record
+        .get("changed_by_device_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     if domains.is_empty() {
         return None;
     }
@@ -55,6 +60,7 @@ pub(crate) fn realtime_workspace_invalidation(
         workspace_epoch,
         domains: domains.into_iter().map(str::to_string).collect(),
         source: "realtime".to_string(),
+        changed_by_device_id,
     })
 }
 

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, watch } from "vue";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import MainWorkbench from "./views/MainWorkbench.vue";
 import HoverPanel from "./views/HoverPanel.vue";
 import { catchUpCloudSync, hideHoverAfterKeyboardClose, closeMainWindow, getSettings, getStorageMode, isCurrentWindowFocused, onCloudSyncStateChanged, onCurrentWindowFocusChanged, onOpenUnassignedResolution, onWorkDataChanged, type StorageModeSnapshot } from "./services/tauri";
@@ -8,6 +9,8 @@ import { stopCompletionFeedback } from "./services/completionFeedback";
 import { applyAppTheme, getCachedAppTheme, isAppTheme } from "./services/theme";
 import { partitionWorkDataRefreshDomains, shouldClearDirectCloudMemory, workDataRefreshPlan } from "./services/workDataRefresh";
 import { shouldRefreshTimeHistory } from "./services/timeEntryHistoryCore";
+import { decideWorkDataInvalidation } from "./services/workDataInvalidationCore";
+import { shouldCalibrateTimer, TimerCalibrationSingleFlight } from "./services/timerCalibrationCore";
 
 applyAppTheme(getCachedAppTheme());
 
@@ -27,13 +30,39 @@ let pendingTimerStoppedEntryId = "";
 let refreshTimer: number | undefined;
 let refreshRunning = false;
 let catchUpTimer: number | undefined;
-let catchUpRunning = false;
-let catchUpAgain = false;
+const catchUpSingleFlight = new TimerCalibrationSingleFlight();
 let lastCatchUpAt = Date.now();
 let lastWakeHeartbeatAt = Date.now();
 let directCloudLoadedThisProcess = false;
+const currentWindowLabel = getCurrentWindow().label;
+let currentWorkspaceEpoch = 0;
+let appliedChangeSeq = 0;
+let currentWorkspaceId = "";
+let wasDirectCloud = false;
+
+function clearPendingDomainRefresh() {
+  pendingRefreshDomains.clear();
+  pendingTimerStoppedEntryId = "";
+  if (refreshTimer) window.clearTimeout(refreshTimer);
+  refreshTimer = undefined;
+}
 
 function applyCloudAccessState(state: StorageModeSnapshot) {
+  const isDirectCloud = state.mode === "cloud" && state.storageProtocol === "direct_v2";
+  if ((wasDirectCloud && !isDirectCloud) || (currentWorkspaceId && state.workspaceId && state.workspaceId !== currentWorkspaceId)) {
+    clearPendingDomainRefresh();
+    store.clearCloudBusinessMemory();
+    currentWorkspaceEpoch = 0;
+    appliedChangeSeq = 0;
+  }
+  if (currentWorkspaceEpoch && state.workspaceEpoch && state.workspaceEpoch !== currentWorkspaceEpoch) {
+    clearPendingDomainRefresh();
+    store.clearCloudBusinessMemory();
+    appliedChangeSeq = 0;
+  }
+  wasDirectCloud = isDirectCloud;
+  currentWorkspaceId = state.workspaceId || currentWorkspaceId;
+  currentWorkspaceEpoch = state.workspaceEpoch || currentWorkspaceEpoch;
   if (!state.storageProtocol) return;
   if (state.mode !== "cloud" || state.storageProtocol !== "direct_v2") {
     directCloudLoadedThisProcess = false;
@@ -50,20 +79,13 @@ function applyCloudAccessState(state: StorageModeSnapshot) {
 
 async function catchUpCloudData() {
   lastCatchUpAt = Date.now();
-  if (catchUpRunning) {
-    catchUpAgain = true;
-    return;
-  }
-  catchUpRunning = true;
   try {
-    do {
-      catchUpAgain = false;
+    await catchUpSingleFlight.run(async () => {
       await catchUpCloudSync();
-    } while (catchUpAgain);
+      await store.loadTimeData();
+    });
   } catch {
     // The backend reports the connection state; keep the loaded page visible.
-  } finally {
-    catchUpRunning = false;
   }
 }
 
@@ -169,7 +191,20 @@ onMounted(() => {
     else unlistenCloudSyncStateChanged = unlisten;
   });
   void onWorkDataChanged((payload) => {
-    scheduleDomainRefresh(payload.domains, payload.timerStoppedEntryId);
+    const decision = decideWorkDataInvalidation({
+      ...payload,
+      changeSeq: payload.changeSeq ?? payload.revision,
+    }, { currentWindowLabel, workspaceEpoch: currentWorkspaceEpoch, appliedChangeSeq });
+    if (decision.action === "ignore") return;
+    if (decision.action === "reset") {
+      clearPendingDomainRefresh();
+      store.clearCloudBusinessMemory();
+      currentWorkspaceEpoch = payload.workspaceEpoch ?? currentWorkspaceEpoch;
+      appliedChangeSeq = 0;
+    }
+    appliedChangeSeq = Math.max(appliedChangeSeq, decision.changeSeq);
+    store.invalidateCloudDomains(decision.domains, decision.changeSeq, payload.workspaceEpoch);
+    scheduleDomainRefresh(decision.domains, payload.timerStoppedEntryId);
   }).then((unlisten) => {
     if (unmounted) unlisten();
     else unlistenWorkDataChanged = unlisten;
@@ -180,7 +215,7 @@ onMounted(() => {
     const now = Date.now();
     const wakeGap = now - lastWakeHeartbeatAt;
     lastWakeHeartbeatAt = now;
-    if (document.visibilityState === "visible" && (wakeGap > 15_000 || now - lastCatchUpAt > 30_000)) {
+    if (document.visibilityState === "visible" && shouldCalibrateTimer(now, lastCatchUpAt, wakeGap, true)) {
       void catchUpCloudData();
     }
   }, 5_000);

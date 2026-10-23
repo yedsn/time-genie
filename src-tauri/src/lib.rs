@@ -444,6 +444,7 @@ pub fn run() {
             settings::integration_secret_clear,
             supabase::storage_mode_get,
             supabase::direct_cloud_release_metrics_get,
+            supabase::direct_cloud_client_metric_record,
             supabase::storage_mode_set_local,
             supabase::storage_mode_set_cloud,
             supabase::cloud_configure,

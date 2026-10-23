@@ -66,6 +66,8 @@ const directImportExportPatchFile = path.join(repoRoot, "supabase", "20261023j_t
 const directReleaseGuardPatchFile = path.join(repoRoot, "supabase", "20261023k_timegenie_direct_cloud_release_guard.sql");
 const directWorkspaceRestorePatchFile = path.join(repoRoot, "supabase", "20261023l_timegenie_direct_cloud_workspace_restore.sql");
 const removeClientGenerationGatePatchFile = path.join(repoRoot, "supabase", "20261023m_timegenie_remove_client_generation_gate.sql");
+const directInteractionPerformancePatchFile = path.join(repoRoot, "supabase", "20261023n_timegenie_direct_cloud_interaction_performance.sql");
+const unassignedNextSessionIdempotencyPatchFile = path.join(repoRoot, "supabase", "20261024_timegenie_unassigned_next_session_idempotency.sql");
 
 const binaryNames = process.platform === "win32"
   ? {
@@ -752,6 +754,43 @@ function verifyStaticSchemaInvariants() {
   }
   if ((schemaIntegrationTest.match(/\\ir 20261023m_timegenie_remove_client_generation_gate\.sql/g) ?? []).length < 2) {
     throw new Error("The schema integration test must prove the client-generation removal patch is idempotent.");
+  }
+  const directInteractionPerformancePatch = fs.readFileSync(directInteractionPerformancePatchFile, "utf8");
+  for (const expected of [
+    "create or replace function timegenie.touch_workspace_change",
+    "changed_by_device_id",
+    "updated_by_device_id",
+    "created_by_device_id",
+  ]) {
+    if (!directInteractionPerformancePatch.includes(expected)) {
+      throw new Error("The direct interaction performance patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261023n_timegenie_direct_cloud_interaction_performance.sql")) {
+    throw new Error("The source schema must include the direct interaction performance patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261023n_timegenie_direct_cloud_interaction_performance\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the direct interaction performance patch is idempotent.");
+  }
+  const unassignedNextSessionIdempotencyPatch = fs.readFileSync(unassignedNextSessionIdempotencyPatchFile, "utf8");
+  for (const expected of [
+    "create or replace function timegenie.direct_cloud_unassigned_anchor_ensure_locked",
+    "session.predecessor_session_id=previous_session_id",
+    "session.state in ('resolved','discarded')",
+    "uq_unassigned_next_session",
+  ]) {
+    if (!unassignedNextSessionIdempotencyPatch.includes(expected)) {
+      throw new Error("The unassigned successor idempotency patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261024_timegenie_unassigned_next_session_idempotency.sql")) {
+    throw new Error("The source schema must include the unassigned successor idempotency patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261024_timegenie_unassigned_next_session_idempotency\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the unassigned successor idempotency patch is idempotent.");
+  }
+  if (!schemaIntegrationTest.includes("unassigned successor ensure was not idempotent")) {
+    throw new Error("The schema integration test must reproduce the resolved-successor unique-index regression.");
   }
   for (const expected of [
     "direct report create was not authoritative/idempotent",

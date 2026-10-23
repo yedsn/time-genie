@@ -11,6 +11,16 @@ pub struct DirectCloudReleaseMetrics {
     pub query_latency_max_ms: f64,
     pub mutation_count: u64,
     pub mutation_error_count: u64,
+    pub mutation_latency_total_ms: f64,
+    pub mutation_latency_max_ms: f64,
+    pub mutation_response_bytes_total: u64,
+    pub mutation_response_bytes_max: u64,
+    pub client_apply_latency_total_ms: f64,
+    pub client_apply_count: u64,
+    pub refresh_started_count: u64,
+    pub refresh_reused_count: u64,
+    pub refresh_suppressed_count: u64,
+    pub refresh_followup_count: u64,
     pub protocol_rejection_count: u64,
     pub realtime_reconnect_count: u64,
     pub copy_failure_count: u64,
@@ -24,6 +34,8 @@ pub struct DirectCloudReleaseMetricsSnapshot {
     #[serde(flatten)]
     pub metrics: DirectCloudReleaseMetrics,
     pub average_query_latency_ms: f64,
+    pub average_mutation_latency_ms: f64,
+    pub average_client_apply_latency_ms: f64,
 }
 
 static METRICS: OnceLock<Mutex<HashMap<String, DirectCloudReleaseMetrics>>> = OnceLock::new();
@@ -70,8 +82,32 @@ pub fn record_query_error(workspace_id: &str, error: &str) {
     });
 }
 
-pub fn record_mutation(workspace_id: &str) {
-    update(workspace_id, |metrics| metrics.mutation_count += 1);
+pub fn record_mutation(workspace_id: &str, duration_ms: f64, response_bytes: u64) {
+    update(workspace_id, |metrics| {
+        metrics.mutation_count += 1;
+        metrics.mutation_latency_total_ms += duration_ms.max(0.0);
+        metrics.mutation_latency_max_ms = metrics.mutation_latency_max_ms.max(duration_ms.max(0.0));
+        metrics.mutation_response_bytes_total += response_bytes;
+        metrics.mutation_response_bytes_max =
+            metrics.mutation_response_bytes_max.max(response_bytes);
+    });
+}
+
+pub fn record_client_apply(workspace_id: &str, duration_ms: f64) {
+    update(workspace_id, |metrics| {
+        metrics.client_apply_count += 1;
+        metrics.client_apply_latency_total_ms += duration_ms.max(0.0);
+    });
+}
+
+pub fn record_refresh_metric(workspace_id: &str, metric: &str) {
+    update(workspace_id, |metrics| match metric {
+        "started" => metrics.refresh_started_count += 1,
+        "reused" => metrics.refresh_reused_count += 1,
+        "suppressed" => metrics.refresh_suppressed_count += 1,
+        "followup" => metrics.refresh_followup_count += 1,
+        _ => {}
+    });
 }
 
 pub fn record_mutation_error(workspace_id: &str, error: &str) {
@@ -113,10 +149,22 @@ pub fn snapshot(workspace_id: &str) -> DirectCloudReleaseMetricsSnapshot {
     } else {
         metrics.query_latency_total_ms / metrics.query_count as f64
     };
+    let average_mutation_latency_ms = if metrics.mutation_count == 0 {
+        0.0
+    } else {
+        metrics.mutation_latency_total_ms / metrics.mutation_count as f64
+    };
+    let average_client_apply_latency_ms = if metrics.client_apply_count == 0 {
+        0.0
+    } else {
+        metrics.client_apply_latency_total_ms / metrics.client_apply_count as f64
+    };
     DirectCloudReleaseMetricsSnapshot {
         workspace_id: workspace_id.to_string(),
         metrics,
         average_query_latency_ms,
+        average_mutation_latency_ms,
+        average_client_apply_latency_ms,
     }
 }
 
@@ -129,8 +177,13 @@ mod tests {
         let workspace_id = "observability-workspace";
         record_query(workspace_id, 12.5);
         record_query_error(workspace_id, "CLOUD_TIMEOUT: timeout");
-        record_mutation(workspace_id);
+        record_mutation(workspace_id, 7.5, 640);
         record_mutation_error(workspace_id, "EMERGENCY_READ_ONLY: maintenance");
+        record_client_apply(workspace_id, 2.5);
+        record_refresh_metric(workspace_id, "started");
+        record_refresh_metric(workspace_id, "reused");
+        record_refresh_metric(workspace_id, "suppressed");
+        record_refresh_metric(workspace_id, "followup");
         record_realtime_reconnect(workspace_id);
         record_copy_failure(workspace_id, "DATA_COPY_HASH_MISMATCH: invalid");
 
@@ -139,9 +192,17 @@ mod tests {
         assert_eq!(snapshot.metrics.query_error_count, 1);
         assert_eq!(snapshot.metrics.mutation_count, 2);
         assert_eq!(snapshot.metrics.mutation_error_count, 1);
+        assert_eq!(snapshot.metrics.mutation_response_bytes_total, 640);
+        assert_eq!(snapshot.metrics.mutation_response_bytes_max, 640);
         assert_eq!(snapshot.metrics.protocol_rejection_count, 1);
         assert_eq!(snapshot.metrics.realtime_reconnect_count, 1);
         assert_eq!(snapshot.metrics.copy_failure_count, 1);
+        assert_eq!(snapshot.metrics.refresh_started_count, 1);
+        assert_eq!(snapshot.metrics.refresh_reused_count, 1);
+        assert_eq!(snapshot.metrics.refresh_suppressed_count, 1);
+        assert_eq!(snapshot.metrics.refresh_followup_count, 1);
+        assert_eq!(snapshot.average_mutation_latency_ms, 3.75);
+        assert_eq!(snapshot.average_client_apply_latency_ms, 2.5);
         assert_eq!(
             snapshot.metrics.last_error_code.as_deref(),
             Some("DATA_COPY_HASH_MISMATCH")

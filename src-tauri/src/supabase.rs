@@ -1255,6 +1255,7 @@ struct DirectCloudDailyEstimateData {
 #[serde(rename_all = "camelCase")]
 struct DirectCloudDailyEstimateRecord {
     estimate_minutes: i64,
+    version: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1628,13 +1629,12 @@ pub fn direct_cloud_daily_estimate_set_for_command(
             "expectedVersion":expected_daily_estimate_version,
         }),
     )?;
+    let daily_estimate = response.data.daily_estimate;
     Ok(crate::tasks::TaskDailyEstimateDto {
         task_id: response.data.task_id,
         work_date: response.data.work_date,
-        estimate_minutes: response
-            .data
-            .daily_estimate
-            .map(|value| value.estimate_minutes),
+        estimate_minutes: daily_estimate.as_ref().map(|value| value.estimate_minutes),
+        version: daily_estimate.map(|value| value.version),
     })
 }
 
@@ -2279,6 +2279,26 @@ pub fn direct_cloud_release_metrics_get(
     ))
 }
 
+#[tauri::command]
+pub fn direct_cloud_client_metric_record(
+    database: tauri::State<'_, Database>,
+    metric: String,
+    duration_ms: Option<f64>,
+) -> Result<(), String> {
+    let state = storage_mode(&database)?;
+    match metric.as_str() {
+        "client_apply" => crate::direct_cloud_observability::record_client_apply(
+            &state.workspace_id,
+            duration_ms.unwrap_or_default(),
+        ),
+        "started" | "reused" | "suppressed" | "followup" => {
+            crate::direct_cloud_observability::record_refresh_metric(&state.workspace_id, &metric)
+        }
+        _ => return Err("VALIDATION_ERROR: 不支持的直连云端客户端指标".to_string()),
+    }
+    Ok(())
+}
+
 pub fn operation_history_list(
     database: &Database,
     request: CloudOperationHistoryListRequest,
@@ -2516,6 +2536,18 @@ fn record_direct_cloud_access_success(workspace_id: &str) {
 }
 
 fn record_direct_cloud_access_error(workspace_id: &str, error: &str) {
+    if matches!(
+        error.split_once(':').map(|(code, _)| code.trim()),
+        Some(
+            "VERSION_CONFLICT"
+                | "ENTITY_DELETED"
+                | "LEASE_LOST"
+                | "IDEMPOTENCY_CONFLICT"
+                | "VALIDATION_ERROR"
+        )
+    ) {
+        return;
+    }
     let (state, reason) = direct_cloud_access_state_for_error(error);
     set_direct_cloud_access_runtime(workspace_id, state, Some(reason));
 }
@@ -2652,6 +2684,7 @@ fn direct_cloud_mutation_with_context<T: for<'de> Deserialize<'de>>(
     operation_id: Option<String>,
     payload: Value,
 ) -> Result<DirectCloudMutationResponse<T>, String> {
+    let started_at = Instant::now();
     if let Err(error) = ensure_direct_cloud_writable(database, &context.workspace_id) {
         crate::direct_cloud_observability::record_mutation_error(&context.workspace_id, &error);
         return Err(error);
@@ -2706,6 +2739,9 @@ fn direct_cloud_mutation_with_context<T: for<'de> Deserialize<'de>>(
             return Err(error);
         }
     };
+    let response_bytes = serde_json::to_vec(&value)
+        .map(|serialized| serialized.len() as u64)
+        .unwrap_or_default();
     let response: DirectCloudMutationResponse<T> =
         serde_json::from_value(value).map_err(|error| {
             let error = format!("CLOUD_RESPONSE_INVALID: {function} 响应无效: {error}");
@@ -2715,7 +2751,11 @@ fn direct_cloud_mutation_with_context<T: for<'de> Deserialize<'de>>(
         })?;
     record_direct_cloud_checkpoint(database, &response.metadata)?;
     record_direct_cloud_access_success(&context.workspace_id);
-    crate::direct_cloud_observability::record_mutation(&context.workspace_id);
+    crate::direct_cloud_observability::record_mutation(
+        &context.workspace_id,
+        started_at.elapsed().as_secs_f64() * 1000.0,
+        response_bytes,
+    );
     Ok(response)
 }
 
@@ -7139,6 +7179,22 @@ pub(crate) fn install_test_session_for_database(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn install_serialized_test_session_for_database(
+    database: &Database,
+    serialized: &str,
+) -> Result<(), String> {
+    let session: CloudSession = serde_json::from_str(serialized)
+        .map_err(|error| format!("AUTH_INVALID: Supabase 测试会话损坏: {error}"))?;
+    if session.user_id.trim().is_empty()
+        || session.access_token.trim().is_empty()
+        || session.refresh_token.trim().is_empty()
+    {
+        return Err("AUTH_INVALID: Supabase 测试会话缺少必要字段".to_string());
+    }
+    save_session(database, &session)
+}
+
 fn session_snapshot(session: &CloudSession) -> CloudSessionSnapshot {
     CloudSessionSnapshot {
         signed_in: true,
@@ -9252,6 +9308,20 @@ mod tests {
             direct_cloud_access_runtime(&workspace_id).unwrap().state,
             DirectCloudAccessState::OnlineWritable
         );
+        for error in [
+            "VERSION_CONFLICT: 数据已被其他设备修改",
+            "ENTITY_DELETED: 记录已删除",
+            "LEASE_LOST: 计时已被接管",
+            "IDEMPOTENCY_CONFLICT: 操作标识已用于其他请求",
+            "VALIDATION_ERROR: 输入无效",
+        ] {
+            record_direct_cloud_access_error(&workspace_id, error);
+            assert_eq!(
+                direct_cloud_access_runtime(&workspace_id).unwrap().state,
+                DirectCloudAccessState::OnlineWritable,
+                "业务拒绝不应把整个云端工作空间降级为只读: {error}"
+            );
+        }
     }
 
     #[test]

@@ -273,11 +273,11 @@ async function handleDirectCloudMutationFailure(error: unknown) {
   const feedback = directCloudMutationFeedback(error);
   if (feedback.level === "warning") ElMessage.warning(feedback.message);
   else ElMessage.error(feedback.message);
-  if (!feedback.shouldRefresh) return;
+  if (feedback.refreshScope === "none") return;
+  if (feedback.refreshScope === "reset") store.clearCloudBusinessMemory();
   await Promise.allSettled([
     store.loadWorkspaceData(),
     store.loadTimeData(),
-    store.loadReports(),
     store.loadUnassignedState(),
     store.loadTodayOverview(),
   ]);
@@ -622,7 +622,7 @@ async function handleCloudDockSync() {
     }
     cloudSyncWorking.value = true;
     try {
-      await Promise.all([store.loadWorkspaceData(), store.loadTimeData(), store.loadReports(), store.loadUnassignedState(), store.loadTodayOverview()]);
+      await Promise.all([store.loadWorkspaceData(true), store.loadTimeData(true), store.refreshReports(true), store.loadUnassignedState(false, true), store.loadTodayOverview(undefined, true)]);
       storageState.value = await getCloudSyncStatus();
       ElMessage.success("已重新读取 Supabase 最新数据");
     } catch (error) {

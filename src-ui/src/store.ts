@@ -83,6 +83,7 @@ import {
   type ActualAdjustmentBatchRequest,
   type ActualAdjustmentSnapshotRecord,
   type TaskDayPlanSnapshotRecord,
+  recordDirectCloudClientMetric,
 } from "./services/tauri";
 import { TRANSIENT_MISSING_STATE_REFRESH_LIMIT, transientMissingStateResult } from "./services/transientStateGuard";
 import { canSubmitUnassignedResolution } from "./services/unassignedResolutionGuard";
@@ -101,6 +102,8 @@ import {
   type ReportListFilters,
   type ReportPageToken,
 } from "./services/reportPaginationCore";
+import { DirectCloudQueryCoordinator, directCloudQueryKey } from "./services/directCloudQueryCoordinatorCore";
+import { applyCreatedTask, collectTaskSubtreeIds, removeTaskSubtree, upsertAuthoritativeTask } from "./services/taskMutationStateCore";
 
 export type TaskStatus = "open" | "done";
 
@@ -307,7 +310,6 @@ export const useWorkdayStore = defineStore("workday", () => {
   const unassignedVersion = ref(0);
   const unassignedThresholdSeconds = ref(5 * 60);
   let clock: number | undefined;
-  let timeRefreshClock: number | undefined;
   let timeDataRequestSeq = 0;
   let timeDataMutationSeq = 0;
   let timeHistoryRequestSeq = 0;
@@ -317,6 +319,12 @@ export const useWorkdayStore = defineStore("workday", () => {
   let unassignedStateMissingRefreshes = 0;
   let todayOverviewRequestSeq = 0;
   let workspaceRequestSeq = 0;
+  const queryCoordinator = new DirectCloudQueryCoordinator(undefined, (metric) => {
+    const mapped = metric === "skipped_fresh" ? "suppressed" : metric;
+    if (mapped === "started" || mapped === "reused" || mapped === "suppressed" || mapped === "followup") {
+      void recordDirectCloudClientMetric(mapped).catch(() => undefined);
+    }
+  });
   const savingTaskIds = new Set<string>();
   const workspaceLoaded = ref(false);
   const workspaceLoading = ref(false);
@@ -407,16 +415,11 @@ export const useWorkdayStore = defineStore("workday", () => {
         }
       }, 1_000);
     }
-    if (!timeRefreshClock) {
-      timeRefreshClock = window.setInterval(() => void loadTimeData().then(() => loadTodayOverview()), 5_000);
-    }
   }
 
   function stopClock() {
     if (clock) window.clearInterval(clock);
     clock = undefined;
-    if (timeRefreshClock) window.clearInterval(timeRefreshClock);
-    timeRefreshClock = undefined;
   }
 
   async function initializeWorkspace(trackUnassigned: boolean) {
@@ -426,6 +429,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   function clearCloudBusinessMemory() {
+    queryCoordinator.clear();
     subjects.splice(0, subjects.length);
     tasks.splice(0, tasks.length);
     todayTasks.splice(0, todayTasks.length);
@@ -459,7 +463,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     return workspaceToday.value;
   }
 
-  async function loadWorkspaceData() {
+  async function loadWorkspaceDataNow(isCurrent: () => boolean = () => true) {
     const requestSeq = ++workspaceRequestSeq;
     workspaceLoading.value = true;
     try {
@@ -469,7 +473,7 @@ export const useWorkdayStore = defineStore("workday", () => {
         listTasks(undefined, undefined, todayDate),
         listTodayTasks(undefined, todayDate),
       ]);
-      if (requestSeq !== workspaceRequestSeq) return true;
+      if (requestSeq !== workspaceRequestSeq || !isCurrent()) return true;
       replaceArrayIfChanged(subjects, subjectRecords.map((subject) => ({
         id: subject.id,
         name: subject.name,
@@ -519,6 +523,11 @@ export const useWorkdayStore = defineStore("workday", () => {
     } finally {
       if (requestSeq === workspaceRequestSeq) workspaceLoading.value = false;
     }
+  }
+
+  async function loadWorkspaceData(force = false) {
+    const result = await queryCoordinator.run("workspace", (isCurrent) => loadWorkspaceDataNow(isCurrent), { force, maxAgeMs: 1_000 });
+    return result ?? true;
   }
 
   function toUiTask(task: TaskRecord): Task {
@@ -629,14 +638,14 @@ export const useWorkdayStore = defineStore("workday", () => {
     return taskDisplayLabel(entry.defaultTask, entry.label);
   }
 
-  async function loadTimeData() {
+  async function loadTimeDataNow(isCurrent: () => boolean = () => true) {
     const requestSeq = ++timeDataRequestSeq;
     const mutationSeq = timeDataMutationSeq;
     try {
       const previousActiveEntry = runningEntry.value ? cloneTimeEntry(runningEntry.value) : undefined;
       const workDate = await ensureWorkspaceCalendar();
       const [result, activeEntry] = await Promise.all([listTimeEntries(workDate), getTimerState()]);
-      if (requestSeq !== timeDataRequestSeq || mutationSeq !== timeDataMutationSeq) return true;
+      if (requestSeq !== timeDataRequestSeq || mutationSeq !== timeDataMutationSeq || !isCurrent()) return true;
       const records = result.entries.slice();
       if (activeEntry) {
         const activeIndex = records.findIndex((entry) => entry.id === activeEntry.id);
@@ -671,7 +680,13 @@ export const useWorkdayStore = defineStore("workday", () => {
     }
   }
 
-  async function loadTodayOverview(subjectId = todayOverviewSubjectId.value) {
+  async function loadTimeData(force = false) {
+    const workDate = await ensureWorkspaceCalendar();
+    const result = await queryCoordinator.run(directCloudQueryKey("time", workDate), (isCurrent) => loadTimeDataNow(isCurrent), { force, maxAgeMs: 5_000 });
+    return result ?? true;
+  }
+
+  async function loadTodayOverviewNow(subjectId = todayOverviewSubjectId.value, isCurrent: () => boolean = () => true) {
     const requestSeq = todayOverviewRequestSeq + 1;
     todayOverviewRequestSeq = requestSeq;
     todayOverviewLoading.value = true;
@@ -685,7 +700,7 @@ export const useWorkdayStore = defineStore("workday", () => {
         historyDays: 30,
         trendDays: 14,
       });
-      if (requestSeq === todayOverviewRequestSeq) replaceRefIfChanged(todayOverview, result);
+      if (requestSeq === todayOverviewRequestSeq && isCurrent()) replaceRefIfChanged(todayOverview, result);
     } catch (error) {
       console.error("加载今日概览失败", error);
     } finally {
@@ -693,15 +708,23 @@ export const useWorkdayStore = defineStore("workday", () => {
     }
   }
 
+  async function loadTodayOverview(subjectId = todayOverviewSubjectId.value, force = false) {
+    const todayDate = await ensureWorkspaceCalendar();
+    const scopedSubjectId = subjectId && subjects.some((subject) => subject.id === subjectId) ? subjectId : "";
+    const result = await queryCoordinator.run(directCloudQueryKey("todayOverview", scopedSubjectId, todayDate), (isCurrent) => loadTodayOverviewNow(subjectId, isCurrent), { force, maxAgeMs: 5_000 });
+    return result ?? true;
+  }
+
   async function selectTodayOverviewSubject(subjectId: string) {
     todayOverviewSubjectId.value = subjectId;
     await loadTodayOverview(subjectId);
   }
 
-  async function requestReportPages(
+  async function requestReportPagesNow(
     token: ReportPageToken,
     targetPage: number,
     replace: boolean,
+    isCurrent: () => boolean = () => true,
   ) {
     const filters = { ...reportPagination.filters };
     const pageSize = reportPagination.pageSize;
@@ -714,7 +737,7 @@ export const useWorkdayStore = defineStore("workday", () => {
           page,
           pageSize,
         });
-        if (token.requestSeq !== reportPagination.requestSeq) return false;
+        if (token.requestSeq !== reportPagination.requestSeq || !isCurrent()) return false;
         finalResult = result;
         mergedReports.push(...result.reports.map(toUiReport));
         if (!result.hasMore) break;
@@ -735,6 +758,12 @@ export const useWorkdayStore = defineStore("workday", () => {
       failReportPage(reportPagination, token, error instanceof Error ? error.message : String(error));
       return false;
     }
+  }
+
+  async function requestReportPages(token: ReportPageToken, targetPage: number, replace: boolean, force = false) {
+    const key = directCloudQueryKey("reports", JSON.stringify(reportPagination.filters), targetPage);
+    const result = await queryCoordinator.run(key, (isCurrent) => requestReportPagesNow(token, targetPage, replace, isCurrent), { force: force || !replace, maxAgeMs: replace ? 2_000 : 0 });
+    return result ?? true;
   }
 
   async function loadReports(filters?: Partial<ReportListFilters>) {
@@ -770,9 +799,9 @@ export const useWorkdayStore = defineStore("workday", () => {
     }
   }
 
-  async function refreshReports() {
+  async function refreshReports(force = false) {
     const token = beginReportRefresh(reportPagination);
-    return await requestReportPages(token, Math.max(1, reportPagination.loadedPageDepth), true);
+    return await requestReportPages(token, Math.max(1, reportPagination.loadedPageDepth), true, force);
   }
 
   async function loadReportsThroughId(reportId: string, filters: Partial<ReportListFilters>) {
@@ -804,12 +833,12 @@ export const useWorkdayStore = defineStore("workday", () => {
     };
   }
 
-  async function loadUnassignedState(authoritative = false) {
+  async function loadUnassignedStateNow(authoritative = false, isCurrent: () => boolean = () => true) {
     const requestSeq = ++unassignedStateRequestSeq;
     const mutationSeq = unassignedStateMutationSeq;
     try {
       const snapshot = await getUnassignedStateSnapshot();
-      if (requestSeq !== unassignedStateRequestSeq || mutationSeq !== unassignedStateMutationSeq) return true;
+      if (requestSeq !== unassignedStateRequestSeq || mutationSeq !== unassignedStateMutationSeq || !isCurrent()) return true;
       unassignedCurrentSession.value = snapshot.current;
       if (authoritative && !snapshot.current) {
         unassignedStateMissingRefreshes = TRANSIENT_MISSING_STATE_REFRESH_LIMIT;
@@ -822,12 +851,26 @@ export const useWorkdayStore = defineStore("workday", () => {
     }
   }
 
-  async function loadTimeHistory(page = timeHistoryPage.value) {
+  async function loadUnassignedState(authoritative = false, force = false) {
+    const result = await queryCoordinator.run("unassigned", (isCurrent) => loadUnassignedStateNow(authoritative, isCurrent), { force: force || authoritative, maxAgeMs: 5_000 });
+    return result ?? true;
+  }
+
+  function upsertReport(report: ReportRecord) {
+    const index = reports.value.findIndex((item) => item.id === report.id);
+    if (index >= 0) reports.value.splice(index, 1, report);
+    else reports.value.unshift(report);
+    reportPagination.items = [...reports.value];
+    queryCoordinator.markMatchingStale("reports");
+    return report;
+  }
+
+  async function loadTimeHistoryNow(page = timeHistoryPage.value, isCurrent: () => boolean = () => true) {
     const requestSeq = ++timeHistoryRequestSeq;
     timeHistoryLoading.value = true;
     try {
       const result = await listTimeEntryHistory(Math.max(1, Math.round(page)));
-      if (requestSeq !== timeHistoryRequestSeq) return result;
+      if (requestSeq !== timeHistoryRequestSeq || !isCurrent()) return result;
       timeHistoryPage.value = result.page;
       timeHistoryTotalDays.value = result.totalDays;
       timeHistoryTotalPages.value = result.totalPages;
@@ -844,6 +887,11 @@ export const useWorkdayStore = defineStore("workday", () => {
     } finally {
       if (requestSeq === timeHistoryRequestSeq) timeHistoryLoading.value = false;
     }
+  }
+
+  async function loadTimeHistory(page = timeHistoryPage.value, force = false) {
+    const targetPage = Math.max(1, Math.round(page));
+    return await queryCoordinator.run(directCloudQueryKey("timeHistory", targetPage), (isCurrent) => loadTimeHistoryNow(targetPage, isCurrent), { force, maxAgeMs: 10_000 });
   }
 
   async function selectTimeHistoryPage(page: number) {
@@ -896,12 +944,14 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   function replaceTask(record: TaskRecord) {
-    const index = tasks.findIndex((task) => task.id === record.id);
+    const startedAt = performance.now();
     const next = toUiTask(record);
-    if (index >= 0) tasks.splice(index, 1, next);
-    else tasks.push(next);
+    upsertAuthoritativeTask(tasks, next);
     const todayIndex = todayTasks.findIndex((task) => task.id === record.id);
     if (todayIndex >= 0) todayTasks.splice(todayIndex, 1, toUiTask(record));
+    const todayPlanIndex = todayPlanTasks.findIndex((task) => task.id === record.id);
+    if (todayPlanIndex >= 0) todayPlanTasks.splice(todayPlanIndex, 1, toUiTask(record));
+    void recordDirectCloudClientMetric("client_apply", performance.now() - startedAt).catch(() => undefined);
     return next;
   }
 
@@ -909,9 +959,31 @@ export const useWorkdayStore = defineStore("workday", () => {
     Object.assign(task, toUiTask(record));
   }
 
+  function markDerivedDomainsStale(domains: Iterable<string>) {
+    invalidateCloudDomains(domains);
+  }
+
+  function applyDailyEstimate(taskId: string, estimateMinutes?: number, version?: number) {
+    for (const task of [...tasks, ...todayTasks, ...todayPlanTasks]) {
+      if (task.id !== taskId && task.dayInstanceSourceTaskId !== taskId) continue;
+      task.todayEstimate = estimateMinutes;
+      task.dailyEstimateVersion = version;
+    }
+  }
+
+  function applyDuplicatedTaskRecords(target: Task[], sourceId: string, records: TaskRecord[]) {
+    const duplicated = records.map(toUiTask);
+    const duplicatedIds = new Set(duplicated.map((task) => task.id));
+    for (let index = target.length - 1; index >= 0; index -= 1) {
+      if (duplicatedIds.has(target[index].id)) target.splice(index, 1);
+    }
+    const sourceEnd = findSubtreeEndIndex(target, sourceId);
+    target.splice(sourceEnd < 0 ? target.length : sourceEnd, 0, ...duplicated);
+  }
+
   function selectPage(page: string) {
     activePage.value = page;
-    if (page === "plan") { planTaskTab.value = "today"; void loadTodayPlan().catch(() => undefined); }
+    if (page === "plan") { planTaskTab.value = "today"; void loadTodayPlan(selectedSubjectId.value, true).catch(() => undefined); }
   }
 
   function selectSubject(subjectId: string) {
@@ -919,7 +991,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     selectedSubjectId.value = subjectId;
     activePage.value = "plan";
     planTaskTab.value = "today";
-    void loadTodayPlan(subjectId).catch(() => undefined);
+    void loadTodayPlan(subjectId, true).catch(() => undefined);
     completedTasksRequestSeq += 1;
     completedTasks.splice(0);
     completedTasksSubjectId.value = "";
@@ -954,8 +1026,8 @@ export const useWorkdayStore = defineStore("workday", () => {
     subject.name = updated.name;
     subject.version = updated.version;
     subject.openTaskCount = updated.openTaskCount;
-    await loadReports();
-    await loadTodayOverview();
+    queryCoordinator.markMatchingStale("reports");
+    queryCoordinator.markMatchingStale("todayOverview");
     return true;
   }
 
@@ -1016,7 +1088,7 @@ export const useWorkdayStore = defineStore("workday", () => {
 
   async function selectPlanTaskTab(tab: PlanTaskTab) {
     planTaskTab.value = tab;
-    if (tab === "today") { await loadTodayPlan().catch(() => undefined); return; }
+    if (tab === "today") { await loadTodayPlan(selectedSubjectId.value, true).catch(() => undefined); return; }
     if (tab === "active") return;
     const subjectChanged = completedTasksSubjectId.value !== selectedSubjectId.value;
     if (subjectChanged) completedTasksPage.value = 1;
@@ -1025,7 +1097,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     }
   }
 
-  async function loadTodayPlan(subjectId = selectedSubjectId.value) {
+  async function loadTodayPlanNow(subjectId = selectedSubjectId.value, isCurrent: () => boolean = () => true) {
     if (!subjectId) return undefined;
     const workDate = await ensureWorkspaceCalendar();
     const requestedSubjectId = subjectId;
@@ -1043,7 +1115,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     }
     try {
       const snapshot = await request;
-      const stillCurrent = isCurrentTodayPlanRequest(token, todayPlanRequestSeq, workspaceToday.value);
+      const stillCurrent = isCurrent() && isCurrentTodayPlanRequest(token, todayPlanRequestSeq, workspaceToday.value);
       const outcome = resolveTodayPlanOutcome(
         { tasks: [...todayPlanTasks], subjectId: todayPlanSubjectId.value },
         stillCurrent ? { ok: true, token, tasks: snapshot.tasks.map(toUiTask) } : { ok: false },
@@ -1065,9 +1137,35 @@ export const useWorkdayStore = defineStore("workday", () => {
     }
   }
 
+  async function loadTodayPlan(subjectId = selectedSubjectId.value, force = false) {
+    if (!subjectId) return undefined;
+    const workDate = await ensureWorkspaceCalendar();
+    return await queryCoordinator.run(directCloudQueryKey("todayPlan", subjectId, workDate), (isCurrent) => loadTodayPlanNow(subjectId, isCurrent), { force, maxAgeMs: 2_000 });
+  }
+
   async function reloadTodayPlanForSubject(subjectId = selectedSubjectId.value) {
     if (!subjectId) return undefined;
-    return await loadTodayPlan(subjectId);
+    return await loadTodayPlan(subjectId, true);
+  }
+
+  function invalidateCloudDomains(domains: Iterable<string>, changeSeq = 0, workspaceEpoch?: number) {
+    const changed = new Set(domains);
+    const invalidatePrefix = (prefix: string) => queryCoordinator.markMatchingStale(prefix, changeSeq, workspaceEpoch);
+    if (changed.has("subjects") || changed.has("tasks")) {
+      queryCoordinator.markStale("workspace", changeSeq, workspaceEpoch);
+      invalidatePrefix("todayPlan");
+      invalidatePrefix("completedTasks");
+      invalidatePrefix("execution");
+      invalidatePrefix("todayOverview");
+      completedTasksStale.value = true;
+    }
+    if (changed.has("time")) {
+      invalidatePrefix("time");
+      invalidatePrefix("timeHistory");
+      invalidatePrefix("todayOverview");
+    }
+    if (changed.has("reports")) invalidatePrefix("reports");
+    if (changed.has("unassigned")) queryCoordinator.markStale("unassigned", changeSeq, workspaceEpoch);
   }
 
   async function setTodayPlanMembership(taskId: string, state: "included" | "excluded") {
@@ -1080,7 +1178,8 @@ export const useWorkdayStore = defineStore("workday", () => {
       source.dayPlanState = state;
       source.dayPlanVersion = plan.version;
     }
-    await Promise.all([loadTodayPlan(task?.subjectId ?? selectedSubjectId.value), loadTodayOverview()]);
+    await loadTodayPlan(task?.subjectId ?? selectedSubjectId.value, true);
+    queryCoordinator.markMatchingStale("todayOverview");
   }
 
   async function addTasksToToday(taskIds: string[]) {
@@ -1094,7 +1193,12 @@ export const useWorkdayStore = defineStore("workday", () => {
       const task = [...todayPlanTasks, ...tasks].find((item) => item.id === taskId);
       return { taskId, state: "included" as const, expectedVersion: task?.dayPlanVersion };
     }));
-    await Promise.all([loadTodayPlan(subjectId), loadTodayOverview()]);
+    for (const taskId of taskIds) {
+      const source = tasks.find((task) => task.id === taskId);
+      if (source) source.dayPlanState = "included";
+    }
+    await loadTodayPlan(subjectId, true);
+    queryCoordinator.markMatchingStale("todayOverview");
   }
 
   async function selectCompletedTasksPage(page: number) {
@@ -1116,13 +1220,13 @@ export const useWorkdayStore = defineStore("workday", () => {
   async function reopenCompletedTask(task: Task) {
     const result = await commitTaskToggle(task);
     if (!result) return;
-    await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(), loadTodayOverview()]);
-    await refreshCompletedTasksAfterMutation();
+    completedTasks.splice(0, completedTasks.length, ...completedTasks.filter((item) => item.id !== task.id));
+    markDerivedDomainsStale(["tasks"]);
     return result;
   }
 
   async function saveCompletedTask(task: Task) {
-    await updateTaskRecord({
+    const updated = await updateTaskRecord({
       id: task.id,
       expectedVersion: task.version,
       title: task.title,
@@ -1131,16 +1235,16 @@ export const useWorkdayStore = defineStore("workday", () => {
       note: task.note ?? null,
       projectName: task.project || null,
     });
-    await Promise.all([loadWorkspaceData(), loadTimeData(), loadReports(), reloadTodayPlanForSubject(task.subjectId)]);
-    await loadTodayOverview();
-    await loadCompletedTasks(completedTasksPage.value);
+    const index = completedTasks.findIndex((item) => item.id === updated.id);
+    if (index >= 0) completedTasks.splice(index, 1, toUiTask(updated));
+    markDerivedDomainsStale(["tasks"]);
     return task.id;
   }
 
   async function deleteCompletedTask(task: Task) {
     await deleteTaskSubtree(task.id, task.version);
-    await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(task?.subjectId), loadTodayOverview()]);
-    await refreshCompletedTasksAfterMutation();
+    completedTasks.splice(0, completedTasks.length, ...completedTasks.filter((item) => item.id !== task.id));
+    markDerivedDomainsStale(["tasks"]);
   }
 
   function dismissUnassignedResolution() {
@@ -1216,7 +1320,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   async function toggleTask(task: Task) {
     const result = await commitTaskToggle(task);
     if (!result) return;
-    await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(task.subjectId), loadTodayOverview()]);
+    markDerivedDomainsStale(["tasks"]);
     return result;
   }
 
@@ -1235,17 +1339,23 @@ export const useWorkdayStore = defineStore("workday", () => {
         effectiveEnd: todayDate,
         ruleExpectedVersion: task.recurrence.version,
       });
+      task.recurrence = undefined;
+      task.version += 1;
     } else {
-      await saveTaskRecurrence({
+      const rule = await saveTaskRecurrence({
         taskId: task.id,
         taskExpectedVersion: task.version,
         frequency: recurrence.frequency,
         weekdaysMask: recurrence.frequency === "weekly" ? recurrence.weekdaysMask : undefined,
         effectiveStart: recurrence.effectiveStart,
-      ruleExpectedVersion: task.recurrence?.version,
+        ruleExpectedVersion: task.recurrence?.version,
       });
+      task.recurrence = rule;
+      task.version += 1;
+      task.status = "open";
+      task.completedAt = undefined;
     }
-    await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(task.subjectId), loadTodayOverview()]);
+    markDerivedDomainsStale(["tasks"]);
   }
 
   function addTask(title = "", subjectId = selectedSubjectId.value) {
@@ -1333,15 +1443,12 @@ export const useWorkdayStore = defineStore("workday", () => {
   async function deleteTask(taskId: string) {
     const deletedTask = tasks.find((task) => task.id === taskId);
     if (deletedTask?.version) await deleteTaskSubtree(deletedTask.id, deletedTask.version);
-    const idsToDelete = getSubtreeIds(taskId);
-    for (let index = tasks.length - 1; index >= 0; index -= 1) {
-      if (idsToDelete.has(tasks[index].id)) tasks.splice(index, 1);
-    }
+    const idsToDelete = removeTaskSubtree(tasks, taskId);
     if (idsToDelete.has(selectedTaskId.value)) {
       const subjectId = deletedTask?.subjectId ?? selectedSubjectId.value;
       selectedTaskId.value = buildVisibleTaskList(tasks.filter((task) => task.subjectId === subjectId))[0]?.id ?? "";
     }
-    if (deletedTask?.version) await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(deletedTask.subjectId), loadTodayOverview()]);
+    if (deletedTask?.version) markDerivedDomainsStale(["tasks"]);
   }
 
   async function saveTask(taskId: string): Promise<string | false> {
@@ -1371,22 +1478,20 @@ export const useWorkdayStore = defineStore("workday", () => {
           }),
         });
         const oldId = task.id;
-        let index = tasks.findIndex((item) => item.id === oldId);
-        const existingCreatedIndex = tasks.findIndex((item) => item.id === created.id);
-        if (existingCreatedIndex >= 0 && existingCreatedIndex !== index) {
-          tasks.splice(existingCreatedIndex, 1);
-          if (existingCreatedIndex < index) index -= 1;
+        selectedTaskId.value = applyCreatedTask({
+          tasks,
+          draftId: oldId,
+          authoritative: toUiTask(created),
+          selectedTaskId: selectedTaskId.value,
+        });
+        if (task.todayEstimate) {
+          const estimate = await setTaskDailyEstimate(created.id, todayDate, task.todayEstimate);
+          applyDailyEstimate(created.id, estimate.estimateMinutes, estimate.version);
         }
-        if (index >= 0) tasks.splice(index, 1, toUiTask(created));
-        else tasks.push(toUiTask(created));
-        for (const child of tasks) if (child.parentId === oldId) child.parentId = created.id;
-        if (selectedTaskId.value === oldId) selectedTaskId.value = created.id;
-        if (task.todayEstimate) await setTaskDailyEstimate(created.id, todayDate, task.todayEstimate);
-        await Promise.all([loadWorkspaceData(), loadTimeData(), loadReports(), reloadTodayPlanForSubject(created.subjectId)]);
-        await loadTodayOverview();
+        markDerivedDomainsStale(["tasks"]);
         return created.id;
       }
-      await updateTaskRecord({
+      replaceTask(await updateTaskRecord({
         id: task.id,
         expectedVersion: task.version,
         title: task.title,
@@ -1394,9 +1499,8 @@ export const useWorkdayStore = defineStore("workday", () => {
         estimateMinutes: task.estimate ?? null,
         note: task.note ?? null,
         projectName: task.project || null,
-      });
-      await Promise.all([loadWorkspaceData(), loadTimeData(), loadReports(), reloadTodayPlanForSubject(task.subjectId)]);
-      await loadTodayOverview();
+      }));
+      markDerivedDomainsStale(["tasks"]);
       return task.id;
     } finally {
       savingTaskIds.delete(taskId);
@@ -1432,8 +1536,8 @@ export const useWorkdayStore = defineStore("workday", () => {
     if (!source) return;
     if (source.version <= 0) return;
     const result = await duplicateTaskSubtree(source.id, source.version);
-    await loadWorkspaceData();
-    await loadTodayOverview();
+    applyDuplicatedTaskRecords(tasks, source.id, result.tasks);
+    markDerivedDomainsStale(["tasks"]);
     selectedTaskId.value = result.rootId;
     return result.rootId;
   }
@@ -1509,7 +1613,8 @@ export const useWorkdayStore = defineStore("workday", () => {
     if (!newParent) return;
     if (moving.version <= 0) return;
     replaceTask(await changeTaskParent(moving.id, moving.version, newParent.id));
-    await loadWorkspaceData();
+    moveTask(moving.id, newParent.id, "inside");
+    markDerivedDomainsStale(["tasks"]);
   }
 
   async function outdentTask(taskId: string) {
@@ -1520,7 +1625,8 @@ export const useWorkdayStore = defineStore("workday", () => {
     if (!parent) return;
     if (moving.version <= 0) return;
     replaceTask(await changeTaskParent(moving.id, moving.version, parent.parentId));
-    await loadWorkspaceData();
+    moveTask(moving.id, parent.id, "after", parent.parentId);
+    markDerivedDomainsStale(["tasks"]);
   }
 
   function getTaskDepth(task: Task, source: Task[]) {
@@ -1540,18 +1646,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   function getSubtreeIds(taskId: string) {
-    const ids = new Set([taskId]);
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const task of tasks) {
-        if (task.parentId && ids.has(task.parentId) && !ids.has(task.id)) {
-          ids.add(task.id);
-          changed = true;
-        }
-      }
-    }
-    return ids;
+    return collectTaskSubtreeIds(tasks, taskId);
   }
 
   function getDescendantIds(taskId: string) {
@@ -1616,9 +1711,9 @@ export const useWorkdayStore = defineStore("workday", () => {
     entries.unshift(entry);
     selectedTaskId.value = persistedTaskId ?? "";
     selectedEntryId.value = entry.id;
-    await loadWorkspaceData();
-    await loadUnassignedState();
-    await loadTodayOverview();
+    queryCoordinator.markMatchingStale("workspace");
+    queryCoordinator.markMatchingStale("unassigned");
+    queryCoordinator.markMatchingStale("todayOverview");
     return true;
   }
 
@@ -1627,8 +1722,8 @@ export const useWorkdayStore = defineStore("workday", () => {
     if (!entry) return;
     markTimeDataChanged();
     replaceTimeEntry(await pauseTimerRecord(entry.id, entry.version));
-    await loadWorkspaceData();
-    await loadTodayOverview();
+    queryCoordinator.markMatchingStale("workspace");
+    queryCoordinator.markMatchingStale("todayOverview");
   }
 
   async function resumeTimer() {
@@ -1636,8 +1731,8 @@ export const useWorkdayStore = defineStore("workday", () => {
     if (entry?.state === "paused") {
       markTimeDataChanged();
       replaceTimeEntry(await resumeTimerRecord(entry.id, entry.version));
-      await loadWorkspaceData();
-      await loadTodayOverview();
+      queryCoordinator.markMatchingStale("workspace");
+      queryCoordinator.markMatchingStale("todayOverview");
     }
   }
 
@@ -1657,11 +1752,11 @@ export const useWorkdayStore = defineStore("workday", () => {
     selectedEntryId.value = stopped.id;
     timerStopConfirmationEntryId.value = stopped.id;
     resetUnassignedTracking();
-    await notifyTimerStopConfirmation(stopped.id);
-    await loadWorkspaceData();
-    await loadUnassignedState();
-    await loadTodayOverview();
-    await loadTimeHistory(timeHistoryPage.value);
+    void notifyTimerStopConfirmation(stopped.id);
+    queryCoordinator.markMatchingStale("workspace");
+    queryCoordinator.markMatchingStale("unassigned");
+    queryCoordinator.markMatchingStale("timeHistory");
+    queryCoordinator.markMatchingStale("todayOverview");
     return stopped.id;
   }
 
@@ -1686,7 +1781,7 @@ export const useWorkdayStore = defineStore("workday", () => {
         previousSiblingId,
         nextSiblingId,
       }));
-      await loadWorkspaceData();
+      markDerivedDomainsStale(["tasks"]);
     } catch (error) {
       await loadWorkspaceData();
       throw error;
@@ -1753,12 +1848,8 @@ export const useWorkdayStore = defineStore("workday", () => {
       snapshot.tasks.splice(0, snapshot.tasks.length, ...remaining.slice(0, insertIndex), ...movingBlock, ...remaining.slice(insertIndex));
     }
     replaceTask(moved);
-    const [, todaySnapshot, executionSnapshot] = await Promise.all([
-      loadWorkspaceData(),
-      loadTodayPlan(subjectId),
-      loadExecutionSnapshot(subjectId),
-    ]);
-    return executionSnapshot ?? todaySnapshot;
+    markDerivedDomainsStale(["tasks"]);
+    return await loadExecutionSnapshot(subjectId);
   }
 
   async function saveTaskNote(taskId: string, note: string) {
@@ -1770,7 +1861,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       expectedVersion: task.version,
       note: normalized ?? null,
     }));
-    await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(task.subjectId)]);
+    markDerivedDomainsStale(["tasks"]);
   }
 
   async function saveTaskTodayEstimate(taskId: string, estimateMinutes?: number) {
@@ -1780,9 +1871,10 @@ export const useWorkdayStore = defineStore("workday", () => {
     if (task.recurrence && estimateMinutes) {
       replaceTask(await setRecurringTaskEstimate(task.id, task.version, todayDate, estimateMinutes));
     } else {
-      await setTaskDailyEstimate(task.id, todayDate, estimateMinutes, task.dailyEstimateVersion);
+      const result = await setTaskDailyEstimate(task.id, todayDate, estimateMinutes, task.dailyEstimateVersion);
+      applyDailyEstimate(task.id, result.estimateMinutes, result.version);
     }
-    await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(task.subjectId), loadTodayOverview()]);
+    markDerivedDomainsStale(["tasks"]);
   }
 
   async function saveTaskEstimateBatch(items: Array<{
@@ -1794,7 +1886,8 @@ export const useWorkdayStore = defineStore("workday", () => {
     if (!selectedSubjectId.value || !items.length) return;
     const todayDate = await ensureWorkspaceCalendar();
     await setTaskDailyEstimateBatch(selectedSubjectId.value, todayDate, items);
-    await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(selectedSubjectId.value), loadTodayOverview()]);
+    for (const item of items) applyDailyEstimate(item.taskId, item.estimateMinutes);
+    markDerivedDomainsStale(["tasks"]);
   }
 
   async function saveTodayImport(request: {
@@ -1839,7 +1932,7 @@ export const useWorkdayStore = defineStore("workday", () => {
 
   async function saveTaskPlanBatch(request: QuickPlanBatchRequest, dayInstanceDate?: string) {
     const result = await applyTaskPlanBatch({ ...request, dayInstanceDate });
-    await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(selectedSubjectId.value), loadTodayOverview()]);
+    markDerivedDomainsStale(["tasks"]);
     return result;
   }
 
@@ -1934,10 +2027,14 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   function replaceTodayTask(record: TaskRecord) {
+    const startedAt = performance.now();
     const next = toUiTask(record);
     const index = todayPlanTasks.findIndex((task) => task.id === record.id);
     if (index >= 0) todayPlanTasks.splice(index, 1, next);
     else todayPlanTasks.push(next);
+    const todayIndex = todayTasks.findIndex((task) => task.id === record.id);
+    if (todayIndex >= 0) todayTasks.splice(todayIndex, 1, toUiTask(record));
+    void recordDirectCloudClientMetric("client_apply", performance.now() - startedAt).catch(() => undefined);
     return next;
   }
 
@@ -1970,20 +2067,16 @@ export const useWorkdayStore = defineStore("workday", () => {
           }),
         });
         const oldId = task.id;
-        let index = todayPlanTasks.findIndex((item) => item.id === oldId);
-        const existingCreatedIndex = todayPlanTasks.findIndex((item) => item.id === created.id);
-        if (existingCreatedIndex >= 0 && existingCreatedIndex !== index) {
-          todayPlanTasks.splice(existingCreatedIndex, 1);
-          if (existingCreatedIndex < index) index -= 1;
-        }
-        if (index >= 0) todayPlanTasks.splice(index, 1, toUiTask(created));
-        else todayPlanTasks.push(toUiTask(created));
-        for (const child of todayPlanTasks) if (child.parentId === oldId) child.parentId = created.id;
-        if (selectedTaskId.value === oldId) selectedTaskId.value = created.id;
-        await Promise.all([reloadTodayPlanForSubject(subjectId), loadTodayOverview()]);
+        selectedTaskId.value = applyCreatedTask({
+          tasks: todayPlanTasks,
+          draftId: oldId,
+          authoritative: toUiTask(created),
+          selectedTaskId: selectedTaskId.value,
+        });
+        markDerivedDomainsStale(["tasks"]);
         return created.id;
       }
-      await updateTaskRecord({
+      replaceTodayTask(await updateTaskRecord({
         id: task.id,
         expectedVersion: task.version,
         title: task.title,
@@ -1991,8 +2084,8 @@ export const useWorkdayStore = defineStore("workday", () => {
         estimateMinutes: task.estimate ?? null,
         note: task.note ?? null,
         projectName: task.project || null,
-      });
-      await Promise.all([reloadTodayPlanForSubject(subjectId), loadTodayOverview()]);
+      }));
+      markDerivedDomainsStale(["tasks"]);
       return task.id;
     } finally {
       savingTaskIds.delete(taskId);
@@ -2012,22 +2105,20 @@ export const useWorkdayStore = defineStore("workday", () => {
       ...(field === "title" ? { title: draft.title } : { estimateMinutes: draft.estimate ?? null }),
     });
     replaceTodayTask(result.instance);
-    await loadWorkspaceData();
+    replaceTask(result.source);
+    markDerivedDomainsStale(["tasks"]);
     return result.instance.id;
   }
 
   async function deleteTodayTask(taskId: string) {
     const deletedTask = todayPlanTask(taskId);
     if (!deletedTask) return;
-    const idsToDelete = getTodaySubtreeIds(taskId);
     if (deletedTask.version > 0) await deleteTaskSubtree(deletedTask.id, deletedTask.version);
-    for (let index = todayPlanTasks.length - 1; index >= 0; index -= 1) {
-      if (idsToDelete.has(todayPlanTasks[index].id)) todayPlanTasks.splice(index, 1);
-    }
+    const idsToDelete = removeTaskSubtree(todayPlanTasks, taskId);
     if (idsToDelete.has(selectedTaskId.value)) {
       selectedTaskId.value = buildVisibleTaskList(todayPlanTasks.filter((task) => task.subjectId === deletedTask.subjectId))[0]?.id ?? "";
     }
-    if (deletedTask.version > 0) await Promise.all([reloadTodayPlanForSubject(deletedTask.subjectId), loadTodayOverview()]);
+    if (deletedTask.version > 0) markDerivedDomainsStale(["tasks"]);
   }
 
   async function saveTodayTaskNote(taskId: string, note: string) {
@@ -2039,7 +2130,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       expectedVersion: task.version,
       note: normalized ?? null,
     }));
-    await reloadTodayPlanForSubject(task.subjectId);
+    markDerivedDomainsStale(["tasks"]);
   }
 
   async function saveTodayTaskNoteToFuture(taskId: string, note: string) {
@@ -2049,21 +2140,24 @@ export const useWorkdayStore = defineStore("workday", () => {
       ? tasks.find((candidate) => candidate.id === task.dayInstanceSourceTaskId)
       : undefined;
     if (!source?.recurrence) { await saveTodayTaskNote(taskId, note); return; }
-    replaceTodayTask((await updateTodayRecurringTask({
+    const result = await updateTodayRecurringTask({
       instanceId: task.id,
       instanceExpectedVersion: task.version,
       sourceExpectedVersion: source.version,
       note: note.trim() || null,
-    })).instance);
-    await loadWorkspaceData();
+    });
+    replaceTodayTask(result.instance);
+    replaceTask(result.source);
+    markDerivedDomainsStale(["tasks"]);
   }
 
   async function saveTodayTaskTodayEstimate(taskId: string, estimateMinutes?: number) {
     const task = todayPlanTask(taskId);
     if (!task || task.version <= 0) return;
     const todayDate = await ensureWorkspaceCalendar();
-    await setTaskDailyEstimate(task.id, todayDate, estimateMinutes, task.dailyEstimateVersion);
-    await Promise.all([reloadTodayPlanForSubject(task.subjectId), loadTodayOverview()]);
+    const result = await setTaskDailyEstimate(task.id, todayDate, estimateMinutes, task.dailyEstimateVersion);
+    applyDailyEstimate(task.id, result.estimateMinutes, result.version);
+    markDerivedDomainsStale(["tasks"]);
   }
 
   async function commitTodayTaskToggle(task: Task): Promise<TaskCompletionResult | undefined> {
@@ -2094,7 +2188,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   async function toggleTodayTask(task: Task) {
     const result = await commitTodayTaskToggle(task);
     if (!result) return;
-    await Promise.all([reloadTodayPlanForSubject(task.subjectId), loadTodayOverview()]);
+    markDerivedDomainsStale(["tasks"]);
     return result;
   }
 
@@ -2119,7 +2213,7 @@ export const useWorkdayStore = defineStore("workday", () => {
         previousSiblingId,
         nextSiblingId,
       }));
-      await reloadTodayPlanForSubject(moving.subjectId);
+      markDerivedDomainsStale(["tasks"]);
     } catch (error) {
       await reloadTodayPlanForSubject(moving.subjectId);
       throw error;
@@ -2130,7 +2224,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     const moving = todayPlanTask(taskId);
     if (!moving || moving.version <= 0) return;
     replaceTodayTask(await changeTaskParent(moving.id, moving.version, newParentId));
-    await reloadTodayPlanForSubject(moving.subjectId);
+    markDerivedDomainsStale(["tasks"]);
   }
 
   async function indentTodayTask(taskId: string) {
@@ -2156,7 +2250,8 @@ export const useWorkdayStore = defineStore("workday", () => {
     const source = todayPlanTask(taskId);
     if (!source || source.version <= 0) return;
     const result = await duplicateTaskSubtree(source.id, source.version);
-    await Promise.all([reloadTodayPlanForSubject(source.subjectId), loadTodayOverview()]);
+    applyDuplicatedTaskRecords(todayPlanTasks, source.id, result.tasks);
+    markDerivedDomainsStale(["tasks"]);
     selectedTaskId.value = result.rootId;
     return result.rootId;
   }
@@ -2179,18 +2274,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   function getTodaySubtreeIds(taskId: string) {
-    const ids = new Set([taskId]);
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const task of todayPlanTasks) {
-        if (task.parentId && ids.has(task.parentId) && !ids.has(task.id)) {
-          ids.add(task.id);
-          changed = true;
-        }
-      }
-    }
-    return ids;
+    return collectTaskSubtreeIds(todayPlanTasks, taskId);
   }
 
   async function loadActualAdjustmentSnapshot(subjectId = selectedSubjectId.value) {
@@ -2217,10 +2301,15 @@ export const useWorkdayStore = defineStore("workday", () => {
     const source = applyToFuture && instance?.dayInstanceSourceTaskId
       ? tasks.find((task) => task.id === instance.dayInstanceSourceTaskId)
       : undefined;
-    if (source?.recurrence) await updateTodayRecurringTask({ instanceId: taskId, instanceExpectedVersion: expectedVersion, sourceExpectedVersion: source.version, title });
-    else await updateTaskRecord({ id: taskId, expectedVersion, title });
-    await Promise.all([reloadTodayPlanForSubject(subjectId), loadTodayOverview()]);
-    if (source) await loadWorkspaceData();
+    if (source?.recurrence) {
+      const result = await updateTodayRecurringTask({ instanceId: taskId, instanceExpectedVersion: expectedVersion, sourceExpectedVersion: source.version, title });
+      replaceTodayTask(result.instance);
+      replaceTask(result.source);
+    } else {
+      const updated = await updateTaskRecord({ id: taskId, expectedVersion, title });
+      replaceTask(updated);
+    }
+    markDerivedDomainsStale(["tasks"]);
     return await loadExecutionSnapshot(subjectId);
   }
 
@@ -2229,10 +2318,15 @@ export const useWorkdayStore = defineStore("workday", () => {
     const source = applyToFuture && instance?.dayInstanceSourceTaskId
       ? tasks.find((task) => task.id === instance.dayInstanceSourceTaskId)
       : undefined;
-    if (source?.recurrence) await updateTodayRecurringTask({ instanceId: taskId, instanceExpectedVersion: expectedVersion, sourceExpectedVersion: source.version, note: note.trim() || null });
-    else await updateTaskRecord({ id: taskId, expectedVersion, note: note.trim() || null });
-    await reloadTodayPlanForSubject(subjectId);
-    if (source) await loadWorkspaceData();
+    if (source?.recurrence) {
+      const result = await updateTodayRecurringTask({ instanceId: taskId, instanceExpectedVersion: expectedVersion, sourceExpectedVersion: source.version, note: note.trim() || null });
+      replaceTodayTask(result.instance);
+      replaceTask(result.source);
+    } else {
+      const updated = await updateTaskRecord({ id: taskId, expectedVersion, note: note.trim() || null });
+      replaceTask(updated);
+    }
+    markDerivedDomainsStale(["tasks"]);
     return await loadExecutionSnapshot(subjectId);
   }
 
@@ -2251,7 +2345,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       ? tasks.find((candidate) => candidate.id === instance.dayInstanceSourceTaskId)
       : undefined;
     if (source?.recurrence) {
-      await updateTodayRecurringTask({
+      const result = await updateTodayRecurringTask({
         instanceId: task.id,
         instanceExpectedVersion: task.expectedVersion,
         sourceExpectedVersion: source.version,
@@ -2261,7 +2355,10 @@ export const useWorkdayStore = defineStore("workday", () => {
         note: task.note?.trim() || null,
         projectName: task.projectName?.trim() || null,
       });
-    } else await updateTaskRecord({
+      replaceTodayTask(result.instance);
+      replaceTask(result.source);
+    } else {
+      const updated = await updateTaskRecord({
       id: task.id,
       expectedVersion: task.expectedVersion,
       title: task.title,
@@ -2269,27 +2366,39 @@ export const useWorkdayStore = defineStore("workday", () => {
       estimateMinutes: task.estimateMinutes ?? null,
       note: task.note?.trim() || null,
       projectName: task.projectName?.trim() || null,
-    });
-    await Promise.all([loadTimeData(), reloadTodayPlanForSubject(task.subjectId), loadTodayOverview()]);
-    if (source) await loadWorkspaceData();
+      });
+      replaceTask(updated);
+    }
+    markDerivedDomainsStale(["tasks"]);
     return await loadExecutionSnapshot(task.subjectId);
   }
 
   async function deleteExecutionTask(taskId: string, expectedVersion: number, subjectId: string) {
     await deleteTaskSubtree(taskId, expectedVersion);
-    await Promise.all([reloadTodayPlanForSubject(subjectId), loadTodayOverview()]);
+    const removeIds = getTodaySubtreeIds(taskId);
+    for (let index = todayPlanTasks.length - 1; index >= 0; index -= 1) {
+      if (removeIds.has(todayPlanTasks[index].id)) todayPlanTasks.splice(index, 1);
+    }
+    markDerivedDomainsStale(["tasks"]);
     return await loadExecutionSnapshot(subjectId);
   }
 
   async function saveActualAdjustmentBatch(request: ActualAdjustmentBatchRequest) {
     const result = await applyActualAdjustmentBatch(request);
-    await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(request.subjectId), loadTimeData(), loadTodayOverview(), loadTimeHistory(timeHistoryPage.value)]);
+    queryCoordinator.markMatchingStale("workspace");
+    queryCoordinator.markMatchingStale("todayPlan");
+    queryCoordinator.markMatchingStale("time");
+    queryCoordinator.markMatchingStale("todayOverview");
+    queryCoordinator.markMatchingStale("timeHistory");
     return result;
   }
 
   async function removeActualAdjustment(adjustmentId: string, expectedVersion: number) {
     await deleteActualAdjustment(adjustmentId, expectedVersion);
-    await Promise.all([loadWorkspaceData(), loadTimeData(), loadTodayOverview(), loadTimeHistory(timeHistoryPage.value)]);
+    queryCoordinator.markMatchingStale("workspace");
+    queryCoordinator.markMatchingStale("time");
+    queryCoordinator.markMatchingStale("todayOverview");
+    queryCoordinator.markMatchingStale("timeHistory");
   }
 
   async function openTimerStopConfirmation(entryId: string) {
@@ -2297,7 +2406,9 @@ export const useWorkdayStore = defineStore("workday", () => {
     timerStopConfirmationEntryId.value = entryId;
     selectedEntryId.value = entryId;
     await loadTimeData();
-    await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(), loadTodayOverview()]);
+    queryCoordinator.markMatchingStale("workspace");
+    queryCoordinator.markMatchingStale("todayPlan");
+    queryCoordinator.markMatchingStale("todayOverview");
   }
 
   function dismissTimerStopConfirmation() {
@@ -2325,8 +2436,10 @@ export const useWorkdayStore = defineStore("workday", () => {
       if (chainSlice) Object.assign(chainSlice, toUiTimeEntry(updated));
       if (entries.some((item) => item.id === slice.id)) replaceTimeEntry(updated);
     }
-    await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(task?.subjectId), loadTodayOverview()]);
-    await loadTimeHistory(timeHistoryPage.value);
+    queryCoordinator.markMatchingStale("workspace");
+    queryCoordinator.markMatchingStale("todayPlan");
+    queryCoordinator.markMatchingStale("todayOverview");
+    queryCoordinator.markMatchingStale("timeHistory");
     const completedTaskIds = completionCandidate && [...todayPlanTasks, ...tasks].find((item) => item.id === completionCandidate)?.status === "done"
       ? [completionCandidate]
       : [];
@@ -2340,9 +2453,10 @@ export const useWorkdayStore = defineStore("workday", () => {
     for (const slice of timerStopConfirmationSlices.value) {
       await updateTimeEntryDisposition({ entryId: slice.id, expectedVersion: slice.version, disposition });
     }
-    await Promise.all([loadTimeData(), loadWorkspaceData()]);
-    await loadTodayOverview();
-    await loadTimeHistory(timeHistoryPage.value);
+    queryCoordinator.markMatchingStale("time");
+    queryCoordinator.markMatchingStale("workspace");
+    queryCoordinator.markMatchingStale("todayOverview");
+    queryCoordinator.markMatchingStale("timeHistory");
     timerStopConfirmationEntryId.value = "";
     timerStopConfirmation.value = undefined;
     return true;
@@ -2368,15 +2482,17 @@ export const useWorkdayStore = defineStore("workday", () => {
       for (const slice of result.previousStopResult.slices) replaceTimeEntry(slice);
     }
     replaceTimeEntry(result.activeEntry);
+    if (result.createdTask) {
+      if (result.createdTask.dayInstanceDate) replaceTodayTask(result.createdTask);
+      else replaceTask(result.createdTask);
+    }
     selectedTaskId.value = result.activeEntry.defaultTaskId ?? result.createdTask?.id ?? "";
     selectedEntryId.value = result.activeEntry.id;
-    await Promise.all([
-      loadWorkspaceData(),
-      loadUnassignedState(),
-      loadTodayOverview(),
-      loadTodayPlan(("taskId" in target ? tasks.find((task) => task.id === target.taskId)?.subjectId : target.newTask.subjectId) ?? selectedSubjectId.value),
-      loadTimeHistory(timeHistoryPage.value),
-    ]);
+    queryCoordinator.markMatchingStale("workspace");
+    queryCoordinator.markMatchingStale("unassigned");
+    queryCoordinator.markMatchingStale("todayPlan");
+    queryCoordinator.markMatchingStale("timeHistory");
+    queryCoordinator.markMatchingStale("todayOverview");
     return result;
   }
 
@@ -2403,8 +2519,10 @@ export const useWorkdayStore = defineStore("workday", () => {
       .map((allocation) => allocation.taskId));
     markTimeDataChanged();
     replaceTimeEntry(await replaceTimeAllocations(entry.id, entry.version, normalized));
-    await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(), loadTodayOverview()]);
-    await loadTimeHistory(timeHistoryPage.value);
+    queryCoordinator.markMatchingStale("workspace");
+    queryCoordinator.markMatchingStale("todayPlan");
+    queryCoordinator.markMatchingStale("todayOverview");
+    queryCoordinator.markMatchingStale("timeHistory");
     const completedTaskIds = [...completionCandidates].filter((taskId) => [...todayPlanTasks, ...tasks].find((task) => task.id === taskId)?.status === "done");
     return { completedCount: completedTaskIds.length, completedTaskIds };
   }
@@ -2428,9 +2546,9 @@ export const useWorkdayStore = defineStore("workday", () => {
     markTimeDataChanged();
     entries.unshift(entry);
     selectedEntryId.value = entry.id;
-    await loadWorkspaceData();
-    await loadTodayOverview();
-    await loadTimeHistory(1);
+    queryCoordinator.markMatchingStale("workspace");
+    queryCoordinator.markMatchingStale("todayOverview");
+    queryCoordinator.markMatchingStale("timeHistory");
     const completedTaskIds = completionCandidate && tasks.find((item) => item.id === completionCandidate)?.status === "done"
       ? [completionCandidate]
       : [];
@@ -2448,9 +2566,9 @@ export const useWorkdayStore = defineStore("workday", () => {
       note: note.trim() || undefined,
       expectedVersion: entry.version,
     }));
-    await loadWorkspaceData();
-    await loadTodayOverview();
-    await loadTimeHistory(timeHistoryPage.value);
+    queryCoordinator.markMatchingStale("workspace");
+    queryCoordinator.markMatchingStale("todayOverview");
+    queryCoordinator.markMatchingStale("timeHistory");
   }
 
   async function setTimeEntryDisposition(entryId: string, disposition: "break" | "discard") {
@@ -2469,9 +2587,9 @@ export const useWorkdayStore = defineStore("workday", () => {
     } else {
       replaceTimeEntry(updatedRecord);
     }
-    await loadWorkspaceData();
-    await loadTodayOverview();
-    await loadTimeHistory(timeHistoryPage.value);
+    queryCoordinator.markMatchingStale("workspace");
+    queryCoordinator.markMatchingStale("todayOverview");
+    queryCoordinator.markMatchingStale("timeHistory");
   }
 
   async function createReport(request: { type: ReportType; referenceDate: string; subjectId: string; taskIds: string[]; templateId?: string }) {
@@ -2482,9 +2600,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       taskIds: request.taskIds,
       templateId: request.templateId,
     });
-    const report = toUiReport(result);
-    await refreshReports();
-    return reports.value.find((item) => item.id === report.id) ?? report;
+    return upsertReport(toUiReport(result));
   }
 
   async function updateReportScope(report: ReportRecord, request: { type: ReportType; referenceDate: string; subjectId: string; taskIds: string[]; templateId?: string }) {
@@ -2497,25 +2613,24 @@ export const useWorkdayStore = defineStore("workday", () => {
       templateId: request.templateId,
       expectedVersion: report.version,
     }));
-    await refreshReports();
-    return reports.value.find((item) => item.id === updated.id) ?? updated;
+    return upsertReport(updated);
   }
 
   async function saveReportContent(report: ReportRecord, markdown: string) {
     const updated = toUiReport(await saveReportContentRecord(report.id, markdown, report.version));
-    await refreshReports();
-    return reports.value.find((item) => item.id === updated.id) ?? updated;
+    return upsertReport(updated);
   }
 
   async function regenerateReport(report: ReportRecord) {
     const updated = toUiReport(await regenerateReportRecord(report.id, report.version));
-    await refreshReports();
-    return reports.value.find((item) => item.id === updated.id) ?? updated;
+    return upsertReport(updated);
   }
 
   async function deleteReport(report: ReportRecord) {
     await deleteReportRecord(report.id, report.version);
-    await refreshReports();
+    reports.value = reports.value.filter((item) => item.id !== report.id);
+    reportPagination.items = [...reports.value];
+    queryCoordinator.markMatchingStale("reports");
   }
 
   async function getReportTemplate(type: ReportType, subjectId?: string) {
@@ -2629,9 +2744,11 @@ export const useWorkdayStore = defineStore("workday", () => {
 
     unassignedDialogOpen.value = false;
     resetUnassignedTracking();
-    await Promise.all([loadTimeData(), loadWorkspaceData(), loadUnassignedState()]);
-    await loadTodayOverview();
-    await loadTimeHistory(timeHistoryPage.value);
+    queryCoordinator.markMatchingStale("time");
+    queryCoordinator.markMatchingStale("workspace");
+    queryCoordinator.markMatchingStale("unassigned");
+    queryCoordinator.markMatchingStale("todayOverview");
+    queryCoordinator.markMatchingStale("timeHistory");
     const completedTaskIds = [...completionCandidates].filter((taskId) => tasks.find((task) => task.id === taskId)?.status === "done");
     return { completedCount: completedTaskIds.length, completedTaskIds };
   }
@@ -2643,7 +2760,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     now, todayMinutes, allocatedMinutes, pendingMinutes, doneCount, todayCompletionDoneCount, todayCompletionTotalCount, todayCompletionPercent, unassignedSeconds, unassignedStartedAt,
     unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen, unassignedWorkDate, unassignedSessionId, unassignedVersion,
     unassignedCurrentSession,
-    workspaceLoaded, workspaceLoading, executionSnapshots, executionSnapshotLoading, clearCloudBusinessMemory, loadExecutionSnapshot, saveExecutionTaskTitle, saveExecutionTaskNote, saveExecutionTaskDetails, deleteExecutionTask, loadWorkspaceData, loadTodayPlan, setTodayPlanMembership, addTasksToToday, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadMoreReports, refreshReports, loadReportsThroughId, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addTaskSelectionDraft, addChildTask, addTaskRelative, createTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTodayImport, saveTaskPlanBatch, loadActualAdjustmentSnapshot, saveActualAdjustmentBatch, removeActualAdjustment, duplicateTask, duplicateSingleTask, deleteTask, moveTask, reorderTask, movePlanTask,
+    workspaceLoaded, workspaceLoading, executionSnapshots, executionSnapshotLoading, clearCloudBusinessMemory, invalidateCloudDomains, loadExecutionSnapshot, saveExecutionTaskTitle, saveExecutionTaskNote, saveExecutionTaskDetails, deleteExecutionTask, loadWorkspaceData, loadTodayPlan, setTodayPlanMembership, addTasksToToday, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadMoreReports, refreshReports, loadReportsThroughId, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addTaskSelectionDraft, addChildTask, addTaskRelative, createTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTodayImport, saveTaskPlanBatch, loadActualAdjustmentSnapshot, saveActualAdjustmentBatch, removeActualAdjustment, duplicateTask, duplicateSingleTask, deleteTask, moveTask, reorderTask, movePlanTask,
     addTodayTask, addTodayChildTask, addTodayTaskRelative, saveTodayTask, saveTodayTaskToFuture, deleteTodayTask, saveTodayTaskNote, saveTodayTaskNoteToFuture, saveTodayTaskTodayEstimate, commitTodayTaskToggle, toggleTodayTask, moveTodayTask, indentTodayTask, outdentTodayTask, duplicateTodayTask, duplicateSingleTodayTask,
     indentTask, outdentTask, moveExecutionTask, startTimer, transitionTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, loadReportTemplates, createReportTemplate, updateReportTemplate, duplicateReportTemplate, setDefaultReportTemplate, deleteReportTemplate, reorderReportTemplates, getReportTemplatePlaceholders, publicReportText, previewObsidianReport, writeObsidianReport,
     beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, dismissUnassignedResolution, resolveUnassignedTime

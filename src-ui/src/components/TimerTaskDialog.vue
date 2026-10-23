@@ -714,7 +714,7 @@ async function selectSubject(nextSubjectId: string) {
   subjectId.value = nextSubjectId;
   query.value = "";
   resetNewTask();
-  if (usesTodayPlan.value) await store.loadTodayPlan(nextSubjectId);
+  if (usesTodayPlan.value) await store.loadTodayPlan(nextSubjectId, true);
   else await store.loadExecutionSnapshot(nextSubjectId);
 }
 

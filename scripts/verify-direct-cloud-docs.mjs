@@ -21,7 +21,7 @@ const allDocs = Object.values(docs).join("\n");
 for (const expected of [
   "direct_v2", "sync_v1", "CLOUD_PROTOCOL_UNSUPPORTED",
   "workspace_restore_prepare", "workspace_restore_commit",
-  "紧急只读", "不重建 SQLite",
+  "紧急只读", "不重建 SQLite", "single-flight", "不执行每 5 秒业务轮询",
 ]) {
   if (!allDocs.includes(expected)) throw new Error(`直连云端文档缺少：${expected}`);
 }
@@ -54,6 +54,7 @@ for (const expected of [
 for (const expected of [
   "紧急只读开关",
   "不得重新启用 `sync_v1` outbox",
+  "test:direct-cloud-interaction-performance",
 ]) {
   if (!docs.protocol.includes(expected)) throw new Error(`运维说明缺少：${expected}`);
 }

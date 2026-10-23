@@ -52,8 +52,9 @@ use crate::unassigned::{
 struct TestConfig {
     project_url: String,
     anon_key: String,
-    email: String,
-    password: String,
+    email: Option<String>,
+    password: Option<String>,
+    session_json: Option<String>,
 }
 
 impl TestConfig {
@@ -63,13 +64,25 @@ impl TestConfig {
             Ok("1"),
             "该测试会删除专用测试账号的工作空间；请显式设置 TG_SUPABASE_E2E_ALLOW_RESET=1"
         );
+        let session_json = env::var("TG_SUPABASE_SESSION_JSON")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let (email, password) = if session_json.is_some() {
+            (None, None)
+        } else {
+            (
+                Some(required_env("TG_SUPABASE_EMAIL")),
+                Some(required_env("TG_SUPABASE_PASSWORD")),
+            )
+        };
         Self {
             project_url: required_env("TG_SUPABASE_URL")
                 .trim_end_matches('/')
                 .to_string(),
             anon_key: required_env("TG_SUPABASE_ANON_KEY"),
-            email: required_env("TG_SUPABASE_EMAIL"),
-            password: required_env("TG_SUPABASE_PASSWORD"),
+            email,
+            password,
+            session_json,
         }
     }
 }
@@ -87,14 +100,18 @@ fn configure_and_sign_in(database: &Database, config: &TestConfig) {
         },
     )
     .unwrap();
-    supabase::sign_in_password(
-        database,
-        CloudSignInRequest {
-            email: config.email.clone(),
-            password: config.password.clone(),
-        },
-    )
-    .unwrap();
+    if let Some(session_json) = config.session_json.as_deref() {
+        supabase::install_serialized_test_session_for_database(database, session_json).unwrap();
+    } else {
+        supabase::sign_in_password(
+            database,
+            CloudSignInRequest {
+                email: config.email.clone().expect("缺少 Supabase 测试邮箱"),
+                password: config.password.clone().expect("缺少 Supabase 测试密码"),
+            },
+        )
+        .unwrap();
+    }
 }
 
 fn reset_owned_workspaces(database: &Database) {
@@ -126,13 +143,16 @@ fn cleanup_owned_workspaces(database: &Database) -> Result<(), String> {
 
 struct CleanupGuard {
     database: Database,
+    sign_out: bool,
 }
 
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
         if supabase::current_session(&self.database).is_ok() {
             let _ = cleanup_owned_workspaces(&self.database);
-            let _ = supabase::sign_out(&self.database);
+            if self.sign_out {
+                let _ = supabase::sign_out(&self.database);
+            }
         }
     }
 }
@@ -4868,6 +4888,7 @@ fn real_supabase_unassigned_two_device_flow() {
     configure_and_sign_in(&device_a, &config);
     let _cleanup = CleanupGuard {
         database: device_a.clone(),
+        sign_out: config.session_json.is_none(),
     };
     reset_owned_workspaces(&device_a);
     let workspace = supabase::workspace_bootstrap(&device_a).unwrap();
@@ -5362,8 +5383,10 @@ fn real_supabase_unassigned_two_device_flow() {
     );
 
     reset_owned_workspaces(&device_a);
-    let _ = supabase::sign_out(&device_a);
-    let _ = supabase::sign_out(&device_b);
+    if config.session_json.is_none() {
+        let _ = supabase::sign_out(&device_a);
+        let _ = supabase::sign_out(&device_b);
+    }
 }
 
 #[test]
@@ -5379,6 +5402,7 @@ fn real_supabase_direct_v2_two_device_flow() {
     configure_and_sign_in(&device_a, &config);
     let _cleanup = CleanupGuard {
         database: device_a.clone(),
+        sign_out: config.session_json.is_none(),
     };
     reset_owned_workspaces(&device_a);
     let workspace = supabase::workspace_bootstrap(&device_a).unwrap();
@@ -5433,6 +5457,7 @@ fn real_supabase_direct_v2_two_device_flow() {
     .unwrap();
     assert!(tasks_b.tasks.iter().any(|item| item.id == task.id));
 
+    let metrics_before_local_update = crate::direct_cloud_observability::snapshot(&workspace.id);
     let updated = supabase::direct_cloud_task_update_for_command(
         &device_a,
         TaskUpdateRequest {
@@ -5448,6 +5473,27 @@ fn real_supabase_direct_v2_two_device_flow() {
         },
     )
     .unwrap();
+    let metrics_after_local_update = crate::direct_cloud_observability::snapshot(&workspace.id);
+    assert_eq!(
+        metrics_after_local_update.metrics.query_count,
+        metrics_before_local_update.metrics.query_count,
+        "本机事项 mutation 不应自行追加权威查询"
+    );
+    assert_eq!(
+        metrics_after_local_update.metrics.mutation_count,
+        metrics_before_local_update.metrics.mutation_count + 1
+    );
+    println!(
+        "DIRECT_V2_PERF task_update mutation_delta={} query_delta={} response_bytes={} mutation_avg_ms={:.2} query_avg_ms={:.2}",
+        metrics_after_local_update.metrics.mutation_count
+            - metrics_before_local_update.metrics.mutation_count,
+        metrics_after_local_update.metrics.query_count
+            - metrics_before_local_update.metrics.query_count,
+        metrics_after_local_update.metrics.mutation_response_bytes_total
+            - metrics_before_local_update.metrics.mutation_response_bytes_total,
+        metrics_after_local_update.average_mutation_latency_ms,
+        metrics_after_local_update.average_query_latency_ms,
+    );
     let stale = supabase::direct_cloud_task_update_for_command(
         &device_b,
         TaskUpdateRequest {
@@ -5485,6 +5531,98 @@ fn real_supabase_direct_v2_two_device_flow() {
             .unwrap()
             .title,
         updated.title
+    );
+    let device_b_followup = supabase::direct_cloud_task_update_for_command(
+        &device_b,
+        TaskUpdateRequest {
+            id: task.id.clone(),
+            expected_version: updated.version,
+            title: Some("Direct V2 设备 B 紧随更新".to_string()),
+            parent_id: None,
+            planned_date: None,
+            estimate_minutes: None,
+            note: None,
+            project_name: None,
+            solution_name: None,
+        },
+    )
+    .unwrap();
+    assert!(device_b_followup.version > updated.version);
+    let followup_visible_on_a = supabase::direct_cloud_task_list_for_command(
+        &device_a,
+        TaskListRequest {
+            subject_id: Some(subject.id.clone()),
+            include_completed: Some(true),
+            planned_date: None,
+            today_date: None,
+            today_only: Some(false),
+            daily_estimate_date: None,
+            query: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        followup_visible_on_a
+            .tasks
+            .iter()
+            .find(|item| item.id == task.id)
+            .map(|item| (item.title.as_str(), item.version)),
+        Some((device_b_followup.title.as_str(), device_b_followup.version)),
+        "设备 B 紧随其后的更高版本修改没有在设备 A 权威校准后到达"
+    );
+
+    let metrics_before_estimate = crate::direct_cloud_observability::snapshot(&workspace.id);
+    let estimate = supabase::direct_cloud_daily_estimate_set_for_command(
+        &device_a,
+        TaskDailyEstimateSetRequest {
+            task_id: task.id.clone(),
+            work_date: "2026-10-23".to_string(),
+            estimate_minutes: Some(45),
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(estimate.estimate_minutes, Some(45));
+    assert_eq!(estimate.version, Some(1));
+    let metrics_after_estimate = crate::direct_cloud_observability::snapshot(&workspace.id);
+    assert_eq!(
+        metrics_after_estimate.metrics.mutation_count,
+        metrics_before_estimate.metrics.mutation_count + 1
+    );
+    assert_eq!(
+        metrics_after_estimate.metrics.query_count, metrics_before_estimate.metrics.query_count,
+        "今日预计 mutation 不应自行追加权威查询"
+    );
+    println!(
+        "DIRECT_V2_PERF daily_estimate mutation_delta={} query_delta={} response_bytes={} mutation_avg_ms={:.2} query_avg_ms={:.2}",
+        metrics_after_estimate.metrics.mutation_count
+            - metrics_before_estimate.metrics.mutation_count,
+        metrics_after_estimate.metrics.query_count - metrics_before_estimate.metrics.query_count,
+        metrics_after_estimate.metrics.mutation_response_bytes_total
+            - metrics_before_estimate.metrics.mutation_response_bytes_total,
+        metrics_after_estimate.average_mutation_latency_ms,
+        metrics_after_estimate.average_query_latency_ms,
+    );
+    let estimate_visible_on_b = supabase::direct_cloud_task_list_for_command(
+        &device_b,
+        TaskListRequest {
+            subject_id: Some(subject.id.clone()),
+            include_completed: Some(true),
+            planned_date: None,
+            today_date: None,
+            today_only: Some(false),
+            daily_estimate_date: Some("2026-10-23".to_string()),
+            query: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        estimate_visible_on_b
+            .tasks
+            .iter()
+            .find(|item| item.id == task.id)
+            .and_then(|item| item.today_estimate_minutes),
+        Some(45)
     );
 
     let operation_id = Uuid::now_v7().to_string();
@@ -5552,6 +5690,15 @@ fn real_supabase_direct_v2_two_device_flow() {
     );
     assert!(report_saved.version > report.version);
 
+    let disconnected_subject = supabase::direct_cloud_subject_rename(
+        &device_a,
+        crate::subjects::SubjectRenameRequest {
+            subject_id: subject.id.clone(),
+            name: "Direct V2 断线期间已更新".to_string(),
+            expected_version: subject.version,
+        },
+    )
+    .unwrap();
     let realtime_config = realtime_test_config(&device_b);
     let realtime_workspace_id = workspace.id.clone();
     let (realtime_ready_tx, realtime_ready_rx) = std::sync::mpsc::sync_channel(0);
@@ -5570,13 +5717,18 @@ fn real_supabase_direct_v2_two_device_flow() {
     realtime_ready_rx
         .recv_timeout(Duration::from_secs(20))
         .expect("Direct V2 Realtime 监听器未就绪");
-    supabase::direct_cloud_workbench_bootstrap(&device_a).unwrap();
-    supabase::direct_cloud_subject_rename(
+    let reconnect_signal = supabase::direct_cloud_task_update_for_command(
         &device_a,
-        crate::subjects::SubjectRenameRequest {
-            subject_id: subject.id.clone(),
-            name: "Direct V2 Realtime 已更新".to_string(),
-            expected_version: subject.version,
+        TaskUpdateRequest {
+            id: task.id.clone(),
+            expected_version: device_b_followup.version,
+            title: Some("Direct V2 重连校准信号".to_string()),
+            parent_id: None,
+            planned_date: None,
+            estimate_minutes: None,
+            note: None,
+            project_name: None,
+            solution_name: None,
         },
     )
     .unwrap();
@@ -5586,8 +5738,33 @@ fn real_supabase_direct_v2_two_device_flow() {
     let subjects_after_reconnect = supabase::direct_cloud_subject_list(&device_b).unwrap();
     assert!(subjects_after_reconnect
         .iter()
-        .any(|item| item.id == subject.id && item.name == "Direct V2 Realtime 已更新"));
+        .any(|item| item.id == subject.id
+            && item.name == disconnected_subject.name
+            && item.version == disconnected_subject.version));
+    let tasks_after_reconnect = supabase::direct_cloud_task_list_for_command(
+        &device_b,
+        TaskListRequest {
+            subject_id: Some(subject.id.clone()),
+            include_completed: Some(true),
+            planned_date: None,
+            today_date: None,
+            today_only: Some(false),
+            daily_estimate_date: None,
+            query: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        tasks_after_reconnect
+            .tasks
+            .iter()
+            .find(|item| item.id == task.id)
+            .map(|item| (item.title.as_str(), item.version)),
+        Some((reconnect_signal.title.as_str(), reconnect_signal.version)),
+        "Realtime 重连后当前可见事项领域没有完成权威校准"
+    );
 
+    let metrics_before_timer_start = crate::direct_cloud_observability::snapshot(&workspace.id);
     let timer = supabase::direct_cloud_timer_start(
         &device_a,
         crate::time_tracking::TimerStartRequest {
@@ -5597,6 +5774,27 @@ fn real_supabase_direct_v2_two_device_flow() {
         },
     )
     .unwrap();
+    let metrics_after_timer_start = crate::direct_cloud_observability::snapshot(&workspace.id);
+    assert_eq!(
+        metrics_after_timer_start.metrics.mutation_count,
+        metrics_before_timer_start.metrics.mutation_count + 1
+    );
+    assert_eq!(
+        metrics_after_timer_start.metrics.query_count,
+        metrics_before_timer_start.metrics.query_count,
+        "计时开始 mutation 不应自行追加权威查询"
+    );
+    println!(
+        "DIRECT_V2_PERF timer_start mutation_delta={} query_delta={} response_bytes={} mutation_avg_ms={:.2} query_avg_ms={:.2}",
+        metrics_after_timer_start.metrics.mutation_count
+            - metrics_before_timer_start.metrics.mutation_count,
+        metrics_after_timer_start.metrics.query_count
+            - metrics_before_timer_start.metrics.query_count,
+        metrics_after_timer_start.metrics.mutation_response_bytes_total
+            - metrics_before_timer_start.metrics.mutation_response_bytes_total,
+        metrics_after_timer_start.average_mutation_latency_ms,
+        metrics_after_timer_start.average_query_latency_ms,
+    );
     let early_takeover = supabase::direct_cloud_timer_takeover(
         &device_b,
         crate::time_tracking::TimerTakeoverRequest {
@@ -5612,6 +5810,7 @@ fn real_supabase_direct_v2_two_device_flow() {
         "{early_takeover}"
     );
     thread::sleep(Duration::from_secs(46));
+    let metrics_before_takeover = crate::direct_cloud_observability::snapshot(&workspace.id);
     let takeover = supabase::direct_cloud_timer_takeover(
         &device_b,
         crate::time_tracking::TimerTakeoverRequest {
@@ -5622,7 +5821,34 @@ fn real_supabase_direct_v2_two_device_flow() {
         },
     )
     .unwrap();
-    assert_eq!(takeover.active_entry.id, timer.id);
+    let original_chain_id = timer.timer_chain_id.as_deref().unwrap_or(&timer.id);
+    let takeover_chain_id = takeover
+        .active_entry
+        .timer_chain_id
+        .as_deref()
+        .unwrap_or(&takeover.active_entry.id);
+    assert_eq!(
+        takeover_chain_id, original_chain_id,
+        "计时接管后没有延续原计时链"
+    );
+    assert!(
+        takeover.slices.iter().any(|entry| entry.id == timer.id),
+        "计时接管结果缺少原计时切片"
+    );
+    assert!(
+        matches!(takeover.active_entry.state.as_str(), "running" | "paused"),
+        "计时接管没有返回活动计时"
+    );
+    let metrics_after_takeover = crate::direct_cloud_observability::snapshot(&workspace.id);
+    assert_eq!(
+        metrics_after_takeover.metrics.mutation_count,
+        metrics_before_takeover.metrics.mutation_count + 1
+    );
+    assert_eq!(
+        metrics_after_takeover.metrics.query_count, metrics_before_takeover.metrics.query_count,
+        "计时接管成功不应自行追加权威查询"
+    );
+    let metrics_before_timer_stop = crate::direct_cloud_observability::snapshot(&workspace.id);
     supabase::direct_cloud_timer_stop(
         &device_b,
         crate::time_tracking::TimerStopRequest {
@@ -5632,6 +5858,88 @@ fn real_supabase_direct_v2_two_device_flow() {
         },
     )
     .unwrap();
+    let metrics_after_timer_stop = crate::direct_cloud_observability::snapshot(&workspace.id);
+    assert_eq!(
+        metrics_after_timer_stop.metrics.mutation_count,
+        metrics_before_timer_stop.metrics.mutation_count + 1
+    );
+    assert_eq!(
+        metrics_after_timer_stop.metrics.query_count, metrics_before_timer_stop.metrics.query_count,
+        "计时停止 mutation 不应自行追加权威查询"
+    );
+    println!(
+        "DIRECT_V2_PERF timer_takeover_stop takeover_mutation_delta={} takeover_query_delta={} takeover_response_bytes={} stop_mutation_delta={} stop_query_delta={} stop_response_bytes={} mutation_avg_ms={:.2} query_avg_ms={:.2}",
+        metrics_after_takeover.metrics.mutation_count
+            - metrics_before_takeover.metrics.mutation_count,
+        metrics_after_takeover.metrics.query_count - metrics_before_takeover.metrics.query_count,
+        metrics_after_takeover.metrics.mutation_response_bytes_total
+            - metrics_before_takeover.metrics.mutation_response_bytes_total,
+        metrics_after_timer_stop.metrics.mutation_count
+            - metrics_before_timer_stop.metrics.mutation_count,
+        metrics_after_timer_stop.metrics.query_count
+            - metrics_before_timer_stop.metrics.query_count,
+        metrics_after_timer_stop.metrics.mutation_response_bytes_total
+            - metrics_before_timer_stop.metrics.mutation_response_bytes_total,
+        metrics_after_timer_stop.average_mutation_latency_ms,
+        metrics_after_timer_stop.average_query_latency_ms,
+    );
+
+    let original_url = config.project_url.clone();
+    device_a
+        .open()
+        .unwrap()
+        .execute(
+            "UPDATE device_settings SET value_json = ?1 WHERE key = 'supabase_project_url'",
+            [json!("http://127.0.0.1:9").to_string()],
+        )
+        .unwrap();
+    let offline_query = supabase::direct_cloud_subject_list(&device_a).unwrap_err();
+    assert!(
+        offline_query.starts_with("NETWORK_ERROR:")
+            || offline_query.starts_with("CLOUD_REQUEST_FAILED:")
+            || offline_query.starts_with("CLOUD_TIMEOUT:"),
+        "{offline_query}"
+    );
+    let offline_state = supabase::storage_mode(&device_a).unwrap();
+    assert!(!offline_state.cloud_writable);
+    assert!(matches!(
+        offline_state.cloud_access_state.as_str(),
+        "offline_readonly" | "degraded_readonly"
+    ));
+    let offline_fingerprint =
+        crate::storage_contract::business_data_fingerprint(&device_a).unwrap();
+    let offline_mutation = supabase::direct_cloud_subject_create(
+        &device_a,
+        crate::subjects::SubjectCreateRequest {
+            name: "断网期间不得写入".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert!(offline_mutation.starts_with("CLOUD_READ_ONLY:"));
+    assert_eq!(
+        offline_fingerprint,
+        crate::storage_contract::business_data_fingerprint(&device_a).unwrap()
+    );
+    let offline_outbox: i64 = device_a
+        .open()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(offline_outbox, 0, "直连断网只读不得创建待同步队列");
+    device_a
+        .open()
+        .unwrap()
+        .execute(
+            "UPDATE device_settings SET value_json = ?1 WHERE key = 'supabase_project_url'",
+            [json!(original_url).to_string()],
+        )
+        .unwrap();
+    supabase::direct_cloud_workbench_bootstrap(&device_a).unwrap();
+    assert!(supabase::storage_mode(&device_a).unwrap().cloud_writable);
+    println!("DIRECT_V2_PERF offline_readonly verified=true outbox=0");
+    if env::var("TG_SUPABASE_E2E_PERFORMANCE_ONLY").as_deref() == Ok("1") {
+        return;
+    }
 
     let snapshot = supabase::workspace_snapshot_create(
         &device_a,
@@ -5742,6 +6050,7 @@ fn real_supabase_two_device_flow() {
     }
     let _cleanup = CleanupGuard {
         database: device_a.clone(),
+        sign_out: config.session_json.is_none(),
     };
     reset_owned_workspaces(&device_a);
     let workspace = supabase::workspace_bootstrap(&device_a).unwrap();

@@ -547,13 +547,14 @@ begin
     when 'task_occurrences' then (row_image->>'task_id') || '|' || (row_image->>'occurrence_date')
     else coalesce(row_image->>'id', row_image->>'task_id')
   end;
-  insert into timegenie.workspace_changes(workspace_id, entity_type, entity_id, operation, entity_version, changed_at)
+  insert into timegenie.workspace_changes(workspace_id, entity_type, entity_id, operation, entity_version, changed_by_device_id, changed_at)
   values (
     (row_image->>'workspace_id')::uuid,
     tg_table_name,
     changed_entity_id,
     lower(tg_op),
     coalesce((row_image->>'version')::bigint, 1),
+    nullif(coalesce(row_image->>'updated_by_device_id', row_image->>'created_by_device_id'), '')::uuid,
     now()
   );
   return coalesce(new, old);
@@ -3904,3 +3905,11 @@ notify pgrst, 'reload schema';
 -- Remove the numeric client-generation gate. Direct cloud authorization now
 -- depends on identity, device, storage protocol and workspace epoch only.
 \ir 20261023m_timegenie_remove_client_generation_gate.sql
+
+-- Direct-cloud interaction performance metadata. Workspace changes retain the
+-- originating device where available without exposing business content.
+\ir 20261023n_timegenie_direct_cloud_interaction_performance.sql
+
+-- Keep direct-cloud unassigned successor creation idempotent when a resolved
+-- current-day anchor already follows an older awaiting-resolution session.
+\ir 20261024_timegenie_unassigned_next_session_idempotency.sql

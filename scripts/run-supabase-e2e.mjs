@@ -3,8 +3,6 @@ import { spawnSync } from "node:child_process";
 const required = [
   "TG_SUPABASE_URL",
   "TG_SUPABASE_ANON_KEY",
-  "TG_SUPABASE_EMAIL",
-  "TG_SUPABASE_PASSWORD",
   "TG_SUPABASE_E2E_ALLOW_RESET",
 ];
 
@@ -15,16 +13,27 @@ if (missing.length) {
   process.exit(2);
 }
 
+const hasSavedSession = Boolean(process.env.TG_SUPABASE_SESSION_JSON);
+const missingPasswordAuth = ["TG_SUPABASE_EMAIL", "TG_SUPABASE_PASSWORD"]
+  .filter((name) => !process.env[name]);
+if (!hasSavedSession && missingPasswordAuth.length) {
+  console.error(`缺少 Supabase 双设备端到端测试身份：${missingPasswordAuth.join(", ")}，也没有当前保存会话。`);
+  process.exit(2);
+}
+
 if (process.env.TG_SUPABASE_E2E_ALLOW_RESET !== "1") {
   console.error("拒绝运行：TG_SUPABASE_E2E_ALLOW_RESET 必须显式设置为 1。该测试会清理专用测试账号的工作空间。");
   process.exit(2);
 }
 
-const tests = [
-  "cloud_e2e::real_supabase_direct_v2_two_device_flow",
-  "cloud_e2e::real_supabase_two_device_flow",
-  "cloud_e2e::real_supabase_unassigned_two_device_flow",
-];
+const directOnly = hasSavedSession || process.env.TG_SUPABASE_E2E_DIRECT_ONLY === "1";
+const tests = directOnly
+  ? ["cloud_e2e::real_supabase_direct_v2_two_device_flow"]
+  : [
+      "cloud_e2e::real_supabase_direct_v2_two_device_flow",
+      "cloud_e2e::real_supabase_two_device_flow",
+      "cloud_e2e::real_supabase_unassigned_two_device_flow",
+    ];
 
 for (const test of tests) {
   const result = spawnSync(

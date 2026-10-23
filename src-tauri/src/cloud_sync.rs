@@ -545,7 +545,12 @@ async fn run_realtime_connection(
                                     workspace_id,
                                     current_workspace_epoch(database, workspace_id).unwrap_or(1),
                                 ) {
-                                    let _ = app.emit("work-data-changed", &invalidation);
+                                    let covered_change_seq = crate::supabase::storage_mode(database)
+                                        .map(|status| status.last_change_seq)
+                                        .unwrap_or_default();
+                                    if invalidation.change_seq > covered_change_seq {
+                                        let _ = app.emit("work-data-changed", &invalidation);
+                                    }
                                 }
                             } else {
                                 signal_cloud_sync(
@@ -604,6 +609,7 @@ fn emit_cloud_refresh_domains(
                 workspace_epoch: status.workspace_epoch,
                 domains: domains.to_vec(),
                 source: source.to_string(),
+                changed_by_device_id: None,
             },
         );
     }
@@ -9845,6 +9851,7 @@ mod tests {
                             "change_seq": 42,
                             "workspace_id": "workspace-1",
                             "entity_type": "tasks",
+                            "changed_by_device_id": "device-1",
                             "entity_id": "task-secret-id",
                             "title": "不应出现在通知中的业务实体"
                         }
@@ -9862,7 +9869,8 @@ mod tests {
                 "changeSeq": 42,
                 "workspaceEpoch": 7,
                 "domains": ["tasks"],
-                "source": "realtime"
+                "source": "realtime",
+                "changedByDeviceId": "device-1"
             })
         );
     }

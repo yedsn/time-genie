@@ -83,22 +83,27 @@ assert.equal(directReauthDefault.detail, "登录已失效，请重新登录 Supa
 assert.deepEqual(directCloudMutationFeedback(new Error("VERSION_CONFLICT: stale version")), {
   level: "warning",
   message: "数据已在其他设备变化，正在重新查询最新云端数据",
-  shouldRefresh: true,
+  refreshScope: "business",
 });
 assert.deepEqual(directCloudMutationFeedback("ENTITY_DELETED: task missing"), {
   level: "warning",
   message: "数据已在其他设备变化，正在重新查询最新云端数据",
-  shouldRefresh: true,
+  refreshScope: "business",
+});
+assert.deepEqual(directCloudMutationFeedback(new Error("WORKSPACE_EPOCH_STALE: server=2")), {
+  level: "warning",
+  message: "云端工作空间已重置，正在清除旧页面数据并重新加载",
+  refreshScope: "reset",
 });
 assert.deepEqual(directCloudMutationFeedback(new Error("DEVICE_REVOKED: revoked")), {
   level: "error",
   message: "登录已失效，请重新登录 Supabase",
-  shouldRefresh: false,
+  refreshScope: "none",
 });
 assert.deepEqual(directCloudMutationFeedback(new Error("CLOUD_OFFLINE: offline")), {
   level: "warning",
   message: "云端离线，只能查看已加载数据；不会保存到本机等待同步",
-  shouldRefresh: false,
+  refreshScope: "none",
 });
 
 const syncing = cloudSyncPresentation({ ...cloud, syncing: true, pendingOperations: 3 }, formatSyncTime);

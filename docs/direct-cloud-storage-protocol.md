@@ -9,6 +9,10 @@
 - 当前进程已加载的数据可在只读状态继续查看，并标识可能不是最新；应用退出后不持久化页面业务缓存，离线重启不会显示 SQLite 历史云端数据。
 - 网络或会话恢复后，客户端先根据 `change_seq` 与 workspace epoch 重新查询当前页面及活动计时，成功取得权威结果后才进入 `online_writable`。
 - Realtime 只发送工作空间、变化序号、epoch 和领域失效信息。断线重连、休眠恢复和窗口重新激活都会进行补查，不要求断线期间每条通知都完整送达。
+- 页面已经读取的数据只保存在当前进程内，退出登录、切换空间或 workspace epoch 变化时立即清空；它不是 SQLite 业务副本，不参与离线编辑，也不会产生待同步队列。
+- mutation 成功后，当前页面直接应用 Supabase 返回的权威实体。报告、今日概览、历史等派生区域只标记失效并按可见性后台刷新，因此保存成功不等待无关查询。
+- 同一查询键使用 single-flight：并发刷新复用进行中的请求，请求期间再次失效最多追加一次校准；发送窗口不会因自己的跨窗口通知重复查询。
+- 活动计时秒数由云端返回的累计时长和同步时间在本地每秒推导，不执行每 5 秒业务轮询；Realtime、窗口恢复和 30～60 秒低频兜底负责权威校准。
 - 云端模式不存在“离线保存”“稍后同步”或本地版本覆盖云端。真实并发在提交时通过 expected version 即时拒绝并重新加载最新状态。
 
 ## 部署顺序
@@ -36,6 +40,7 @@
    - `supabase/20261023i_timegenie_direct_cloud_today_overview.sql`
    - `supabase/20261023j_timegenie_direct_cloud_import_export.sql`
    - `supabase/20261023k_timegenie_direct_cloud_release_guard.sql`
+   - `supabase/20261023n_timegenie_direct_cloud_interaction_performance.sql`
 3. 执行后确认 `timegenie.workspaces.storage_protocol` 列为 `text not null default 'sync_v1'`，且约束只允许 `sync_v1` 和 `direct_v2`。
 4. 在仓库根目录运行 `npm run test:supabase:schema`。该命令会启动临时 PostgreSQL，部署 schema、重复执行协议补丁并运行权限及协议屏障集成测试。
 
@@ -330,9 +335,14 @@ Rust 只读适配器分别对应工作台、事项列表/详情/已完成分页�
 | `queryCount`、`queryErrorCount` | 云端查询总量与失败数。 |
 | `queryLatencyTotalMs`、`queryLatencyMaxMs`、`averageQueryLatencyMs` | 查询总耗时、最大耗时与平均耗时；只累计成功查询的端到端客户端耗时。 |
 | `mutationCount`、`mutationErrorCount` | 云端 mutation 最终结果总数与失败数；网络重试只按最终结果计数。 |
+| `mutationLatencyTotalMs`、`mutationLatencyMaxMs`、`averageMutationLatencyMs` | mutation 客户端端到端总耗时、最大耗时与平均耗时。 |
+| `clientApplyLatencyTotalMs`、`clientApplyCount`、`averageClientApplyLatencyMs` | mutation 权威结果写入当前进程状态的耗时与次数。 |
+| `refreshStartedCount`、`refreshReusedCount`、`refreshSuppressedCount`、`refreshFollowupCount` | 领域查询启动、复用、因新鲜度抑制和追加校准次数，用于识别请求放大。 |
 | `protocolRejectionCount` | `CLOUD_PROTOCOL_UNSUPPORTED`、`WORKSPACE_EPOCH_STALE` 和 `EMERGENCY_READ_ONLY` 等协议拒绝。 |
 | `realtimeReconnectCount` | Realtime 连接结束后的重连次数。 |
 | `copyFailureCount` | 复制预览、导出、上传或完整替换失败次数。 |
 | `lastErrorCode` | 最近一次失败的错误码，不含业务正文或凭据。 |
 
 指标只用于发布观察和故障定位，不改变业务数据，也不持久化查询内容。发布后应持续关注查询错误、mutation 错误、协议拒绝与复制失败；出现异常增长时优先启用紧急只读并重新查询权威状态。
+
+开发与发布验证入口为 `npm run test:direct-cloud-interaction-performance`。该命令检查请求预算、查询协调器、窗口/Realtime 失效决策、计时低频校准以及敏感字段边界。一次普通事项更新的目标预算是一笔 mutation，且不附带计时或报告查询；可见派生区域需要校准时才允许最小查询。

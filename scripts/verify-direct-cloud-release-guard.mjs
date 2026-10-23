@@ -26,6 +26,9 @@ for (const field of [
   "realtime_reconnect_count",
   "copy_failure_count",
   "last_error_code",
+  "mutation_latency_total_ms",
+  "client_apply_latency_total_ms",
+  "refresh_reused_count",
 ]) {
   if (!observability.includes(field)) {
     throw new Error("Release metrics are missing the field: " + field);
@@ -49,6 +52,9 @@ if (!cloudSync.includes("record_realtime_reconnect")) {
 }
 if (!lib.includes("supabase::direct_cloud_release_metrics_get")) {
   throw new Error("The release metrics Tauri command is not registered.");
+}
+if (!lib.includes("supabase::direct_cloud_client_metric_record")) {
+  throw new Error("The client performance metric Tauri command is not registered.");
 }
 if (!frontendApi.includes("getDirectCloudReleaseMetrics")) {
   throw new Error("The frontend release metrics API is missing.");
@@ -95,6 +101,7 @@ for (const expected of [
   "emergency_read_only = true",
   "emergency_read_only = false",
   "supabase/20261023k_timegenie_direct_cloud_release_guard.sql",
+  "supabase/20261023n_timegenie_direct_cloud_interaction_performance.sql",
   "不会转入 SQLite outbox",
   "writable: true",
 ]) {

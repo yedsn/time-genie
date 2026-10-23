@@ -34,7 +34,9 @@ export function createTaskTreeSortable(options: {
   const taskIdOf = (element: HTMLElement) => element.getAttribute(options.taskIdAttribute) ?? "";
 
   function clearSelection(elements = rows()) {
-    for (const element of elements) Sortable.utils.deselect(element);
+    for (const element of elements) {
+      if (element.isConnected && element.parentElement) Sortable.utils.deselect(element);
+    }
   }
 
   function clearDropState() {
@@ -58,8 +60,11 @@ export function createTaskTreeSortable(options: {
   }
 
   function destroy() {
-    sortable?.destroy();
-    sortable = undefined;
+    if (sortable) {
+      const current = sortable;
+      sortable = undefined;
+      if (current.el?.isConnected) current.destroy();
+    }
     clearDropState();
   }
 

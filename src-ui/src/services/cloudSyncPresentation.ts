@@ -26,7 +26,7 @@ export type CloudSyncPresentation = {
 export type DirectCloudMutationFeedback = {
   level: "warning" | "error";
   message: string;
-  shouldRefresh: boolean;
+  refreshScope: "none" | "business" | "reset";
 };
 
 function errorMessage(error: unknown): string {
@@ -39,27 +39,34 @@ export function directCloudMutationFeedback(error: unknown): DirectCloudMutation
     return {
       level: "warning",
       message: "数据已在其他设备变化，正在重新查询最新云端数据",
-      shouldRefresh: true,
+      refreshScope: "business",
+    };
+  }
+  if (/WORKSPACE_EPOCH_STALEs*:/.test(message)) {
+    return {
+      level: "warning",
+      message: "云端工作空间已重置，正在清除旧页面数据并重新加载",
+      refreshScope: "reset",
     };
   }
   if (/(?:DEVICE_REVOKED|AUTH_REQUIRED|AUTH_INVALID|AUTH_FAILED|AUTH_RETRY_REQUIRED|AUTH_BLOCKED|AUTH_UNVERIFIED|CREDENTIAL_UNAVAILABLE)\s*:/.test(message)) {
     return {
       level: "error",
       message: "登录已失效，请重新登录 Supabase",
-      shouldRefresh: false,
+      refreshScope: "none",
     };
   }
   if (/(?:CLOUD_READ_ONLY|CLOUD_OFFLINE|NETWORK_UNAVAILABLE|REQUEST_TIMEOUT|SERVICE_UNAVAILABLE)\s*:/.test(message)) {
     return {
       level: "warning",
       message: "云端离线，只能查看已加载数据；不会保存到本机等待同步",
-      shouldRefresh: false,
+      refreshScope: "none",
     };
   }
   return {
     level: "error",
     message: message.replace(/^[A-Z][A-Z_]*:\s*/, "") || "云端保存失败，请重试查询最新数据",
-    shouldRefresh: false,
+    refreshScope: "none",
   };
 }
 
