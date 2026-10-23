@@ -10,7 +10,7 @@ use crate::tasks::{self, TaskDto};
 pub const INCLUDED: &str = "included";
 pub const EXCLUDED: &str = "excluded";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskDayPlanSnapshotRequest {
     pub subject_id: String,
@@ -26,7 +26,7 @@ pub struct TaskDayPlanSnapshotDto {
     pub revision: i64,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskDayPlanSetRequest {
     pub task_id: String,
@@ -35,7 +35,7 @@ pub struct TaskDayPlanSetRequest {
     pub expected_version: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskDayPlanDto {
     pub task_id: String,
@@ -49,7 +49,7 @@ pub(crate) struct TaskDayPlanWriteResult {
     pub plan: TaskDayPlanDto,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskDayPlanBatchSetRequest {
     pub subject_id: String,
@@ -57,7 +57,7 @@ pub struct TaskDayPlanBatchSetRequest {
     pub items: Vec<TaskDayPlanBatchItem>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskDayPlanBatchItem {
     pub task_id: String,
@@ -65,7 +65,7 @@ pub struct TaskDayPlanBatchItem {
     pub expected_version: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskDayPlanBatchSetResult {
     pub changed_count: usize,
@@ -1204,7 +1204,16 @@ pub fn task_day_plan_snapshot(
     database: tauri::State<'_, Database>,
     request: TaskDayPlanSnapshotRequest,
 ) -> Result<TaskDayPlanSnapshotDto, String> {
-    snapshot(&database, request)
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Planning,
+        crate::storage_contract::StorageOperation::Query,
+        |database| snapshot(database, request),
+        |database| {
+            crate::supabase::direct_cloud_day_plan_snapshot_for_command(database, direct_request)
+        },
+    )
 }
 
 #[tauri::command]
@@ -1212,11 +1221,20 @@ pub fn task_day_plan_set(
     database: tauri::State<'_, Database>,
     request: TaskDayPlanSetRequest,
 ) -> Result<TaskDayPlanDto, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = set_day_plan(&database, request, Some(&state))?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Planning,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = set_day_plan(database, request, Some(&state))?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| crate::supabase::direct_cloud_day_plan_set_for_command(database, direct_request),
+    )
 }
 
 #[tauri::command]
@@ -1224,11 +1242,22 @@ pub fn task_day_plan_batch_set(
     database: tauri::State<'_, Database>,
     request: TaskDayPlanBatchSetRequest,
 ) -> Result<TaskDayPlanBatchSetResult, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = set_day_plan_batch(&database, request, Some(&state))?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Planning,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = set_day_plan_batch(database, request, Some(&state))?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| {
+            crate::supabase::direct_cloud_day_plan_batch_set_for_command(database, direct_request)
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1341,6 +1370,12 @@ mod tests {
         let child = create_task(&database, "云端今日成员子事项", Some(parent.id.clone()));
         let cloud_state = crate::supabase::StorageModeSnapshot {
             mode: "cloud".to_string(),
+            storage_protocol: crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string(),
+            configured_cloud_protocol: crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string(),
+            storage_backend: "legacy_sync_sqlite".to_string(),
+            cloud_access_state: "legacy_sync".to_string(),
+            cloud_writable: true,
+            read_only_reason: None,
             workspace_id: Uuid::now_v7().to_string(),
             device_id: Uuid::now_v7().to_string(),
             online: true,

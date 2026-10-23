@@ -585,6 +585,15 @@ exists (
 
 唯一约束：`(provider, entity_type, entity_id)` 和 `(provider, external_id)`。
 
+`direct_v2` 云端表中该实体额外包含 `version`（bigint，默认 1），更新外部绑定时必须提交期望版本。云端绑定只保存在 Supabase；本机 `external_bindings` 仅服务本地模式与旧 `sync_v1`。
+
+### 5.14A direct_v2 报告、设置与集成归属
+
+- 报告、报告模板、共享设置、工作日历和主体工作时段只保存在 Supabase，云端模式不写本机业务副本。
+- `integration_configs` 云端只保存 `enabled`、`config_json` 和 `version`；`secret_ref` 是本机凭据库引用，不进入云端。
+- 本机仅保留设备身份、设备设置、会话凭据引用和 `local_report_outputs` 等设备级元数据。
+- `plan_import_batches`、`plan_import_items`、`sync_runs` 和 `sync_items` 只用于本地模式或旧 `sync_v1`；`direct_v2` 的 Obsidian 计划导入与 SeaTable 同步预览保存在进程内存，确认后由云端 RPC 原子提交。
+
 ### 5.15 `sync_runs` 与 `sync_items`
 
 用途：记录 Obsidian/SeaTable 的预览、执行和失败重试，不依赖独立同步页面。
@@ -648,6 +657,8 @@ Supabase `anon` key 可以随应用配置或连接配置保存，不属于管理
 - `config_json`：路径、服务地址、表名和字段映射
 - `secret_ref`：系统凭据库中的引用，不保存 Token 原文；Supabase refresh token 使用单独的 `supabase` 凭据引用
 - `updated_at`、`version`
+
+`direct_v2` 云端 `integration_configs` 只保存 `enabled`、`config_json` 和 `version`，不存在 `secret_ref` 列；凭据引用只保留在本机，云端响应也不会返回凭据值或本机路径。
 
 SeaTable Token、Supabase refresh token 等敏感值应使用 Windows Credential Manager 或等价系统凭据存储。普通数据库导出、报告和日志不得包含完整凭据。
 
@@ -939,3 +950,13 @@ UI mock 数据只用于开发演示，不应自动写入用户正式数据库。
 10. 获取真实 Obsidian 日报样例后，再冻结解析规则和默认模板。
 
 本阶段禁止创建 Supabase 项目或表、执行建表 SQL、写入 SQLite、调用 SeaTable 或覆盖 Obsidian 文件。
+# 双存储数据边界
+
+业务数据按六个领域管理：事项、计划与重复、计时与未归属、报告与模板、共享设置与集成、数据保护。表级分类的单一来源是 `src-tauri/storage-boundaries.json`，校验脚本会阻止未分类的新表进入构建。
+
+- `localBusiness`：仅供本地模式、显式复制和救援流程使用的 SQLite 业务表。
+- `cloudBusiness`：必须为空；`direct_v2` 下云端不落本地业务副本，Supabase 是唯一业务权威。
+- `deviceMetadata`：登录引用、连接配置、设备身份、本机路径、窗口和设备偏好等。
+- `legacySync`：`sync_v1` 兼容期使用的 outbox、增量状态、冲突与租约数据；直连模式不得把它们作为日常业务数据源。
+
+本地空间和云端空间互相独立，只有显式的一次性复制流程可以读取源空间并完整替换目标空间；切换存储模式本身不会合并或覆盖业务数据。

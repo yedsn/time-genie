@@ -218,15 +218,15 @@ async function commitRestore() {
       targetContentHash: restorePrepared.value.targetContentHash,
       preparedEpoch: restorePrepared.value.preparedEpoch,
     });
-    restoreCommitted = result.restored && result.localCacheRebuilt;
+    restoreCommitted = result.restored;
     restorePrepared.value = undefined;
     restoreOpen.value = false;
     previewOpen.value = false;
     await props.afterRestore?.();
-    ElMessage.success(`已恢复到“${selected.value.name}”时点，当前设备数据已重新下载`);
+    ElMessage.success(`已恢复到“${selected.value.name}”时点，并已重新读取云端权威数据`);
   } catch (error) {
     const message = errorText(error, "云端恢复失败，当前数据未改变");
-    if (restoreCommitted) ElMessage.warning("云端和本机数据已经恢复，但当前页面重新载入失败，请重新打开应用查看恢复后的数据");
+    if (restoreCommitted) ElMessage.warning("云端已经恢复，但当前页面重新查询失败，请重试刷新或重新打开应用");
     else if (message.includes("RESTORE_LOCAL_REBUILD_FAILED")) ElMessage.error(message.replace("RESTORE_LOCAL_REBUILD_FAILED: ", ""));
     else ElMessage.error(message);
   }

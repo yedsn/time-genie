@@ -1,0 +1,42 @@
+{
+  "packageVersion": 1,
+  "groups": [
+    "planning",
+    "time_tracking",
+    "reports",
+    "shared_settings"
+  ],
+  "entities": [
+    { "name": "subjects", "group": "planning", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "subject_work_schedules", "group": "planning", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "subject_work_schedule_segments", "group": "planning", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "work_days", "group": "planning", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "tasks", "group": "planning", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "task_status_events", "group": "planning", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "task_day_plans", "group": "planning", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "task_daily_estimates", "group": "planning", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "task_recurrence_rules", "group": "planning", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "task_occurrences", "group": "planning", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "time_entries", "group": "time_tracking", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "time_segments", "group": "time_tracking", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "time_allocations", "group": "time_tracking", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "unassigned_sessions", "group": "time_tracking", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "unassigned_segments", "group": "time_tracking", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "actual_time_adjustments", "group": "time_tracking", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "report_templates", "group": "reports", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "reports", "group": "reports", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "report_tasks", "group": "reports", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "app_settings", "group": "shared_settings", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "integration_configs", "group": "shared_settings", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+    { "name": "external_bindings", "group": "shared_settings", "localBackup": "include", "cloudSnapshot": "include", "copy": "include" },
+
+    { "name": "daily_report_import_sources", "group": "planning", "localBackup": "include", "cloudSnapshot": "exclude", "copy": "exclude", "exclusionReason": "本机日报导入来源只用于本地幂等与来源追踪，云端没有对应共享实体。" },
+    { "name": "actual_adjustment_batches", "group": "time_tracking", "localBackup": "exclude", "cloudSnapshot": "exclude", "copy": "exclude", "exclusionReason": "幂等批次记录不是可迁移业务结果。" },
+    { "name": "plan_import_batches", "group": "planning", "localBackup": "exclude", "cloudSnapshot": "exclude", "copy": "exclude", "exclusionReason": "导入过程批次不是共享业务实体。" },
+    { "name": "plan_import_items", "group": "planning", "localBackup": "exclude", "cloudSnapshot": "exclude", "copy": "exclude", "exclusionReason": "导入过程明细不是共享业务实体。" },
+    { "name": "daily_report_import_batches", "group": "planning", "localBackup": "exclude", "cloudSnapshot": "exclude", "copy": "exclude", "exclusionReason": "导入过程批次不是共享业务实体。" },
+    { "name": "daily_report_import_items", "group": "planning", "localBackup": "exclude", "cloudSnapshot": "exclude", "copy": "exclude", "exclusionReason": "导入过程明细不是共享业务实体。" },
+    { "name": "tracking_runtime_state", "group": "time_tracking", "localBackup": "exclude", "cloudSnapshot": "exclude", "copy": "exclude", "exclusionReason": "设备运行时恢复状态不能跨空间复制。" },
+    { "name": "workspaces", "group": "metadata", "localBackup": "metadata", "cloudSnapshot": "metadata", "copy": "metadata", "exclusionReason": "工作空间名称、时区、epoch 和协议作为数据包外壳元数据处理，不作为实体行替换。" }
+  ]
+}

@@ -126,7 +126,21 @@ pub fn calendar_context_at(
 pub fn work_calendar_get_context(
     database: tauri::State<'_, Database>,
 ) -> Result<WorkspaceCalendarContextDto, String> {
-    calendar_context_at(&database.open()?, now_millis())
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::SharedSettingsIntegrations,
+        crate::storage_contract::StorageOperation::Query,
+        |database| calendar_context_at(&database.open()?, now_millis()),
+        |database| {
+            let data = crate::supabase::direct_cloud_workbench_bootstrap(database)?.data;
+            Ok(WorkspaceCalendarContextDto {
+                timezone: data.timezone,
+                current_work_date: data.current_work_date,
+                current_day_start_at: data.current_day_start_at,
+                current_day_end_at: data.current_day_end_at,
+            })
+        },
+    )
 }
 
 pub fn day_bounds(timezone: Tz, work_date: &str) -> Result<DayBounds, String> {

@@ -1,0 +1,97 @@
+{
+  "businessDomains": {
+    "tasks": ["subjects", "tasks"],
+    "planning": ["today_plans", "today_overview", "recurring"],
+    "time": ["time_tracking", "unassigned", "actual_time_adjustments", "time_allocation_export"],
+    "reports": ["reports", "daily_report_import"],
+    "sharedSettingsIntegrations": ["settings", "work_calendar", "subject_work_schedules", "seatable", "obsidian"],
+    "dataProtection": ["data_protection"]
+  },
+  "businessDomainTables": {
+    "tasks": ["subjects", "tasks", "task_status_events"],
+    "planning": ["plan_import_batches", "plan_import_items", "task_daily_estimates", "task_day_plans", "task_occurrences", "task_recurrence_rules", "tasks"],
+    "time": ["actual_adjustment_batches", "actual_time_adjustments", "tasks", "time_allocations", "time_entries", "time_segments", "tracking_runtime_state", "unassigned_segments", "unassigned_sessions"],
+    "reports": ["daily_report_import_batches", "daily_report_import_items", "daily_report_import_sources", "report_tasks", "report_templates", "reports", "tasks", "time_entries"],
+    "sharedSettingsIntegrations": ["app_settings", "external_bindings", "integration_configs", "subject_work_schedule_segments", "subject_work_schedules", "subjects", "work_days", "workspaces"],
+    "dataProtection": ["workspaces"]
+  },
+  "infrastructureModules": [
+    "automation_hooks",
+    "cloud_sync",
+    "database",
+    "supabase"
+  ],
+  "rootInfrastructureCommands": [
+    "window_show",
+    "window_hide",
+    "window_close_main",
+    "window_start_dragging_main",
+    "window_minimize_main",
+    "window_toggle_maximize_main",
+    "window_is_main_maximized",
+    "window_open_main_overview",
+    "window_open_main_timer_task_selection",
+    "window_open_main_unassigned",
+    "window_hide_hover_after_keyboard_close",
+    "get_app_version",
+    "check_app_update",
+    "download_and_install_update",
+    "restart_app"
+  ],
+  "sqliteTables": {
+    "localBusiness": [
+      "actual_adjustment_batches",
+      "actual_time_adjustments",
+      "app_settings",
+      "daily_report_import_batches",
+      "daily_report_import_items",
+      "daily_report_import_sources",
+      "external_bindings",
+      "integration_configs",
+      "plan_import_batches",
+      "plan_import_items",
+      "report_tasks",
+      "report_templates",
+      "reports",
+      "subject_work_schedule_segments",
+      "subject_work_schedules",
+      "subjects",
+      "task_daily_estimates",
+      "task_day_plans",
+      "task_occurrences",
+      "task_recurrence_rules",
+      "task_status_events",
+      "tasks",
+      "time_allocations",
+      "time_entries",
+      "time_segments",
+      "tracking_runtime_state",
+      "unassigned_segments",
+      "unassigned_sessions",
+      "work_days",
+      "workspaces"
+    ],
+    "cloudBusiness": [],
+    "deviceMetadata": [
+      "app_metadata",
+      "device_hook_runs",
+      "device_hooks",
+      "device_settings",
+      "devices",
+      "local_backup_history",
+      "local_report_outputs",
+      "schema_migrations"
+    ],
+    "legacySync": [
+      "cloud_deferred_entities",
+      "legacy_abandoned_outbox",
+      "local_sync_state",
+      "processed_operations",
+      "sync_items",
+      "sync_outbox",
+      "sync_runs",
+      "tracking_leases",
+      "workspace_changes"
+    ]
+  }
+}

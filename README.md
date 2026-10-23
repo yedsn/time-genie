@@ -21,7 +21,7 @@ TimeGenie（时序）是一个 Windows 优先的本地优先桌面工作台，�
 
 - **工作过程闭环**：从今日待办、计时、工时分配到日报/周报/月报都在同一个桌面应用中完成。
 - **本地优先**：默认使用本机 SQLite，不依赖网络即可记录工作；敏感 Token 和登录会话保存到系统凭据库。
-- **可选云端模式**：接入 Supabase 后，可以把 PostgreSQL 作为权威数据源，并通过 Realtime、离线队列和冲突处理支持多设备使用。
+- **可选云端模式**：接入 Supabase 后，可以把 PostgreSQL 作为唯一业务数据源；页面在线直读直写，Realtime 只通知页面重新查询，不在本机维护云端业务副本。
 - **外部工具友好**：支持从 Obsidian 导入计划、把报告写回 Obsidian，也可以将待办同步到 SeaTable 并查询待报销信息。
 - **面向结算的时间规则**：计时、补录、未归属时间和最终事项分配分开保存，避免把“记录过时间”误当成“已经结算”。
 
@@ -35,7 +35,7 @@ TimeGenie（时序）是一个 Windows 优先的本地优先桌面工作台，�
 | 未归属时间 | 后台累计超过阈值后要求处理，可分配给事项、记为休息或丢弃 |
 | 报告 | 统一管理日报、周报、月报，支持模板、编辑、重新生成、复制上报版和写入 Obsidian |
 | SeaTable | 连接检测、待办同步预览、确认写入、失败重试、待报销查询 |
-| Supabase | 邮箱密码登录、本地迁移云端、云端缓存、增量同步、离线队列和冲突处理 |
+| Supabase | 邮箱密码登录、在线直读直写、多设备 Realtime 刷新、断网只读与即时版本冲突提示 |
 | 托盘 | 悬浮面板、全局计时状态和最小化启动等设备级设置 |
 
 ## 主要流程
@@ -87,17 +87,21 @@ SeaTable Token、Supabase 会话等敏感内容会保存到系统凭据库，不
 
 ## Supabase 云端模式
 
-云端模式适合需要在多台设备之间同步同一份工作数据的场景。
+云端模式适合需要在多台设备之间使用同一份工作数据、并且使用时能够联网的场景。
 
-- Supabase PostgreSQL 是云端模式的最终权威数据源；桌面端业务写入先在本机 SQLite 事务中保存并进入同步队列，成功推送后再由云端快照确认，避免网络抖动导致本地修改丢失。
+- `direct_v2` 以 Supabase PostgreSQL 作为唯一业务权威。页面查询直接读取云端，修改直接提交云端 RPC；本机不保存可编辑的云端业务副本，也不创建待同步队列。
+- 云端模式必须联网。网络不可达、请求超时、Supabase 5xx 或会话无法验证时，界面进入只读状态；本次进程已经加载的内容可以继续查看，但不能创建、编辑、删除、计时或保存报告，也不会暂存为“稍后同步”。
+- 冷启动时若无法连接云端，应用显示不可用/空状态，不会读取 SQLite 历史业务数据冒充当前云端内容。恢复网络后会根据 `change_seq` 和 workspace epoch 重新查询当前页面，查询成功后才恢复编辑。
+- Realtime 的通知只包含工作空间、变化序号、workspace epoch 和受影响领域。通知丢失、连接重建、系统休眠恢复或窗口重新激活时，客户端会执行权威补查，而不是依赖每条通知完整到达。
+- 多设备同时修改同一实体时，陈旧提交会立即返回版本冲突并要求重新加载最新数据；不会生成后台同步冲突，也没有本地/云端版本覆盖选择。
 - 桌面端只允许配置 anon key，拒绝 service role key；用户会话保存到系统凭据库。
 - 已提供 Auth、工作空间、设备注册、RLS、变更序列、迁移入口、全局单计时器 RPC 和 15 秒续租/45 秒过期的后台采集租约。
 - `schema.sql` 会在 `timegenie` schema 下创建业务表和 RPC，不在 `public` 下创建 TimeGenie 业务表；它会显式撤销匿名角色对业务表和保护 RPC 的访问，只向 `authenticated` 授予 API 所需权限；RLS 再按账号限制工作空间范围。
 - 客户端在保存连接或登录时会自动检测项目是否已初始化：缺少 `timegenie` 结构或未暴露该 schema 时，只提示用户在 Supabase SQL Editor 执行 `supabase/schema.sql` 后重新检测；桌面端只持有 anon key，不会也无法自动建表。
 - Supabase/PostgREST 需要暴露 `timegenie` schema。本地 CLI 已在 [`supabase/config.toml`](supabase/config.toml) 配置；自托管环境请把 `timegenie` 加入 `PGRST_DB_SCHEMAS` 后重启 REST/PostgREST 服务。
 - 旧 Supabase 项目升级时不需要重跑完整 schema；按发布时间顺序执行 [`supabase/20261003_timegenie_recurring_migration_patch.sql`](supabase/20261003_timegenie_recurring_migration_patch.sql)、[`supabase/20261004_timegenie_cloud_sync_patch.sql`](supabase/20261004_timegenie_cloud_sync_patch.sql)、[`supabase/20261004b_timegenie_migration_target_guard_patch.sql`](supabase/20261004b_timegenie_migration_target_guard_patch.sql)、[`supabase/20261004c_timegenie_work_day_version_guard_patch.sql`](supabase/20261004c_timegenie_work_day_version_guard_patch.sql)、[`supabase/20261004d_timegenie_session_revocation_patch.sql`](supabase/20261004d_timegenie_session_revocation_patch.sql) 和 [`supabase/20261005_timegenie_timer_sync_coordination_patch.sql`](supabase/20261005_timegenie_timer_sync_coordination_patch.sql)，用于补齐周期事项、同步实体身份、未归属会话同步、迁移目标保护、工作日版本冲突保护、长期登录与设备撤销，以及计时队列协调。
-- Realtime 订阅 `timegenie.workspace_changes`，客户端按 `change_seq` 增量补拉。
-- 当前仍未纳入同步模型的业务写操作会明确提示不可用，不会伪装成已同步；已有业务写入会在界面显示待同步、失败或冲突状态。
+- Realtime 订阅 `timegenie.workspace_changes`，客户端按领域标脏并重新查询 Supabase；通知 payload 不作为业务数据落地。
+- 现有 `sync_v1` 云端工作空间可在“设置 → 数据存储”执行单向升级：界面先显示其他已登记设备及旧队列状态；正常路径会完成最后一次 push/pull 后切换，受阻队列可先导出救援备份、输入“放弃旧修改”后二次确认。工作空间一旦进入 `direct_v2` 不能降回旧同步协议，旧客户端的补丁、增量拉取和租约写会返回 `CLIENT_UPGRADE_REQUIRED`，升级客户端后直接读取最新 Supabase 数据。
 
 正式启用前，建议在两台设备上完成登录、迁移、冲突和计时互斥验证。已执行旧项目增量补丁后，可在 Supabase SQL Editor 中运行只读脚本 [`supabase/20261004_verify_timegenie_cloud_guards.sql`](supabase/20261004_verify_timegenie_cloud_guards.sql)，确认迁移目标保护、未归属会话同步和工作日版本保护函数已经部署生效。
 

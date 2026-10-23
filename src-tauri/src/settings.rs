@@ -47,7 +47,7 @@ pub struct IntegrationConfigSnapshot {
     pub version: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct IntegrationConfigRequest {
     pub provider: String,
@@ -63,14 +63,14 @@ pub struct SecretPresence {
     pub supabase_session_set: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct IntegrationSecretRequest {
     pub provider: SecretProvider,
     pub value: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum SecretProvider {
     Seatable,
@@ -674,9 +674,237 @@ fn now_millis() -> i64 {
         .as_millis() as i64
 }
 
+fn update_device_setting(database: &Database, key: &str, value: Value) -> Result<(), String> {
+    let serialized = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+    database
+        .open()?
+        .execute(
+            "INSERT INTO device_settings(key, value_json, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+            params![key, serialized, now_millis()],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn direct_settings_snapshot(database: &Database) -> Result<SettingsSnapshot, String> {
+    let response = crate::supabase::direct_cloud_shared_configuration(database)?;
+    let workspace_id = response.metadata.workspace_id.clone();
+    let mut shared: BTreeMap<String, Value> = serde_json::from_value(response.data.settings)
+        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 共享设置响应无效: {error}"))?;
+    if let Some(timezone) = response.data.workspace.get("timezone").cloned() {
+        shared.insert("timezone".to_string(), timezone);
+    }
+    let connection = database.open()?;
+    let device = read_settings(&connection, "device_settings", None)?;
+    let storage_mode = read_device_value(&connection, "storage_mode")?
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "local".to_string());
+    let mut integrations = BTreeMap::new();
+    for value in response.data.integrations {
+        let provider = value
+            .get("provider")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "CLOUD_RESPONSE_INVALID: 集成配置缺少 provider".to_string())?
+            .to_string();
+        let enabled = value
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| "CLOUD_RESPONSE_INVALID: 集成配置缺少 enabled".to_string())?;
+        let version = value
+            .get("version")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| "CLOUD_RESPONSE_INVALID: 集成配置缺少 version".to_string())?;
+        let requires_device_credential = value
+            .get("requiresDeviceCredential")
+            .and_then(Value::as_bool)
+            .unwrap_or(provider == "seatable");
+        integrations.insert(
+            provider.clone(),
+            IntegrationConfigSnapshot {
+                enabled,
+                config: value
+                    .get("config")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Object(Default::default())),
+                has_secret: requires_device_credential && secret_exists(&provider, &workspace_id),
+                version,
+            },
+        );
+    }
+    let secrets = SecretPresence {
+        seatable_token_set: secret_exists("seatable", &workspace_id),
+        supabase_session_set: secret_exists("supabase", &workspace_id)
+            || credential_account_exists(SUPABASE_SESSION_ACCOUNT),
+    };
+    Ok(SettingsSnapshot {
+        storage_mode,
+        workspace_id,
+        device_id: response.metadata.device_id,
+        shared,
+        device,
+        integrations,
+        secrets,
+    })
+}
+
+pub(crate) fn direct_update_setting_for_command(
+    database: &Database,
+    request: SettingsUpdate,
+) -> Result<SettingsSnapshot, String> {
+    validate_setting_key(&request.scope, &request.key)?;
+    validate_setting_value(&request.key, &request.value)?;
+    if matches!(request.scope, SettingsScope::Device) {
+        update_device_setting(database, &request.key, request.value)?;
+        return direct_settings_snapshot(database);
+    }
+    let current = crate::supabase::direct_cloud_shared_configuration(database)?;
+    let expected_version = current
+        .data
+        .setting_versions
+        .get(&request.key)
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    crate::supabase::direct_cloud_shared_setting_update_mutation(
+        database,
+        uuid::Uuid::now_v7().to_string(),
+        serde_json::json!({
+            "key": request.key,
+            "value": request.value,
+            "expectedVersion": expected_version,
+        }),
+    )?;
+    direct_settings_snapshot(database)
+}
+
+fn direct_integration_record(
+    response: &crate::supabase::DirectCloudSharedConfigurationResponse,
+    provider: &str,
+) -> Option<Value> {
+    response
+        .data
+        .integrations
+        .iter()
+        .find(|value| value.get("provider").and_then(Value::as_str) == Some(provider))
+        .cloned()
+}
+
+pub(crate) fn direct_update_integration_config_for_command(
+    database: &Database,
+    request: IntegrationConfigRequest,
+) -> Result<SettingsSnapshot, String> {
+    let provider = request.provider.trim().to_ascii_lowercase();
+    if !matches!(provider.as_str(), "seatable" | "obsidian") {
+        return Err(format!("不支持的共享集成: {}", request.provider));
+    }
+    reject_sensitive_json(&request.config, "config")?;
+    let current = crate::supabase::direct_cloud_shared_configuration(database)?;
+    let current_record = direct_integration_record(&current, &provider);
+    let expected_version = request.expected_version.or_else(|| {
+        current_record
+            .as_ref()
+            .and_then(|value| value.get("version"))
+            .and_then(Value::as_i64)
+    });
+    crate::supabase::direct_cloud_integration_config_save_mutation(
+        database,
+        uuid::Uuid::now_v7().to_string(),
+        serde_json::json!({
+            "provider": provider,
+            "enabled": request.enabled,
+            "config": request.config,
+            "expectedVersion": expected_version,
+        }),
+    )?;
+    direct_settings_snapshot(database)
+}
+
+fn direct_set_integration_secret_for_command(
+    database: &Database,
+    request: IntegrationSecretRequest,
+) -> Result<SettingsSnapshot, String> {
+    if request.value.trim().is_empty() {
+        return Err("凭据不能为空".to_string());
+    }
+    let provider = request.provider.as_str();
+    let current = crate::supabase::direct_cloud_shared_configuration(database)?;
+    let workspace_id = current.metadata.workspace_id.clone();
+    credential_entry(provider, &workspace_id)?
+        .set_password(request.value.trim())
+        .map_err(|error| format!("保存 {provider} 凭据失败: {error}"))?;
+    if provider == "seatable" {
+        let current_record = direct_integration_record(&current, provider);
+        let config = current_record
+            .as_ref()
+            .and_then(|value| value.get("config"))
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Default::default()));
+        let expected_version = current_record
+            .as_ref()
+            .and_then(|value| value.get("version"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        crate::supabase::direct_cloud_integration_config_save_mutation(
+            database,
+            uuid::Uuid::now_v7().to_string(),
+            serde_json::json!({
+                "provider": provider,
+                "enabled": true,
+                "config": config,
+                "expectedVersion": expected_version,
+            }),
+        )?;
+    }
+    direct_settings_snapshot(database)
+}
+
+fn direct_clear_integration_secret_for_command(
+    database: &Database,
+    provider: SecretProvider,
+) -> Result<SettingsSnapshot, String> {
+    let provider_name = provider.as_str();
+    let current = crate::supabase::direct_cloud_shared_configuration(database)?;
+    let workspace_id = current.metadata.workspace_id.clone();
+    let entry = credential_entry(provider_name, &workspace_id)?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => {}
+        Err(error) => return Err(format!("删除 {provider_name} 凭据失败: {error}")),
+    }
+    if provider_name == "seatable" {
+        if let Some(current_record) = direct_integration_record(&current, provider_name) {
+            let config = current_record
+                .get("config")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Default::default()));
+            let expected_version = current_record
+                .get("version")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            crate::supabase::direct_cloud_integration_config_save_mutation(
+                database,
+                uuid::Uuid::now_v7().to_string(),
+                serde_json::json!({
+                    "provider": provider_name,
+                    "enabled": false,
+                    "config": config,
+                    "expectedVersion": expected_version,
+                }),
+            )?;
+        }
+    }
+    direct_settings_snapshot(database)
+}
+
 #[tauri::command]
 pub fn settings_get(database: tauri::State<'_, Database>) -> Result<SettingsSnapshot, String> {
-    get_settings(&database)
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::SharedSettingsIntegrations,
+        crate::storage_contract::StorageOperation::Query,
+        |database| get_settings(database),
+        direct_settings_snapshot,
+    )
 }
 
 #[tauri::command]
@@ -685,15 +913,25 @@ pub fn settings_update(
     database: tauri::State<'_, Database>,
     request: SettingsUpdate,
 ) -> Result<SettingsSnapshot, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
     let is_shared = matches!(&request.scope, SettingsScope::Shared);
     let refresh_tray =
         matches!(&request.scope, SettingsScope::Device) && request.key == "tray_icon_style";
-    let result = update_setting_with_cloud_operation(&database, request, Some(&state))?;
-    if is_shared {
-        crate::cloud_sync::flush_if_online(&database)?;
-    }
+    let direct_request = request.clone();
+    let result = crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::SharedSettingsIntegrations,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = update_setting_with_cloud_operation(database, request, Some(&state))?;
+            if is_shared {
+                crate::cloud_sync::flush_if_online(database)?;
+            }
+            Ok(result)
+        },
+        |database| direct_update_setting_for_command(database, direct_request),
+    )?;
     if refresh_tray {
         let _ = crate::refresh_tray_presentation(&app, &database);
     }
@@ -705,11 +943,21 @@ pub fn integration_secret_set(
     database: tauri::State<'_, Database>,
     request: IntegrationSecretRequest,
 ) -> Result<SettingsSnapshot, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = set_integration_secret_with_cloud_operation(&database, request, Some(&state))?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::SharedSettingsIntegrations,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result =
+                set_integration_secret_with_cloud_operation(database, request, Some(&state))?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| direct_set_integration_secret_for_command(database, direct_request),
+    )
 }
 
 #[tauri::command]
@@ -717,11 +965,21 @@ pub fn integration_config_update(
     database: tauri::State<'_, Database>,
     request: IntegrationConfigRequest,
 ) -> Result<SettingsSnapshot, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = update_integration_config_with_cloud_operation(&database, request, Some(&state))?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::SharedSettingsIntegrations,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result =
+                update_integration_config_with_cloud_operation(database, request, Some(&state))?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| direct_update_integration_config_for_command(database, direct_request),
+    )
 }
 
 #[tauri::command]
@@ -729,11 +987,21 @@ pub fn integration_secret_clear(
     database: tauri::State<'_, Database>,
     provider: SecretProvider,
 ) -> Result<SettingsSnapshot, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = clear_integration_secret_with_cloud_operation(&database, provider, Some(&state))?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+    let direct_provider = provider.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::SharedSettingsIntegrations,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result =
+                clear_integration_secret_with_cloud_operation(database, provider, Some(&state))?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| direct_clear_integration_secret_for_command(database, direct_provider),
+    )
 }
 
 #[cfg(test)]

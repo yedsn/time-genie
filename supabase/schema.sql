@@ -422,6 +422,7 @@ create table if not exists timegenie.external_bindings (
   external_revision text,
   last_synced_hash text,
   last_synced_at timestamptz,
+  version bigint not null default 1,
   unique(workspace_id, provider, entity_type, entity_id),
   unique(workspace_id, provider, external_id)
 );
@@ -3819,3 +3820,71 @@ notify pgrst, 'reload schema';
 -- Old clients may enqueue a today-plan mapping for hierarchy-only context
 -- parents. Acknowledge that harmless legacy operation without storing it.
 \ir 20261022e_timegenie_ignore_context_day_plans.sql
+
+-- Workspace-level protocol barrier between legacy SQLite sync and direct
+-- Supabase storage. Existing workspaces stay on sync_v1 until explicitly
+-- upgraded after their old local queues are handled.
+\ir 20261022f_timegenie_direct_cloud_storage_protocol.sql
+
+-- Direct-v2 subject and task mutations with expected-version concurrency,
+-- hierarchy validation, subtree soft deletion and operation history.
+\ir 20261022g_timegenie_direct_cloud_subject_task_mutations.sql
+
+-- Direct-v2 daily estimates and today plans, including atomic batch writes and
+-- explicit today-instance lifecycle management.
+\ir 20261022h_timegenie_direct_cloud_task_planning_mutations.sql
+
+-- Direct-v2 recurrence rule history, daily occurrence materialization and
+-- occurrence completion transitions.
+\ir 20261022i_timegenie_direct_cloud_recurrence_mutations.sql
+\ir 20261022j_timegenie_direct_cloud_task_domain_routing.sql
+
+-- Direct-v2 timer transitions and allocation replacement. These wrappers
+-- reject legacy sync workspaces and keep each timer transition atomic.
+\ir 20261022k_timegenie_direct_cloud_timer_mutations.sql
+
+-- Direct-v2 timer continuity, calendar rollover and device takeover. Reads and
+-- lease heartbeats never change the ordinary timer version; recovery is an
+-- explicit versioned mutation.
+\ir 20261022l_timegenie_direct_cloud_timer_recovery.sql
+
+-- Direct-v2 unassigned anchors, calendar-day boundaries and work/break/discard
+-- resolution. Each work date has at most one shared collecting anchor.
+\ir 20261022m_timegenie_direct_cloud_unassigned_mutations.sql
+
+-- Direct-v2 manual time and actual-time adjustment snapshots/mutations. Task
+-- mapping, allocations and quick-created tasks commit in one cloud transaction.
+\ir 20261022n_timegenie_direct_cloud_manual_actual_mutations.sql
+
+-- Direct-v2 corrections and work/break/discard disposition for ended time
+-- entries, with expected-version checks and idempotent operation results.
+\ir 20261022o_timegenie_direct_cloud_time_entry_mutations.sql
+
+-- Direct-v2 report lifecycle. Scope snapshots, generated content, expected
+-- versions and processed-operation results commit atomically in Supabase.
+\ir 20261023a_timegenie_direct_cloud_report_mutations.sql
+
+-- Direct-v2 report-template lifecycle. Template defaults, ordering, soft
+-- deletion and processed-operation results commit atomically in Supabase.
+\ir 20261023b_timegenie_direct_cloud_report_template_mutations.sql
+
+-- Direct-v2 shared settings, work calendar and subject schedules. Device-only
+-- preferences remain in the local database and are not accepted by these RPCs.
+\ir 20261023c_timegenie_direct_cloud_shared_settings_mutations.sql
+
+-- Direct-v2 integration metadata. Credentials stay in the device credential
+-- store and device-local paths stay in device settings.
+\ir 20261023d_timegenie_direct_cloud_integration_mutations.sql
+
+-- Direct-v2 Obsidian plan import. Confirmation creates every imported task in
+-- one cloud transaction and remains idempotent per preview batch.
+\ir 20261023e_timegenie_direct_cloud_plan_import.sql
+
+-- Explicit local-to-cloud copy staging. Uploaded data packages are validated
+-- before the later atomic replace step may touch authoritative business data.
+\ir 20261023f_timegenie_data_copy_staging.sql
+\ir 20261023g_timegenie_data_copy_replace.sql
+
+-- Consistent cloud-to-local export packages. Shared business rows are frozen,
+-- recursively sanitized and downloaded in hash-verified chunks.
+\ir 20261023h_timegenie_data_copy_export.sql

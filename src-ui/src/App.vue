@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted } from "vue";
+import { computed, onMounted, onUnmounted, watch } from "vue";
 import MainWorkbench from "./views/MainWorkbench.vue";
 import HoverPanel from "./views/HoverPanel.vue";
-import { hideHoverAfterKeyboardClose, closeMainWindow, getSettings, isCurrentWindowFocused, onCurrentWindowFocusChanged, onOpenUnassignedResolution, onWorkDataChanged } from "./services/tauri";
+import { catchUpCloudSync, hideHoverAfterKeyboardClose, closeMainWindow, getSettings, getStorageMode, isCurrentWindowFocused, onCloudSyncStateChanged, onCurrentWindowFocusChanged, onOpenUnassignedResolution, onWorkDataChanged, type StorageModeSnapshot } from "./services/tauri";
 import { useWorkdayStore } from "./store";
 import { stopCompletionFeedback } from "./services/completionFeedback";
 import { applyAppTheme, getCachedAppTheme, isAppTheme } from "./services/theme";
-import { workDataRefreshPlan } from "./services/workDataRefresh";
+import { partitionWorkDataRefreshDomains, shouldClearDirectCloudMemory, workDataRefreshPlan } from "./services/workDataRefresh";
 import { shouldRefreshTimeHistory } from "./services/timeEntryHistoryCore";
 
 applyAppTheme(getCachedAppTheme());
@@ -16,6 +16,7 @@ const params = new URLSearchParams(window.location.search);
 const view = computed(() => params.get("view") ?? "main");
 let unlistenWindowFocus: (() => void) | undefined;
 let unlistenWorkDataChanged: (() => void) | undefined;
+let unlistenCloudSyncStateChanged: (() => void) | undefined;
 let unlistenOpenUnassignedResolution: (() => void) | undefined;
 let unmounted = false;
 let mainWindowFocused = false;
@@ -25,6 +26,46 @@ const pendingRefreshDomains = new Set<string>();
 let pendingTimerStoppedEntryId = "";
 let refreshTimer: number | undefined;
 let refreshRunning = false;
+let catchUpTimer: number | undefined;
+let catchUpRunning = false;
+let catchUpAgain = false;
+let lastCatchUpAt = Date.now();
+let lastWakeHeartbeatAt = Date.now();
+let directCloudLoadedThisProcess = false;
+
+function applyCloudAccessState(state: StorageModeSnapshot) {
+  if (!state.storageProtocol) return;
+  if (state.mode !== "cloud" || state.storageProtocol !== "direct_v2") {
+    directCloudLoadedThisProcess = false;
+    return;
+  }
+  if (state.cloudAccessState === "online_writable") {
+    directCloudLoadedThisProcess = true;
+    return;
+  }
+  if (shouldClearDirectCloudMemory(state.cloudAccessState, directCloudLoadedThisProcess)) {
+    store.clearCloudBusinessMemory();
+  }
+}
+
+async function catchUpCloudData() {
+  lastCatchUpAt = Date.now();
+  if (catchUpRunning) {
+    catchUpAgain = true;
+    return;
+  }
+  catchUpRunning = true;
+  try {
+    do {
+      catchUpAgain = false;
+      await catchUpCloudSync();
+    } while (catchUpAgain);
+  } catch {
+    // The backend reports the connection state; keep the loaded page visible.
+  } finally {
+    catchUpRunning = false;
+  }
+}
 
 function onKeydown(event: KeyboardEvent) {
   if (event.key !== "Escape" || event.repeat) return;
@@ -52,7 +93,12 @@ function handleMainWindowFocus(focused: boolean) {
     activationCheckArmed = true;
     return;
   }
+  void catchUpCloudData();
   void promptPendingUnassignedTimeOnce(activationSequence);
+}
+
+function handleVisibilityChange() {
+  if (document.visibilityState === "visible") void catchUpCloudData();
 }
 
 function scheduleDomainRefresh(domains: string[], timerStoppedEntryId?: string) {
@@ -65,16 +111,31 @@ function scheduleDomainRefresh(domains: string[], timerStoppedEntryId?: string) 
   }, 80);
 }
 
+function hasVisiblePendingRefresh() {
+  const { visible } = partitionWorkDataRefreshDomains(
+    pendingRefreshDomains,
+    store.activePage,
+    view.value === "main",
+  );
+  return visible.length > 0;
+}
+
 async function flushDomainRefresh() {
   if (refreshRunning) return;
   refreshRunning = true;
   try {
     while (pendingRefreshDomains.size || pendingTimerStoppedEntryId) {
-      const domains = new Set(pendingRefreshDomains);
+      const { visible } = partitionWorkDataRefreshDomains(
+        pendingRefreshDomains,
+        store.activePage,
+        view.value === "main",
+      );
       const timerStoppedEntryId = pendingTimerStoppedEntryId;
-      pendingRefreshDomains.clear();
+      if (!visible.length && !timerStoppedEntryId) break;
+      visible.forEach((domain) => pendingRefreshDomains.delete(domain));
+      const domains = new Set(visible);
       pendingTimerStoppedEntryId = "";
-      const plan = workDataRefreshPlan(domains, view.value === "main");
+      const plan = workDataRefreshPlan(domains, view.value === "main", store.activePage);
       const loads: Promise<unknown>[] = [];
       if (plan.workspace) loads.push(store.loadWorkspaceData());
       if (plan.time) {
@@ -89,9 +150,11 @@ async function flushDomainRefresh() {
     }
   } finally {
     refreshRunning = false;
-    if (pendingRefreshDomains.size || pendingTimerStoppedEntryId) scheduleDomainRefresh([]);
+    if (pendingTimerStoppedEntryId || hasVisiblePendingRefresh()) scheduleDomainRefresh([]);
   }
 }
+
+watch(() => store.activePage, () => scheduleDomainRefresh([]));
 
 onMounted(() => {
   document.body.dataset.view = view.value;
@@ -100,6 +163,11 @@ onMounted(() => {
     applyAppTheme(isAppTheme(theme) ? theme : "forest", true);
   }).catch(() => undefined);
   store.startClock(true);
+  void getStorageMode().then(applyCloudAccessState).catch(() => undefined);
+  void onCloudSyncStateChanged(applyCloudAccessState).then((unlisten) => {
+    if (unmounted) unlisten();
+    else unlistenCloudSyncStateChanged = unlisten;
+  });
   void onWorkDataChanged((payload) => {
     scheduleDomainRefresh(payload.domains, payload.timerStoppedEntryId);
   }).then((unlisten) => {
@@ -107,6 +175,15 @@ onMounted(() => {
     else unlistenWorkDataChanged = unlisten;
   });
   window.addEventListener("keydown", onKeydown);
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+  catchUpTimer = window.setInterval(() => {
+    const now = Date.now();
+    const wakeGap = now - lastWakeHeartbeatAt;
+    lastWakeHeartbeatAt = now;
+    if (document.visibilityState === "visible" && (wakeGap > 15_000 || now - lastCatchUpAt > 30_000)) {
+      void catchUpCloudData();
+    }
+  }, 5_000);
   if (view.value === "main") {
     void onOpenUnassignedResolution(async () => {
       await store.loadUnassignedState(true);
@@ -129,10 +206,13 @@ onUnmounted(() => {
   unmounted = true;
   unlistenWindowFocus?.();
   unlistenWorkDataChanged?.();
+  unlistenCloudSyncStateChanged?.();
   unlistenOpenUnassignedResolution?.();
   if (refreshTimer) window.clearTimeout(refreshTimer);
+  if (catchUpTimer) window.clearInterval(catchUpTimer);
   store.stopClock();
   window.removeEventListener("keydown", onKeydown);
+  document.removeEventListener("visibilitychange", handleVisibilityChange);
   stopCompletionFeedback();
 });
 </script>

@@ -425,6 +425,24 @@ export const useWorkdayStore = defineStore("workday", () => {
     await loadTodayOverview();
   }
 
+  function clearCloudBusinessMemory() {
+    subjects.splice(0, subjects.length);
+    tasks.splice(0, tasks.length);
+    todayTasks.splice(0, todayTasks.length);
+    todayPlanTasks.splice(0, todayPlanTasks.length);
+    entries.splice(0, entries.length);
+    timeHistoryGroups.splice(0, timeHistoryGroups.length);
+    reports.value = [];
+    completedTasks.splice(0, completedTasks.length);
+    selectedSubjectId.value = "";
+    selectedTaskId.value = "";
+    selectedEntryId.value = "";
+    todayOverview.value = null;
+    unassignedCurrentSession.value = undefined;
+    applyUnassignedState(null);
+    workspaceLoaded.value = false;
+  }
+
   async function refreshWorkspaceCalendar() {
     const context = await getWorkspaceCalendarContext();
     workspaceTimezone.value = context.timezone;
@@ -1762,7 +1780,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     if (task.recurrence && estimateMinutes) {
       replaceTask(await setRecurringTaskEstimate(task.id, task.version, todayDate, estimateMinutes));
     } else {
-      await setTaskDailyEstimate(task.id, todayDate, estimateMinutes);
+      await setTaskDailyEstimate(task.id, todayDate, estimateMinutes, task.dailyEstimateVersion);
     }
     await Promise.all([loadWorkspaceData(), reloadTodayPlanForSubject(task.subjectId), loadTodayOverview()]);
   }
@@ -2044,7 +2062,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     const task = todayPlanTask(taskId);
     if (!task || task.version <= 0) return;
     const todayDate = await ensureWorkspaceCalendar();
-    await setTaskDailyEstimate(task.id, todayDate, estimateMinutes);
+    await setTaskDailyEstimate(task.id, todayDate, estimateMinutes, task.dailyEstimateVersion);
     await Promise.all([reloadTodayPlanForSubject(task.subjectId), loadTodayOverview()]);
   }
 
@@ -2625,7 +2643,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     now, todayMinutes, allocatedMinutes, pendingMinutes, doneCount, todayCompletionDoneCount, todayCompletionTotalCount, todayCompletionPercent, unassignedSeconds, unassignedStartedAt,
     unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen, unassignedWorkDate, unassignedSessionId, unassignedVersion,
     unassignedCurrentSession,
-    workspaceLoaded, workspaceLoading, executionSnapshots, executionSnapshotLoading, loadExecutionSnapshot, saveExecutionTaskTitle, saveExecutionTaskNote, saveExecutionTaskDetails, deleteExecutionTask, loadWorkspaceData, loadTodayPlan, setTodayPlanMembership, addTasksToToday, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadMoreReports, refreshReports, loadReportsThroughId, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addTaskSelectionDraft, addChildTask, addTaskRelative, createTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTodayImport, saveTaskPlanBatch, loadActualAdjustmentSnapshot, saveActualAdjustmentBatch, removeActualAdjustment, duplicateTask, duplicateSingleTask, deleteTask, moveTask, reorderTask, movePlanTask,
+    workspaceLoaded, workspaceLoading, executionSnapshots, executionSnapshotLoading, clearCloudBusinessMemory, loadExecutionSnapshot, saveExecutionTaskTitle, saveExecutionTaskNote, saveExecutionTaskDetails, deleteExecutionTask, loadWorkspaceData, loadTodayPlan, setTodayPlanMembership, addTasksToToday, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadMoreReports, refreshReports, loadReportsThroughId, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addTaskSelectionDraft, addChildTask, addTaskRelative, createTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTodayImport, saveTaskPlanBatch, loadActualAdjustmentSnapshot, saveActualAdjustmentBatch, removeActualAdjustment, duplicateTask, duplicateSingleTask, deleteTask, moveTask, reorderTask, movePlanTask,
     addTodayTask, addTodayChildTask, addTodayTaskRelative, saveTodayTask, saveTodayTaskToFuture, deleteTodayTask, saveTodayTaskNote, saveTodayTaskNoteToFuture, saveTodayTaskTodayEstimate, commitTodayTaskToggle, toggleTodayTask, moveTodayTask, indentTodayTask, outdentTodayTask, duplicateTodayTask, duplicateSingleTodayTask,
     indentTask, outdentTask, moveExecutionTask, startTimer, transitionTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, loadReportTemplates, createReportTemplate, updateReportTemplate, duplicateReportTemplate, setDefaultReportTemplate, deleteReportTemplate, reorderReportTemplates, getReportTemplatePlaceholders, publicReportText, previewObsidianReport, writeObsidianReport,
     beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, dismissUnassignedResolution, resolveUnassignedTime

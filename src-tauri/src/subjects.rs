@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::database::Database;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubjectDto {
     pub id: String,
@@ -14,20 +14,20 @@ pub struct SubjectDto {
     pub version: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubjectCreateResult {
     pub subject: SubjectDto,
     pub already_exists: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubjectCreateRequest {
     pub name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubjectRenameRequest {
     pub subject_id: String,
@@ -271,7 +271,13 @@ fn now_millis() -> i64 {
 
 #[tauri::command]
 pub fn subject_list(database: tauri::State<'_, Database>) -> Result<Vec<SubjectDto>, String> {
-    list_subjects(&database)
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Tasks,
+        crate::storage_contract::StorageOperation::Query,
+        list_subjects,
+        crate::supabase::direct_cloud_subject_list,
+    )
 }
 
 #[tauri::command]
@@ -279,14 +285,26 @@ pub fn subject_create(
     database: tauri::State<'_, Database>,
     request: SubjectCreateRequest,
 ) -> Result<SubjectCreateResult, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result =
-        create_subject_with_cloud_operation(&database, request, Some((&state, "subject_create")))?;
-    if !result.already_exists {
-        crate::cloud_sync::flush_if_online(&database)?;
-    }
-    Ok(result)
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Tasks,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = create_subject_with_cloud_operation(
+                database,
+                request,
+                Some((&state, "subject_create")),
+            )?;
+            if !result.already_exists {
+                crate::cloud_sync::flush_if_online(database)?;
+            }
+            Ok(result)
+        },
+        |database| crate::supabase::direct_cloud_subject_create(database, direct_request),
+    )
 }
 
 #[tauri::command]
@@ -294,16 +312,25 @@ pub fn subject_rename(
     database: tauri::State<'_, Database>,
     request: SubjectRenameRequest,
 ) -> Result<SubjectDto, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let base_version = request.expected_version;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = rename_subject_with_cloud_operation(
+    let direct_request = request.clone();
+    crate::storage_contract::route(
         &database,
-        request,
-        Some((&state, "subject_rename", base_version)),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+        crate::storage_contract::BusinessDomain::Tasks,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let base_version = request.expected_version;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = rename_subject_with_cloud_operation(
+                database,
+                request,
+                Some((&state, "subject_rename", base_version)),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| crate::supabase::direct_cloud_subject_rename(database, direct_request),
+    )
 }
 
 #[cfg(test)]

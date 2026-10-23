@@ -22,7 +22,7 @@ pub struct UnassignedStateDto {
     pub version: i64,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct UnassignedAllocationInput {
     pub task_id: String,
@@ -32,7 +32,7 @@ pub struct UnassignedAllocationInput {
     pub task_expected_version: Option<i64>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolveWorkRequest {
     pub session_id: String,
@@ -41,7 +41,7 @@ pub struct ResolveWorkRequest {
     pub operation_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolveSessionRequest {
     pub session_id: String,
@@ -1528,27 +1528,27 @@ fn now_millis() -> i64 {
 pub fn unassigned_get_state(
     database: tauri::State<'_, Database>,
 ) -> Result<Option<UnassignedStateDto>, String> {
-    let state = crate::supabase::storage_mode(&database)?;
-    if state.mode == "cloud" {
-        crate::cloud_sync::refresh_unassigned_state_for_cloud_mode(&database)
-    } else {
-        get_state(&database)
-    }
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Mutation,
+        get_state,
+        crate::supabase::direct_cloud_unassigned_ensure,
+    )
 }
 
 #[tauri::command]
 pub fn unassigned_get_state_snapshot(
     database: tauri::State<'_, Database>,
 ) -> Result<UnassignedStateSnapshotDto, String> {
-    let state = crate::supabase::storage_mode(&database)?;
-    let current = if state.mode == "cloud" {
-        crate::cloud_sync::refresh_unassigned_state_for_cloud_mode(&database)?
-    } else {
-        get_state(&database)?
-    };
-    let connection = database.open()?;
-    let workspace_id = workspace_id(&connection)?;
-    load_state_snapshot(&connection, &workspace_id, current, now_millis())
+    let current = crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Mutation,
+        get_state,
+        crate::supabase::direct_cloud_unassigned_ensure,
+    )?;
+    Ok(UnassignedStateSnapshotDto { current })
 }
 
 #[tauri::command]
@@ -1556,7 +1556,17 @@ pub fn unassigned_get_session(
     database: tauri::State<'_, Database>,
     session_id: String,
 ) -> Result<UnassignedStateDto, String> {
-    get_session_state(&database, &session_id)
+    let direct_session_id = session_id.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Query,
+        |database| get_session_state(database, &session_id),
+        |database| {
+            crate::supabase::direct_cloud_unassigned_state(database, Some(direct_session_id))?
+                .ok_or_else(|| "NOT_FOUND: 未归属会话不存在或已处理".to_string())
+        },
+    )
 }
 
 #[tauri::command]
@@ -1564,7 +1574,14 @@ pub fn unassigned_resolve_work(
     database: tauri::State<'_, Database>,
     request: ResolveWorkRequest,
 ) -> Result<UnassignedResolveResult, String> {
-    resolve_work_for_sync(&database, request)
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| resolve_work_for_sync(database, request),
+        |database| crate::supabase::direct_cloud_unassigned_resolve_work(database, direct_request),
+    )
 }
 
 #[tauri::command]
@@ -1572,7 +1589,20 @@ pub fn unassigned_resolve_break(
     database: tauri::State<'_, Database>,
     request: ResolveSessionRequest,
 ) -> Result<UnassignedResolveResult, String> {
-    resolve_break_for_sync(&database, request)
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| resolve_break_for_sync(database, request),
+        |database| {
+            crate::supabase::direct_cloud_unassigned_resolve_session(
+                database,
+                direct_request,
+                "break",
+            )
+        },
+    )
 }
 
 #[tauri::command]
@@ -1580,7 +1610,20 @@ pub fn unassigned_discard(
     database: tauri::State<'_, Database>,
     request: ResolveSessionRequest,
 ) -> Result<UnassignedResolveResult, String> {
-    discard_for_sync(&database, request)
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| discard_for_sync(database, request),
+        |database| {
+            crate::supabase::direct_cloud_unassigned_resolve_session(
+                database,
+                direct_request,
+                "discard",
+            )
+        },
+    )
 }
 
 #[cfg(test)]

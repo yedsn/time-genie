@@ -14,10 +14,36 @@ use uuid::Uuid;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-pub const BACKUP_FORMAT_VERSION: u32 = 1;
+pub const DATA_PACKAGE_FORMAT_VERSION: u32 = 1;
+pub const BACKUP_FORMAT_VERSION: u32 = DATA_PACKAGE_FORMAT_VERSION;
+pub const DATA_PACKAGE_CATALOG_JSON: &str = include_str!("../data-package-catalog.json");
 pub const MAX_ARCHIVE_MEMBERS: usize = 16;
 pub const MAX_ARCHIVE_MEMBER_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_ARCHIVE_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DataPackageCatalogScope {
+    entities: Vec<DataPackageCatalogScopeEntity>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DataPackageCatalogScopeEntity {
+    name: String,
+    copy: String,
+}
+
+pub fn data_package_copy_entity_names() -> Result<Vec<String>, String> {
+    let catalog: DataPackageCatalogScope = serde_json::from_str(DATA_PACKAGE_CATALOG_JSON)
+        .map_err(|error| format!("DATA_PACKAGE_CATALOG_INVALID: {error}"))?;
+    Ok(catalog
+        .entities
+        .into_iter()
+        .filter(|entity| entity.copy == "include")
+        .map(|entity| entity.name)
+        .collect())
+}
 
 pub const ARCHIVE_MEMBERS: [&str; 7] = [
     "manifest.json",
@@ -28,6 +54,7 @@ pub const ARCHIVE_MEMBERS: [&str; 7] = [
     "data/shared-settings.json",
     "checksums.json",
 ];
+pub const LEGACY_SYNC_ARCHIVE_MEMBER: &str = "data/legacy-sync.json";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtectionGroup {
@@ -348,6 +375,7 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     "device_settings",
     "local_sync_state",
     "sync_outbox",
+    "legacy_abandoned_outbox",
     "cloud_deferred_entities",
     "tracking_runtime_state",
     "device_hooks",
@@ -380,7 +408,7 @@ const EXCLUDED_CATEGORIES: &[&str] = &[
     "系统凭据与 Token",
     "Supabase 项目连接与登录会话",
     "设备授权身份",
-    "同步队列、冲突和同步游标",
+    "同步操作 payload、设备身份与同步游标",
     "自动化命令及执行记录",
     "运行时租约与本机路径",
 ];
@@ -400,6 +428,46 @@ struct BackupManifest {
     pending_operation_count: i64,
     entity_counts: BTreeMap<String, usize>,
     excluded_categories: Vec<String>,
+    #[serde(default)]
+    legacy_sync_diagnostics: Option<LegacySyncDiagnostics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacySyncQueueCounts {
+    pub pending: i64,
+    pub sending: i64,
+    pub failed: i64,
+    pub conflict: i64,
+    pub total: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacySyncOperationDiagnostic {
+    pub sequence: i64,
+    pub operation_type: String,
+    pub entity_type: String,
+    pub state: String,
+    pub attempt_count: i64,
+    pub base_version: Option<i64>,
+    pub payload_version: Option<i64>,
+    pub workspace_epoch: i64,
+    pub error_code: Option<String>,
+    pub created_at: i64,
+    pub last_attempt_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacySyncDiagnostics {
+    pub disposition_reason: String,
+    pub queue_counts: LegacySyncQueueCounts,
+    pub operations: Vec<LegacySyncOperationDiagnostic>,
+    pub operations_truncated: bool,
+    pub business_data_included: bool,
+    pub raw_payload_excluded: bool,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -415,6 +483,14 @@ pub struct BackupExportRequest {
     pub path: String,
     #[serde(default)]
     pub rescue: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupRescueExportRequest {
+    pub path: String,
+    #[serde(default)]
+    pub disposition_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -477,6 +553,16 @@ pub struct BackupPreview {
     pub entity_counts: BTreeMap<String, usize>,
     pub excluded_categories: Vec<String>,
     pub replaced_entity_counts: BTreeMap<String, usize>,
+    pub legacy_sync_diagnostics: Option<LegacySyncDiagnostics>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedRescueBackup {
+    pub(crate) created_at: String,
+    pub(crate) checksum: String,
+    pub(crate) source_workspace_marker: String,
+    pub(crate) pending_operation_count: i64,
+    pub(crate) legacy_queue_operation_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -505,13 +591,14 @@ pub fn export_backup(
     database: &crate::database::Database,
     request: BackupExportRequest,
 ) -> Result<BackupExportResult, String> {
-    export_backup_with_policy(database, request, false)
+    export_backup_with_policy(database, request, false, None)
 }
 
 fn export_backup_with_policy(
     database: &crate::database::Database,
     request: BackupExportRequest,
     allow_import_safety_rescue: bool,
+    disposition_reason: Option<String>,
 ) -> Result<BackupExportResult, String> {
     let target = validated_backup_target(&request.path)?;
     let frozen_at = now_millis();
@@ -596,6 +683,15 @@ fn export_backup_with_policy(
         .map_err(|error| error.to_string())?;
     let mut tables = export_tables(&transaction, &local_workspace_id)?;
     freeze_active_tracking(&mut tables, frozen_at)?;
+    let legacy_sync_diagnostics = if rescue {
+        Some(build_legacy_sync_diagnostics(
+            &transaction,
+            cloud_workspace_id.as_deref(),
+            disposition_reason.as_deref(),
+        )?)
+    } else {
+        None
+    };
     transaction.commit().map_err(|error| error.to_string())?;
     let entity_counts = tables
         .iter()
@@ -627,6 +723,7 @@ fn export_backup_with_policy(
             .iter()
             .map(|value| (*value).to_string())
             .collect(),
+        legacy_sync_diagnostics,
     };
     let archive_entries = backup_entries(&manifest, &workspace, &tables)?;
     let bytes = create_json_archive(&archive_entries)?;
@@ -667,6 +764,7 @@ pub(crate) fn export_automatic_safety_backup(
             rescue: false,
         },
         true,
+        None,
     )
 }
 
@@ -700,6 +798,7 @@ pub fn preview_backup(
         entity_counts: validated.manifest.entity_counts,
         excluded_categories: validated.manifest.excluded_categories,
         replaced_entity_counts,
+        legacy_sync_diagnostics: validated.manifest.legacy_sync_diagnostics,
     })
 }
 
@@ -729,6 +828,7 @@ fn import_backup_with_safety_path(
             rescue: false,
         },
         true,
+        None,
     )?;
     let workspace_id = restore_validated_backup(database, &validated)?;
     Ok(BackupImportResult {
@@ -749,14 +849,16 @@ pub fn data_backup_export(
 #[tauri::command]
 pub fn data_backup_export_rescue(
     database: tauri::State<'_, crate::database::Database>,
-    request: BackupPreviewRequest,
+    request: BackupRescueExportRequest,
 ) -> Result<BackupExportResult, String> {
-    export_backup(
+    export_backup_with_policy(
         &database,
         BackupExportRequest {
             path: request.path,
             rescue: true,
         },
+        false,
+        request.disposition_reason,
     )
 }
 
@@ -1017,6 +1119,12 @@ fn backup_entries(
             Value::Object(group_tables),
         );
     }
+    if let Some(diagnostics) = manifest.legacy_sync_diagnostics.as_ref() {
+        entries.insert(
+            LEGACY_SYNC_ARCHIVE_MEMBER.to_string(),
+            to_json_value(diagnostics)?,
+        );
+    }
     let checksums = checksums_for(&entries)?;
     entries.insert("checksums.json".to_string(), to_json_value(checksums)?);
     Ok(entries)
@@ -1031,7 +1139,9 @@ fn validate_backup_path(path: &Path) -> Result<ValidatedBackup, String> {
     let entries = read_json_archive(file)?;
     let names = entries.keys().map(String::as_str).collect::<BTreeSet<_>>();
     let required = ARCHIVE_MEMBERS.into_iter().collect::<BTreeSet<_>>();
-    if names != required {
+    let mut allowed = required.clone();
+    allowed.insert(LEGACY_SYNC_ARCHIVE_MEMBER);
+    if !required.is_subset(&names) || !names.is_subset(&allowed) {
         return Err(format!(
             "INVALID_BACKUP: 备份成员不完整，期望 {required:?}，实际 {names:?}"
         ));
@@ -1061,6 +1171,16 @@ fn validate_backup_path(path: &Path) -> Result<ValidatedBackup, String> {
         BACKUP_KIND_STANDARD | BACKUP_KIND_RESCUE
     ) {
         return Err("INVALID_BACKUP: 不支持的备份种类".to_string());
+    }
+    let has_legacy_diagnostics = entries.contains_key(LEGACY_SYNC_ARCHIVE_MEMBER);
+    if manifest.legacy_sync_diagnostics.is_some() != has_legacy_diagnostics {
+        return Err("INVALID_BACKUP: 旧同步诊断清单与备份成员不一致".to_string());
+    }
+    if manifest.backup_kind == BACKUP_KIND_STANDARD && has_legacy_diagnostics {
+        return Err("INVALID_BACKUP: 标准备份不能包含旧同步诊断".to_string());
+    }
+    if let Some(diagnostics) = manifest.legacy_sync_diagnostics.as_ref() {
+        validate_legacy_sync_diagnostics(diagnostics, manifest.pending_operation_count)?;
     }
     let workspace: WorkspaceMetadata = serde_json::from_value(entries["workspace.json"].clone())
         .map_err(|error| format!("INVALID_BACKUP: workspace 无效: {error}"))?;
@@ -1280,6 +1400,253 @@ fn freeze_active_tracking(
     Ok(())
 }
 
+fn build_legacy_sync_diagnostics(
+    connection: &Connection,
+    cloud_workspace_id: Option<&str>,
+    disposition_reason: Option<&str>,
+) -> Result<LegacySyncDiagnostics, String> {
+    let workspace_id = cloud_workspace_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "RESCUE_BACKUP_NOT_AVAILABLE: 缺少云端工作空间标记".to_string())?;
+    let queue_counts = connection
+        .query_row(
+            "SELECT
+               COALESCE(SUM(CASE WHEN state='pending' THEN 1 ELSE 0 END),0),
+               COALESCE(SUM(CASE WHEN state='sending' THEN 1 ELSE 0 END),0),
+               COALESCE(SUM(CASE WHEN state='failed' THEN 1 ELSE 0 END),0),
+               COALESCE(SUM(CASE WHEN state='conflict' THEN 1 ELSE 0 END),0),
+               COUNT(*)
+             FROM sync_outbox
+             WHERE workspace_id=?1 AND state IN ('pending','sending','failed','conflict')",
+            [workspace_id],
+            |row| {
+                Ok(LegacySyncQueueCounts {
+                    pending: row.get(0)?,
+                    sending: row.get(1)?,
+                    failed: row.get(2)?,
+                    conflict: row.get(3)?,
+                    total: row.get(4)?,
+                })
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    const DIAGNOSTIC_LIMIT: usize = 5_000;
+    let mut statement = connection
+        .prepare(
+            "SELECT operation_type,entity_type,state,attempt_count,base_version,
+                    payload_version,workspace_epoch,created_at,last_attempt_at,error_json
+             FROM sync_outbox
+             WHERE workspace_id=?1 AND state IN ('pending','sending','failed','conflict')
+             ORDER BY created_at,operation_type,entity_type
+             LIMIT ?2",
+        )
+        .map_err(|error| error.to_string())?;
+    let operations = statement
+        .query_map(
+            params![workspace_id, (DIAGNOSTIC_LIMIT + 1) as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            },
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let operations_truncated = operations.len() > DIAGNOSTIC_LIMIT;
+    let operations = operations
+        .into_iter()
+        .take(DIAGNOSTIC_LIMIT)
+        .enumerate()
+        .map(
+            |(
+                index,
+                (
+                    operation_type,
+                    entity_type,
+                    state,
+                    attempt_count,
+                    base_version,
+                    payload_version,
+                    workspace_epoch,
+                    created_at,
+                    last_attempt_at,
+                    error_json,
+                ),
+            )| {
+                LegacySyncOperationDiagnostic {
+                    sequence: index as i64 + 1,
+                    operation_type,
+                    entity_type,
+                    state,
+                    attempt_count,
+                    base_version,
+                    payload_version,
+                    workspace_epoch,
+                    error_code: diagnostic_error_code(error_json.as_deref()),
+                    created_at,
+                    last_attempt_at,
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+    let reason = disposition_reason
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("升级到直连云端存储前导出旧同步队列并明确放弃")
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(500)
+        .collect::<String>();
+    Ok(LegacySyncDiagnostics {
+        disposition_reason: reason,
+        queue_counts,
+        operations,
+        operations_truncated,
+        business_data_included: true,
+        raw_payload_excluded: true,
+        note: "包含旧云端本地业务快照与队列诊断；不包含操作 payload、设备标识、访问令牌或密码"
+            .to_string(),
+    })
+}
+
+fn diagnostic_error_code(raw: Option<&str>) -> Option<String> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let message = serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .or_else(|| value.as_str().map(ToOwned::to_owned))
+        })
+        .unwrap_or_else(|| raw.to_string());
+    let candidate = message
+        .split_once(':')
+        .map(|(code, _)| code.trim())
+        .unwrap_or("");
+    const SAFE_CODES: &[&str] = &[
+        "AUTH_REQUIRED",
+        "CLIENT_UPGRADE_REQUIRED",
+        "DEVICE_REVOKED",
+        "ENTITY_DELETED",
+        "IDEMPOTENCY_CONFLICT",
+        "LEASE_LOST",
+        "NETWORK_ERROR",
+        "OFFLINE_RESTRICTED",
+        "VALIDATION_ERROR",
+        "VERSION_CONFLICT",
+        "WORKSPACE_EPOCH_STALE",
+    ];
+    Some(if SAFE_CODES.contains(&candidate) {
+        candidate.to_string()
+    } else {
+        "REMOTE_ERROR".to_string()
+    })
+}
+
+fn validate_legacy_sync_diagnostics(
+    diagnostics: &LegacySyncDiagnostics,
+    pending_operation_count: i64,
+) -> Result<(), String> {
+    if diagnostics.queue_counts.total
+        != diagnostics.queue_counts.pending
+            + diagnostics.queue_counts.sending
+            + diagnostics.queue_counts.failed
+            + diagnostics.queue_counts.conflict
+    {
+        return Err("INVALID_BACKUP: 旧同步队列汇总不一致".to_string());
+    }
+    if diagnostics.queue_counts.total != pending_operation_count {
+        return Err("INVALID_BACKUP: 旧同步队列数量与清单不一致".to_string());
+    }
+    if !diagnostics.business_data_included || !diagnostics.raw_payload_excluded {
+        return Err("INVALID_BACKUP: 旧同步诊断范围标记无效".to_string());
+    }
+    if diagnostics.disposition_reason.trim().is_empty() {
+        return Err("INVALID_BACKUP: 旧同步处置原因不能为空".to_string());
+    }
+    if !diagnostics.operations_truncated
+        && diagnostics.operations.len() as i64 != diagnostics.queue_counts.total
+    {
+        return Err("INVALID_BACKUP: 旧同步操作明细数量不一致".to_string());
+    }
+    let mut states = BTreeMap::<&str, i64>::new();
+    for (index, operation) in diagnostics.operations.iter().enumerate() {
+        if operation.sequence != index as i64 + 1 {
+            return Err("INVALID_BACKUP: 旧同步操作序号不连续".to_string());
+        }
+        if !matches!(
+            operation.state.as_str(),
+            "pending" | "sending" | "failed" | "conflict"
+        ) {
+            return Err("INVALID_BACKUP: 旧同步操作状态无效".to_string());
+        }
+        *states.entry(operation.state.as_str()).or_default() += 1;
+        if operation.attempt_count < 0 {
+            return Err("INVALID_BACKUP: 旧同步重试次数无效".to_string());
+        }
+        if operation.error_code.as_deref().is_some_and(|code| {
+            code.is_empty()
+                || !code
+                    .chars()
+                    .all(|character| character.is_ascii_uppercase() || character == '_')
+        }) {
+            return Err("INVALID_BACKUP: 旧同步错误码无效".to_string());
+        }
+    }
+    if !diagnostics.operations_truncated
+        && (states.get("pending").copied().unwrap_or(0) != diagnostics.queue_counts.pending
+            || states.get("sending").copied().unwrap_or(0) != diagnostics.queue_counts.sending
+            || states.get("failed").copied().unwrap_or(0) != diagnostics.queue_counts.failed
+            || states.get("conflict").copied().unwrap_or(0) != diagnostics.queue_counts.conflict)
+    {
+        return Err("INVALID_BACKUP: 旧同步状态计数不一致".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_rescue_backup_for_abandon(
+    path: &Path,
+) -> Result<ValidatedRescueBackup, String> {
+    let bytes = fs::read(path).map_err(|error| format!("无法读取救援备份: {error}"))?;
+    let validated = validate_backup_path(path)?;
+    if validated.manifest.backup_kind != BACKUP_KIND_RESCUE {
+        return Err("RESCUE_BACKUP_REQUIRED: 必须使用带旧同步诊断的救援备份".to_string());
+    }
+    let diagnostics = validated
+        .manifest
+        .legacy_sync_diagnostics
+        .as_ref()
+        .ok_or_else(|| "RESCUE_BACKUP_INCOMPLETE: 救援备份缺少旧同步诊断".to_string())?;
+    Ok(ValidatedRescueBackup {
+        checksum: sha256_hex(&bytes),
+        created_at: validated.manifest.created_at,
+        source_workspace_marker: validated.manifest.source_workspace_marker,
+        pending_operation_count: validated.manifest.pending_operation_count,
+        legacy_queue_operation_count: diagnostics.operations.len(),
+    })
+}
+
 fn restore_validated_backup(
     database: &crate::database::Database,
     backup: &ValidatedBackup,
@@ -1337,6 +1704,212 @@ fn restore_validated_backup(
         .map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(new_workspace_id)
+}
+
+pub(crate) fn replace_local_business_data_from_copy(
+    database: &crate::database::Database,
+    snapshot: &Value,
+) -> Result<String, String> {
+    let expected_entities = data_package_copy_entity_names()?;
+    let mut tables = BTreeMap::new();
+    for entity_name in expected_entities {
+        let rows = snapshot
+            .get(&entity_name)
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| format!("DATA_PACKAGE_ENTITY_MISSING: {entity_name}"))?;
+        tables.insert(entity_name, rows);
+    }
+    validate_references(&tables)?;
+
+    let mut connection = database.open()?;
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let workspace_id: String = transaction
+        .query_row(
+            "SELECT id FROM workspaces WHERE storage_mode='local' AND deleted_at IS NULL ORDER BY created_at LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let preserved_path_settings = preserved_local_path_settings(&transaction, &workspace_id)?;
+    let preserved_secret_refs = preserved_integration_secret_refs(&transaction, &workspace_id)?;
+    clear_local_copy_target(&transaction, &workspace_id)?;
+    for entity in PROTECTED_ENTITIES
+        .iter()
+        .filter(|entity| tables.contains_key(entity.table))
+    {
+        let rows = tables
+            .get(entity.table)
+            .ok_or_else(|| format!("DATA_PACKAGE_ENTITY_MISSING: {}", entity.table))?;
+        insert_table_rows(&transaction, entity.table, rows, &workspace_id)?;
+    }
+    restore_deferred_references(&transaction, &tables)?;
+    restore_preserved_local_metadata(
+        &transaction,
+        &workspace_id,
+        &preserved_path_settings,
+        &preserved_secret_refs,
+    )?;
+    transaction
+        .execute(
+            "UPDATE app_metadata SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='global_revision'",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(workspace_id)
+}
+
+fn preserved_local_path_settings(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+) -> Result<Vec<(String, String, i64, i64)>, String> {
+    let mut statement = transaction
+        .prepare("SELECT key,value_json,updated_at,version FROM app_settings WHERE workspace_id=?1")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([workspace_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .filter_map(|row| match row {
+            Ok((key, value, updated_at, version)) if is_local_path_setting_key(&key) => {
+                Some(Ok((key, value, updated_at, version)))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error.to_string())),
+        })
+        .collect();
+    rows
+}
+
+fn preserved_integration_secret_refs(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+) -> Result<HashMap<String, String>, String> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT provider,secret_ref FROM integration_configs WHERE workspace_id=?1 AND secret_ref IS NOT NULL AND secret_ref<>''",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([workspace_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(|error| error.to_string());
+    rows
+}
+
+fn restore_preserved_local_metadata(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    path_settings: &[(String, String, i64, i64)],
+    secret_refs: &HashMap<String, String>,
+) -> Result<(), String> {
+    for (key, value_json, updated_at, version) in path_settings {
+        transaction
+            .execute(
+                "INSERT INTO app_settings(workspace_id,key,value_json,updated_at,version) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workspace_id,key) DO NOTHING",
+                params![workspace_id,key,value_json,updated_at,version],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    for (provider, secret_ref) in secret_refs {
+        transaction
+            .execute(
+                "UPDATE integration_configs SET secret_ref=?1 WHERE workspace_id=?2 AND provider=?3",
+                params![secret_ref,workspace_id,provider],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn is_local_path_setting_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase().replace(['-', '_', ' '], "");
+    [
+        "localpath",
+        "directory",
+        "filepath",
+        "sourcepath",
+        "outputpath",
+        "vaultpath",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn clear_local_copy_target(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+) -> Result<(), String> {
+    transaction
+        .execute(
+            "DELETE FROM local_report_outputs WHERE report_id IN (SELECT id FROM reports WHERE workspace_id=?1)",
+            [workspace_id],
+        )
+        .map_err(|error| error.to_string())?;
+    for (table, field) in [
+        ("time_entries", "origin_unassigned_session_id"),
+        ("time_entries", "previous_entry_id"),
+        ("unassigned_sessions", "generated_entry_id"),
+        ("tasks", "parent_id"),
+    ] {
+        transaction
+            .execute(
+                &format!("UPDATE {table} SET {field}=NULL WHERE workspace_id=?1"),
+                [workspace_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    for table in [
+        "daily_report_import_items",
+        "daily_report_import_sources",
+        "daily_report_import_batches",
+        "plan_import_items",
+        "plan_import_batches",
+        "actual_adjustment_batches",
+        "tracking_runtime_state",
+        "external_bindings",
+        "integration_configs",
+        "subject_work_schedule_segments",
+        "subject_work_schedules",
+        "report_tasks",
+        "task_occurrences",
+        "task_recurrence_rules",
+        "task_day_plans",
+        "task_daily_estimates",
+        "time_allocations",
+        "actual_time_adjustments",
+        "time_segments",
+        "unassigned_segments",
+        "time_entries",
+        "unassigned_sessions",
+        "task_status_events",
+        "reports",
+        "report_templates",
+        "tasks",
+        "work_days",
+        "app_settings",
+        "subjects",
+    ] {
+        transaction
+            .execute(
+                &format!("DELETE FROM {table} WHERE workspace_id=?1"),
+                [workspace_id],
+            )
+            .map_err(|error| {
+                format!("LOCAL_DATA_COPY_REPLACE_FAILED: 清理 {table} 失败: {error}")
+            })?;
+    }
+    Ok(())
 }
 
 fn delete_workspace_data(transaction: &Transaction<'_>, workspace_id: &str) -> Result<(), String> {
@@ -1436,8 +2009,10 @@ fn insert_table_rows(
             } else if matches!(
                 (table, column.as_str()),
                 ("tasks", "parent_id")
+                    | ("tasks", "day_instance_source_task_id")
                     | ("time_entries", "origin_unassigned_session_id")
                     | ("time_entries", "previous_entry_id")
+                    | ("unassigned_sessions", "predecessor_session_id")
             ) {
                 Some(Value::Null)
             } else {
@@ -1472,9 +2047,15 @@ fn restore_deferred_references(
     let session_ids = backup_row_ids(tables, "unassigned_sessions");
     for (table, field, targets) in [
         ("tasks", "parent_id", &task_ids),
+        ("tasks", "day_instance_source_task_id", &task_ids),
         ("time_entries", "previous_entry_id", &entry_ids),
         // 来源会话可能已被清理：只有备份里仍然存在该会话时才回填，否则保持 NULL。
         ("time_entries", "origin_unassigned_session_id", &session_ids),
+        (
+            "unassigned_sessions",
+            "predecessor_session_id",
+            &session_ids,
+        ),
     ] {
         for row in tables.get(table).into_iter().flatten() {
             let Some(value) = row.get(field).and_then(Value::as_str) else {
@@ -1536,6 +2117,11 @@ fn json_to_sql_value(table: &str, column: &str, value: &Value) -> Result<SqlValu
             .map(SqlValue::Integer)
             .or_else(|| value.as_f64().map(SqlValue::Real))
             .ok_or_else(|| "INVALID_BACKUP: 数字超出 SQLite 范围".to_string()),
+        Value::String(value) if column.ends_with("_at") => {
+            Ok(chrono::DateTime::parse_from_rfc3339(value)
+                .map(|timestamp| SqlValue::Integer(timestamp.timestamp_millis()))
+                .unwrap_or_else(|_| SqlValue::Text(value.clone())))
+        }
         Value::String(value) => Ok(SqlValue::Text(value.clone())),
         Value::Array(_) | Value::Object(_) => canonical_json_bytes(value)
             .and_then(|bytes| String::from_utf8(bytes).map_err(|error| error.to_string()))
@@ -1848,7 +2434,8 @@ pub fn checksums_for(
 }
 
 fn validate_member_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
-    let allowed = ARCHIVE_MEMBERS.into_iter().collect::<BTreeSet<_>>();
+    let mut allowed = ARCHIVE_MEMBERS.into_iter().collect::<BTreeSet<_>>();
+    allowed.insert(LEGACY_SYNC_ARCHIVE_MEMBER);
     for name in names {
         if !allowed.contains(name)
             || name.starts_with('/')
@@ -1886,6 +2473,25 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::{tempdir, TempDir};
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct DataPackageCatalog {
+        package_version: u32,
+        groups: Vec<String>,
+        entities: Vec<DataPackageCatalogEntity>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct DataPackageCatalogEntity {
+        name: String,
+        group: String,
+        local_backup: String,
+        cloud_snapshot: String,
+        copy: String,
+        exclusion_reason: Option<String>,
+    }
 
     const SYNC_SOURCES: &[&str] = &[
         "subjects",
@@ -1931,6 +2537,124 @@ mod tests {
         }
         assert!(EXCLUDED_FIELDS.contains(&"secret_ref"));
         assert!(EXCLUDED_FIELDS.contains(&"refresh_token"));
+    }
+
+    #[test]
+    fn data_package_catalog_unifies_backup_snapshot_and_copy_scope() {
+        let catalog: DataPackageCatalog = serde_json::from_str(DATA_PACKAGE_CATALOG_JSON).unwrap();
+        assert_eq!(catalog.package_version, DATA_PACKAGE_FORMAT_VERSION);
+        assert_eq!(
+            catalog.groups,
+            ["planning", "time_tracking", "reports", "shared_settings"]
+        );
+
+        let names = catalog
+            .entities
+            .iter()
+            .map(|entity| entity.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names.len(),
+            catalog.entities.len(),
+            "数据包目录存在重复实体"
+        );
+
+        let storage_boundaries: Value =
+            serde_json::from_str(include_str!("../storage-boundaries.json")).unwrap();
+        let local_business_tables = storage_boundaries["sqliteTables"]["localBusiness"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names, local_business_tables,
+            "新增本地业务表必须在数据包目录中显式分类"
+        );
+
+        let local_backup_entities = catalog
+            .entities
+            .iter()
+            .filter(|entity| entity.local_backup == "include")
+            .map(|entity| entity.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            local_backup_entities,
+            PROTECTED_ENTITIES
+                .iter()
+                .map(|entity| entity.table)
+                .collect::<BTreeSet<_>>(),
+            "本地备份范围必须来自统一数据包目录"
+        );
+
+        let snapshot_sql =
+            include_str!("../../supabase/20261018c_timegenie_workspace_snapshots.sql");
+        assert!(snapshot_sql.contains(&format!(
+            "format_version integer not null default {}",
+            DATA_PACKAGE_FORMAT_VERSION
+        )));
+        let catalog_body = snapshot_sql
+            .split("create or replace function timegenie.workspace_snapshot_entity_catalog()")
+            .nth(1)
+            .unwrap()
+            .split("$$;")
+            .next()
+            .unwrap();
+        let cloud_snapshot_entities = catalog_body
+            .split("('")
+            .skip(1)
+            .filter_map(|value| value.split("','").next())
+            .collect::<BTreeSet<_>>();
+        let declared_cloud_snapshot_entities = catalog
+            .entities
+            .iter()
+            .filter(|entity| entity.cloud_snapshot == "include")
+            .map(|entity| entity.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            declared_cloud_snapshot_entities, cloud_snapshot_entities,
+            "云端快照 SQL 范围必须来自统一数据包目录"
+        );
+
+        let copy_entities = catalog
+            .entities
+            .iter()
+            .filter(|entity| entity.copy == "include")
+            .map(|entity| entity.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(copy_entities, cloud_snapshot_entities);
+        assert!(copy_entities.is_subset(&local_backup_entities));
+
+        for entity in &catalog.entities {
+            assert!(matches!(
+                entity.local_backup.as_str(),
+                "include" | "exclude" | "metadata"
+            ));
+            assert!(matches!(
+                entity.cloud_snapshot.as_str(),
+                "include" | "exclude" | "metadata"
+            ));
+            assert!(matches!(
+                entity.copy.as_str(),
+                "include" | "exclude" | "metadata"
+            ));
+            if entity.local_backup != "include"
+                || entity.cloud_snapshot != "include"
+                || entity.copy != "include"
+            {
+                assert!(
+                    entity
+                        .exclusion_reason
+                        .as_deref()
+                        .is_some_and(|reason| !reason.trim().is_empty()),
+                    "排除或元数据实体 {} 必须说明原因",
+                    entity.name
+                );
+            }
+            if entity.copy == "include" {
+                assert!(catalog.groups.contains(&entity.group));
+            }
+        }
     }
 
     #[test]
@@ -2186,7 +2910,7 @@ mod tests {
             )
             .unwrap();
         connection.execute("INSERT INTO local_sync_state(workspace_id,device_id,last_change_seq,workspace_epoch,epoch_blocked) VALUES(?1,?2,0,3,0)",params![cloud_workspace_id,device_id]).unwrap();
-        connection.execute("INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,payload_json,state,attempt_count,created_at,workspace_epoch) VALUES('pending-op',?1,?2,'update','tasks','{}','pending',0,1,3)",params![cloud_workspace_id,device_id]).unwrap();
+        connection.execute("INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,payload_json,state,attempt_count,created_at,workspace_epoch,error_json) VALUES('pending-op',?1,?2,'update','tasks','{}','pending',0,1,3,?3)",params![cloud_workspace_id,device_id,json!({"message":"VERSION_CONFLICT: token=rescue-error-secret"}).to_string()]).unwrap();
         drop(connection);
         set_device_setting(&database, "storage_mode", json!("cloud"));
         set_device_setting(&database, "cloud_workspace_id", json!(cloud_workspace_id));
@@ -2224,6 +2948,50 @@ mod tests {
         let validated = validate_backup_path(&rescue).unwrap();
         assert_eq!(validated.manifest.source_workspace_epoch, 3);
         assert_eq!(validated.manifest.pending_operation_count, 1);
+        let diagnostics = validated.manifest.legacy_sync_diagnostics.unwrap();
+        assert_eq!(diagnostics.queue_counts.pending, 1);
+        assert_eq!(diagnostics.queue_counts.total, 1);
+        assert_eq!(diagnostics.operations.len(), 1);
+        assert_eq!(diagnostics.operations[0].operation_type, "update");
+        assert_eq!(diagnostics.operations[0].entity_type, "tasks");
+        assert_eq!(
+            diagnostics.operations[0].error_code.as_deref(),
+            Some("VERSION_CONFLICT")
+        );
+        assert!(diagnostics.business_data_included);
+        assert!(diagnostics.raw_payload_excluded);
+        assert!(!diagnostics.disposition_reason.trim().is_empty());
+        let abandon = validate_rescue_backup_for_abandon(&rescue).unwrap();
+        assert_eq!(abandon.pending_operation_count, 1);
+        assert_eq!(abandon.legacy_queue_operation_count, 1);
+        let archive_text = read_json_archive(fs::File::open(&rescue).unwrap())
+            .unwrap()
+            .values()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!archive_text.contains("rescue-error-secret"));
+
+        let reasoned = directory.path().join("reasoned-rescue.timegenie-backup");
+        export_backup_with_policy(
+            &database,
+            BackupExportRequest {
+                path: reasoned.display().to_string(),
+                rescue: true,
+            },
+            false,
+            Some("用户确认导出后放弃旧修改".to_string()),
+        )
+        .unwrap();
+        let reasoned = validate_backup_path(&reasoned).unwrap();
+        assert_eq!(
+            reasoned
+                .manifest
+                .legacy_sync_diagnostics
+                .unwrap()
+                .disposition_reason,
+            "用户确认导出后放弃旧修改"
+        );
     }
 
     #[test]
@@ -2399,7 +3167,7 @@ mod tests {
             assert!(validated
                 .manifest
                 .excluded_categories
-                .contains(&"同步队列、冲突和同步游标".to_string()));
+                .contains(&"同步操作 payload、设备身份与同步游标".to_string()));
         }
         let validated_standard = validate_backup_path(&standard).unwrap();
         assert_eq!(validated_standard.manifest.pending_operation_count, 0);

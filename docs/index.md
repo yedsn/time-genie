@@ -18,7 +18,7 @@ features:
   - title: 工作闭环
     details: 从今日待办、计时、工时分配到日报、周报、月报都在同一个桌面应用中完成。
   - title: 本地优先
-    details: 默认使用本机 SQLite，敏感 Token 和登录会话保存到系统凭据库，可选接入 Supabase 多设备同步。
+    details: 默认使用本机 SQLite；也可选择 Supabase 在线云端空间。两个空间独立，云端直接读写、断网只读，不产生本地待同步队列。
   - title: 外部工具衔接
     details: 支持从 Obsidian 导入计划、把报告写回 Obsidian，也可以将待办同步到 SeaTable。
 ---

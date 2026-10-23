@@ -527,19 +527,19 @@ Rust 向所有窗口广播：
 5. 使用 `clientRequestId` 幂等，避免双击创建两条记录。
 6. 广播 `timer-state-changed`。
 
-本地模式在 SQLite 事务中完成；云端模式调用 PostgreSQL RPC `timer_start(workspace_id, task_id, device_id, operation_id)`，由部分唯一索引保证整个工作空间只有一条活动计时器。若其他设备已经开始，返回 `REMOTE_TIMER_ACTIVE` 和当前计时摘要，前端直接展示该计时而不是新建。
+本地模式在 SQLite 事务中完成；`direct_v2` 云端模式调用 PostgreSQL RPC `direct_cloud_timer_start(p_workspace_id, p_device_id, p_operation_id, p_expected_epoch, p_payload)`。`p_payload` 包含 `taskId`、`note` 和当前设备 `leaseToken`，由部分唯一索引保证整个工作空间只有一条活动计时器。已有活动计时、陈旧版本或租约失效时返回结构化错误，客户端立即重查权威活动计时。
 
-返回包含服务端 `startedAt` 和 `startedByDevice`，各窗口用该时间计算显示秒数。任意在线设备都可以查看、暂停、继续或结束当前计时，所有动作通过 Realtime 同步。
+返回包含服务器生成的 `startedAt`、`durationSeconds` 和版本，各窗口与托盘直接采用该权威结果。任意在线设备都可以查看当前计时；暂停、继续、结束和切换必须由当前租约持有设备提交，或在租约过期后通过接管 RPC 取得写入资格。Realtime 只触发重新查询，不把计时实体落入 SQLite。
 
 ### 7.3 `timer_pause`
 
 请求：`{entryId, expectedVersion}`。
 
-处理：关闭当前开放分段，汇总 `durationSeconds`，状态改为 `paused`。暂停期间不启动未归属时间，因为它仍属于当前计时过程的主动暂停。云端模式通过 RPC 原子检查 `expectedVersion`，并记录执行设备。
+处理：关闭当前开放分段，汇总 `durationSeconds`，状态改为 `paused`。暂停期间不启动未归属时间，因为它仍属于当前计时过程的主动暂停。`direct_v2` 使用 `direct_cloud_timer_pause` 原子检查 `expectedVersion` 与 `leaseToken`；陈旧版本返回 `VERSION_CONFLICT`，失去租约返回 `LEASE_LOST`。
 
 ### 7.4 `timer_resume`
 
-请求：`{entryId, expectedVersion, operationId}`。新增开放分段并改为 `running`。云端离线时禁止继续，避免其他设备已经结束或切换该计时。
+请求：`{entryId, expectedVersion, operationId}`。新增开放分段并改为 `running`。`direct_v2` 映射为 `direct_cloud_timer_resume`，`operationId` 作为稳定 `p_operation_id`，payload 还携带当前 `leaseToken`。云端不可用时禁止继续，且不创建本地待同步操作。
 
 ### 7.5 `timer_stop`
 
@@ -562,7 +562,7 @@ Rust 向所有窗口广播：
 - 启动/恢复后台未归属会话。
 - 返回结束后的时间记录，前端随后通过归属确认或 `time_allocation_replace` 保存分配。
 
-云端断网时允许先记录“结束待提交”，锁定本机计时操作并继续显示等待同步；在结束请求成功前不得开始下一条计时。若云端记录已被其他设备结束，按服务端结果关闭本地计时并提示实际结束设备和时间。
+`direct_v2` 云端断网时禁止结束，不记录“结束待提交”，也不写 SQLite 或 outbox。请求以稳定 operation ID 幂等执行；若提交后响应丢失，客户端使用同一 operation ID 重试并采用第一次的服务器结果。`VERSION_CONFLICT` 或 `LEASE_LOST` 时立即提示计时已变化/已被接管并重新查询活动计时。
 
 ## 8. 时间记录与工时分配接口
 
@@ -645,16 +645,16 @@ Rust 向所有窗口广播：
 
 ## 9. 未归属时间接口
 
-云端模式先通过后台采集租约确定负责设备：
+`direct_v2` 云端模式通过计时租约协调当前计时写资格，并由云端维护共享未归属锚点：
 
 | Command | 说明 |
 | --- | --- |
-| `tracking_lease_acquire` | 没有有效持有者时原子获取 45 秒租约 |
-| `tracking_lease_renew` | 每 15 秒携带 token 续租 |
-| `tracking_lease_release` | 退出应用或切换本地模式时释放 |
-| `tracking_lease_get` | 查看当前持有设备和过期时间 |
+| `direct_cloud_tracking_acquire` | 没有有效持有者时原子获取 45 秒租约 |
+| `direct_cloud_tracking_heartbeat` | 携带 token 延长 45 秒有效期 |
+| `direct_cloud_timer_takeover` | 租约过期后由另一设备原子接管并返回权威计时 |
+| `direct_cloud_active_timer` | 查看当前权威活动计时，不提升计时版本 |
 
-未持有租约的设备不得累计未归属分段，但可以查看并处理已经达到阈值的未归属会话。
+未持有租约的设备不能修改当前活动计时，但可以读取共享未归属状态并提交带版本条件的处理请求。失败写入返回 `LEASE_LOST` 或 `VERSION_CONFLICT`，不会进入同步冲突队列。
 
 ### 9.1 `unassigned_get_state`
 
@@ -674,7 +674,7 @@ Rust 向所有窗口广播：
 }
 ```
 
-本地模式由 Rust 后台任务负责阈值判断；云端模式由租约持有设备续写分段并通过 RPC 检查阈值。主窗口进入前台或收到状态事件时，`mustResolve=true` 必须打开不可关闭弹框。
+本地模式由 Rust 后台任务负责阈值判断；`direct_v2` 使用 `direct_cloud_unassigned_state` 读取服务器累计秒数，必要时由 `direct_cloud_unassigned_ensure` 原子建立共享锚点。主窗口进入前台或收到失效通知时重新查询；`mustResolve=true` 必须打开不可关闭弹框。
 
 ### 9.2 `unassigned_resolve_work`
 
@@ -923,7 +923,66 @@ Rust 向所有窗口广播：
 
 `settings_get` 同时返回 `storage.mode`、登录账号、工作空间、当前设备和同步状态。共享设置进入 Supabase；托盘行为、Obsidian 本地路径、设备名称和文件输出状态只进入本机 SQLite。只返回 `hasSecret: true/false`，不得返回完整 Token。日志中请求 DTO 必须对 `token`、`authorization`、`password` 和 `secret` 字段脱敏。
 
-## 15. Rust 服务结构建议
+## 15. 报告、共享设置与集成直连（direct_v2）
+
+`direct_v2` 云端模式下，本领域命令通过 `storage_contract::route` 分流：本地模式与旧 `sync_v1` 保持原有 SQLite/outbox 行为，云端模式直接调用 Supabase RPC，不写本地业务表，也不生成待同步操作。
+
+### 15.1 报告与模板
+
+| Command | 直连 RPC | 并发条件 |
+| --- | --- | --- |
+| `report_create` | `direct_cloud_report_create` | `clientRequestId` 作为幂等 operation ID |
+| `report_update_scope` | `direct_cloud_report_scope_update` | `expectedVersion` |
+| `report_save_content` | `direct_cloud_report_content_save` | `expectedVersion` |
+| `report_regenerate` | `direct_cloud_report_regenerate` | `expectedVersion` |
+| `report_delete` | `direct_cloud_report_delete` | `expectedVersion` |
+| `report_list`、`report_get` | `direct_cloud_report_list`、`direct_cloud_report_detail` | 只读查询 |
+| 模板创建、复制、更新、默认切换、排序、删除 | `direct_cloud_report_template_*` | 每项携带 `expectedVersion` |
+
+报告列表的 `"all"` 类型筛选在直连适配中转换为 `null`。模板排序请求使用 `{reportType, items:[{templateId, expectedVersion}]}`。陈旧版本返回 `VERSION_CONFLICT`，客户端立即重查权威报告或模板并展示最新版本，不创建本地冲突记录。
+
+### 15.2 设备设置与共享设置
+
+| 内容 | `direct_v2` 归属 |
+| --- | --- |
+| 用户名、共享业务设置、工作日历 | Supabase `direct_cloud_shared_setting_update` / `direct_cloud_shared_configuration` |
+| 主体工作时段 | `direct_cloud_subject_schedule_save`，每天独立提交 `expectedVersion` |
+| 托盘、窗口、设备名、Obsidian 路径、声音偏好 | 本机 `device_settings` |
+| SeaTable Token、Supabase 会话 | 系统凭据库 |
+
+`settings_update` 对设备范围只写本机；共享范围先读取当前版本再以 `expectedVersion` 提交，成功后用云端返回值刷新页面。云端拒绝时不改动本机业务数据，也不进入后台冲突队列。
+
+### 15.3 集成元数据与外部绑定
+
+| Command | `direct_v2` 行为 |
+| --- | --- |
+| `integration_config_update` | 读取 `direct_cloud_shared_configuration` 后调用 `direct_cloud_integration_config_save`；新记录 `expectedVersion=0` |
+| `integration_secret_set`、`integration_secret_clear` | 凭据只写系统凭据库；云端只同步 `enabled` 与业务配置 |
+| `seatable_connection_test` | 配置从云端读取，Token 从本机凭据库读取，连接测试直连 SeaTable |
+| `seatable_task_sync_preview` | 主体、事项和绑定从云端查询；预览只保存在进程内 |
+| `seatable_task_sync_execute`、`seatable_sync_retry_failed` | 写入 SeaTable 后调用 `direct_cloud_external_binding_upsert` |
+| `seatable_reimbursements_query` | 主体从云端校验，不写本地同步运行记录 |
+| `obsidian_report_write_preview`、`obsidian_report_write_execute` | 报告从 `direct_cloud_report_detail` 读取；目标路径来自设备设置 |
+| `obsidian_plan_import_preview`、`obsidian_plan_import_confirm` | 预览只解析本机 Markdown；确认调用 `direct_cloud_plan_import_confirm` 原子创建事项 |
+
+外部绑定写入规则：
+
+- 新绑定提交 `expectedVersion=0`，已有绑定提交云端当前 `version`。
+- 返回 `VERSION_CONFLICT` 表示其他设备已更新绑定；本次 SeaTable 写入记为失败项，重试前重新预览。
+- 云端配置和绑定响应不包含凭据原文；`token`、`password`、`secret` 等字段被服务端拒绝，`vaultPath` 等本机路径只保存在设备设置。
+- `direct_v2` 的 SeaTable/Obsidian 预览不写 `sync_runs`、`sync_items` 或 `sync_outbox`；应用重启后需要重新预览。
+
+### 15.4 错误语义
+
+| 错误码 | 含义 | 客户端行为 |
+| --- | --- | --- |
+| `VERSION_CONFLICT` | 期望版本落后于云端 | 立即重查权威数据并提示其他设备已修改 |
+| `NOT_FOUND` | 实体不存在或已删除 | 刷新列表并退出编辑状态 |
+| `VALIDATION_ERROR` | 参数或配置无效 | 展示字段错误，不自动重试 |
+| `SYNC_CONFLICT` | SeaTable 预览存在未绑定的重复记录 | 人工处理后重新预览 |
+| `INTEGRATION_NOT_CONFIGURED` | 集成未启用或缺少配置 | 引导到设置页 |
+
+## 16. Rust 服务结构建议
 
 ```text
 src-tauri/src/
@@ -991,9 +1050,9 @@ src-tauri/src/
 - `cloud_sync_service` 负责 Realtime 订阅、变更序号补拉、outbox 推送、幂等重试和冲突记录，业务 Service 不直接处理同步循环。
 - 托盘菜单调用服务层，不得绕过事务直接修改内存状态。
 
-## 16. 测试重点
+## 17. 测试重点
 
-### 16.1 数据与树
+### 17.1 数据与树
 
 - 拖动父项时整棵子树移动且层级不变。
 - `Tab/Shift+Tab` 正确更新父链并拒绝循环。
@@ -1002,7 +1061,7 @@ src-tauri/src/
 - 完成子项后完成列表平铺显示完整路径，父项不被自动完成。
 - 事项完成后再取消完成，历史报告仍能按周期结束时间还原当时状态。
 
-### 16.2 计时
+### 17.2 计时
 
 - 主窗口和托盘同时点击开始时只创建一条活动记录。
 - 两台设备同时点击开始时只有一个请求成功，另一台收到 `REMOTE_TIMER_ACTIVE`。
@@ -1012,7 +1071,7 @@ src-tauri/src/
 - 后台未归属时间同一时间只有租约持有设备累计，租约过期后可以被其他设备接管。
 - 修正时间后分配超出时保存失败且编辑内容可恢复。
 
-### 16.3 未归属时间
+### 17.3 未归属时间
 
 - 累计等于 5 分钟时不弹，大于 5 分钟后进入必须处理状态。
 - 两台设备同时处理未归属会话时只有一个 RPC 成功，另一台收到版本冲突并刷新。
@@ -1021,7 +1080,7 @@ src-tauri/src/
 - 提交瞬间分钟增加时返回新差额，不丢失用户输入。
 - 分配、休息、丢弃三种操作均只能执行一次。
 
-### 16.4 报告
+### 17.4 报告
 
 - 同主体和周期只能有一份当前报告。
 - 报告名称始终由日期或范围生成。
@@ -1030,7 +1089,7 @@ src-tauri/src/
 - 人工编辑后保存，重新生成必须二次确认并覆盖。
 - 周报/月报能列出每日情况和缺失日期。
 
-### 16.5 外部集成
+### 17.5 外部集成
 
 - Obsidian 文件在预览后变化时阻止覆盖。
 - SeaTable 重复同步使用稳定绑定，不产生重复 TODO。
@@ -1040,7 +1099,7 @@ src-tauri/src/
 - 部分失败能只重试失败项。
 - 数据导出和日志不包含完整 Token。
 
-## 17. 实现顺序建议
+## 18. 实现顺序建议
 
 以下仅为后续 `openspec-apply-change` 的依赖顺序，本轮不修改 `tasks.md`：
 
@@ -1057,7 +1116,7 @@ src-tauri/src/
 11. 从 mock store 切换到 commands，删除业务 `localStorage` 持久化。
 12. 双机并发、断网恢复、数据库备份和升级测试。
 
-## 18. 正式实现前必须确认
+## 19. 正式实现前必须确认
 
 1. OpenSpec 与当前 UI 的差异已经同步并通过评审。
 2. 本地模式和 Supabase 云端模式的首版是否同时交付，还是先本地后云端。
@@ -1070,3 +1129,12 @@ src-tauri/src/
 9. 周报/月报工资与报销内容是否进入首个正式版本；当前 UI 报告库尚未展示这两个字段。
 
 本阶段禁止实现命令、创建数据库、执行迁移、写 Obsidian 或调用 SeaTable。
+# 双存储接口边界
+
+TimeGenie 将业务接口划分为六个领域：事项、计划与重复、计时与未归属、报告与模板、共享设置与集成、数据保护。可执行清单维护在 `src-tauri/storage-boundaries.json`，新增 Tauri 业务命令必须归入其中一个领域。
+
+- 本地模式由 SQLite 适配器实现全部业务查询与修改，并保持完全离线可用。
+- `sync_v1` 是升级兼容协议，暂时继续使用 SQLite 与同步队列，不代表目标架构。
+- `direct_v2` 由 Supabase 适配器直接执行查询和 mutation；云端不落本地业务副本，也不创建待同步业务操作。
+- 登录凭据、连接配置、设备身份和设备偏好属于设备元数据，可继续保存在本机；共享设置仍属于业务数据。
+- 前端继续调用稳定的 Tauri DTO，由 Rust 存储路由选择适配器，前端不直接持有 Supabase 数据库写权限。

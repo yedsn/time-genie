@@ -25,6 +25,7 @@ mod recurring;
 mod reports;
 mod seatable;
 mod settings;
+mod storage_contract;
 mod subject_work_schedules;
 mod subjects;
 mod supabase;
@@ -299,7 +300,9 @@ pub fn run() {
                 .default_window_icon()
                 .cloned()
                 .ok_or_else(|| std::io::Error::other("应用默认图标未配置"))?;
-            let initial_timer = time_tracking::get_timer_state(&database).ok().flatten();
+            let initial_timer = time_tracking::timer_state_for_storage(&database)
+                .ok()
+                .flatten();
             let initial_style = settings::tray_icon_style(&database);
             let initial_presentation = tray_presentation::TrayPresentation::from_timer(
                 initial_timer.as_ref(),
@@ -439,6 +442,7 @@ pub fn run() {
             settings::integration_secret_clear,
             supabase::storage_mode_get,
             supabase::storage_mode_set_local,
+            supabase::storage_mode_set_cloud,
             supabase::cloud_configure,
             supabase::cloud_project_probe,
             supabase::cloud_sign_in_password,
@@ -450,6 +454,9 @@ pub fn run() {
             supabase::cloud_device_list,
             supabase::cloud_device_revoke,
             supabase::cloud_sync_resume_after_reauth,
+            supabase::storage_protocol_upgrade_preflight_get,
+            supabase::storage_protocol_upgrade_with_drained_queue_command,
+            supabase::storage_protocol_upgrade_after_rescue_command,
             supabase::cloud_operation_history_list,
             supabase::cloud_operation_history_detail,
             supabase::cloud_workspace_snapshot_create,
@@ -463,6 +470,12 @@ pub fn run() {
             supabase::cloud_workspace_restore_commit,
             supabase::cloud_workspace_restore_cancel,
             supabase::storage_migration_preview,
+            supabase::storage_copy_stage_local_to_cloud,
+            supabase::storage_copy_replace_cloud,
+            supabase::storage_copy_export_cloud_begin,
+            supabase::storage_copy_export_cloud_chunk,
+            supabase::storage_copy_export_cloud_discard,
+            supabase::storage_copy_replace_local,
             supabase::storage_migration_execute,
             cloud_sync::cloud_sync_status,
             cloud_sync::cloud_sync_queue,
@@ -533,6 +546,8 @@ pub fn run() {
             time_tracking::timer_pause,
             time_tracking::timer_resume,
             time_tracking::timer_stop,
+            time_tracking::timer_recover,
+            time_tracking::timer_takeover,
             time_tracking::time_entry_list,
             time_tracking::time_entry_history_list,
             time_tracking::time_entry_create_manual,
@@ -976,7 +991,26 @@ pub(crate) fn refresh_tray_presentation(
     app: &AppHandle,
     database: &Database,
 ) -> Result<(), String> {
-    let timer_result = time_tracking::get_timer_state(database);
+    refresh_tray_presentation_with_timer_result(
+        app,
+        database,
+        time_tracking::timer_state_for_storage(database),
+    )
+}
+
+pub(crate) fn refresh_tray_presentation_with_timer(
+    app: &AppHandle,
+    database: &Database,
+    timer: Option<time_tracking::TimeEntryDto>,
+) -> Result<(), String> {
+    refresh_tray_presentation_with_timer_result(app, database, Ok(timer))
+}
+
+fn refresh_tray_presentation_with_timer_result(
+    app: &AppHandle,
+    database: &Database,
+    timer_result: Result<Option<time_tracking::TimeEntryDto>, String>,
+) -> Result<(), String> {
     let style = settings::tray_icon_style(database);
     let presentation =
         tray_presentation::TrayPresentation::from_timer_result(timer_result.clone(), Some(&style))?;
@@ -1088,9 +1122,9 @@ fn execute_tray_timer_action(
     database: &Database,
     action: TrayTimerAction,
 ) -> Result<serde_json::Value, String> {
-    let current = time_tracking::get_timer_state(database)?;
+    let current = time_tracking::timer_state_for_storage(database)?;
     let result = match action {
-        TrayTimerAction::Start => time_tracking::start_timer_with_hooks_for_sync(
+        TrayTimerAction::Start => time_tracking::timer_start_for_storage(
             database,
             time_tracking::TimerStartRequest {
                 task_id: None,
@@ -1101,7 +1135,7 @@ fn execute_tray_timer_action(
         TrayTimerAction::Pause => {
             let entry =
                 current.ok_or_else(|| "TIMER_NOT_RUNNING: 当前没有正在运行的计时".to_string())?;
-            time_tracking::pause_timer_for_sync(
+            time_tracking::timer_pause_for_storage(
                 database,
                 time_tracking::TimerVersionRequest {
                     entry_id: entry.id,
@@ -1112,7 +1146,7 @@ fn execute_tray_timer_action(
         TrayTimerAction::Resume => {
             let entry =
                 current.ok_or_else(|| "TIMER_NOT_PAUSED: 当前没有已暂停的计时".to_string())?;
-            time_tracking::resume_timer_for_sync(
+            time_tracking::timer_resume_for_storage(
                 database,
                 time_tracking::TimerResumeRequest {
                     entry_id: entry.id,
@@ -1124,7 +1158,7 @@ fn execute_tray_timer_action(
         TrayTimerAction::Stop => {
             let entry =
                 current.ok_or_else(|| "TIMER_NOT_RUNNING: 当前没有可结束的计时".to_string())?;
-            time_tracking::stop_timer_with_hooks_for_sync(
+            time_tracking::timer_stop_for_storage(
                 database,
                 time_tracking::TimerStopRequest {
                     entry_id: entry.id,
@@ -1132,6 +1166,7 @@ fn execute_tray_timer_action(
                     create_default_allocation: false,
                 },
             )?
+            .current_entry
         }
     };
     serde_json::to_value(result).map_err(|error| error.to_string())

@@ -30,7 +30,7 @@ pub struct TaskOccurrenceDto {
     pub version: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecurrenceSaveRequest {
     pub task_id: String,
@@ -41,7 +41,7 @@ pub struct RecurrenceSaveRequest {
     pub rule_expected_version: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecurrenceCloseRequest {
     pub task_id: String,
@@ -724,11 +724,22 @@ pub fn task_recurrence_save(
     database: tauri::State<'_, Database>,
     request: RecurrenceSaveRequest,
 ) -> Result<RecurrenceRuleDto, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = save_rule_with_cloud_operation(&database, request, Some(&state))?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Planning,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = save_rule_with_cloud_operation(database, request, Some(&state))?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| {
+            crate::supabase::direct_cloud_recurrence_save_for_command(database, direct_request)
+        },
+    )
 }
 
 #[tauri::command]
@@ -736,10 +747,21 @@ pub fn task_recurrence_close(
     database: tauri::State<'_, Database>,
     request: RecurrenceCloseRequest,
 ) -> Result<(), String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    close_rule_with_cloud_operation(&database, request, Some(&state))?;
-    crate::cloud_sync::flush_if_online(&database)
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Planning,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            close_rule_with_cloud_operation(database, request, Some(&state))?;
+            crate::cloud_sync::flush_if_online(database)
+        },
+        |database| {
+            crate::supabase::direct_cloud_recurrence_close_for_command(database, direct_request)
+        },
+    )
 }
 
 #[cfg(test)]

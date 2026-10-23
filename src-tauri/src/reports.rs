@@ -41,7 +41,7 @@ pub struct ReportListResult {
     pub revision: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReportTypeCountsDto {
     pub all: i64,
@@ -3328,21 +3328,56 @@ pub fn report_list(
     database: tauri::State<'_, Database>,
     request: ReportListRequest,
 ) -> Result<ReportListResult, String> {
-    list_reports(&database, request)
+    let direct_request = ReportListRequest {
+        report_type: request.report_type.clone(),
+        subject_id: request.subject_id.clone(),
+        query: request.query.clone(),
+        page: request.page,
+        page_size: request.page_size,
+    };
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Query,
+        |database| list_reports(database, request),
+        |database| direct_report_list_for_command(database, direct_request),
+    )
 }
 #[tauri::command]
 pub fn report_task_suggestions(
     database: tauri::State<'_, Database>,
     request: ReportTaskSuggestionRequest,
 ) -> Result<Vec<ReportTaskSuggestionDto>, String> {
-    suggest_report_tasks(&database, request)
+    let direct_request = ReportTaskSuggestionRequest {
+        report_type: request.report_type.clone(),
+        reference_date: request.reference_date.clone(),
+        subject_id: request.subject_id.clone(),
+        include_task_ids: request.include_task_ids.clone(),
+    };
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Query,
+        |database| suggest_report_tasks(database, request),
+        |database| direct_report_task_suggestions_for_command(database, direct_request),
+    )
 }
 #[tauri::command]
 pub fn report_work_period_preview(
     database: tauri::State<'_, Database>,
     request: ReportWorkPeriodPreviewRequest,
 ) -> Result<String, String> {
-    preview_report_work_period(&database, request)
+    let direct_request = ReportWorkPeriodPreviewRequest {
+        subject_id: request.subject_id.clone(),
+        reference_date: request.reference_date.clone(),
+    };
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Query,
+        |database| preview_report_work_period(database, request),
+        |database| direct_report_work_period_preview_for_command(database, direct_request),
+    )
 }
 
 #[tauri::command]
@@ -3350,7 +3385,19 @@ pub fn report_preview(
     database: tauri::State<'_, Database>,
     request: ReportPreviewRequest,
 ) -> Result<String, String> {
-    preview_report(&database, request)
+    let direct_request = ReportPreviewRequest {
+        report_type: request.report_type.clone(),
+        reference_date: request.reference_date.clone(),
+        subject_id: request.subject_id.clone(),
+        template_id: request.template_id.clone(),
+    };
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Query,
+        |database| preview_report(database, request),
+        |database| direct_report_preview_for_command(database, direct_request),
+    )
 }
 
 pub fn preview_report(
@@ -3391,208 +3438,1036 @@ pub fn preview_report(
     Ok(markdown)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectReportRecord {
+    id: String,
+    report_type: String,
+    subject_id: String,
+    subject_name: String,
+    period_start: String,
+    period_end: String,
+    reference_date: String,
+    #[serde(default)]
+    task_ids: Vec<String>,
+    template_id: Option<String>,
+    template_name: Option<String>,
+    #[serde(default)]
+    template_archived: bool,
+    markdown: String,
+    content_source: String,
+    generated_count: i64,
+    updated_at: i64,
+    version: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectReportCursor {
+    updated_at: String,
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectReportTemplateRecord {
+    id: String,
+    report_type: String,
+    name: String,
+    description: Option<String>,
+    content: String,
+    is_default: bool,
+    is_builtin: bool,
+    sort_order: i64,
+    #[serde(default)]
+    deleted_at: Option<i64>,
+    version: i64,
+}
+
+pub(crate) fn direct_report_from_value(value: serde_json::Value) -> Result<ReportDto, String> {
+    let record: DirectReportRecord = serde_json::from_value(value)
+        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 报告响应无效: {error}"))?;
+    Ok(ReportDto {
+        period: period_label(&record.period_start, &record.period_end),
+        id: record.id,
+        report_type: record.report_type,
+        subject_id: record.subject_id,
+        subject_name: record.subject_name,
+        period_start: record.period_start,
+        period_end: record.period_end,
+        reference_date: record.reference_date,
+        task_ids: record.task_ids,
+        template_id: record.template_id,
+        template_name: record.template_name,
+        template_archived: record.template_archived,
+        markdown: record.markdown,
+        content_source: record.content_source,
+        generated_count: record.generated_count,
+        updated_at: record.updated_at,
+        version: record.version,
+    })
+}
+
+fn direct_template_from_value(value: serde_json::Value) -> Result<ReportTemplateDto, String> {
+    let record: DirectReportTemplateRecord = serde_json::from_value(value)
+        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 报告模板响应无效: {error}"))?;
+    Ok(ReportTemplateDto {
+        id: record.id,
+        report_type: record.report_type,
+        name: record.name,
+        description: record.description,
+        content: record.content,
+        is_default: record.is_default,
+        is_builtin: record.is_builtin,
+        sort_order: record.sort_order,
+        deleted_at: record.deleted_at,
+        version: record.version,
+    })
+}
+
+fn direct_report_mutation(
+    database: &Database,
+    function: &str,
+    operation_id: String,
+    payload: serde_json::Value,
+) -> Result<ReportDto, String> {
+    let data = match function {
+        "direct_cloud_report_create" => {
+            crate::supabase::direct_cloud_report_create_mutation(database, operation_id, payload)?
+        }
+        "direct_cloud_report_scope_update" => {
+            crate::supabase::direct_cloud_report_scope_update_mutation(
+                database,
+                operation_id,
+                payload,
+            )?
+        }
+        "direct_cloud_report_content_save" => {
+            crate::supabase::direct_cloud_report_content_save_mutation(
+                database,
+                operation_id,
+                payload,
+            )?
+        }
+        "direct_cloud_report_regenerate" => {
+            crate::supabase::direct_cloud_report_regenerate_mutation(
+                database,
+                operation_id,
+                payload,
+            )?
+        }
+        "direct_cloud_report_delete" => {
+            crate::supabase::direct_cloud_report_delete_mutation(database, operation_id, payload)?
+        }
+        _ => return Err(format!("CLOUD_REQUEST_INVALID: 未知报告操作 {function}")),
+    };
+    direct_report_from_value(
+        data.get("report")
+            .cloned()
+            .ok_or_else(|| "CLOUD_RESPONSE_INVALID: 报告响应缺少 report".to_string())?,
+    )
+}
+
+pub(crate) fn direct_report_list_for_command(
+    database: &Database,
+    request: ReportListRequest,
+) -> Result<ReportListResult, String> {
+    let page = request.page.unwrap_or(1).max(1);
+    let page_size = request.page_size.unwrap_or(20).clamp(1, 100);
+    if let Some(report_type) = request.report_type.as_deref() {
+        if report_type != "all" {
+            validate_report_type(report_type)?;
+        }
+    }
+    let mut cursor: Option<DirectReportCursor> = None;
+    let mut final_response = None;
+    let mut beyond_end = false;
+    for current_page in 1..=page {
+        let report_type = request.report_type.clone().filter(|value| value != "all");
+        let response = crate::supabase::direct_cloud_report_list(
+            database,
+            crate::supabase::DirectCloudReportListQuery {
+                report_type,
+                subject_id: request.subject_id.clone(),
+                query: request.query.clone(),
+                cursor_updated_at: cursor.as_ref().map(|item| item.updated_at.clone()),
+                cursor_id: cursor.as_ref().map(|item| item.id.clone()),
+                limit: Some(page_size),
+            },
+        )?;
+        let has_more = response.data.has_more;
+        cursor = response
+            .data
+            .next_cursor
+            .clone()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 报告游标无效: {error}"))?;
+        if current_page < page && (!has_more || cursor.is_none()) {
+            beyond_end = true;
+        }
+        final_response = Some(response);
+        if beyond_end || current_page == page {
+            break;
+        }
+    }
+    let response =
+        final_response.ok_or_else(|| "CLOUD_RESPONSE_INVALID: 报告列表响应为空".to_string())?;
+    let reports = if beyond_end {
+        Vec::new()
+    } else {
+        response
+            .data
+            .reports
+            .into_iter()
+            .map(direct_report_from_value)
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(ReportListResult {
+        reports,
+        page,
+        page_size,
+        total: response
+            .data
+            .type_counts
+            .get("all")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0),
+        has_more: !beyond_end && response.data.has_more,
+        type_counts: serde_json::from_value(response.data.type_counts)
+            .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 报告计数无效: {error}"))?,
+        revision: response.metadata.change_seq,
+    })
+}
+
+fn direct_report_task_suggestions_for_command(
+    database: &Database,
+    request: ReportTaskSuggestionRequest,
+) -> Result<Vec<ReportTaskSuggestionDto>, String> {
+    validate_report_type(&request.report_type)?;
+    let response = crate::supabase::direct_cloud_task_list(
+        database,
+        crate::supabase::DirectCloudTaskQuery {
+            subject_id: Some(request.subject_id),
+            include_completed: Some(true),
+            planned_date: (request.report_type == "daily").then_some(request.reference_date),
+            query: None,
+        },
+    )?;
+    Ok(response
+        .data
+        .tasks
+        .into_iter()
+        .map(|task| {
+            let is_selectable = task.status == "open"
+                || task.completed_at.is_some()
+                || task.total_minutes > 0
+                || request.include_task_ids.contains(&task.id);
+            ReportTaskSuggestionDto {
+                actual_minutes: task.total_minutes,
+                default_selected: is_selectable && task.total_minutes > 0,
+                daily_estimate_minutes: task.today_estimate_minutes,
+                estimate_minutes: task.estimate_minutes,
+                parent_id: task.parent_id,
+                period_status: if is_selectable { "active" } else { "context" }.to_string(),
+                sort_order: task.sort_order,
+                status: task.status,
+                task_id: task.id,
+                title: task.title,
+                candidate_role: if is_selectable {
+                    "selectable"
+                } else {
+                    "context"
+                }
+                .to_string(),
+            }
+        })
+        .collect())
+}
+
+fn direct_report_work_period_preview_for_command(
+    database: &Database,
+    request: ReportWorkPeriodPreviewRequest,
+) -> Result<String, String> {
+    let date = NaiveDate::parse_from_str(&request.reference_date, "%Y-%m-%d")
+        .map_err(|_| "VALIDATION_ERROR: 报告日期格式无效".to_string())?;
+    let weekday = date.weekday().num_days_from_monday() as i64;
+    let response = crate::supabase::direct_cloud_shared_configuration(database)?;
+    let subject = response
+        .data
+        .subject_work_schedules
+        .iter()
+        .find(|value| value["subjectId"] == request.subject_id)
+        .ok_or_else(|| "NOT_FOUND: 主体工作时段不存在".to_string())?;
+    let day = subject["days"]
+        .as_array()
+        .and_then(|days| {
+            days.iter()
+                .find(|day| day["weekday"].as_i64() == Some(weekday))
+        })
+        .ok_or_else(|| "CACHE_ERROR: 主体工作时段不完整".to_string())?;
+    if day["enabled"].as_bool() != Some(true) {
+        return Ok("休息".to_string());
+    }
+    Ok(day["segments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|segment| {
+            Some(format!(
+                "{}-{}",
+                segment["start"].as_str()?,
+                segment["end"].as_str()?
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
+fn direct_report_preview_for_command(
+    database: &Database,
+    request: ReportPreviewRequest,
+) -> Result<String, String> {
+    Ok(crate::supabase::direct_cloud_report_preview(
+        database,
+        crate::supabase::DirectCloudReportPreviewQuery {
+            report_type: request.report_type,
+            reference_date: request.reference_date,
+            subject_id: request.subject_id,
+            template_id: request.template_id,
+        },
+    )?
+    .data
+    .markdown)
+}
+
+pub(crate) fn direct_report_create_for_command(
+    database: &Database,
+    request: ReportCreateRequest,
+) -> Result<ReportDto, String> {
+    direct_report_mutation(
+        database,
+        "direct_cloud_report_create",
+        request.client_request_id,
+        serde_json::json!({
+            "reportType": request.report_type,
+            "referenceDate": request.reference_date,
+            "subjectId": request.subject_id,
+            "taskIds": request.task_ids,
+            "templateId": request.template_id,
+        }),
+    )
+}
+
+fn direct_report_scope_update_for_command(
+    database: &Database,
+    request: ReportScopeUpdateRequest,
+) -> Result<ReportDto, String> {
+    direct_report_mutation(
+        database,
+        "direct_cloud_report_scope_update",
+        Uuid::now_v7().to_string(),
+        serde_json::json!({
+            "reportId": request.report_id,
+            "expectedVersion": request.expected_version,
+            "reportType": request.report_type,
+            "referenceDate": request.reference_date,
+            "subjectId": request.subject_id,
+            "taskIds": request.task_ids,
+            "templateId": request.template_id,
+        }),
+    )
+}
+
+pub(crate) fn direct_report_content_save_for_command(
+    database: &Database,
+    request: ReportContentSaveRequest,
+) -> Result<ReportDto, String> {
+    direct_report_mutation(
+        database,
+        "direct_cloud_report_content_save",
+        Uuid::now_v7().to_string(),
+        serde_json::json!({
+            "reportId": request.report_id,
+            "expectedVersion": request.expected_version,
+            "markdown": request.markdown,
+        }),
+    )
+}
+
+fn direct_report_regenerate_for_command(
+    database: &Database,
+    request: ReportVersionRequest,
+) -> Result<ReportDto, String> {
+    direct_report_mutation(
+        database,
+        "direct_cloud_report_regenerate",
+        Uuid::now_v7().to_string(),
+        serde_json::json!({
+            "reportId": request.report_id,
+            "expectedVersion": request.expected_version,
+        }),
+    )
+}
+
+fn direct_report_delete_for_command(
+    database: &Database,
+    request: ReportVersionRequest,
+) -> Result<(), String> {
+    direct_report_mutation(
+        database,
+        "direct_cloud_report_delete",
+        Uuid::now_v7().to_string(),
+        serde_json::json!({
+            "reportId": request.report_id,
+            "expectedVersion": request.expected_version,
+        }),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn direct_template_list_for_command(
+    database: &Database,
+    report_type: Option<String>,
+) -> Result<Vec<ReportTemplateDto>, String> {
+    crate::supabase::direct_cloud_report_templates(database, report_type)?
+        .data
+        .templates
+        .into_iter()
+        .map(direct_template_from_value)
+        .collect()
+}
+
+fn direct_template_get_for_command(
+    database: &Database,
+    request: ReportTemplateGetRequest,
+) -> Result<ReportTemplateDto, String> {
+    validate_report_type(&request.report_type)?;
+    direct_template_list_for_command(database, Some(request.report_type))?
+        .into_iter()
+        .find(|template| template.is_default)
+        .ok_or_else(|| "NOT_FOUND: 报告模板不存在".to_string())
+}
+
+fn direct_template_get_by_id_for_command(
+    database: &Database,
+    request: ReportTemplateIdRequest,
+) -> Result<ReportTemplateDto, String> {
+    direct_template_list_for_command(database, None)?
+        .into_iter()
+        .find(|template| template.id == request.template_id)
+        .ok_or_else(|| "NOT_FOUND: 报告模板不存在".to_string())
+}
+
+fn direct_template_create_for_command(
+    database: &Database,
+    request: ReportTemplateCreateRequest,
+) -> Result<ReportTemplateDto, String> {
+    validate_report_type(&request.report_type)?;
+    let name = validate_template_name(&request.name)?;
+    validate_template(&request.report_type, &request.content)?;
+    let data = crate::supabase::direct_cloud_report_template_create_mutation(
+        database,
+        Uuid::now_v7().to_string(),
+        serde_json::json!({
+            "reportType": request.report_type,
+            "name": name,
+            "description": request.description,
+            "content": request.content,
+        }),
+    )?;
+    direct_template_from_value(
+        data.get("template")
+            .cloned()
+            .ok_or_else(|| "CLOUD_RESPONSE_INVALID: 模板响应缺少 template".to_string())?,
+    )
+}
+
+fn direct_template_update_for_command(
+    database: &Database,
+    request: ReportTemplateUpdateRequest,
+) -> Result<ReportTemplateDto, String> {
+    let name = validate_template_name(&request.name)?;
+    let data = crate::supabase::direct_cloud_report_template_update_mutation(
+        database,
+        Uuid::now_v7().to_string(),
+        serde_json::json!({
+            "templateId": request.template_id,
+            "expectedVersion": request.expected_version,
+            "name": name,
+            "description": request.description,
+            "content": request.content,
+            "sortOrder": request.sort_order,
+        }),
+    )?;
+    direct_template_from_value(
+        data.get("template")
+            .cloned()
+            .ok_or_else(|| "CLOUD_RESPONSE_INVALID: 模板响应缺少 template".to_string())?,
+    )
+}
+
+fn direct_template_duplicate_for_command(
+    database: &Database,
+    request: ReportTemplateDuplicateRequest,
+) -> Result<ReportTemplateDto, String> {
+    let data = crate::supabase::direct_cloud_report_template_duplicate_mutation(
+        database,
+        Uuid::now_v7().to_string(),
+        serde_json::json!({
+            "templateId": request.template_id,
+            "name": request.name,
+            "description": request.description,
+        }),
+    )?;
+    direct_template_from_value(
+        data.get("template")
+            .cloned()
+            .ok_or_else(|| "CLOUD_RESPONSE_INVALID: 模板响应缺少 template".to_string())?,
+    )
+}
+
+pub(crate) fn direct_template_set_default_for_command(
+    database: &Database,
+    request: ReportTemplateSetDefaultRequest,
+) -> Result<ReportTemplateDto, String> {
+    let data = crate::supabase::direct_cloud_report_template_set_default_mutation(
+        database,
+        Uuid::now_v7().to_string(),
+        serde_json::json!({
+            "templateId": request.template_id,
+            "expectedVersion": request.expected_version,
+        }),
+    )?;
+    direct_template_from_value(
+        data.get("template")
+            .cloned()
+            .ok_or_else(|| "CLOUD_RESPONSE_INVALID: 模板响应缺少 template".to_string())?,
+    )
+}
+
+fn direct_template_reorder_for_command(
+    database: &Database,
+    request: ReportTemplateReorderRequest,
+) -> Result<Vec<ReportTemplateDto>, String> {
+    validate_report_type(&request.report_type)?;
+    let current = direct_template_list_for_command(database, Some(request.report_type.clone()))?;
+    let current_ids = current
+        .iter()
+        .map(|template| template.id.as_str())
+        .collect::<HashSet<_>>();
+    let request_ids = request
+        .template_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if current_ids != request_ids {
+        return Err("VALIDATION_ERROR: 模板排序列表不完整".to_string());
+    }
+    let items = request
+        .template_ids
+        .iter()
+        .map(|id| {
+            let version = current
+                .iter()
+                .find(|template| template.id == *id)
+                .map(|template| template.version)
+                .ok_or_else(|| "VALIDATION_ERROR: 模板排序列表不完整".to_string())?;
+            Ok(serde_json::json!({
+                "templateId": id,
+                "expectedVersion": version,
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let data = crate::supabase::direct_cloud_report_template_reorder_mutation(
+        database,
+        Uuid::now_v7().to_string(),
+        serde_json::json!({
+            "reportType": request.report_type,
+            "items": items,
+        }),
+    )?;
+    data.get("templates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "CLOUD_RESPONSE_INVALID: 模板排序响应缺少 templates".to_string())?
+        .iter()
+        .cloned()
+        .map(direct_template_from_value)
+        .collect()
+}
+
+fn direct_template_delete_for_command(
+    database: &Database,
+    request: ReportTemplateDeleteRequest,
+) -> Result<(), String> {
+    crate::supabase::direct_cloud_report_template_delete_mutation(
+        database,
+        Uuid::now_v7().to_string(),
+        serde_json::json!({
+            "templateId": request.template_id,
+            "expectedVersion": request.expected_version,
+            "replacementTemplateId": request.replacement_template_id,
+        }),
+    )?;
+    Ok(())
+}
+
+fn direct_template_save_for_command(
+    database: &Database,
+    request: ReportTemplateSaveRequest,
+) -> Result<ReportTemplateDto, String> {
+    validate_report_type(&request.report_type)?;
+    validate_template(&request.report_type, &request.content)?;
+    let templates = direct_template_list_for_command(database, Some(request.report_type.clone()))?;
+    if let Some(template) = templates.into_iter().find(|template| template.is_default) {
+        let expected_version = request.expected_version.unwrap_or(template.version);
+        return direct_template_update_for_command(
+            database,
+            ReportTemplateUpdateRequest {
+                template_id: template.id,
+                name: template.name,
+                description: template.description,
+                content: request.content,
+                sort_order: template.sort_order,
+                expected_version,
+            },
+        );
+    }
+    let created = direct_template_create_for_command(
+        database,
+        ReportTemplateCreateRequest {
+            report_type: request.report_type.clone(),
+            name: format!("标准{}", report_type_label(&request.report_type)),
+            description: None,
+            content: request.content,
+        },
+    )?;
+    direct_template_set_default_for_command(
+        database,
+        ReportTemplateSetDefaultRequest {
+            template_id: created.id,
+            expected_version: created.version,
+        },
+    )
+}
+
+fn direct_public_report_for_command(
+    database: &Database,
+    request: ReportVersionRequest,
+) -> Result<PublicReportDto, String> {
+    let report = crate::supabase::direct_cloud_report_detail(database, request.report_id)?;
+    let report = direct_report_from_value(report.data.report)?;
+    if report.version != request.expected_version {
+        return Err("VERSION_CONFLICT: 报告已变化".to_string());
+    }
+    Ok(PublicReportDto {
+        report_id: report.id,
+        markdown: report.markdown,
+    })
+}
+
 #[tauri::command]
 pub fn report_create(
     database: tauri::State<'_, Database>,
     request: ReportCreateRequest,
 ) -> Result<ReportDto, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let operation_id = request.client_request_id.clone();
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = create_report_with_cloud_operation(
+    let direct_request = ReportCreateRequest {
+        report_type: request.report_type.clone(),
+        reference_date: request.reference_date.clone(),
+        subject_id: request.subject_id.clone(),
+        task_ids: request.task_ids.clone(),
+        template_id: request.template_id.clone(),
+        client_request_id: request.client_request_id.clone(),
+    };
+    crate::storage_contract::route(
         &database,
-        request,
-        Some((&state, "report_create", Some(operation_id.as_str()))),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let operation_id = request.client_request_id.clone();
+            let state = crate::supabase::storage_mode(database)?;
+            let result = create_report_with_cloud_operation(
+                database,
+                request,
+                Some((&state, "report_create", Some(operation_id.as_str()))),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| direct_report_create_for_command(database, direct_request),
+    )
 }
 #[tauri::command]
 pub fn report_update_scope(
     database: tauri::State<'_, Database>,
     request: ReportScopeUpdateRequest,
 ) -> Result<ReportDto, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = update_report_scope_with_cloud_operation(
+    let direct_request = ReportScopeUpdateRequest {
+        report_id: request.report_id.clone(),
+        report_type: request.report_type.clone(),
+        reference_date: request.reference_date.clone(),
+        subject_id: request.subject_id.clone(),
+        task_ids: request.task_ids.clone(),
+        template_id: request.template_id.clone(),
+        expected_version: request.expected_version,
+    };
+    crate::storage_contract::route(
         &database,
-        request,
-        Some((&state, "report_update_scope")),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = update_report_scope_with_cloud_operation(
+                database,
+                request,
+                Some((&state, "report_update_scope")),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| direct_report_scope_update_for_command(database, direct_request),
+    )
 }
 #[tauri::command]
 pub fn report_save_content(
     database: tauri::State<'_, Database>,
     request: ReportContentSaveRequest,
 ) -> Result<ReportDto, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = save_report_content_with_cloud_operation(
+    let direct_request = ReportContentSaveRequest {
+        report_id: request.report_id.clone(),
+        markdown: request.markdown.clone(),
+        expected_version: request.expected_version,
+    };
+    crate::storage_contract::route(
         &database,
-        request,
-        Some((&state, "report_save_content")),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = save_report_content_with_cloud_operation(
+                database,
+                request,
+                Some((&state, "report_save_content")),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| direct_report_content_save_for_command(database, direct_request),
+    )
 }
 #[tauri::command]
 pub fn report_regenerate(
     database: tauri::State<'_, Database>,
     request: ReportVersionRequest,
 ) -> Result<ReportDto, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = regenerate_report_with_cloud_operation(
+    let direct_request = ReportVersionRequest {
+        report_id: request.report_id.clone(),
+        expected_version: request.expected_version,
+    };
+    crate::storage_contract::route(
         &database,
-        request,
-        Some((&state, "report_regenerate")),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = regenerate_report_with_cloud_operation(
+                database,
+                request,
+                Some((&state, "report_regenerate")),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| direct_report_regenerate_for_command(database, direct_request),
+    )
 }
 #[tauri::command]
 pub fn report_delete(
     database: tauri::State<'_, Database>,
     request: ReportVersionRequest,
 ) -> Result<(), String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    delete_report_with_cloud_operation(&database, request, Some((&state, "report_delete")))?;
-    crate::cloud_sync::flush_if_online(&database)
+    let direct_request = ReportVersionRequest {
+        report_id: request.report_id.clone(),
+        expected_version: request.expected_version,
+    };
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            delete_report_with_cloud_operation(database, request, Some((&state, "report_delete")))?;
+            crate::cloud_sync::flush_if_online(database)
+        },
+        |database| direct_report_delete_for_command(database, direct_request),
+    )
 }
 #[tauri::command]
 pub fn report_public_text(
     database: tauri::State<'_, Database>,
     request: ReportVersionRequest,
 ) -> Result<PublicReportDto, String> {
-    public_report(&database, request)
+    let direct_request = ReportVersionRequest {
+        report_id: request.report_id.clone(),
+        expected_version: request.expected_version,
+    };
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Query,
+        |database| public_report(database, request),
+        |database| direct_public_report_for_command(database, direct_request),
+    )
 }
 #[tauri::command]
 pub fn report_template_get(
     database: tauri::State<'_, Database>,
     request: ReportTemplateGetRequest,
 ) -> Result<ReportTemplateDto, String> {
-    get_template(&database, request)
+    let direct_request = ReportTemplateGetRequest {
+        report_type: request.report_type.clone(),
+        subject_id: request.subject_id.clone(),
+    };
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Query,
+        |database| get_template(database, request),
+        |database| direct_template_get_for_command(database, direct_request),
+    )
 }
 #[tauri::command]
 pub fn report_template_save(
     database: tauri::State<'_, Database>,
     request: ReportTemplateSaveRequest,
 ) -> Result<ReportTemplateDto, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = save_template_with_cloud_operation(
+    let direct_request = ReportTemplateSaveRequest {
+        report_type: request.report_type.clone(),
+        subject_id: request.subject_id.clone(),
+        content: request.content.clone(),
+        expected_version: request.expected_version,
+    };
+    crate::storage_contract::route(
         &database,
-        request,
-        Some((&state, "report_template_save")),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = save_template_with_cloud_operation(
+                database,
+                request,
+                Some((&state, "report_template_save")),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| direct_template_save_for_command(database, direct_request),
+    )
 }
 #[tauri::command]
 pub fn report_template_list(
     database: tauri::State<'_, Database>,
     request: ReportTemplateListRequest,
 ) -> Result<Vec<ReportTemplateDto>, String> {
-    list_templates(&database, request)
+    let direct_report_type = request.report_type.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Query,
+        |database| list_templates(database, request),
+        |database| direct_template_list_for_command(database, direct_report_type),
+    )
 }
 #[tauri::command]
 pub fn report_template_get_by_id(
     database: tauri::State<'_, Database>,
     request: ReportTemplateIdRequest,
 ) -> Result<ReportTemplateDto, String> {
-    get_template_by_id(&database, request)
+    let direct_request = ReportTemplateIdRequest {
+        template_id: request.template_id.clone(),
+    };
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Query,
+        |database| get_template_by_id(database, request),
+        |database| direct_template_get_by_id_for_command(database, direct_request),
+    )
 }
 #[tauri::command]
 pub fn report_template_create(
     database: tauri::State<'_, Database>,
     request: ReportTemplateCreateRequest,
 ) -> Result<ReportTemplateDto, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = create_template_with_cloud_operation(
+    let direct_request = ReportTemplateCreateRequest {
+        report_type: request.report_type.clone(),
+        name: request.name.clone(),
+        description: request.description.clone(),
+        content: request.content.clone(),
+    };
+    crate::storage_contract::route(
         &database,
-        request,
-        Some((&state, "report_template_create")),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = create_template_with_cloud_operation(
+                database,
+                request,
+                Some((&state, "report_template_create")),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| direct_template_create_for_command(database, direct_request),
+    )
 }
 #[tauri::command]
 pub fn report_template_update(
     database: tauri::State<'_, Database>,
     request: ReportTemplateUpdateRequest,
 ) -> Result<ReportTemplateDto, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = update_template_with_cloud_operation(
+    let direct_request = ReportTemplateUpdateRequest {
+        template_id: request.template_id.clone(),
+        name: request.name.clone(),
+        description: request.description.clone(),
+        content: request.content.clone(),
+        sort_order: request.sort_order,
+        expected_version: request.expected_version,
+    };
+    crate::storage_contract::route(
         &database,
-        request,
-        Some((&state, "report_template_update")),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = update_template_with_cloud_operation(
+                database,
+                request,
+                Some((&state, "report_template_update")),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| direct_template_update_for_command(database, direct_request),
+    )
 }
 #[tauri::command]
 pub fn report_template_duplicate(
     database: tauri::State<'_, Database>,
     request: ReportTemplateDuplicateRequest,
 ) -> Result<ReportTemplateDto, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = duplicate_template_with_cloud_operation(
+    let direct_request = ReportTemplateDuplicateRequest {
+        template_id: request.template_id.clone(),
+        name: request.name.clone(),
+        description: request.description.clone(),
+    };
+    crate::storage_contract::route(
         &database,
-        request,
-        Some((&state, "report_template_duplicate")),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = duplicate_template_with_cloud_operation(
+                database,
+                request,
+                Some((&state, "report_template_duplicate")),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| direct_template_duplicate_for_command(database, direct_request),
+    )
 }
 #[tauri::command]
 pub fn report_template_set_default(
     database: tauri::State<'_, Database>,
     request: ReportTemplateSetDefaultRequest,
 ) -> Result<ReportTemplateDto, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = set_default_template_with_cloud_operation(
+    let direct_request = ReportTemplateSetDefaultRequest {
+        template_id: request.template_id.clone(),
+        expected_version: request.expected_version,
+    };
+    crate::storage_contract::route(
         &database,
-        request,
-        Some((&state, "report_template_set_default")),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = set_default_template_with_cloud_operation(
+                database,
+                request,
+                Some((&state, "report_template_set_default")),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| direct_template_set_default_for_command(database, direct_request),
+    )
 }
 #[tauri::command]
 pub fn report_template_delete(
     database: tauri::State<'_, Database>,
     request: ReportTemplateDeleteRequest,
 ) -> Result<(), String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    delete_template_with_cloud_operation(
+    let direct_request = ReportTemplateDeleteRequest {
+        template_id: request.template_id.clone(),
+        replacement_template_id: request.replacement_template_id.clone(),
+        expected_version: request.expected_version,
+    };
+    crate::storage_contract::route(
         &database,
-        request,
-        Some((&state, "report_template_delete")),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            delete_template_with_cloud_operation(
+                database,
+                request,
+                Some((&state, "report_template_delete")),
+            )?;
+            crate::cloud_sync::flush_if_online(database)
+        },
+        |database| direct_template_delete_for_command(database, direct_request),
+    )
 }
 #[tauri::command]
 pub fn report_template_reorder(
     database: tauri::State<'_, Database>,
     request: ReportTemplateReorderRequest,
 ) -> Result<Vec<ReportTemplateDto>, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = reorder_templates_with_cloud_operation(
+    let direct_request = ReportTemplateReorderRequest {
+        report_type: request.report_type.clone(),
+        template_ids: request.template_ids.clone(),
+    };
+    crate::storage_contract::route(
         &database,
-        request,
-        Some((&state, "report_template_reorder")),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+        crate::storage_contract::BusinessDomain::Reports,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = reorder_templates_with_cloud_operation(
+                database,
+                request,
+                Some((&state, "report_template_reorder")),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| direct_template_reorder_for_command(database, direct_request),
+    )
 }
 #[tauri::command]
 pub fn report_template_placeholders(

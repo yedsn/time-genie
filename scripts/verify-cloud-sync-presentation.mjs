@@ -39,6 +39,36 @@ assert.equal(cloudSaveStatusLabel({ ...cloud, online: false }), "云端连接不
 assert.equal(cloudSaveStatusLabel(cloud), "所有更改均已保存");
 assert.equal(cloudSaveStatusLabel({ ...cloud, syncing: true }), "所有更改均已保存");
 assert.equal(cloudSaveStatusLabel({ ...cloud, syncing: true, pendingOperations: 3 }), "还有 3 项待保存");
+assert.equal(cloudSaveStatusLabel({ ...cloud, storageProtocol: "direct_v2", cloudAccessState: "connecting", cloudWritable: false }), "正在连接云端");
+assert.equal(cloudSaveStatusLabel({ ...cloud, storageProtocol: "direct_v2", cloudAccessState: "online_writable", cloudWritable: true }), "已直接保存到云端");
+assert.equal(cloudSaveStatusLabel({ ...cloud, storageProtocol: "direct_v2", cloudAccessState: "offline_readonly", cloudWritable: false }), "云端只读");
+assert.equal(cloudSaveStatusLabel({ ...cloud, storageProtocol: "direct_v2", cloudAccessState: "reauth_required", cloudWritable: false }), "需要重新登录");
+
+const directOnline = cloudSyncPresentation({
+  ...cloud, storageProtocol: "direct_v2", cloudAccessState: "online_writable", cloudWritable: true, lastSyncedAt: 4321,
+}, formatSyncTime);
+assert.equal(directOnline.label, "云端在线");
+assert.match(directOnline.detail, /最近刷新 time:4321/);
+assert.equal(directOnline.needsAttention, false);
+
+const directConnecting = cloudSyncPresentation({
+  ...cloud, storageProtocol: "direct_v2", cloudAccessState: "connecting", cloudWritable: false,
+}, formatSyncTime);
+assert.equal(directConnecting.label, "正在连接云端");
+assert.equal(directConnecting.needsAttention, false);
+
+const directOffline = cloudSyncPresentation({
+  ...cloud, storageProtocol: "direct_v2", cloudAccessState: "offline_readonly", cloudWritable: false, readOnlyReason: "网络不可达",
+}, formatSyncTime);
+assert.equal(directOffline.label, "云端只读");
+assert.equal(directOffline.detail, "网络不可达");
+assert.equal(directOffline.attentionLevel, "offline");
+
+const directReauth = cloudSyncPresentation({
+  ...cloud, storageProtocol: "direct_v2", cloudAccessState: "reauth_required", cloudWritable: false, readOnlyReason: "设备授权已撤销",
+}, formatSyncTime);
+assert.equal(directReauth.label, "需要重新登录");
+assert.equal(directReauth.attentionLevel, "critical");
 
 const syncing = cloudSyncPresentation({ ...cloud, syncing: true, pendingOperations: 3 }, formatSyncTime);
 assert.equal(syncing.label, "还有 3 项待保存");

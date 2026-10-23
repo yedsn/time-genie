@@ -340,12 +340,85 @@ fn now_millis() -> i64 {
         .as_millis() as i64
 }
 
+fn direct_schedule_from_value(
+    value: &serde_json::Value,
+) -> Result<Vec<WorkScheduleDayDto>, String> {
+    let days = value
+        .get("days")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "CLOUD_RESPONSE_INVALID: 主体工作时段响应缺少 days".to_string())?;
+    let mut parsed = days
+        .iter()
+        .cloned()
+        .map(serde_json::from_value::<WorkScheduleDayDto>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 主体工作时段响应无效: {error}"))?;
+    parsed.sort_by_key(|day| day.weekday);
+    if parsed.len() != 7 {
+        return Err("CACHE_ERROR: 主体工作时段不完整".to_string());
+    }
+    Ok(parsed)
+}
+
+pub(crate) fn direct_schedule_get_for_command(
+    database: &Database,
+    subject_id: &str,
+) -> Result<Vec<WorkScheduleDayDto>, String> {
+    let response = crate::supabase::direct_cloud_shared_configuration(database)?;
+    let schedule = response
+        .data
+        .subject_work_schedules
+        .iter()
+        .find(|item| item["subjectId"] == subject_id)
+        .ok_or_else(|| "NOT_FOUND: 主体工作时段不存在".to_string())?;
+    direct_schedule_from_value(schedule)
+}
+
+pub(crate) fn direct_schedule_save_for_command(
+    database: &Database,
+    request: WorkScheduleSaveRequest,
+) -> Result<Vec<WorkScheduleDayDto>, String> {
+    validate_days(&request.days)?;
+    let days = request
+        .days
+        .iter()
+        .map(|day| {
+            serde_json::json!({
+                "id": day.id,
+                "weekday": day.weekday,
+                "enabled": day.enabled,
+                "segments": day.segments,
+                "expectedVersion": day.version,
+            })
+        })
+        .collect::<Vec<_>>();
+    let data = crate::supabase::direct_cloud_subject_schedule_save_mutation(
+        database,
+        Uuid::now_v7().to_string(),
+        serde_json::json!({
+            "subjectId": request.subject_id,
+            "days": days,
+        }),
+    )?;
+    let schedule = data
+        .get("schedule")
+        .ok_or_else(|| "CLOUD_RESPONSE_INVALID: 主体工作时段响应缺少 schedule".to_string())?;
+    direct_schedule_from_value(schedule)
+}
+
 #[tauri::command]
 pub fn subject_work_schedule_get(
     database: tauri::State<'_, Database>,
     request: WorkScheduleGetRequest,
 ) -> Result<Vec<WorkScheduleDayDto>, String> {
-    get_schedule(&database, &request.subject_id)
+    let direct_subject_id = request.subject_id.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::SharedSettingsIntegrations,
+        crate::storage_contract::StorageOperation::Query,
+        |database| get_schedule(database, &request.subject_id),
+        |database| direct_schedule_get_for_command(database, &direct_subject_id),
+    )
 }
 
 #[tauri::command]
@@ -353,11 +426,23 @@ pub fn subject_work_schedule_save(
     database: tauri::State<'_, Database>,
     request: WorkScheduleSaveRequest,
 ) -> Result<Vec<WorkScheduleDayDto>, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = save_schedule_with_cloud_operations(&database, request, Some(&state))?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+    let direct_request = WorkScheduleSaveRequest {
+        subject_id: request.subject_id.clone(),
+        days: request.days.clone(),
+    };
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::SharedSettingsIntegrations,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = save_schedule_with_cloud_operations(database, request, Some(&state))?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| direct_schedule_save_for_command(database, direct_request),
+    )
 }
 
 #[cfg(test)]
@@ -460,6 +545,12 @@ mod tests {
         drop(connection);
         let state = crate::supabase::StorageModeSnapshot {
             mode: "cloud".to_string(),
+            storage_protocol: crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string(),
+            configured_cloud_protocol: crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string(),
+            storage_backend: "legacy_sync_sqlite".to_string(),
+            cloud_access_state: "legacy_sync_offline".to_string(),
+            cloud_writable: true,
+            read_only_reason: None,
             workspace_id,
             device_id,
             online: false,

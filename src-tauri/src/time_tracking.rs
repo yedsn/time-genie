@@ -42,7 +42,7 @@ pub struct TimeEntryDto {
     pub allocations: Vec<TimeAllocationDto>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TimeEntryListResult {
     pub entries: Vec<TimeEntryDto>,
@@ -55,7 +55,7 @@ pub struct TimeEntryListResult {
 
 pub const TIME_ENTRY_HISTORY_DAYS_PER_PAGE: i64 = 7;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TimeEntryHistoryRequest {
     pub page: i64,
@@ -63,7 +63,7 @@ pub struct TimeEntryHistoryRequest {
     pub include_breaks: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TimeEntryHistoryDayDto {
     pub work_date: String,
@@ -78,7 +78,7 @@ pub struct TimeEntryHistoryDayDto {
     pub adjustments: Vec<crate::actual_time_adjustments::ActualTimeAdjustmentDto>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TimeEntryHistoryResult {
     pub page: i64,
@@ -100,7 +100,7 @@ pub struct TimerStopResultDto {
 
 const CONTINUITY_GRACE_MILLIS: i64 = 90_000;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TimerStartRequest {
     pub task_id: Option<String>,
@@ -108,14 +108,14 @@ pub struct TimerStartRequest {
     pub client_request_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TimerVersionRequest {
     pub entry_id: String,
     pub expected_version: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TimerResumeRequest {
     pub entry_id: String,
@@ -123,7 +123,7 @@ pub struct TimerResumeRequest {
     pub operation_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TimerStopRequest {
     pub entry_id: String,
@@ -131,7 +131,7 @@ pub struct TimerStopRequest {
     pub create_default_allocation: bool,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TimerTransitionNewTaskRequest {
     pub subject_id: String,
@@ -142,7 +142,7 @@ pub struct TimerTransitionNewTaskRequest {
     pub day_instance_date: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TimerTransitionRequest {
     pub client_request_id: String,
@@ -165,7 +165,37 @@ pub struct TimerTransitionResultDto {
     pub no_op: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TimerRecoveryRequest {
+    pub entry_id: String,
+    pub expected_version: i64,
+    pub client_request_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TimerTakeoverRequest {
+    pub entry_id: String,
+    pub expected_version: i64,
+    pub lease_token: String,
+    pub client_request_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TimerRecoveryResultDto {
+    pub active_entry: TimeEntryDto,
+    pub slices: Vec<TimeEntryDto>,
+    pub recovered: bool,
+    pub calendar_rollover: bool,
+    pub continuity_interrupted: bool,
+    pub created_slice_count: i64,
+    pub observed_at: i64,
+    pub no_op: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TimeEntryListRequest {
     pub work_date: String,
@@ -176,7 +206,7 @@ fn default_include_breaks() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ManualEntryRequest {
     pub task_id: Option<String>,
@@ -191,7 +221,7 @@ pub struct ManualEntryRequest {
     pub client_request_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TimeEntryUpdateRequest {
     pub entry_id: String,
@@ -201,7 +231,7 @@ pub struct TimeEntryUpdateRequest {
     pub expected_version: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TimeEntryDispositionRequest {
     pub entry_id: String,
@@ -209,7 +239,7 @@ pub struct TimeEntryDispositionRequest {
     pub disposition: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AllocationReplaceRequest {
     pub entry_id: String,
@@ -217,7 +247,7 @@ pub struct AllocationReplaceRequest {
     pub expected_version: i64,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AllocationInput {
     pub task_id: String,
@@ -2870,11 +2900,175 @@ fn map_active_timer_error(error: rusqlite::Error) -> String {
     }
 }
 
+fn local_timer_recovery(
+    database: &Database,
+    request: TimerRecoveryRequest,
+) -> Result<TimerRecoveryResultDto, String> {
+    let before = get_time_entry_by_id(database, &request.entry_id)?;
+    if before.version != request.expected_version {
+        return Err("VERSION_CONFLICT: 计时版本已变化，请重新加载".to_string());
+    }
+    if before.state != "running" && before.state != "paused" {
+        return Err("VERSION_CONFLICT: 计时已经结束，请重新加载".to_string());
+    }
+    let connection = database.open()?;
+    let workspace = workspace_id(&connection)?;
+    let chain_id = before
+        .timer_chain_id
+        .clone()
+        .unwrap_or_else(|| before.id.clone());
+    let before_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM time_entries
+             WHERE workspace_id=?1 AND COALESCE(timer_chain_id,id)=?2 AND deleted_at IS NULL",
+            params![workspace, chain_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    drop(connection);
+
+    let observed_at = now_millis();
+    coordinate_active_timer(database, observed_at)?;
+    let connection = database.open()?;
+    let active_id: Option<String> = connection
+        .query_row(
+            "SELECT id FROM time_entries
+             WHERE workspace_id=?1 AND state IN ('running','paused') AND deleted_at IS NULL
+             LIMIT 1",
+            [&workspace],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let active_id =
+        active_id.ok_or_else(|| "VALIDATION_ERROR: 计时恢复后找不到活动计时".to_string())?;
+    let active_entry = load_entry(&connection, &active_id, observed_at)?;
+    let chain_result = timer_chain_result_from_connection(&connection, active_entry.clone())?;
+    let after_count = chain_result.slices.len() as i64;
+    let recovered = active_entry.id != before.id || active_entry.version != before.version;
+    let calendar_rollover = active_entry.work_date != before.work_date;
+    Ok(TimerRecoveryResultDto {
+        active_entry,
+        slices: chain_result.slices,
+        recovered,
+        calendar_rollover,
+        continuity_interrupted: recovered && !calendar_rollover,
+        created_slice_count: (after_count - before_count).max(0),
+        observed_at,
+        no_op: !recovered,
+    })
+}
+
 #[tauri::command]
 pub fn timer_get_state(
     database: tauri::State<'_, Database>,
 ) -> Result<Option<TimeEntryDto>, String> {
-    get_timer_state(&database)
+    timer_state_for_storage(&database)
+}
+
+pub fn timer_state_for_storage(database: &Database) -> Result<Option<TimeEntryDto>, String> {
+    crate::storage_contract::route(
+        database,
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Query,
+        get_timer_state,
+        crate::supabase::direct_cloud_active_timer,
+    )
+}
+
+pub(crate) fn timer_start_for_storage(
+    database: &Database,
+    request: TimerStartRequest,
+) -> Result<TimeEntryDto, String> {
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        database,
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let operation_id = request.client_request_id.clone();
+            let state = crate::supabase::storage_mode(database)?;
+            let result = start_timer_with_hooks_and_cloud_operation(
+                database,
+                request,
+                Some((&state, "timer_start", Some(operation_id.as_str()))),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| crate::supabase::direct_cloud_timer_start(database, direct_request),
+    )
+}
+
+pub(crate) fn timer_pause_for_storage(
+    database: &Database,
+    request: TimerVersionRequest,
+) -> Result<TimeEntryDto, String> {
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        database,
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result =
+                pause_timer_with_cloud_operation(database, request, Some((&state, "timer_pause")))?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| crate::supabase::direct_cloud_timer_pause(database, direct_request),
+    )
+}
+
+pub(crate) fn timer_resume_for_storage(
+    database: &Database,
+    request: TimerResumeRequest,
+) -> Result<TimeEntryDto, String> {
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        database,
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let operation_id = request.operation_id.clone();
+            let state = crate::supabase::storage_mode(database)?;
+            let result = resume_timer_with_cloud_operation(
+                database,
+                request,
+                Some((&state, "timer_resume", Some(operation_id.as_str()))),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| crate::supabase::direct_cloud_timer_resume(database, direct_request),
+    )
+}
+
+pub(crate) fn timer_stop_for_storage(
+    database: &Database,
+    request: TimerStopRequest,
+) -> Result<TimerStopResultDto, String> {
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        database,
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = stop_timer_with_hooks_and_cloud_operation(
+                database,
+                request,
+                Some((&state, "timer_stop")),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            timer_chain_result(database, result)
+        },
+        |database| crate::supabase::direct_cloud_timer_stop(database, direct_request),
+    )
 }
 
 #[tauri::command]
@@ -2883,15 +3077,8 @@ pub fn timer_start(
     database: tauri::State<'_, Database>,
     request: TimerStartRequest,
 ) -> Result<TimeEntryDto, String> {
-    let operation_id = request.client_request_id.clone();
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = start_timer_with_hooks_and_cloud_operation(
-        &database,
-        request,
-        Some((&state, "timer_start", Some(operation_id.as_str()))),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    let _ = crate::refresh_tray_presentation(&app, &database);
+    let result = timer_start_for_storage(&database, request)?;
+    let _ = crate::refresh_tray_presentation_with_timer(&app, &database, Some(result.clone()));
     Ok(result)
 }
 
@@ -2901,11 +3088,25 @@ pub fn timer_transition(
     database: tauri::State<'_, Database>,
     request: TimerTransitionRequest,
 ) -> Result<TimerTransitionResultDto, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = transition_timer_with_cloud_operation(&database, request, Some(&state))?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    let _ = crate::refresh_tray_presentation(&app, &database);
+    let direct_request = request.clone();
+    let result = crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = transition_timer_with_cloud_operation(database, request, Some(&state))?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| crate::supabase::direct_cloud_timer_transition(database, direct_request),
+    )?;
+    let _ = crate::refresh_tray_presentation_with_timer(
+        &app,
+        &database,
+        Some(result.active_entry.clone()),
+    );
     Ok(result)
 }
 
@@ -2915,13 +3116,8 @@ pub fn timer_pause(
     database: tauri::State<'_, Database>,
     request: TimerVersionRequest,
 ) -> Result<TimeEntryDto, String> {
-    let expected_version = request.expected_version;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result =
-        pause_timer_with_cloud_operation(&database, request, Some((&state, "timer_pause")))?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    let _ = crate::refresh_tray_presentation(&app, &database);
-    let _ = expected_version;
+    let result = timer_pause_for_storage(&database, request)?;
+    let _ = crate::refresh_tray_presentation_with_timer(&app, &database, Some(result.clone()));
     Ok(result)
 }
 
@@ -2931,17 +3127,8 @@ pub fn timer_resume(
     database: tauri::State<'_, Database>,
     request: TimerResumeRequest,
 ) -> Result<TimeEntryDto, String> {
-    let expected_version = request.expected_version;
-    let operation_id = request.operation_id.clone();
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = resume_timer_with_cloud_operation(
-        &database,
-        request,
-        Some((&state, "timer_resume", Some(operation_id.as_str()))),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    let _ = crate::refresh_tray_presentation(&app, &database);
-    let _ = expected_version;
+    let result = timer_resume_for_storage(&database, request)?;
+    let _ = crate::refresh_tray_presentation_with_timer(&app, &database, Some(result.clone()));
     Ok(result)
 }
 
@@ -2951,17 +3138,58 @@ pub fn timer_stop(
     database: tauri::State<'_, Database>,
     request: TimerStopRequest,
 ) -> Result<TimerStopResultDto, String> {
-    let expected_version = request.expected_version;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = stop_timer_with_hooks_and_cloud_operation(
+    let result = timer_stop_for_storage(&database, request)?;
+    let _ = crate::refresh_tray_presentation_with_timer(&app, &database, None);
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn timer_recover(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, Database>,
+    request: TimerRecoveryRequest,
+) -> Result<TimerRecoveryResultDto, String> {
+    let direct_request = request.clone();
+    let result = crate::storage_contract::route(
         &database,
-        request,
-        Some((&state, "timer_stop")),
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| local_timer_recovery(database, request),
+        |database| crate::supabase::direct_cloud_timer_recover(database, direct_request),
     )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    let _ = crate::refresh_tray_presentation(&app, &database);
-    let _ = expected_version;
-    timer_chain_result(&database, result)
+    let _ = crate::refresh_tray_presentation_with_timer(
+        &app,
+        &database,
+        Some(result.active_entry.clone()),
+    );
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn timer_takeover(
+    app: tauri::AppHandle,
+    database: tauri::State<'_, Database>,
+    request: TimerTakeoverRequest,
+) -> Result<TimerRecoveryResultDto, String> {
+    let direct_request = request.clone();
+    let local_request = TimerRecoveryRequest {
+        entry_id: request.entry_id,
+        expected_version: request.expected_version,
+        client_request_id: request.client_request_id,
+    };
+    let result = crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| local_timer_recovery(database, local_request),
+        |database| crate::supabase::direct_cloud_timer_takeover(database, direct_request),
+    )?;
+    let _ = crate::refresh_tray_presentation_with_timer(
+        &app,
+        &database,
+        Some(result.active_entry.clone()),
+    );
+    Ok(result)
 }
 
 #[tauri::command]
@@ -2969,7 +3197,16 @@ pub fn time_entry_list(
     database: tauri::State<'_, Database>,
     request: TimeEntryListRequest,
 ) -> Result<TimeEntryListResult, String> {
-    list_time_entries(&database, request)
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Query,
+        |database| list_time_entries(database, request),
+        |database| {
+            crate::supabase::direct_cloud_time_entry_list_for_command(database, direct_request)
+        },
+    )
 }
 
 #[tauri::command]
@@ -2977,7 +3214,14 @@ pub fn time_entry_history_list(
     database: tauri::State<'_, Database>,
     request: TimeEntryHistoryRequest,
 ) -> Result<TimeEntryHistoryResult, String> {
-    list_time_entry_history(&database, request)
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Query,
+        |database| list_time_entry_history(database, request),
+        |database| crate::supabase::direct_cloud_time_history_for_command(database, direct_request),
+    )
 }
 
 #[tauri::command]
@@ -2985,20 +3229,29 @@ pub fn time_entry_create_manual(
     database: tauri::State<'_, Database>,
     request: ManualEntryRequest,
 ) -> Result<TimeEntryDto, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let operation_id = request.client_request_id.clone();
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = create_manual_entry_with_cloud_operation(
+    let direct_request = request.clone();
+    crate::storage_contract::route(
         &database,
-        request,
-        Some((
-            &state,
-            "time_entry_create_manual",
-            Some(operation_id.as_str()),
-        )),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let operation_id = request.client_request_id.clone();
+            let state = crate::supabase::storage_mode(database)?;
+            let result = create_manual_entry_with_cloud_operation(
+                database,
+                request,
+                Some((
+                    &state,
+                    "time_entry_create_manual",
+                    Some(operation_id.as_str()),
+                )),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| crate::supabase::direct_cloud_manual_time_create(database, direct_request),
+    )
 }
 
 #[tauri::command]
@@ -3006,15 +3259,24 @@ pub fn time_entry_update(
     database: tauri::State<'_, Database>,
     request: TimeEntryUpdateRequest,
 ) -> Result<TimeEntryDto, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = update_time_entry_with_cloud_operation(
+    let direct_request = request.clone();
+    crate::storage_contract::route(
         &database,
-        request,
-        Some((&state, "time_entry_update")),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = update_time_entry_with_cloud_operation(
+                database,
+                request,
+                Some((&state, "time_entry_update")),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| crate::supabase::direct_cloud_time_entry_update(database, direct_request),
+    )
 }
 
 #[tauri::command]
@@ -3022,15 +3284,24 @@ pub fn time_entry_update_disposition(
     database: tauri::State<'_, Database>,
     request: TimeEntryDispositionRequest,
 ) -> Result<TimeEntryDto, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = update_time_entry_disposition_with_cloud_operation(
+    let direct_request = request.clone();
+    crate::storage_contract::route(
         &database,
-        request,
-        Some((&state, "time_entry_update_disposition")),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = update_time_entry_disposition_with_cloud_operation(
+                database,
+                request,
+                Some((&state, "time_entry_update_disposition")),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| crate::supabase::direct_cloud_time_entry_disposition(database, direct_request),
+    )
 }
 
 #[tauri::command]
@@ -3038,15 +3309,24 @@ pub fn time_allocation_replace(
     database: tauri::State<'_, Database>,
     request: AllocationReplaceRequest,
 ) -> Result<TimeEntryDto, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = replace_allocations_with_hooks_and_cloud_operation(
+    let direct_request = request.clone();
+    crate::storage_contract::route(
         &database,
-        request,
-        Some((&state, "time_allocation_replace")),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = replace_allocations_with_hooks_and_cloud_operation(
+                database,
+                request,
+                Some((&state, "time_allocation_replace")),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| crate::supabase::direct_cloud_time_allocation_replace(database, direct_request),
+    )
 }
 
 #[cfg(test)]
@@ -3121,6 +3401,12 @@ mod tests {
             .unwrap();
         crate::supabase::StorageModeSnapshot {
             mode: "cloud".to_string(),
+            storage_protocol: crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string(),
+            configured_cloud_protocol: crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string(),
+            storage_backend: "legacy_sync_sqlite".to_string(),
+            cloud_access_state: "legacy_sync_offline".to_string(),
+            cloud_writable: true,
+            read_only_reason: None,
             workspace_id: local_workspace_id,
             device_id,
             online: false,

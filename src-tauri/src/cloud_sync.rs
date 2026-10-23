@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 use crate::database::Database;
 use crate::supabase::{
-    client, current_session, ensure_current_device_authorized, mark_auth_blocked, storage_mode,
-    CLOUD_SCHEMA,
+    client, current_session, direct_cloud_workbench_bootstrap, ensure_current_device_authorized,
+    mark_auth_blocked, storage_mode, CLOUD_SCHEMA,
 };
 
 const REALTIME_HEARTBEAT_SECONDS: u64 = 25;
@@ -37,6 +37,7 @@ static CLOUD_SYNC_APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 static CLOUD_SYNC_SIGNALS: AtomicU8 = AtomicU8::new(0);
 static CLOUD_SYNC_OBSERVED_REMOTE_SEQ: AtomicI64 = AtomicI64::new(0);
 static CLOUD_SYNC_ENABLED: AtomicBool = AtomicBool::new(false);
+static LEGACY_SYNC_ENABLED: AtomicBool = AtomicBool::new(false);
 static CLOUD_SYNC_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CLOUD_SAVE_ACTIVITY: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
@@ -47,10 +48,15 @@ pub fn spawn_background_services(database: Database, app: AppHandle) {
     spawn_sync_coordinator(database.clone(), app.clone());
     spawn_tracking_lease_maintainer(database.clone(), app.clone());
     spawn_realtime_listener(database.clone(), app);
-    if storage_mode(&database).is_ok_and(|state| state.mode == "cloud") {
-        wake_after_connection_ready();
-    } else {
-        disable_cloud_sync();
+    match storage_mode(&database) {
+        Ok(state)
+            if state.mode == "cloud"
+                && state.storage_protocol == crate::storage_contract::DIRECT_CLOUD_PROTOCOL =>
+        {
+            enter_direct_cloud_mode();
+        }
+        Ok(state) if state.mode == "cloud" => wake_after_connection_ready(),
+        _ => disable_cloud_sync(),
     }
 }
 
@@ -87,12 +93,25 @@ fn end_cloud_save_activity() {
 
 pub(crate) fn wake_after_connection_ready() {
     CLOUD_SYNC_ENABLED.store(true, Ordering::Release);
+    LEGACY_SYNC_ENABLED.store(true, Ordering::Release);
     cloud_mode_wakeup().notify_waiters();
     signal_cloud_sync(SYNC_SIGNAL_CONNECTION_READY, None);
 }
 
+pub(crate) fn enter_direct_cloud_mode() {
+    CLOUD_SYNC_ENABLED.store(true, Ordering::Release);
+    LEGACY_SYNC_ENABLED.store(false, Ordering::Release);
+    CLOUD_SYNC_ACTIVE.store(false, Ordering::Release);
+    CLOUD_SAVE_ACTIVITY.store(0, Ordering::Release);
+    CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
+    CLOUD_SYNC_OBSERVED_REMOTE_SEQ.store(0, Ordering::Release);
+    clear_tracking_lease_tokens();
+    cloud_mode_wakeup().notify_waiters();
+}
+
 pub(crate) fn disable_cloud_sync() {
     CLOUD_SYNC_ENABLED.store(false, Ordering::Release);
+    LEGACY_SYNC_ENABLED.store(false, Ordering::Release);
     CLOUD_SYNC_ACTIVE.store(false, Ordering::Release);
     CLOUD_SAVE_ACTIVITY.store(0, Ordering::Release);
     CLOUD_SYNC_SIGNALS.store(0, Ordering::Release);
@@ -117,6 +136,11 @@ fn spawn_sync_coordinator(database: Database, app: AppHandle) {
                 wakeup.notified().await;
             }
             let signals = CLOUD_SYNC_SIGNALS.swap(0, Ordering::AcqRel);
+            if !LEGACY_SYNC_ENABLED.load(Ordering::Acquire) {
+                CLOUD_SYNC_ACTIVE.store(false, Ordering::Release);
+                retry_after = None;
+                continue;
+            }
             if signals == 0 {
                 continue;
             }
@@ -203,7 +227,7 @@ fn spawn_tracking_lease_maintainer(database: Database, app: AppHandle) {
     let mode_wakeup = cloud_mode_wakeup();
     tauri::async_runtime::spawn(async move {
         loop {
-            while !CLOUD_SYNC_ENABLED.load(Ordering::Acquire) {
+            while !LEGACY_SYNC_ENABLED.load(Ordering::Acquire) {
                 mode_wakeup.notified().await;
             }
             tokio::select! {
@@ -212,7 +236,7 @@ fn spawn_tracking_lease_maintainer(database: Database, app: AppHandle) {
                     continue;
                 }
             }
-            if !CLOUD_SYNC_ENABLED.load(Ordering::Acquire) {
+            if !LEGACY_SYNC_ENABLED.load(Ordering::Acquire) {
                 continue;
             }
             let database_for_lease = database.clone();
@@ -220,6 +244,12 @@ fn spawn_tracking_lease_maintainer(database: Database, app: AppHandle) {
                 let state = storage_mode(&database_for_lease)?;
                 if state.mode != "cloud" || !state.online {
                     clear_tracking_lease_token(&database_for_lease);
+                    return Ok(());
+                }
+                if state.storage_protocol == crate::storage_contract::DIRECT_CLOUD_PROTOCOL {
+                    // Direct-v2 timer writes claim the lease inside their own
+                    // mutation transaction; the legacy background lease must
+                    // not probe that workspace with sync_v1 RPCs.
                     return Ok(());
                 }
                 acquire_or_renew_tracking_lease(&database_for_lease).map(|_| ())
@@ -342,13 +372,15 @@ fn spawn_realtime_listener(database: Database, app: AppHandle) {
                 let anon_key = api.anon_key().to_string();
                 Ok::<_, String>(Some((
                     state.workspace_id,
+                    state.storage_protocol,
                     api.project_url,
                     anon_key,
                     session.access_token,
                 )))
             })
             .await;
-            let (workspace_id, project_url, anon_key, access_token) = match config {
+            let (workspace_id, storage_protocol, project_url, anon_key, access_token) = match config
+            {
                 Ok(Ok(Some(config))) => config,
                 Ok(Ok(None)) => {
                     tokio::time::sleep(Duration::from_secs(REALTIME_RECONNECT_SECONDS)).await;
@@ -374,6 +406,7 @@ fn spawn_realtime_listener(database: Database, app: AppHandle) {
                 &database,
                 &app,
                 &workspace_id,
+                &storage_protocol,
                 &project_url,
                 &anon_key,
                 &access_token,
@@ -412,8 +445,9 @@ fn realtime_reconnect_delay(attempt: u32, jitter_seed: u64) -> Duration {
 
 async fn run_realtime_connection(
     database: &Database,
-    _app: &AppHandle,
+    app: &AppHandle,
     workspace_id: &str,
+    storage_protocol: &str,
     project_url: &str,
     anon_key: &str,
     access_token: &str,
@@ -501,12 +535,30 @@ async fn run_realtime_connection(
                             && message.get("ref").and_then(Value::as_str) == Some("1")
                             && message.pointer("/payload/status").and_then(Value::as_str) == Some("ok")
                         {
-                            signal_cloud_sync(SYNC_SIGNAL_CONNECTION_READY, None);
+                            if storage_protocol
+                                != crate::storage_contract::DIRECT_CLOUD_PROTOCOL
+                            {
+                                signal_cloud_sync(SYNC_SIGNAL_CONNECTION_READY, None);
+                            } else {
+                                spawn_direct_cloud_catch_up(database, app);
+                            }
                         } else if event == "postgres_changes" {
-                            signal_cloud_sync(
-                                SYNC_SIGNAL_REMOTE_HINT,
-                                realtime_change_seq(&message),
-                            );
+                            if storage_protocol
+                                == crate::storage_contract::DIRECT_CLOUD_PROTOCOL
+                            {
+                                if let Some(invalidation) = realtime_workspace_invalidation(
+                                    &message,
+                                    workspace_id,
+                                    current_workspace_epoch(database, workspace_id).unwrap_or(1),
+                                ) {
+                                    let _ = app.emit("work-data-changed", &invalidation);
+                                }
+                            } else {
+                                signal_cloud_sync(
+                                    SYNC_SIGNAL_REMOTE_HINT,
+                                    realtime_change_seq(&message),
+                                );
+                            }
                         } else if event == "phx_error" || event == "phx_close" {
                             return Err("NETWORK_ERROR: Supabase Realtime 频道已断开".to_string());
                         }
@@ -534,6 +586,84 @@ fn realtime_change_seq(message: &Value) -> Option<i64> {
         .or_else(|| message.pointer("/payload/record/change_seq"))
         .or_else(|| message.pointer("/payload/data/new/change_seq"))
         .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceInvalidation {
+    workspace_id: String,
+    change_seq: i64,
+    workspace_epoch: i64,
+    domains: Vec<String>,
+    source: String,
+}
+
+fn realtime_workspace_invalidation(
+    message: &Value,
+    expected_workspace_id: &str,
+    workspace_epoch: i64,
+) -> Option<WorkspaceInvalidation> {
+    let record = message
+        .pointer("/payload/data/record")
+        .or_else(|| message.pointer("/payload/record"))
+        .or_else(|| message.pointer("/payload/data/new"))?;
+    let change_seq = record
+        .get("change_seq")
+        .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))?;
+    let workspace_id = record
+        .get("workspace_id")
+        .and_then(Value::as_str)
+        .filter(|value| *value == expected_workspace_id)?;
+    let domains = record
+        .get("entity_type")
+        .and_then(Value::as_str)
+        .map(realtime_refresh_domains)
+        .unwrap_or_default();
+    if domains.is_empty() {
+        return None;
+    }
+    Some(WorkspaceInvalidation {
+        workspace_id: workspace_id.to_string(),
+        change_seq,
+        workspace_epoch,
+        domains: domains.into_iter().map(str::to_string).collect(),
+        source: "realtime".to_string(),
+    })
+}
+
+fn realtime_refresh_domains(entity_type: &str) -> Vec<&'static str> {
+    match entity_type {
+        "subjects" | "subject_work_schedules" => vec!["subjects"],
+        "tasks"
+        | "task_status_events"
+        | "task_daily_estimates"
+        | "task_day_plans"
+        | "task_recurrence_rules"
+        | "task_occurrences" => vec!["tasks"],
+        "work_days"
+        | "time_entries"
+        | "time_segments"
+        | "time_allocations"
+        | "actual_time_adjustments"
+        | "actual_adjustment_batches" => vec!["time"],
+        "unassigned_sessions" | "unassigned_segments" => vec!["unassigned"],
+        "report_templates" | "reports" | "report_tasks" => vec!["reports"],
+        "app_settings" | "integration_configs" | "external_bindings" => vec!["settings"],
+        _ => Vec::new(),
+    }
+}
+
+fn current_workspace_epoch(database: &Database, workspace_id: &str) -> Result<i64, String> {
+    database
+        .open()?
+        .query_row(
+            "SELECT workspace_epoch FROM local_sync_state WHERE workspace_id=?1",
+            [workspace_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(1))
+        .map_err(|error| error.to_string())
 }
 
 fn realtime_url(project_url: &str, anon_key: &str) -> Result<Url, String> {
@@ -565,7 +695,13 @@ fn emit_cloud_refresh_domains(
         let _ = app.emit("cloud-sync-state-changed", &status);
         let _ = app.emit(
             "work-data-changed",
-            json!({ "revision": revision, "domains": domains, "source": source }),
+            &WorkspaceInvalidation {
+                workspace_id: status.workspace_id,
+                change_seq: revision,
+                workspace_epoch: status.workspace_epoch,
+                domains: domains.to_vec(),
+                source: source.to_string(),
+            },
         );
     }
 }
@@ -586,6 +722,11 @@ fn emit_cloud_error(app: &AppHandle, database: &Database, error: &str) {
             "cloud-sync-state-changed",
             json!({
                 "mode": status.mode,
+                "storageProtocol": status.storage_protocol,
+                "storageBackend": status.storage_backend,
+                "cloudAccessState": status.cloud_access_state,
+                "cloudWritable": status.cloud_writable,
+                "readOnlyReason": status.read_only_reason,
                 "workspaceId": status.workspace_id,
                 "deviceId": status.device_id,
                 "online": false,
@@ -597,6 +738,11 @@ fn emit_cloud_error(app: &AppHandle, database: &Database, error: &str) {
                 "lastError": status.last_error.as_deref().unwrap_or(error),
                 "pendingOperations": status.pending_operations,
                 "conflictCount": status.conflict_count,
+                "authBlocked": status.auth_blocked,
+                "authBlockedReason": status.auth_blocked_reason,
+                "workspaceEpoch": status.workspace_epoch,
+                "epochBlocked": status.epoch_blocked,
+                "epochBlockedReason": status.epoch_blocked_reason,
                 "error": error
             }),
         );
@@ -607,6 +753,11 @@ fn emit_cloud_error(app: &AppHandle, database: &Database, error: &str) {
 #[serde(rename_all = "camelCase")]
 pub struct CloudSyncStatus {
     pub mode: String,
+    pub storage_protocol: String,
+    pub storage_backend: String,
+    pub cloud_access_state: String,
+    pub cloud_writable: bool,
+    pub read_only_reason: Option<String>,
     pub workspace_id: String,
     pub device_id: String,
     pub online: bool,
@@ -618,6 +769,8 @@ pub struct CloudSyncStatus {
     pub last_error: Option<String>,
     pub pending_operations: i64,
     pub conflict_count: i64,
+    pub auth_blocked: bool,
+    pub auth_blocked_reason: Option<String>,
     pub workspace_epoch: i64,
     pub epoch_blocked: bool,
     pub epoch_blocked_reason: Option<String>,
@@ -835,6 +988,13 @@ pub struct CloudSyncPushResult {
     pub conflicts: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LegacyQueueDrainResult {
+    pub(crate) pushed: i64,
+    pub(crate) last_change_seq: i64,
+    pub(crate) domains: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudSyncQueueItem {
@@ -1029,6 +1189,11 @@ pub fn sync_status(database: &Database) -> Result<CloudSyncStatus, String> {
     let state = storage_mode(database)?;
     Ok(CloudSyncStatus {
         mode: state.mode,
+        storage_protocol: state.storage_protocol,
+        storage_backend: state.storage_backend,
+        cloud_access_state: state.cloud_access_state,
+        cloud_writable: state.cloud_writable,
+        read_only_reason: state.read_only_reason,
         workspace_id: state.workspace_id,
         device_id: state.device_id,
         online: state.online,
@@ -1040,6 +1205,8 @@ pub fn sync_status(database: &Database) -> Result<CloudSyncStatus, String> {
         last_error: state.last_error,
         pending_operations: state.pending_operations,
         conflict_count: state.conflict_count,
+        auth_blocked: state.auth_blocked,
+        auth_blocked_reason: state.auth_blocked_reason,
         workspace_epoch: state.workspace_epoch,
         epoch_blocked: state.epoch_blocked,
         epoch_blocked_reason: state.epoch_blocked_reason,
@@ -1055,6 +1222,7 @@ fn run_sync_coordinator_round(
     let state = storage_mode(database)?;
     if state.mode != "cloud" {
         CLOUD_SYNC_ENABLED.store(false, Ordering::Release);
+        LEGACY_SYNC_ENABLED.store(false, Ordering::Release);
         clear_tracking_lease_token(database);
         return Ok(SyncCoordinatorRoundResult {
             domains: Vec::new(),
@@ -1063,7 +1231,18 @@ fn run_sync_coordinator_round(
             retry_after: None,
         });
     }
+    if state.storage_protocol == crate::storage_contract::DIRECT_CLOUD_PROTOCOL {
+        LEGACY_SYNC_ENABLED.store(false, Ordering::Release);
+        clear_tracking_lease_token(database);
+        return Ok(SyncCoordinatorRoundResult {
+            domains: Vec::new(),
+            last_change_seq: state.last_change_seq,
+            source: "direct-cloud".to_string(),
+            retry_after: None,
+        });
+    }
     CLOUD_SYNC_ENABLED.store(true, Ordering::Release);
+    LEGACY_SYNC_ENABLED.store(true, Ordering::Release);
     if state.epoch_blocked {
         return Ok(SyncCoordinatorRoundResult {
             domains: Vec::new(),
@@ -1266,6 +1445,9 @@ fn catch_up_incremental(database: &Database) -> Result<CloudSyncPullResult, Stri
             domains: Vec::new(),
         });
     }
+    if state.storage_protocol == crate::storage_contract::DIRECT_CLOUD_PROTOCOL {
+        return catch_up_direct_cloud(database, state);
+    }
     let mut last_change_seq = state.last_change_seq;
     let mut changes = Vec::new();
     let mut domains = HashSet::new();
@@ -1293,6 +1475,74 @@ fn catch_up_incremental(database: &Database) -> Result<CloudSyncPullResult, Stri
         has_more: false,
         domains,
     })
+}
+
+fn catch_up_direct_cloud(
+    database: &Database,
+    previous: crate::supabase::StorageModeSnapshot,
+) -> Result<CloudSyncPullResult, String> {
+    let response = direct_cloud_workbench_bootstrap(database)?;
+    let metadata = response.metadata;
+    let changed = metadata.change_seq > previous.last_change_seq
+        || metadata.workspace_epoch != previous.workspace_epoch;
+    let domains = if changed {
+        direct_cloud_catch_up_domains()
+    } else {
+        Vec::new()
+    };
+    Ok(CloudSyncPullResult {
+        changes: Vec::new(),
+        last_change_seq: metadata.change_seq,
+        has_more: false,
+        domains,
+    })
+}
+
+fn direct_cloud_catch_up_domains() -> Vec<String> {
+    [
+        "subjects",
+        "tasks",
+        "time",
+        "unassigned",
+        "reports",
+        "settings",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn spawn_direct_cloud_catch_up(database: &Database, app: &AppHandle) {
+    let database = database.clone();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let database_for_query = database.clone();
+        let result =
+            tauri::async_runtime::spawn_blocking(move || catch_up_incremental(&database_for_query))
+                .await;
+        match result {
+            Ok(Ok(catch_up)) if !catch_up.domains.is_empty() => {
+                emit_cloud_refresh_domains(
+                    &app,
+                    &database,
+                    "catch-up",
+                    catch_up.last_change_seq,
+                    &catch_up.domains,
+                );
+            }
+            Ok(Err(error)) => emit_cloud_error(&app, &database, &error),
+            Err(error) => emit_cloud_error(
+                &app,
+                &database,
+                &format!("SYNC_WORKER_ERROR: 云端补查任务异常: {error}"),
+            ),
+            Ok(Ok(_)) => {
+                if let Ok(status) = sync_status(&database) {
+                    let _ = app.emit("cloud-sync-state-changed", &status);
+                }
+            }
+        }
+    });
 }
 
 fn pull_locked(
@@ -3361,15 +3611,24 @@ fn ensure_supported_cloud_entity_type(entity_type: &str) -> Result<(), String> {
     }
 }
 
-pub fn flush_if_online(database: &Database) -> Result<(), String> {
+fn flush_if_online_with_signal_result(database: &Database) -> Result<bool, String> {
     if CLOUD_SYNC_ENABLED.load(Ordering::Acquire) {
+        if storage_mode(database).is_ok_and(|state| state.mode != "cloud") {
+            return Ok(false);
+        }
         signal_cloud_sync(SYNC_SIGNAL_LOCAL_DIRTY, None);
         if let Some(app) = CLOUD_SYNC_APP_HANDLE.get() {
             if let Ok(status) = sync_status(database) {
                 let _ = app.emit("cloud-sync-state-changed", &status);
             }
         }
+        return Ok(true);
     }
+    Ok(false)
+}
+
+pub fn flush_if_online(database: &Database) -> Result<(), String> {
+    flush_if_online_with_signal_result(database)?;
     Ok(())
 }
 
@@ -3838,6 +4097,73 @@ fn push_outbox_locked(
         pushed,
         pending,
         conflicts,
+    })
+}
+
+/// Drains the legacy outbox and pulls every pending incremental page while the
+/// upgrade operation holds the sync lock. The callback runs before the lock is
+/// released so the protocol switch cannot race a normal sync round.
+pub(crate) fn drain_legacy_queue_then<T>(
+    database: &Database,
+    after_drain: impl FnOnce(&LegacyQueueDrainResult) -> Result<T, String>,
+) -> Result<T, String> {
+    let _operation_guard = cloud_sync_operation_guard();
+    let result = drain_legacy_queue_locked(database)?;
+    after_drain(&result)
+}
+
+fn drain_legacy_queue_locked(database: &Database) -> Result<LegacyQueueDrainResult, String> {
+    let state = storage_mode(database)?;
+    if state.mode != "cloud" {
+        return Err("CLOUD_MODE_REQUIRED: 只有云端模式可以处理旧同步队列".to_string());
+    }
+    if state.storage_protocol != crate::storage_contract::LEGACY_SYNC_PROTOCOL {
+        return Err("CLIENT_UPGRADE_REQUIRED: 当前工作空间已不是旧同步协议".to_string());
+    }
+    if !state.online {
+        return Err("AUTH_REQUIRED: 云端会话不可用，无法完成旧同步队列".to_string());
+    }
+
+    let push = push_outbox_locked(database, true, true)?;
+    if push.pending > 0 || push.conflicts > 0 {
+        return Err(format!(
+            "LEGACY_QUEUE_BLOCKED: 旧同步队列仍有 {} 条待处理操作和 {} 条冲突，请处理后重试",
+            push.pending, push.conflicts
+        ));
+    }
+
+    let mut last_change_seq = storage_mode(database)?.last_change_seq;
+    let mut domains = std::collections::BTreeSet::<String>::new();
+    loop {
+        let previous_seq = last_change_seq;
+        let pulled = pull_locked(
+            database,
+            CloudSyncPullRequest {
+                after_change_seq: Some(last_change_seq),
+                limit: Some(500),
+            },
+        )?;
+        last_change_seq = pulled.last_change_seq.max(last_change_seq);
+        domains.extend(pulled.domains);
+        if !pulled.has_more {
+            break;
+        }
+        if last_change_seq <= previous_seq {
+            return Err("SYNC_CONVERGENCE_STALLED: 云端增量游标没有推进，升级已暂停".to_string());
+        }
+    }
+
+    let final_state = storage_mode(database)?;
+    if final_state.pending_operations > 0 || final_state.conflict_count > 0 {
+        return Err(format!(
+            "LEGACY_QUEUE_BLOCKED: 最终刷新后仍有 {} 条待处理操作和 {} 条冲突",
+            final_state.pending_operations, final_state.conflict_count
+        ));
+    }
+    Ok(LegacyQueueDrainResult {
+        pushed: push.pushed,
+        last_change_seq,
+        domains: domains.into_iter().collect(),
     })
 }
 
@@ -8590,11 +8916,28 @@ pub fn cloud_sync_refresh(_database: tauri::State<'_, Database>) -> Result<(), S
 #[tauri::command]
 pub async fn cloud_sync_catch_up(
     database: tauri::State<'_, Database>,
+    app: AppHandle,
 ) -> Result<CloudSyncPullResult, String> {
     let database = database.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || catch_up_incremental(&database))
-        .await
-        .map_err(|error| format!("SYNC_WORKER_ERROR: 云端刷新任务异常: {error}"))?
+    let database_for_query = database.clone();
+    let result =
+        tauri::async_runtime::spawn_blocking(move || catch_up_incremental(&database_for_query))
+            .await
+            .map_err(|error| format!("SYNC_WORKER_ERROR: 云端刷新任务异常: {error}"))?;
+    if let Ok(catch_up) = &result {
+        if !catch_up.domains.is_empty() {
+            emit_cloud_refresh_domains(
+                &app,
+                &database,
+                "catch-up",
+                catch_up.last_change_seq,
+                &catch_up.domains,
+            );
+        } else if let Ok(status) = sync_status(&database) {
+            let _ = app.emit("cloud-sync-state-changed", &status);
+        }
+    }
+    result
 }
 
 #[tauri::command]
@@ -9541,6 +9884,111 @@ mod tests {
     }
 
     #[test]
+    fn realtime_invalidation_contains_only_refresh_coordinates() {
+        let invalidation = realtime_workspace_invalidation(
+            &json!({
+                "event": "postgres_changes",
+                "payload": {
+                    "data": {
+                        "record": {
+                            "change_seq": 42,
+                            "workspace_id": "workspace-1",
+                            "entity_type": "tasks",
+                            "entity_id": "task-secret-id",
+                            "title": "不应出现在通知中的业务实体"
+                        }
+                    }
+                }
+            }),
+            "workspace-1",
+            7,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(invalidation).unwrap(),
+            json!({
+                "workspaceId": "workspace-1",
+                "changeSeq": 42,
+                "workspaceEpoch": 7,
+                "domains": ["tasks"],
+                "source": "realtime"
+            })
+        );
+    }
+
+    #[test]
+    fn realtime_entity_types_map_to_all_business_refresh_domains() {
+        let cases: &[(&str, &str)] = &[
+            ("subjects", "subjects"),
+            ("subject_work_schedules", "subjects"),
+            ("tasks", "tasks"),
+            ("task_status_events", "tasks"),
+            ("task_daily_estimates", "tasks"),
+            ("task_day_plans", "tasks"),
+            ("task_recurrence_rules", "tasks"),
+            ("task_occurrences", "tasks"),
+            ("work_days", "time"),
+            ("time_entries", "time"),
+            ("time_segments", "time"),
+            ("time_allocations", "time"),
+            ("actual_time_adjustments", "time"),
+            ("actual_adjustment_batches", "time"),
+            ("unassigned_sessions", "unassigned"),
+            ("unassigned_segments", "unassigned"),
+            ("report_templates", "reports"),
+            ("reports", "reports"),
+            ("report_tasks", "reports"),
+            ("app_settings", "settings"),
+            ("integration_configs", "settings"),
+            ("external_bindings", "settings"),
+        ];
+        for (entity_type, domain) in cases {
+            assert_eq!(
+                realtime_refresh_domains(entity_type),
+                vec![*domain],
+                "unexpected domain for {entity_type}"
+            );
+        }
+        assert!(realtime_refresh_domains("future_entity").is_empty());
+    }
+
+    #[test]
+    fn realtime_invalidation_rejects_other_workspaces_and_unknown_entities() {
+        let other_workspace = json!({
+            "payload": {"record": {
+                "change_seq": 1,
+                "workspace_id": "workspace-2",
+                "entity_type": "tasks"
+            }}
+        });
+        assert!(realtime_workspace_invalidation(&other_workspace, "workspace-1", 1).is_none());
+
+        let unsupported_entity = json!({
+            "payload": {"record": {
+                "change_seq": 1,
+                "workspace_id": "workspace-1",
+                "entity_type": "future_entity"
+            }}
+        });
+        assert!(realtime_workspace_invalidation(&unsupported_entity, "workspace-1", 1).is_none());
+    }
+
+    #[test]
+    fn direct_cloud_catch_up_invalidates_every_business_domain() {
+        assert_eq!(
+            direct_cloud_catch_up_domains(),
+            vec![
+                "subjects",
+                "tasks",
+                "time",
+                "unassigned",
+                "reports",
+                "settings",
+            ]
+        );
+    }
+
+    #[test]
     fn realtime_reconnect_backoff_is_jittered_and_bounded() {
         let first = realtime_reconnect_delay(0, 123);
         let later = realtime_reconnect_delay(4, 456);
@@ -9772,8 +10220,45 @@ mod tests {
         let directory = tempdir().unwrap();
         let database =
             Database::initialize_at(directory.path().join("local-wakeup.sqlite3")).unwrap();
-        flush_if_online(&database).unwrap();
-        assert_eq!(CLOUD_SYNC_SIGNALS.load(Ordering::Acquire), 0);
+        assert!(!flush_if_online_with_signal_result(&database).unwrap());
+    }
+
+    #[test]
+    fn direct_cloud_mode_keeps_realtime_but_stops_legacy_coordination() {
+        let _guard = CLOUD_SYNC_TEST_STATE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (directory, database, _) =
+            cloud_database_with_outbox_state("direct-mode-workers.sqlite3", "pending");
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "INSERT INTO device_settings(key, value_json, updated_at)
+                 VALUES('cloud_storage_protocol', '\"direct_v2\"', 1)
+                 ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+                [],
+            )
+            .unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute("DELETE FROM sync_outbox", [])
+            .unwrap();
+
+        enter_direct_cloud_mode();
+        assert!(CLOUD_SYNC_ENABLED.load(Ordering::Acquire));
+        assert!(!LEGACY_SYNC_ENABLED.load(Ordering::Acquire));
+        CLOUD_SYNC_SIGNALS.store(SYNC_SIGNAL_LOCAL_DIRTY, Ordering::Release);
+        assert_eq!(
+            run_sync_coordinator_round_for_test(&database).unwrap(),
+            "direct-cloud"
+        );
+        assert!(CLOUD_SYNC_SIGNALS.load(Ordering::Acquire) & SYNC_SIGNAL_LOCAL_DIRTY != 0);
+        assert!(!LEGACY_SYNC_ENABLED.load(Ordering::Acquire));
+        disable_cloud_sync();
+        drop(directory);
     }
 
     #[test]

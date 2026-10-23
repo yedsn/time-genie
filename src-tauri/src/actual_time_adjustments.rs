@@ -64,7 +64,7 @@ pub struct ActualAdjustmentSnapshotDto {
     pub adjustments: Vec<ActualTimeAdjustmentDto>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActualAdjustmentSnapshotRequest {
     pub subject_id: String,
@@ -127,7 +127,7 @@ pub struct ActualAdjustmentBatchResult {
     pub adjustments: Vec<ActualTimeAdjustmentDto>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActualAdjustmentDeleteRequest {
     pub adjustment_id: String,
@@ -723,7 +723,16 @@ pub fn actual_adjustment_snapshot(
     database: tauri::State<'_, Database>,
     request: ActualAdjustmentSnapshotRequest,
 ) -> Result<ActualAdjustmentSnapshotDto, String> {
-    snapshot(&database, request)
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Query,
+        |database| snapshot(database, request),
+        |database| {
+            crate::supabase::direct_cloud_actual_adjustment_snapshot(database, direct_request)
+        },
+    )
 }
 
 #[tauri::command]
@@ -731,8 +740,19 @@ pub fn actual_adjustment_batch_apply(
     database: tauri::State<'_, Database>,
     request: ActualAdjustmentBatchRequest,
 ) -> Result<ActualAdjustmentBatchResult, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    apply_batch(&database, request)
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            apply_batch(database, request)
+        },
+        |database| {
+            crate::supabase::direct_cloud_actual_adjustment_batch_apply(database, direct_request)
+        },
+    )
 }
 
 #[tauri::command]
@@ -740,8 +760,17 @@ pub fn actual_adjustment_delete(
     database: tauri::State<'_, Database>,
     request: ActualAdjustmentDeleteRequest,
 ) -> Result<ActualTimeAdjustmentDto, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    delete_adjustment(&database, request)
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::Time,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            delete_adjustment(database, request)
+        },
+        |database| crate::supabase::direct_cloud_actual_adjustment_delete(database, direct_request),
+    )
 }
 
 #[cfg(test)]

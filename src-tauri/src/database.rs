@@ -160,6 +160,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "daily_report_task_import",
         sql: include_str!("../migrations/0029_daily_report_task_import.sql"),
     },
+    Migration {
+        version: 30,
+        name: "legacy_abandoned_outbox",
+        sql: include_str!("../migrations/0030_legacy_abandoned_outbox.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]

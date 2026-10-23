@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::{Client, Response};
@@ -11,7 +12,7 @@ use uuid::Uuid;
 
 use crate::database::Database;
 use crate::settings::integration_secret;
-use crate::tasks::{list_tasks, TaskListRequest};
+use crate::tasks::{list_tasks, TaskDto, TaskListRequest};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -62,7 +63,7 @@ pub struct SyncExecuteRequest {
     pub run_id: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ReimbursementsRequest {
     pub subject_id: String,
@@ -82,7 +83,7 @@ pub struct SyncPreviewItem {
     pub row: Value,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskSyncPreview {
     pub run_id: String,
@@ -106,7 +107,7 @@ pub struct ConnectionTestResult {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncExecutionResult {
     pub run_id: String,
@@ -394,89 +395,27 @@ fn preview_task_sync_with(
             |row| row.get(0),
         )
         .map_err(|_| "NOT_FOUND: 主体不存在".to_string())?;
-    let selected: HashSet<_> = request.task_ids.iter().cloned().collect();
-    let tasks = list_tasks(
-        database,
-        TaskListRequest {
-            subject_id: Some(request.subject_id.clone()),
-            include_completed: Some(true),
-            planned_date: None,
-            today_date: None,
-            today_only: Some(false),
-            daily_estimate_date: None,
-            query: None,
-        },
-    )?
-    .tasks;
-    let mut items = Vec::new();
-    for task in tasks {
-        let task_id = task.id;
-        if !selected.is_empty() && !selected.contains(&task_id) {
-            continue;
-        }
-        let title = task.title;
-        let row = json!({
-            config.local_id_field.clone(): task_id,
-            config.item_field.clone(): title,
-            config.subject_field.clone(): subject_name,
-            config.project_field.clone(): task.project_name.unwrap_or_else(|| "-".to_string()),
-            config.solution_field.clone(): task.solution_name.unwrap_or_default(),
-            config.status_field.clone(): if task.status == "done" { "DONE" } else { "TODO" },
-            config.date_field.clone(): request.work_date,
-            config.hours_field.clone(): task.total_minutes as f64 / 60.0,
-        });
+    let tasks = list_tasks(database, subject_task_request(&request.subject_id))?.tasks;
+    let mut bindings = HashMap::new();
+    for task in &tasks {
         let binding: Option<String> = connection
             .query_row(
                 "SELECT external_id FROM external_bindings WHERE workspace_id = ?1 AND provider = 'seatable' AND entity_type = 'task' AND entity_id = ?2",
-                params![workspace_id, task_id],
+                params![workspace_id, task.id],
                 |row| row.get(0),
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        let by_local_id = remote_rows.iter().find(|remote| {
-            string_cell(remote, &config.local_id_field).as_deref() == Some(task_id.as_str())
-        });
-        let matched = binding
-            .as_ref()
-            .and_then(|id| {
-                remote_rows
-                    .iter()
-                    .find(|remote| row_id(remote).as_deref() == Some(id))
-            })
-            .or(by_local_id);
-        let duplicate = remote_rows.iter().any(|remote| {
-            string_cell(remote, &config.item_field).as_deref() == Some(title.as_str())
-                && string_cell(remote, &config.subject_field).as_deref()
-                    == Some(subject_name.as_str())
-                && string_cell(remote, &config.date_field).as_deref()
-                    == Some(request.work_date.as_str())
-        });
-        let (action, reason, external_id) = if let Some(remote) = matched {
-            let id = row_id(remote);
-            if mapped_row_matches(remote, &row) {
-                ("skip", "外部记录已是最新内容", id)
-            } else {
-                ("update", "已通过稳定事项 ID 匹配外部记录", id)
-            }
-        } else if duplicate {
-            (
-                "conflict",
-                "发现同日期、主体和标题的未绑定记录，需要人工处理",
-                None,
-            )
-        } else {
-            ("create", "未找到外部绑定，将新增记录", None)
-        };
-        items.push(SyncPreviewItem {
-            item_id: Uuid::now_v7().to_string(),
-            task_id,
-            title,
-            action: action.to_string(),
-            reason: reason.to_string(),
-            external_id,
-            row,
-        });
+        bindings.insert(task.id.clone(), binding);
     }
+    let items = build_preview_items(
+        &request,
+        config,
+        &subject_name,
+        tasks,
+        &bindings,
+        &remote_rows,
+    );
     let run_id = Uuid::now_v7().to_string();
     let preview = summarize_preview(
         run_id.clone(),
@@ -509,6 +448,79 @@ fn preview_task_sync_with(
             .map_err(|error| error.to_string())?;
     }
     Ok(preview)
+}
+
+fn build_preview_items(
+    request: &TaskSyncPreviewRequest,
+    config: &SeaTableConfig,
+    subject_name: &str,
+    tasks: Vec<TaskDto>,
+    bindings: &HashMap<String, Option<String>>,
+    remote_rows: &[Value],
+) -> Vec<SyncPreviewItem> {
+    let selected: HashSet<_> = request.task_ids.iter().cloned().collect();
+    let mut items = Vec::new();
+    for task in tasks {
+        let task_id = task.id;
+        if !selected.is_empty() && !selected.contains(&task_id) {
+            continue;
+        }
+        let title = task.title;
+        let row = json!({
+            config.local_id_field.clone(): task_id,
+            config.item_field.clone(): title,
+            config.subject_field.clone(): subject_name,
+            config.project_field.clone(): task.project_name.unwrap_or_else(|| "-".to_string()),
+            config.solution_field.clone(): task.solution_name.unwrap_or_default(),
+            config.status_field.clone(): if task.status == "done" { "DONE" } else { "TODO" },
+            config.date_field.clone(): request.work_date,
+            config.hours_field.clone(): task.total_minutes as f64 / 60.0,
+        });
+        let binding = bindings.get(&task_id).cloned().flatten();
+        let by_local_id = remote_rows.iter().find(|remote| {
+            string_cell(remote, &config.local_id_field).as_deref() == Some(task_id.as_str())
+        });
+        let matched = binding
+            .as_ref()
+            .and_then(|id| {
+                remote_rows
+                    .iter()
+                    .find(|remote| row_id(remote).as_deref() == Some(id))
+            })
+            .or(by_local_id);
+        let duplicate = remote_rows.iter().any(|remote| {
+            string_cell(remote, &config.item_field).as_deref() == Some(title.as_str())
+                && string_cell(remote, &config.subject_field).as_deref() == Some(subject_name)
+                && string_cell(remote, &config.date_field).as_deref()
+                    == Some(request.work_date.as_str())
+        });
+        let (action, reason, external_id) = if let Some(remote) = matched {
+            let id = row_id(remote);
+            if mapped_row_matches(remote, &row) {
+                ("skip", "外部记录已是最新内容", id)
+            } else {
+                ("update", "已通过稳定事项 ID 匹配外部记录", id)
+            }
+        } else if duplicate {
+            (
+                "conflict",
+                "发现同日期、主体和标题的未绑定记录，需要人工处理",
+                None,
+            )
+        } else {
+            ("create", "未找到外部绑定，将新增记录", None)
+        };
+        items.push(SyncPreviewItem {
+            item_id: Uuid::now_v7().to_string(),
+            task_id,
+            title,
+            action: action.to_string(),
+            reason: reason.to_string(),
+            external_id,
+            row,
+        });
+    }
+    items
 }
 
 fn execute_task_sync_with(
@@ -722,6 +734,489 @@ fn retry_failed_with(
     )
 }
 
+struct DirectSeatableContext {
+    workspace_id: String,
+    config: SeaTableConfig,
+    bindings: Vec<Value>,
+}
+
+fn direct_seatable_context(database: &Database) -> Result<DirectSeatableContext, String> {
+    let shared = crate::supabase::direct_cloud_shared_configuration(database)?;
+    let workspace_id = shared
+        .data
+        .workspace
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "CLOUD_RESPONSE_INVALID: 共享配置缺少工作空间".to_string())?
+        .to_string();
+    let integration = shared
+        .data
+        .integrations
+        .iter()
+        .find(|integration| integration.get("provider").and_then(Value::as_str) == Some("seatable"))
+        .ok_or_else(|| "INTEGRATION_NOT_CONFIGURED: SeaTable 尚未配置".to_string())?;
+    if !integration
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err("INTEGRATION_NOT_CONFIGURED: SeaTable 集成未启用".to_string());
+    }
+    let config: SeaTableConfig = serde_json::from_value(
+        integration
+            .get("config")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+    )
+    .map_err(|error| format!("VALIDATION_ERROR: SeaTable 配置无效: {error}"))?;
+    validate_config(&config)?;
+    Ok(DirectSeatableContext {
+        workspace_id,
+        config,
+        bindings: shared.data.bindings,
+    })
+}
+
+fn direct_binding_record<'a>(bindings: &'a [Value], task_id: &str) -> Option<&'a Value> {
+    bindings.iter().find(|binding| {
+        binding.get("provider").and_then(Value::as_str) == Some("seatable")
+            && binding.get("entityType").and_then(Value::as_str) == Some("task")
+            && binding.get("entityId").and_then(Value::as_str) == Some(task_id)
+    })
+}
+
+fn direct_binding_external_id(bindings: &[Value], task_id: &str) -> Option<String> {
+    direct_binding_record(bindings, task_id)
+        .and_then(|binding| binding.get("externalId"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn direct_binding_version(bindings: &[Value], task_id: &str) -> i64 {
+    direct_binding_record(bindings, task_id)
+        .and_then(|binding| binding.get("version"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+}
+
+fn cache_direct_binding(bindings: &mut Vec<Value>, task_id: &str, external_id: &str, version: i64) {
+    if let Some(binding) = bindings.iter_mut().find(|binding| {
+        binding.get("provider").and_then(Value::as_str) == Some("seatable")
+            && binding.get("entityType").and_then(Value::as_str) == Some("task")
+            && binding.get("entityId").and_then(Value::as_str) == Some(task_id)
+    }) {
+        if let Some(object) = binding.as_object_mut() {
+            object.insert("externalId".to_string(), json!(external_id));
+            object.insert("version".to_string(), json!(version));
+        }
+        return;
+    }
+    bindings.push(json!({
+        "provider": "seatable",
+        "entityType": "task",
+        "entityId": task_id,
+        "externalId": external_id,
+        "version": version,
+    }));
+}
+
+fn direct_subject_name(database: &Database, subject_id: &str) -> Result<String, String> {
+    crate::supabase::direct_cloud_subject_list(database)?
+        .into_iter()
+        .find(|subject| subject.id == subject_id)
+        .map(|subject| subject.name)
+        .ok_or_else(|| "NOT_FOUND: 主体不存在".to_string())
+}
+
+fn subject_task_request(subject_id: &str) -> TaskListRequest {
+    TaskListRequest {
+        subject_id: Some(subject_id.to_string()),
+        include_completed: Some(true),
+        planned_date: None,
+        today_date: None,
+        today_only: Some(false),
+        daily_estimate_date: None,
+        query: None,
+    }
+}
+
+struct DirectSyncRun {
+    preview: TaskSyncPreview,
+    item_states: HashMap<String, String>,
+    item_errors: HashMap<String, String>,
+    result: Option<SyncExecutionResult>,
+}
+
+#[derive(Default)]
+struct DirectSyncRuns {
+    order: Vec<String>,
+    runs: HashMap<String, DirectSyncRun>,
+}
+
+fn direct_sync_runs() -> &'static Mutex<DirectSyncRuns> {
+    static RUNS: OnceLock<Mutex<DirectSyncRuns>> = OnceLock::new();
+    RUNS.get_or_init(|| Mutex::new(DirectSyncRuns::default()))
+}
+
+fn store_direct_run(preview: TaskSyncPreview) -> TaskSyncPreview {
+    let mut registry = direct_sync_runs()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let run_id = preview.run_id.clone();
+    let item_states = preview
+        .items
+        .iter()
+        .map(|item| (item.item_id.clone(), "pending".to_string()))
+        .collect();
+    registry.order.push(run_id.clone());
+    while registry.order.len() > 32 {
+        let oldest = registry.order.remove(0);
+        registry.runs.remove(&oldest);
+    }
+    registry.runs.insert(
+        run_id,
+        DirectSyncRun {
+            preview: preview.clone(),
+            item_states,
+            item_errors: HashMap::new(),
+            result: None,
+        },
+    );
+    preview
+}
+
+fn mark_direct_item(run_id: &str, item_id: &str, state: &str, error: Option<String>) {
+    let mut registry = direct_sync_runs()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(run) = registry.runs.get_mut(run_id) {
+        run.item_states
+            .insert(item_id.to_string(), state.to_string());
+        match error {
+            Some(message) => {
+                run.item_errors.insert(item_id.to_string(), message);
+            }
+            None => {
+                run.item_errors.remove(item_id);
+            }
+        }
+    }
+}
+
+fn direct_preview_task_sync_with(
+    database: &Database,
+    request: TaskSyncPreviewRequest,
+    context: &DirectSeatableContext,
+    client: &impl SeaTableApi,
+) -> Result<TaskSyncPreview, String> {
+    let remote_rows =
+        client.list_rows(&context.config.task_table, Some(&context.config.task_view))?;
+    let subject_name = direct_subject_name(database, &request.subject_id)?;
+    let tasks = crate::supabase::direct_cloud_task_list_for_command(
+        database,
+        subject_task_request(&request.subject_id),
+    )?
+    .tasks;
+    Ok(build_direct_preview(
+        &request,
+        context,
+        &subject_name,
+        tasks,
+        &remote_rows,
+    ))
+}
+
+fn build_direct_preview(
+    request: &TaskSyncPreviewRequest,
+    context: &DirectSeatableContext,
+    subject_name: &str,
+    tasks: Vec<TaskDto>,
+    remote_rows: &[Value],
+) -> TaskSyncPreview {
+    let bindings = tasks
+        .iter()
+        .map(|task| {
+            (
+                task.id.clone(),
+                direct_binding_external_id(&context.bindings, &task.id),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let items = build_preview_items(
+        request,
+        &context.config,
+        subject_name,
+        tasks,
+        &bindings,
+        remote_rows,
+    );
+    let preview = summarize_preview(
+        Uuid::now_v7().to_string(),
+        context.config.task_table.clone(),
+        request.work_date.clone(),
+        subject_name.to_string(),
+        items,
+    );
+    store_direct_run(preview)
+}
+
+trait DirectBindingStore {
+    fn list(&self, database: &Database) -> Result<Vec<Value>, String>;
+    fn upsert(
+        &self,
+        database: &Database,
+        task_id: &str,
+        external_id: &str,
+        expected_version: i64,
+    ) -> Result<i64, String>;
+}
+
+struct CloudBindingStore;
+
+impl DirectBindingStore for CloudBindingStore {
+    fn list(&self, database: &Database) -> Result<Vec<Value>, String> {
+        Ok(
+            crate::supabase::direct_cloud_shared_configuration(database)?
+                .data
+                .bindings,
+        )
+    }
+
+    fn upsert(
+        &self,
+        database: &Database,
+        task_id: &str,
+        external_id: &str,
+        expected_version: i64,
+    ) -> Result<i64, String> {
+        direct_upsert_binding(database, task_id, external_id, expected_version)
+    }
+}
+
+fn direct_upsert_binding(
+    database: &Database,
+    task_id: &str,
+    external_id: &str,
+    expected_version: i64,
+) -> Result<i64, String> {
+    let response = crate::supabase::direct_cloud_external_binding_upsert_mutation(
+        database,
+        Uuid::now_v7().to_string(),
+        json!({
+            "provider": "seatable",
+            "entityType": "task",
+            "entityId": task_id,
+            "externalId": external_id,
+            "lastSyncedAt": now_millis(),
+            "expectedVersion": expected_version,
+        }),
+    )?;
+    Ok(response
+        .pointer("/data/binding/version")
+        .and_then(Value::as_i64)
+        .unwrap_or(expected_version + 1))
+}
+
+fn direct_execute_task_sync_with(
+    database: &Database,
+    run_id: &str,
+    context: &DirectSeatableContext,
+    client: &impl SeaTableApi,
+    store: &impl DirectBindingStore,
+) -> Result<SyncExecutionResult, String> {
+    let preview = {
+        let registry = direct_sync_runs()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let run = registry
+            .runs
+            .get(run_id)
+            .ok_or_else(|| "NOT_FOUND: SeaTable 同步预览不存在".to_string())?;
+        if let Some(result) = &run.result {
+            return Ok(result.clone());
+        }
+        run.preview.clone()
+    };
+    if preview.conflict_count > 0 {
+        return Err("SYNC_CONFLICT: 预览中存在可能重复的事项，请先处理冲突".to_string());
+    }
+    let mut bindings = store.list(database)?;
+    let mut success = 0;
+    let mut failed = 0;
+    let mut skipped = 0;
+    for item in &preview.items {
+        let previous_state = {
+            let registry = direct_sync_runs()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            registry
+                .runs
+                .get(run_id)
+                .and_then(|run| run.item_states.get(&item.item_id).cloned())
+                .unwrap_or_else(|| "pending".to_string())
+        };
+        if previous_state == "succeeded" {
+            if item.action == "skip" {
+                skipped += 1;
+            } else {
+                success += 1;
+            }
+            continue;
+        }
+        if item.action == "skip" {
+            skipped += 1;
+            mark_direct_item(run_id, &item.item_id, "succeeded", None);
+            continue;
+        }
+        let result = match item.action.as_str() {
+            "create" => client
+                .create_row(&context.config.task_table, &item.row)
+                .map(Some),
+            "update" => item
+                .external_id
+                .as_deref()
+                .ok_or_else(|| "SCHEMA_MISMATCH: 更新项缺少外部行 ID".to_string())
+                .and_then(|id| {
+                    client
+                        .update_row(&context.config.task_table, id, &item.row)
+                        .map(|_| Some(id.to_string()))
+                }),
+            _ => Err(format!("SYNC_CONFLICT: 不支持执行动作 {}", item.action)),
+        };
+        match result {
+            Ok(external_id) => {
+                let external_id = external_id.or(item.external_id.clone()).unwrap_or_default();
+                let expected_version = direct_binding_version(&bindings, &item.task_id);
+                match store.upsert(database, &item.task_id, &external_id, expected_version) {
+                    Ok(version) => {
+                        cache_direct_binding(&mut bindings, &item.task_id, &external_id, version);
+                        success += 1;
+                        mark_direct_item(run_id, &item.item_id, "succeeded", None);
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        mark_direct_item(run_id, &item.item_id, "failed", Some(error));
+                    }
+                }
+            }
+            Err(error) => {
+                failed += 1;
+                mark_direct_item(run_id, &item.item_id, "failed", Some(error));
+            }
+        }
+    }
+    let state = if failed == 0 {
+        "succeeded"
+    } else if success > 0 || skipped > 0 {
+        "partial"
+    } else {
+        "failed"
+    };
+    let result = SyncExecutionResult {
+        run_id: run_id.to_string(),
+        state: state.to_string(),
+        success_count: success,
+        failed_count: failed,
+        skipped_count: skipped,
+    };
+    let mut registry = direct_sync_runs()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(run) = registry.runs.get_mut(run_id) {
+        run.result = Some(result.clone());
+    }
+    Ok(result)
+}
+
+fn direct_retry_failed_with(
+    database: &Database,
+    run_id: &str,
+    context: &DirectSeatableContext,
+    client: &impl SeaTableApi,
+    store: &impl DirectBindingStore,
+) -> Result<SyncExecutionResult, String> {
+    let preview = {
+        let registry = direct_sync_runs()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let run = registry
+            .runs
+            .get(run_id)
+            .ok_or_else(|| "NOT_FOUND: 原同步记录不存在".to_string())?;
+        let failed_ids = run.item_errors.keys().cloned().collect::<HashSet<_>>();
+        if failed_ids.is_empty() {
+            return Err("VALIDATION_ERROR: 没有可重试的失败事项".to_string());
+        }
+        summarize_preview(
+            Uuid::now_v7().to_string(),
+            run.preview.table_name.clone(),
+            run.preview.work_date.clone(),
+            run.preview.subject_name.clone(),
+            run.preview
+                .items
+                .iter()
+                .filter(|item| failed_ids.contains(&item.item_id))
+                .cloned()
+                .map(|mut item| {
+                    item.item_id = Uuid::now_v7().to_string();
+                    item
+                })
+                .collect(),
+        )
+    };
+    let stored = store_direct_run(preview);
+    direct_execute_task_sync_with(database, &stored.run_id, context, client, store)
+}
+
+fn direct_query_reimbursements_with(
+    database: &Database,
+    request: ReimbursementsRequest,
+    context: &DirectSeatableContext,
+    client: &impl SeaTableApi,
+) -> Result<ReimbursementResult, String> {
+    let subject_name = direct_subject_name(database, &request.subject_id)?;
+    let rows = client.list_rows(&context.config.reimbursement_table, None)?;
+    Ok(build_reimbursement_result(
+        request,
+        &context.config,
+        subject_name,
+        rows,
+    ))
+}
+
+fn build_reimbursement_result(
+    request: ReimbursementsRequest,
+    config: &SeaTableConfig,
+    subject_name: String,
+    rows: Vec<Value>,
+) -> ReimbursementResult {
+    let items = rows
+        .into_iter()
+        .filter_map(|row| {
+            if string_cell(&row, &config.subject_field).as_deref() != Some(subject_name.as_str())
+                || string_cell(&row, &config.status_field).as_deref()
+                    != Some(config.reimbursement_pending_status.as_str())
+            {
+                return None;
+            }
+            let amount = number_cell(&row, &config.reimbursement_amount_field)?;
+            Some(ReimbursementItem {
+                description: string_cell(&row, &config.reimbursement_item_field)
+                    .unwrap_or_else(|| "未命名报销项".to_string()),
+                amount,
+            })
+        })
+        .collect::<Vec<_>>();
+    ReimbursementResult {
+        subject_id: request.subject_id.clone(),
+        subject_name,
+        period_start: request.period_start.clone(),
+        period_end: request.period_end.clone(),
+        total: items.iter().map(|item| item.amount).sum(),
+        items,
+    }
+}
+
 pub fn query_reimbursements(
     database: &Database,
     request: ReimbursementsRequest,
@@ -755,31 +1250,7 @@ fn query_reimbursements_with(
         )
         .map_err(|_| "NOT_FOUND: 主体不存在".to_string())?;
     let rows = client.list_rows(&config.reimbursement_table, None)?;
-    let items = rows
-        .into_iter()
-        .filter_map(|row| {
-            if string_cell(&row, &config.subject_field).as_deref() != Some(subject_name.as_str())
-                || string_cell(&row, &config.status_field).as_deref()
-                    != Some(config.reimbursement_pending_status.as_str())
-            {
-                return None;
-            }
-            let amount = number_cell(&row, &config.reimbursement_amount_field)?;
-            Some(ReimbursementItem {
-                description: string_cell(&row, &config.reimbursement_item_field)
-                    .unwrap_or_else(|| "未命名报销项".to_string()),
-                amount,
-            })
-        })
-        .collect::<Vec<_>>();
-    let result = ReimbursementResult {
-        subject_id: request.subject_id.clone(),
-        subject_name,
-        period_start: request.period_start.clone(),
-        period_end: request.period_end.clone(),
-        total: items.iter().map(|item| item.amount).sum(),
-        items,
-    };
+    let result = build_reimbursement_result(request.clone(), config, subject_name, rows);
     connection.execute(
         "INSERT INTO sync_runs(id, workspace_id, provider, operation_type, state, request_json, preview_json, success_count, created_at, started_at, completed_at)
          VALUES (?1, ?2, 'seatable', 'reimbursements_query', 'succeeded', ?3, ?4, ?5, ?6, ?6, ?6)",
@@ -1010,7 +1481,18 @@ fn default_reimbursement_item_field() -> String {
 pub fn seatable_connection_test(
     database: tauri::State<'_, Database>,
 ) -> Result<ConnectionTestResult, String> {
-    test_connection(&database)
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::SharedSettingsIntegrations,
+        crate::storage_contract::StorageOperation::Query,
+        |database| test_connection(database),
+        |database| {
+            let context = direct_seatable_context(database)?;
+            let token = integration_secret("seatable", &context.workspace_id)?;
+            let client = SeaTableClient::connect(&context.config, &token)?;
+            test_connection_with(&context.config, &client)
+        },
+    )
 }
 
 #[tauri::command]
@@ -1018,7 +1500,23 @@ pub fn seatable_task_sync_preview(
     database: tauri::State<'_, Database>,
     request: TaskSyncPreviewRequest,
 ) -> Result<TaskSyncPreview, String> {
-    preview_task_sync(&database, request)
+    let direct_request = TaskSyncPreviewRequest {
+        subject_id: request.subject_id.clone(),
+        work_date: request.work_date.clone(),
+        task_ids: request.task_ids.clone(),
+    };
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::SharedSettingsIntegrations,
+        crate::storage_contract::StorageOperation::Query,
+        |database| preview_task_sync(database, request),
+        |database| {
+            let context = direct_seatable_context(database)?;
+            let token = integration_secret("seatable", &context.workspace_id)?;
+            let client = SeaTableClient::connect(&context.config, &token)?;
+            direct_preview_task_sync_with(database, direct_request, &context, &client)
+        },
+    )
 }
 
 #[tauri::command]
@@ -1026,28 +1524,48 @@ pub fn seatable_task_sync_execute(
     database: tauri::State<'_, Database>,
     request: SyncExecuteRequest,
 ) -> Result<SyncExecutionResult, String> {
-    let state = crate::supabase::storage_mode(&database)?;
-    let connection = database.open()?;
-    let (_, config) = load_config(&connection)?;
-    let workspace_id: String = connection
-        .query_row(
-            "SELECT workspace_id FROM sync_runs WHERE id = ?1",
-            [&request.run_id],
-            |row| row.get(0),
-        )
-        .map_err(|_| "NOT_FOUND: SeaTable 同步预览不存在".to_string())?;
-    let token = integration_secret("seatable", &workspace_id)?;
-    let client = SeaTableClient::connect(&config, &token)?;
-    drop(connection);
-    let result = execute_task_sync_with(
+    let direct_run_id = request.run_id.clone();
+    crate::storage_contract::route(
         &database,
-        request,
-        &config,
-        &client,
-        Some((&state, "external_binding_upsert")),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+        crate::storage_contract::BusinessDomain::SharedSettingsIntegrations,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            let state = crate::supabase::storage_mode(database)?;
+            let connection = database.open()?;
+            let (_, config) = load_config(&connection)?;
+            let workspace_id: String = connection
+                .query_row(
+                    "SELECT workspace_id FROM sync_runs WHERE id = ?1",
+                    [&request.run_id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| "NOT_FOUND: SeaTable 同步预览不存在".to_string())?;
+            let token = integration_secret("seatable", &workspace_id)?;
+            let client = SeaTableClient::connect(&config, &token)?;
+            drop(connection);
+            let result = execute_task_sync_with(
+                database,
+                request,
+                &config,
+                &client,
+                Some((&state, "external_binding_upsert")),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| {
+            let context = direct_seatable_context(database)?;
+            let token = integration_secret("seatable", &context.workspace_id)?;
+            let client = SeaTableClient::connect(&context.config, &token)?;
+            direct_execute_task_sync_with(
+                database,
+                &direct_run_id,
+                &context,
+                &client,
+                &CloudBindingStore,
+            )
+        },
+    )
 }
 
 #[tauri::command]
@@ -1055,28 +1573,48 @@ pub fn seatable_sync_retry_failed(
     database: tauri::State<'_, Database>,
     request: SyncExecuteRequest,
 ) -> Result<SyncExecutionResult, String> {
-    let state = crate::supabase::storage_mode(&database)?;
-    let connection = database.open()?;
-    let (_, config) = load_config(&connection)?;
-    let workspace_id: String = connection
-        .query_row(
-            "SELECT workspace_id FROM sync_runs WHERE id = ?1",
-            [&request.run_id],
-            |row| row.get(0),
-        )
-        .map_err(|_| "NOT_FOUND: 原同步记录不存在".to_string())?;
-    let token = integration_secret("seatable", &workspace_id)?;
-    let client = SeaTableClient::connect(&config, &token)?;
-    drop(connection);
-    let result = retry_failed_with(
+    let direct_run_id = request.run_id.clone();
+    crate::storage_contract::route(
         &database,
-        request,
-        &config,
-        &client,
-        Some((&state, "external_binding_upsert")),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+        crate::storage_contract::BusinessDomain::SharedSettingsIntegrations,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            let state = crate::supabase::storage_mode(database)?;
+            let connection = database.open()?;
+            let (_, config) = load_config(&connection)?;
+            let workspace_id: String = connection
+                .query_row(
+                    "SELECT workspace_id FROM sync_runs WHERE id = ?1",
+                    [&request.run_id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| "NOT_FOUND: 原同步记录不存在".to_string())?;
+            let token = integration_secret("seatable", &workspace_id)?;
+            let client = SeaTableClient::connect(&config, &token)?;
+            drop(connection);
+            let result = retry_failed_with(
+                database,
+                request,
+                &config,
+                &client,
+                Some((&state, "external_binding_upsert")),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| {
+            let context = direct_seatable_context(database)?;
+            let token = integration_secret("seatable", &context.workspace_id)?;
+            let client = SeaTableClient::connect(&context.config, &token)?;
+            direct_retry_failed_with(
+                database,
+                &direct_run_id,
+                &context,
+                &client,
+                &CloudBindingStore,
+            )
+        },
+    )
 }
 
 #[tauri::command]
@@ -1084,7 +1622,19 @@ pub fn seatable_reimbursements_query(
     database: tauri::State<'_, Database>,
     request: ReimbursementsRequest,
 ) -> Result<ReimbursementResult, String> {
-    query_reimbursements(&database, request)
+    let direct_request = request.clone();
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::SharedSettingsIntegrations,
+        crate::storage_contract::StorageOperation::Query,
+        |database| query_reimbursements(database, request),
+        |database| {
+            let context = direct_seatable_context(database)?;
+            let token = integration_secret("seatable", &context.workspace_id)?;
+            let client = SeaTableClient::connect(&context.config, &token)?;
+            direct_query_reimbursements_with(database, direct_request, &context, &client)
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1520,5 +2070,120 @@ mod tests {
         .unwrap();
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.total, 28.5);
+    }
+
+    struct MemoryBindings(Mutex<Vec<Value>>);
+
+    impl DirectBindingStore for MemoryBindings {
+        fn list(&self, _database: &Database) -> Result<Vec<Value>, String> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+
+        fn upsert(
+            &self,
+            _database: &Database,
+            task_id: &str,
+            external_id: &str,
+            expected_version: i64,
+        ) -> Result<i64, String> {
+            let next = expected_version + 1;
+            let mut bindings = self.0.lock().unwrap();
+            bindings
+                .retain(|binding| binding.get("entityId").and_then(Value::as_str) != Some(task_id));
+            bindings.push(json!({
+                "provider": "seatable",
+                "entityType": "task",
+                "entityId": task_id,
+                "externalId": external_id,
+                "version": next,
+            }));
+            Ok(next)
+        }
+    }
+
+    #[test]
+    fn direct_sync_uses_cloud_bindings_without_local_business_writes() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("direct-seatable.sqlite3")).unwrap();
+        let manifest: Value =
+            serde_json::from_str(crate::storage_contract::STORAGE_BOUNDARIES_JSON).unwrap();
+        let connection = database.open().unwrap();
+        for table in manifest["sqliteTables"]["localBusiness"]
+            .as_array()
+            .unwrap()
+        {
+            let table = table.as_str().unwrap();
+            connection
+                .execute_batch(&format!("ALTER TABLE {table} RENAME TO blocked_{table}"))
+                .unwrap();
+        }
+        drop(connection);
+        let outbox_before: i64 = database
+            .open()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+        let context = DirectSeatableContext {
+            workspace_id: "20000000-0000-0000-0000-0000000000aa".to_string(),
+            config: config(),
+            bindings: Vec::new(),
+        };
+        let tasks = vec![TaskDto {
+            id: "task-1".to_string(),
+            subject_id: "subject-1".to_string(),
+            parent_id: None,
+            day_instance_date: None,
+            day_instance_kind: None,
+            day_instance_source_task_id: None,
+            title: "任务一".to_string(),
+            status: "open".to_string(),
+            planned_date: None,
+            estimate_minutes: Some(90),
+            today_estimate_minutes: None,
+            daily_estimate_version: None,
+            day_plan_state: None,
+            day_plan_version: None,
+            today_member: false,
+            today_context: false,
+            note: None,
+            project_name: Some("项目".to_string()),
+            solution_name: None,
+            sort_order: 0,
+            completed_at: None,
+            depth: 0,
+            path_label: String::new(),
+            selectable: true,
+            direct_minutes: 0,
+            total_minutes: 90,
+            execution_state: "not_started".to_string(),
+            recurrence: None,
+            occurrence_date: None,
+            occurrence_origin: None,
+            occurrence_version: None,
+            version: 1,
+        }];
+        let request = TaskSyncPreviewRequest {
+            subject_id: "subject-1".to_string(),
+            work_date: "2026-10-23".to_string(),
+            task_ids: Vec::new(),
+        };
+        let client = MockSeaTable::new();
+        let preview = build_direct_preview(&request, &context, "晓健", tasks, &[]);
+        assert_eq!(preview.create_count, 1);
+        let store = MemoryBindings(Mutex::new(Vec::new()));
+        let result =
+            direct_execute_task_sync_with(&database, &preview.run_id, &context, &client, &store)
+                .unwrap();
+        assert_eq!(result.state, "succeeded");
+        assert_eq!(result.success_count, 1);
+        assert_eq!(store.0.lock().unwrap()[0]["version"], json!(1));
+        let outbox_after: i64 = database
+            .open()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(outbox_before, outbox_after);
+        assert_eq!(client.create_calls.lock().unwrap()["任务一"], 1);
     }
 }

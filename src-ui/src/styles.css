@@ -2796,6 +2796,39 @@ pre {
 .storage-migration-section { min-width: 0; }
 .storage-account-section { grid-template-columns: minmax(0, 1fr); }
 .storage-migration-section { padding-bottom: 2px; }
+.storage-copy-section { display: grid; gap: 10px; }
+.storage-copy-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.storage-copy-card { display: grid; align-content: start; gap: 8px; min-width: 0; padding: 10px; border: 1px solid var(--line-soft); border-radius: 7px; background: var(--surface-soft); }
+.storage-copy-card > div:first-child { display: grid; gap: 3px; }
+.storage-copy-card strong { color: var(--text); font-size: 12px; }
+.storage-copy-card small, .storage-copy-card p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.storage-copy-card p { color: #e7b75f; }
+.storage-copy-impact { display: grid; gap: 3px; padding: 7px; border-radius: 6px; background: color-mix(in srgb, var(--surface) 72%, transparent); color: var(--text-soft); font-size: 10px; }
+.storage-protocol-upgrade-section { display: grid; gap: 10px; }
+.protocol-upgrade-warning { display: flex; gap: 8px; align-items: flex-start; padding: 9px; border: 1px solid color-mix(in srgb, #e7b75f 42%, var(--line-soft)); border-radius: 7px; background: color-mix(in srgb, #e7b75f 9%, var(--surface-soft)); color: #e7b75f; }
+.protocol-upgrade-warning > div { display: grid; gap: 3px; }
+.protocol-upgrade-warning strong { color: var(--text); font-size: 11px; }
+.protocol-upgrade-warning span { color: var(--text-soft); font-size: 10px; line-height: 1.5; }
+.protocol-upgrade-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+.protocol-upgrade-summary > span { display: grid; gap: 2px; padding: 8px; border: 1px solid var(--line-soft); border-radius: 6px; background: var(--surface-soft); }
+.protocol-upgrade-summary strong { color: var(--text); font-size: 16px; }
+.protocol-upgrade-summary small, .protocol-upgrade-devices span, .protocol-upgrade-backup-path { color: var(--muted); font-size: 10px; line-height: 1.45; }
+.protocol-upgrade-devices { display: grid; gap: 4px; padding: 8px; border-radius: 6px; background: var(--surface-soft); }
+.protocol-upgrade-devices strong { color: var(--text); font-size: 11px; }
+.protocol-upgrade-paths { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.protocol-upgrade-paths article { display: grid; align-content: start; gap: 8px; min-width: 0; padding: 10px; border: 1px solid var(--line-soft); border-radius: 7px; background: var(--surface-soft); }
+.protocol-upgrade-paths article > div { display: grid; gap: 3px; }
+.protocol-upgrade-paths article strong { color: var(--text); font-size: 11px; }
+.protocol-upgrade-paths article small { color: var(--muted); font-size: 10px; line-height: 1.5; }
+.protocol-upgrade-paths label { display: grid; gap: 4px; color: var(--text-soft); font-size: 10px; }
+.protocol-upgrade-paths input { min-width: 0; }
+.protocol-upgrade-backup-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.storage-mode-switch-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding-top: 9px; border-top: 1px solid var(--line-soft); color: var(--muted); font-size: 10px; }
+.storage-mode-switch-row strong { color: var(--text); }
+.readonly-fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+.workspace-readonly-fieldset { display: contents; }
+.workspace-readonly-banner { position: sticky; z-index: 12; top: 0; margin: 0 0 10px; }
+.readonly-fieldset:disabled { opacity: .72; }
 .local-cache-section { padding-top: 12px; }
 .settings-hooks-panel {
   grid-column: 1 / -1;
@@ -3582,6 +3615,9 @@ pre {
   .storage-status-card { align-items: flex-start; }
   .storage-status-meta { min-width: 0; }
   .storage-section-heading, .cloud-account-row, .local-cache-reset-row { align-items: stretch; flex-direction: column; }
+  .storage-copy-grid { grid-template-columns: 1fr; }
+  .protocol-upgrade-summary, .protocol-upgrade-paths { grid-template-columns: 1fr; }
+  .storage-mode-switch-row { align-items: stretch; flex-direction: column; }
   .cloud-account-row { display: grid; }
   .cloud-account-row .settings-inline-actions, .local-cache-reset-row .danger-button { justify-self: start; }
   .cloud-account-actions { display: grid; grid-template-columns: repeat(2, max-content); }

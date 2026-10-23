@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, OptionalExtension};
@@ -9,7 +10,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::database::Database;
-use crate::tasks::{parse_plan_markdown, TaskDto};
+use crate::tasks::{parse_plan_markdown, PlanImportItemDto, TaskDto};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,7 +59,7 @@ pub struct PlanImportPreviewRequest {
     pub subject_id: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanImportPreviewResult {
     pub batch_id: String,
@@ -72,7 +73,7 @@ pub struct PlanImportPreviewResult {
     pub version: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanImportPreviewItem {
     pub id: String,
@@ -343,29 +344,8 @@ pub fn preview_plan_from_obsidian(
     let connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     ensure_subject(&connection, &workspace_id, &request.subject_id)?;
-    let (root_path, pattern) = obsidian_path_settings(&connection)?;
-    if root_path.trim().is_empty() {
-        return Err("INTEGRATION_NOT_CONFIGURED: 请先设置 Obsidian 根目录".to_string());
-    }
-    let source_path = resolve_daily_path(&root_path, &pattern, &request.source_date)?;
-    let (source_exists, raw_markdown, source_mtime) = if source_path.exists() {
-        let metadata = fs::metadata(&source_path).map_err(|error| {
-            format!(
-                "无法读取 Obsidian 文件信息 {}: {error}",
-                source_path.display()
-            )
-        })?;
-        let markdown = fs::read_to_string(&source_path).map_err(|error| {
-            format!("无法读取 Obsidian 日报 {}: {error}", source_path.display())
-        })?;
-        (
-            true,
-            markdown,
-            metadata.modified().ok().map(system_time_millis),
-        )
-    } else {
-        (false, String::new(), None)
-    };
+    let (source_path, source_exists, raw_markdown, source_mtime) =
+        read_plan_source(&connection, &request.source_date)?;
     let content_hash = source_exists.then(|| content_hash(&raw_markdown));
     let mut parsed = parse_plan_markdown(&raw_markdown);
     if !source_exists {
@@ -398,14 +378,8 @@ pub fn preview_plan_from_obsidian(
         )
         .map_err(|error| error.to_string())?;
 
-    let mut client_to_item = HashMap::new();
-    let mut items = Vec::new();
-    for item in parsed.items {
-        let id = Uuid::now_v7().to_string();
-        let parent_id = item
-            .parent_client_id
-            .as_ref()
-            .and_then(|client_id| client_to_item.get(client_id).cloned());
+    let items = build_plan_preview_items(parsed.items);
+    for item in &items {
         connection
             .execute(
                 "INSERT INTO plan_import_items(
@@ -413,10 +387,10 @@ pub fn preview_plan_from_obsidian(
                    sort_order, source_line_no, source_text, parse_status
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
-                    id,
+                    item.id,
                     workspace_id,
                     batch_id,
-                    parent_id,
+                    item.parent_id,
                     item.title,
                     item.estimate_minutes,
                     item.sort_order,
@@ -426,17 +400,6 @@ pub fn preview_plan_from_obsidian(
                 ],
             )
             .map_err(|error| error.to_string())?;
-        client_to_item.insert(item.client_id, id.clone());
-        items.push(PlanImportPreviewItem {
-            id,
-            parent_id,
-            title: item.title,
-            estimate_minutes: item.estimate_minutes,
-            sort_order: item.sort_order,
-            source_line_no: item.source_line_no,
-            source_text: item.source_text,
-            parse_status: item.parse_status,
-        });
     }
     Ok(PlanImportPreviewResult {
         batch_id,
@@ -449,6 +412,58 @@ pub fn preview_plan_from_obsidian(
         warnings: parsed.warnings,
         version: 1,
     })
+}
+
+fn read_plan_source(
+    connection: &rusqlite::Connection,
+    source_date: &str,
+) -> Result<(PathBuf, bool, String, Option<i64>), String> {
+    let (root_path, pattern) = obsidian_path_settings(connection)?;
+    if root_path.trim().is_empty() {
+        return Err("INTEGRATION_NOT_CONFIGURED: 请先设置 Obsidian 根目录".to_string());
+    }
+    let source_path = resolve_daily_path(&root_path, &pattern, source_date)?;
+    if !source_path.exists() {
+        return Ok((source_path, false, String::new(), None));
+    }
+    let metadata = fs::metadata(&source_path).map_err(|error| {
+        format!(
+            "无法读取 Obsidian 文件信息 {}: {error}",
+            source_path.display()
+        )
+    })?;
+    let markdown = fs::read_to_string(&source_path)
+        .map_err(|error| format!("无法读取 Obsidian 日报 {}: {error}", source_path.display()))?;
+    Ok((
+        source_path,
+        true,
+        markdown,
+        metadata.modified().ok().map(system_time_millis),
+    ))
+}
+
+fn build_plan_preview_items(items: Vec<PlanImportItemDto>) -> Vec<PlanImportPreviewItem> {
+    let mut client_to_item = HashMap::new();
+    let mut preview_items = Vec::new();
+    for item in items {
+        let id = Uuid::now_v7().to_string();
+        let parent_id = item
+            .parent_client_id
+            .as_ref()
+            .and_then(|client_id| client_to_item.get(client_id).cloned());
+        client_to_item.insert(item.client_id, id.clone());
+        preview_items.push(PlanImportPreviewItem {
+            id,
+            parent_id,
+            title: item.title,
+            estimate_minutes: item.estimate_minutes,
+            sort_order: item.sort_order,
+            source_line_no: item.source_line_no,
+            source_text: item.source_text,
+            parse_status: item.parse_status,
+        });
+    }
+    preview_items
 }
 
 #[cfg(test)]
@@ -817,12 +832,345 @@ fn bump_revision(connection: &rusqlite::Connection) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+struct DirectPlanImportState {
+    preview: PlanImportPreviewResult,
+    subject_id: String,
+    target_date: String,
+    confirmed: Option<Vec<TaskDto>>,
+}
+
+fn direct_plan_imports() -> &'static Mutex<HashMap<String, DirectPlanImportState>> {
+    static IMPORTS: OnceLock<Mutex<HashMap<String, DirectPlanImportState>>> = OnceLock::new();
+    IMPORTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn direct_report_writes() -> &'static Mutex<HashMap<String, ReportWritePreviewResult>> {
+    static WRITES: OnceLock<Mutex<HashMap<String, ReportWritePreviewResult>>> = OnceLock::new();
+    WRITES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cloud_subject_name(database: &Database, subject_id: &str) -> Result<String, String> {
+    crate::supabase::direct_cloud_subject_list(database)?
+        .into_iter()
+        .find(|subject| subject.id == subject_id)
+        .map(|subject| subject.name)
+        .ok_or_else(|| "NOT_FOUND: 主体不存在".to_string())
+}
+
+fn direct_preview_plan_from_obsidian(
+    database: &Database,
+    request: PlanImportPreviewRequest,
+) -> Result<PlanImportPreviewResult, String> {
+    validate_date(&request.source_date)?;
+    validate_date(&request.target_date)?;
+    cloud_subject_name(database, &request.subject_id)?;
+    let connection = database.open()?;
+    let (source_path, source_exists, raw_markdown, source_mtime) =
+        read_plan_source(&connection, &request.source_date)?;
+    let content_hash = source_exists.then(|| content_hash(&raw_markdown));
+    let mut parsed = parse_plan_markdown(&raw_markdown);
+    if !source_exists {
+        parsed
+            .warnings
+            .push(format!("源日报不存在：{}", source_path.display()));
+    }
+    let preview = PlanImportPreviewResult {
+        batch_id: Uuid::now_v7().to_string(),
+        source_path: source_path.display().to_string(),
+        source_exists,
+        source_mtime,
+        source_content_hash: content_hash,
+        raw_markdown,
+        items: build_plan_preview_items(parsed.items),
+        warnings: parsed.warnings,
+        version: 1,
+    };
+    let mut registry = direct_plan_imports()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    while registry.len() >= 32 {
+        let Some(key) = registry.keys().next().cloned() else {
+            break;
+        };
+        registry.remove(&key);
+    }
+    registry.insert(
+        preview.batch_id.clone(),
+        DirectPlanImportState {
+            preview: preview.clone(),
+            subject_id: request.subject_id,
+            target_date: request.target_date,
+            confirmed: None,
+        },
+    );
+    Ok(preview)
+}
+
+fn direct_confirm_plan_import(
+    database: &Database,
+    request: PlanImportConfirmRequest,
+) -> Result<PlanImportConfirmResult, String> {
+    let (preview, subject_id, target_date) = {
+        let registry = direct_plan_imports()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let state = registry
+            .get(&request.batch_id)
+            .ok_or_else(|| "NOT_FOUND: 导入批次不存在".to_string())?;
+        if let Some(tasks) = &state.confirmed {
+            return Ok(PlanImportConfirmResult {
+                batch_id: request.batch_id,
+                tasks: tasks.clone(),
+                already_confirmed: true,
+            });
+        }
+        if state.preview.version != request.expected_version {
+            return Err("VERSION_CONFLICT: 导入预览已经变化".to_string());
+        }
+        (
+            state.preview.clone(),
+            state.subject_id.clone(),
+            state.target_date.clone(),
+        )
+    };
+    let selected = request
+        .items
+        .into_iter()
+        .filter(|item| item.selected && !item.title.trim().is_empty())
+        .map(|item| (item.import_item_id.clone(), item))
+        .collect::<HashMap<_, _>>();
+    let mut items = Vec::new();
+    for item in &preview.items {
+        let Some(selection) = selected.get(&item.id) else {
+            continue;
+        };
+        if item.parse_status != "recognized" {
+            continue;
+        }
+        if selection
+            .estimate_minutes
+            .is_some_and(|minutes| minutes <= 0)
+        {
+            return Err("VALIDATION_ERROR: 预计用时必须大于 0 分钟".to_string());
+        }
+        items.push(serde_json::json!({
+            "id": item.id,
+            "parentId": item.parent_id,
+            "title": selection.title.trim(),
+            "estimateMinutes": selection.estimate_minutes,
+            "sortOrder": item.sort_order,
+        }));
+    }
+    if items.is_empty() {
+        return Err("VALIDATION_ERROR: 请至少选择一个可导入事项".to_string());
+    }
+    let response = crate::supabase::direct_cloud_plan_import_confirm_mutation(
+        database,
+        request.batch_id.clone(),
+        serde_json::json!({
+            "subjectId": subject_id,
+            "targetDate": target_date,
+            "items": items,
+        }),
+    )?;
+    let tasks = response
+        .get("tasks")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|value| {
+            serde_json::from_value::<crate::supabase::DirectCloudTaskData>(value)
+                .map(TaskDto::from)
+                .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 导入事项响应无效: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut registry = direct_plan_imports()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(state) = registry.get_mut(&request.batch_id) {
+        state.confirmed = Some(tasks.clone());
+    }
+    Ok(PlanImportConfirmResult {
+        batch_id: request.batch_id,
+        tasks,
+        already_confirmed: false,
+    })
+}
+
+fn inspect_report_file(target_path: &Path) -> Result<(bool, String, Option<i64>), String> {
+    if !target_path.exists() {
+        return Ok((false, String::new(), None));
+    }
+    let metadata = fs::metadata(target_path)
+        .map_err(|error| format!("无法读取目标文件信息 {}: {error}", target_path.display()))?;
+    let content = fs::read_to_string(target_path)
+        .map_err(|error| format!("无法读取目标文件 {}: {error}", target_path.display()))?;
+    Ok((
+        true,
+        content,
+        metadata.modified().ok().map(system_time_millis),
+    ))
+}
+
+fn direct_preview_report_write(
+    database: &Database,
+    request: ReportWritePreviewRequest,
+) -> Result<ReportWritePreviewResult, String> {
+    let connection = database.open()?;
+    let report = crate::reports::direct_report_from_value(
+        crate::supabase::direct_cloud_report_detail(database, request.report_id.clone())?
+            .data
+            .report,
+    )?;
+    if report.version != request.expected_version {
+        return Err("VERSION_CONFLICT: 报告内容已变化，请保存后重试".to_string());
+    }
+    let target_path = resolve_report_path(
+        &connection,
+        &report.report_type,
+        &report.period_start,
+        &report.period_end,
+    )?;
+    let (file_exists, existing_content, existing_file_mtime) = inspect_report_file(&target_path)?;
+    let result = ReportWritePreviewResult {
+        run_id: Uuid::now_v7().to_string(),
+        report_id: request.report_id,
+        report_version: report.version,
+        target_path: target_path.display().to_string(),
+        file_exists,
+        existing_content_hash: file_exists.then(|| content_hash(&existing_content)),
+        existing_file_mtime,
+        existing_content,
+        report_markdown: report.markdown,
+        action: if file_exists { "update" } else { "create" }.to_string(),
+    };
+    let mut registry = direct_report_writes()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    while registry.len() >= 32 {
+        let Some(key) = registry.keys().next().cloned() else {
+            break;
+        };
+        registry.remove(&key);
+    }
+    registry.insert(result.run_id.clone(), result.clone());
+    Ok(result)
+}
+
+fn direct_execute_report_write(
+    database: &Database,
+    request: ReportWriteExecuteRequest,
+) -> Result<ReportWriteExecuteResult, String> {
+    if !matches!(request.strategy.as_str(), "overwrite" | "append") {
+        return Err("VALIDATION_ERROR: 写入方式必须是 overwrite 或 append".to_string());
+    }
+    let preview = {
+        let registry = direct_report_writes()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        registry
+            .get(&request.run_id)
+            .cloned()
+            .ok_or_else(|| "NOT_FOUND: 写入预览不存在或已经执行".to_string())?
+    };
+    let report = crate::reports::direct_report_from_value(
+        crate::supabase::direct_cloud_report_detail(database, preview.report_id.clone())?
+            .data
+            .report,
+    )?;
+    if report.version != preview.report_version || report.markdown != preview.report_markdown {
+        return Err("REPORT_CHANGED: 报告在预览后已变化，请重新预览".to_string());
+    }
+    let target_path = PathBuf::from(&preview.target_path);
+    let (file_exists, existing_content, existing_file_mtime) = inspect_report_file(&target_path)?;
+    if file_exists != preview.file_exists
+        || file_exists.then(|| content_hash(&existing_content)) != preview.existing_content_hash
+        || existing_file_mtime != preview.existing_file_mtime
+    {
+        return Err("EXTERNAL_FILE_CHANGED: Obsidian 文件在预览后已变化，请重新预览".to_string());
+    }
+    let output =
+        if request.strategy == "append" && file_exists && !existing_content.trim().is_empty() {
+            format!(
+                "{}\n\n---\n\n{}",
+                existing_content.trim_end(),
+                preview.report_markdown.trim_start()
+            )
+        } else {
+            preview.report_markdown.clone()
+        };
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("无法创建 Obsidian 目录 {}: {error}", parent.display()))?;
+    }
+    fs::write(&target_path, &output)
+        .map_err(|error| format!("无法写入 Obsidian 文件 {}: {error}", target_path.display()))?;
+    let metadata = fs::metadata(&target_path)
+        .map_err(|error| format!("无法读取写入结果 {}: {error}", target_path.display()))?;
+    let written_at = now_millis();
+    let output_mtime = metadata
+        .modified()
+        .ok()
+        .map(system_time_millis)
+        .unwrap_or(written_at);
+    let connection = database.open()?;
+    let device_id: String = connection
+        .query_row(
+            "SELECT id FROM devices WHERE revoked_at IS NULL ORDER BY created_at LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| "CLOUD_DEVICE_REQUIRED: 请先完成云端设备注册".to_string())?;
+    connection
+        .execute(
+            "INSERT INTO local_report_outputs(report_id, device_id, output_path, output_content_hash, output_file_mtime, written_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(report_id, device_id) DO UPDATE SET
+               output_path = excluded.output_path,
+               output_content_hash = excluded.output_content_hash,
+               output_file_mtime = excluded.output_file_mtime,
+               written_at = excluded.written_at",
+            params![
+                preview.report_id,
+                device_id,
+                preview.target_path,
+                content_hash(&output),
+                output_mtime,
+                written_at
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    let mut registry = direct_report_writes()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    registry.remove(&request.run_id);
+    Ok(ReportWriteExecuteResult {
+        run_id: request.run_id,
+        report_id: preview.report_id,
+        target_path: preview.target_path,
+        strategy: request.strategy,
+        written_at,
+    })
+}
+
 #[tauri::command]
 pub fn obsidian_plan_import_preview(
     database: tauri::State<'_, Database>,
     request: PlanImportPreviewRequest,
 ) -> Result<PlanImportPreviewResult, String> {
-    preview_plan_from_obsidian(&database, request)
+    let direct_request = PlanImportPreviewRequest {
+        source_date: request.source_date.clone(),
+        target_date: request.target_date.clone(),
+        subject_id: request.subject_id.clone(),
+    };
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::SharedSettingsIntegrations,
+        crate::storage_contract::StorageOperation::Query,
+        |database| preview_plan_from_obsidian(database, request),
+        |database| direct_preview_plan_from_obsidian(database, direct_request),
+    )
 }
 
 #[tauri::command]
@@ -830,15 +1178,37 @@ pub fn obsidian_plan_import_confirm(
     database: tauri::State<'_, Database>,
     request: PlanImportConfirmRequest,
 ) -> Result<PlanImportConfirmResult, String> {
-    crate::supabase::ensure_repository_write_mode(&database)?;
-    let state = crate::supabase::storage_mode(&database)?;
-    let result = confirm_plan_import_with_cloud_operation(
+    let direct_request = PlanImportConfirmRequest {
+        batch_id: request.batch_id.clone(),
+        items: request
+            .items
+            .iter()
+            .map(|item| PlanImportConfirmItem {
+                import_item_id: item.import_item_id.clone(),
+                selected: item.selected,
+                title: item.title.clone(),
+                estimate_minutes: item.estimate_minutes,
+            })
+            .collect(),
+        expected_version: request.expected_version,
+    };
+    crate::storage_contract::route(
         &database,
-        request,
-        Some((&state, "obsidian_plan_import")),
-    )?;
-    crate::cloud_sync::flush_if_online(&database)?;
-    Ok(result)
+        crate::storage_contract::BusinessDomain::SharedSettingsIntegrations,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| {
+            crate::supabase::ensure_repository_write_mode(database)?;
+            let state = crate::supabase::storage_mode(database)?;
+            let result = confirm_plan_import_with_cloud_operation(
+                database,
+                request,
+                Some((&state, "obsidian_plan_import")),
+            )?;
+            crate::cloud_sync::flush_if_online(database)?;
+            Ok(result)
+        },
+        |database| direct_confirm_plan_import(database, direct_request),
+    )
 }
 
 #[tauri::command]
@@ -846,7 +1216,17 @@ pub fn obsidian_report_write_preview(
     database: tauri::State<'_, Database>,
     request: ReportWritePreviewRequest,
 ) -> Result<ReportWritePreviewResult, String> {
-    preview_report_write(&database, request)
+    let direct_request = ReportWritePreviewRequest {
+        report_id: request.report_id.clone(),
+        expected_version: request.expected_version,
+    };
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::SharedSettingsIntegrations,
+        crate::storage_contract::StorageOperation::Query,
+        |database| preview_report_write(database, request),
+        |database| direct_preview_report_write(database, direct_request),
+    )
 }
 
 #[tauri::command]
@@ -854,7 +1234,17 @@ pub fn obsidian_report_write_execute(
     database: tauri::State<'_, Database>,
     request: ReportWriteExecuteRequest,
 ) -> Result<ReportWriteExecuteResult, String> {
-    execute_report_write(&database, request)
+    let direct_request = ReportWriteExecuteRequest {
+        run_id: request.run_id.clone(),
+        strategy: request.strategy.clone(),
+    };
+    crate::storage_contract::route(
+        &database,
+        crate::storage_contract::BusinessDomain::SharedSettingsIntegrations,
+        crate::storage_contract::StorageOperation::Mutation,
+        |database| execute_report_write(database, request),
+        |database| direct_execute_report_write(database, direct_request),
+    )
 }
 
 #[cfg(test)]

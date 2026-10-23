@@ -1,5 +1,9 @@
 export type CloudSyncPresentationState = {
   mode: "local" | "cloud" | string;
+  storageProtocol?: "sync_v1" | "direct_v2" | string;
+  cloudAccessState?: string;
+  cloudWritable?: boolean;
+  readOnlyReason?: string;
   online: boolean;
   syncState: "synced" | "pending" | "conflict" | "error" | string;
   syncing?: boolean;
@@ -32,6 +36,12 @@ export type CloudSyncRetryFeedback = {
 
 export function cloudSaveStatusLabel(state: CloudSyncPresentationState | undefined): string {
   if (!state || state.mode !== "cloud") return "仅保存在本机";
+  if (state.storageProtocol === "direct_v2") {
+    if (state.cloudAccessState === "connecting") return "正在连接云端";
+    if (state.cloudAccessState === "online_writable" && state.cloudWritable) return "已直接保存到云端";
+    if (state.cloudAccessState === "reauth_required") return "需要重新登录";
+    return "云端只读";
+  }
 
   const pending = Math.max(0, state.pendingOperations) + Math.max(0, state.conflictCount);
   if (pending > 0) return `还有 ${pending} 项待保存`;
@@ -50,6 +60,34 @@ export function cloudSyncPresentation(
       detail: "",
       needsAttention: false,
       attentionLevel: "",
+    };
+  }
+
+  if (state.storageProtocol === "direct_v2") {
+    const accessState = state.cloudAccessState ?? (state.online ? "connecting" : "offline_readonly");
+    if (accessState === "online_writable" && state.cloudWritable) {
+      return {
+        label: "云端在线",
+        detail: state.lastSyncedAt
+          ? `已直接读取 Supabase · 最近刷新 ${formatSyncTime(state.lastSyncedAt)}`
+          : "已直接连接 Supabase，修改会立即提交到云端",
+        needsAttention: false,
+        attentionLevel: "",
+      };
+    }
+    if (accessState === "connecting") {
+      return {
+        label: "正在连接云端",
+        detail: state.readOnlyReason || "正在验证会话并加载 Supabase 数据",
+        needsAttention: false,
+        attentionLevel: "",
+      };
+    }
+    return {
+      label: accessState === "reauth_required" ? "需要重新登录" : "云端只读",
+      detail: state.readOnlyReason || "Supabase 当前不可用，已加载内容可查看但不能修改",
+      needsAttention: true,
+      attentionLevel: accessState === "reauth_required" ? "critical" : "offline",
     };
   }
 

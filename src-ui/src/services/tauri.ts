@@ -55,6 +55,35 @@ export type DataBackupPreview = {
   entityCounts: Record<string, number>;
   excludedCategories: string[];
   replacedEntityCounts: Record<string, number>;
+  legacySyncDiagnostics?: LegacySyncDiagnostics;
+};
+
+export type LegacySyncDiagnostics = {
+  dispositionReason: string;
+  queueCounts: {
+    pending: number;
+    sending: number;
+    failed: number;
+    conflict: number;
+    total: number;
+  };
+  operations: Array<{
+    sequence: number;
+    operationType: string;
+    entityType: string;
+    state: "pending" | "sending" | "failed" | "conflict";
+    attemptCount: number;
+    baseVersion?: number;
+    payloadVersion?: number;
+    workspaceEpoch: number;
+    errorCode?: string;
+    createdAt: number;
+    lastAttemptAt?: number;
+  }>;
+  operationsTruncated: boolean;
+  businessDataIncluded: boolean;
+  rawPayloadExcluded: boolean;
+  note: string;
 };
 
 export type DataBackupImportResult = {
@@ -82,8 +111,8 @@ export async function exportDataBackup(path: string): Promise<DataBackupExportRe
   return await invoke("data_backup_export", { request: { path, rescue: false } });
 }
 
-export async function exportRescueDataBackup(path: string): Promise<DataBackupExportResult> {
-  return await invoke("data_backup_export_rescue", { request: { path } });
+export async function exportRescueDataBackup(path: string, dispositionReason?: string): Promise<DataBackupExportResult> {
+  return await invoke("data_backup_export_rescue", { request: { path, dispositionReason } });
 }
 
 export async function previewDataBackup(path: string): Promise<DataBackupPreview> {
@@ -176,6 +205,12 @@ export type CloudSessionSnapshot = {
 
 export type StorageModeSnapshot = {
   mode: "local" | "cloud";
+  storageProtocol: "local" | "sync_v1" | "direct_v2" | string;
+  configuredCloudProtocol: "sync_v1" | "direct_v2" | string;
+  storageBackend: "local_sqlite" | "legacy_sync_sqlite" | "direct_supabase" | string;
+  cloudAccessState: "local_writable" | "legacy_sync" | "legacy_sync_offline" | "online_writable" | "offline_readonly" | "degraded_readonly" | "reauth_required" | "protocol_incompatible" | string;
+  cloudWritable: boolean;
+  readOnlyReason?: string;
   workspaceId: string;
   deviceId: string;
   online: boolean;
@@ -214,6 +249,50 @@ export type CloudDevice = {
   reauthorizedAt?: string;
   revokedAt?: string;
   current: boolean;
+};
+
+export type StorageProtocolUpgradePreflight = {
+  workspaceId: string;
+  deviceId: string;
+  storageProtocol: string;
+  localProtocol: string;
+  workspaceEpoch: number;
+  localWorkspaceEpoch: number;
+  schemaGeneration: number;
+  serverUpgradeAllowed: boolean;
+  alreadyDirect: boolean;
+  requiresLocalQueueDisposition: boolean;
+  allowedQueueDispositions: string[];
+  devices: CloudDevice[];
+  queue: { pending: number; sending: number; failed: number; conflict: number; total: number };
+  canUpgradeWithDrainedQueue: boolean;
+  blockedReasons: string[];
+  serverTime: string;
+};
+
+export type StorageProtocolUpgradeResult = {
+  upgraded: boolean;
+  alreadyDirect: boolean;
+  workspaceEpoch: number;
+  storageProtocol: "direct_v2";
+  changeSeq?: number;
+  safetySnapshotId?: string;
+  pushedOperations: number;
+  lastChangeSeq: number;
+  refreshedDomains: string[];
+};
+
+export type StorageProtocolAbandonResult = {
+  upgraded: boolean;
+  alreadyDirect: boolean;
+  workspaceEpoch: number;
+  storageProtocol: "direct_v2";
+  changeSeq?: number;
+  safetySnapshotId?: string;
+  quarantinedOperations: number;
+  rescueBackupPath: string;
+  rescueBackupChecksum: string;
+  lastChangeSeq: number;
 };
 
 export type CloudOperationHistoryCursor = { occurredAt: string; id: string };
@@ -357,9 +436,65 @@ export type StorageMigrationPreview = {
   direction: "local_to_cloud" | "cloud_to_local_snapshot";
   sourceWorkspaceId: string;
   targetWorkspaceId?: string;
+  packageVersion: number;
+  schemaGeneration: number;
   entities: Array<{ entity: string; localCount: number; cloudCount?: number }>;
+  sourceEntityCount: number;
+  targetEntityCount: number;
+  targetIsEmpty: boolean;
+  replaceEntityCount: number;
+  safetySnapshotRequired: boolean;
   conflicts: string[];
   canExecute: boolean;
+};
+
+export type DataCopyStageResult = {
+  packageId: string;
+  status: "validated";
+  entityCounts: Record<string, number>;
+  contentHash: string;
+  chunkCount: number;
+};
+
+export type DataCopyReplaceResult = {
+  replaced: boolean;
+  packageId: string;
+  contentHash: string;
+  safetySnapshotId: string;
+  previousEpoch: number;
+  workspaceEpoch: number;
+  resetChangeSeq: number;
+  entityCounts: Record<string, number>;
+};
+
+export type DataCopyExportManifest = {
+  packageId: string;
+  packageVersion: number;
+  schemaGeneration: number;
+  workspaceEpoch: number;
+  changeSeq: number;
+  entityCounts: Record<string, number>;
+  contentHash: string;
+  chunkCount: number;
+  expiresAt: string;
+};
+
+export type DataCopyExportChunk = {
+  packageId: string;
+  chunkIndex: number;
+  entityName: string;
+  contentText: string;
+  contentHash: string;
+  rowCount: number;
+};
+
+export type DataCopyReplaceLocalResult = {
+  replaced: boolean;
+  packageId: string;
+  contentHash: string;
+  safetyBackupPath: string;
+  workspaceId: string;
+  entityCounts: Record<string, number>;
 };
 
 export type CloudSyncConflict = {
@@ -944,8 +1079,8 @@ export async function listTodayTasks(subjectId?: string, todayDate?: string): Pr
   });
 }
 
-export async function setTaskDailyEstimate(taskId: string, workDate: string, estimateMinutes?: number): Promise<void> {
-  await invoke("task_daily_estimate_set", { request: { taskId, workDate, estimateMinutes } });
+export async function setTaskDailyEstimate(taskId: string, workDate: string, estimateMinutes?: number, expectedDailyEstimateVersion?: number): Promise<void> {
+  await invoke("task_daily_estimate_set", { request: { taskId, workDate, estimateMinutes }, expectedDailyEstimateVersion });
   await notifyWorkDataChanged(workDataChangeDomainsForMutation("task"), "task-daily-estimate");
 }
 
@@ -1604,6 +1739,10 @@ export async function setLocalStorageMode(): Promise<StorageModeSnapshot> {
   return await invoke("storage_mode_set_local");
 }
 
+export async function setCloudStorageMode(): Promise<StorageModeSnapshot> {
+  return await invoke("storage_mode_set_cloud");
+}
+
 export async function configureCloud(projectUrl: string, anonKey: string): Promise<StorageModeSnapshot> {
   return await invoke("cloud_configure", { request: { projectUrl, anonKey } });
 }
@@ -1650,6 +1789,35 @@ export async function previewStorageMigration(direction: StorageMigrationPreview
   return await invoke("storage_migration_preview", { request: { direction } });
 }
 
+export async function stageLocalDataCopyToCloud(): Promise<DataCopyStageResult> {
+  return await invoke("storage_copy_stage_local_to_cloud");
+}
+
+export async function replaceCloudWithStagedLocalData(request: {
+  packageId: string;
+  contentHash: string;
+  operationId: string;
+  confirmed: boolean;
+}): Promise<DataCopyReplaceResult> {
+  return await invoke("storage_copy_replace_cloud", { request });
+}
+
+export async function beginCloudDataCopyExport(): Promise<DataCopyExportManifest> {
+  return await invoke("storage_copy_export_cloud_begin");
+}
+
+export async function getCloudDataCopyExportChunk(packageId: string, chunkIndex: number): Promise<DataCopyExportChunk> {
+  return await invoke("storage_copy_export_cloud_chunk", { request: { packageId, chunkIndex } });
+}
+
+export async function discardCloudDataCopyExport(packageId: string): Promise<{ packageId: string; discarded: boolean }> {
+  return await invoke("storage_copy_export_cloud_discard", { request: { packageId } });
+}
+
+export async function replaceLocalWithCloudDataCopy(confirmed: boolean): Promise<DataCopyReplaceLocalResult> {
+  return await invoke("storage_copy_replace_local", { request: { confirmed } });
+}
+
 export async function executeStorageMigration(direction: StorageMigrationPreview["direction"] = "local_to_cloud"): Promise<StorageModeSnapshot> {
   return await invoke("storage_migration_execute", {
     request: { direction, confirmed: true },
@@ -1658,6 +1826,36 @@ export async function executeStorageMigration(direction: StorageMigrationPreview
 
 export async function getCloudSyncStatus(): Promise<StorageModeSnapshot> {
   return await invoke("cloud_sync_status");
+}
+
+export async function getStorageProtocolUpgradePreflight(): Promise<StorageProtocolUpgradePreflight> {
+  return await invoke("storage_protocol_upgrade_preflight_get");
+}
+
+export async function upgradeStorageProtocolWithDrainedQueue(
+  operationId = crypto.randomUUID(),
+  createSafetySnapshot = true,
+): Promise<StorageProtocolUpgradeResult> {
+  return await invoke("storage_protocol_upgrade_with_drained_queue_command", {
+    request: { operationId, createSafetySnapshot },
+  });
+}
+
+export async function upgradeStorageProtocolAfterRescue(
+  rescueBackupPath: string,
+  confirmationText: string,
+  operationId = crypto.randomUUID(),
+  createSafetySnapshot = true,
+): Promise<StorageProtocolAbandonResult> {
+  return await invoke("storage_protocol_upgrade_after_rescue_command", {
+    request: {
+      operationId,
+      rescueBackupPath,
+      confirmed: true,
+      confirmationText,
+      createSafetySnapshot,
+    },
+  });
 }
 
 export async function listCloudSyncQueue(): Promise<CloudSyncQueueItem[]> {
@@ -1831,14 +2029,20 @@ export async function onNavigatePage(handler: (page: string) => void) {
 }
 
 export async function onWorkDataChanged(handler: (payload: {
-  revision: number;
+  revision?: number;
+  workspaceId?: string;
+  changeSeq?: number;
+  workspaceEpoch?: number;
   domains: string[];
   source: "realtime" | "poll" | string;
   timerStoppedEntryId?: string;
 }) => void) {
   try {
     return await listen("work-data-changed", ({ payload }) => handler(payload as {
-      revision: number;
+      revision?: number;
+      workspaceId?: string;
+      changeSeq?: number;
+      workspaceEpoch?: number;
       domains: string[];
       source: string;
       timerStoppedEntryId?: string;

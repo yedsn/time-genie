@@ -47,6 +47,20 @@ const todayInstanceProtocolPatchFile = path.join(repoRoot, "supabase", "20261022
 const snapshotTaskOrderPatchFile = path.join(repoRoot, "supabase", "20261022d_timegenie_snapshot_task_order.sql");
 const ignoreContextDayPlansPatchFile = path.join(repoRoot, "supabase", "20261022e_timegenie_ignore_context_day_plans.sql");
 const dailyReportCollectionTemplatesPatchFile = path.join(repoRoot, "supabase", "20261021c_timegenie_daily_report_collection_templates.sql");
+const directProtocolPatchFile = path.join(repoRoot, "supabase", "20261022f_timegenie_direct_cloud_storage_protocol.sql");
+const directSubjectTaskMutationPatchFile = path.join(repoRoot, "supabase", "20261022g_timegenie_direct_cloud_subject_task_mutations.sql");
+const directTaskPlanningMutationPatchFile = path.join(repoRoot, "supabase", "20261022h_timegenie_direct_cloud_task_planning_mutations.sql");
+const directRecurrenceMutationPatchFile = path.join(repoRoot, "supabase", "20261022i_timegenie_direct_cloud_recurrence_mutations.sql");
+const directTaskDomainRoutingPatchFile = path.join(repoRoot, "supabase", "20261022j_timegenie_direct_cloud_task_domain_routing.sql");
+const directTimerMutationPatchFile = path.join(repoRoot, "supabase", "20261022k_timegenie_direct_cloud_timer_mutations.sql");
+const directTimerRecoveryPatchFile = path.join(repoRoot, "supabase", "20261022l_timegenie_direct_cloud_timer_recovery.sql");
+const directUnassignedMutationPatchFile = path.join(repoRoot, "supabase", "20261022m_timegenie_direct_cloud_unassigned_mutations.sql");
+const directManualActualMutationPatchFile = path.join(repoRoot, "supabase", "20261022n_timegenie_direct_cloud_manual_actual_mutations.sql");
+const directTimeEntryMutationPatchFile = path.join(repoRoot, "supabase", "20261022o_timegenie_direct_cloud_time_entry_mutations.sql");
+const directReportMutationPatchFile = path.join(repoRoot, "supabase", "20261023a_timegenie_direct_cloud_report_mutations.sql");
+const directReportTemplateMutationPatchFile = path.join(repoRoot, "supabase", "20261023b_timegenie_direct_cloud_report_template_mutations.sql");
+const directSharedSettingsMutationPatchFile = path.join(repoRoot, "supabase", "20261023c_timegenie_direct_cloud_shared_settings_mutations.sql");
+const directIntegrationMutationPatchFile = path.join(repoRoot, "supabase", "20261023d_timegenie_direct_cloud_integration_mutations.sql");
 
 const binaryNames = process.platform === "win32"
   ? {
@@ -141,7 +155,16 @@ function verifyStaticSchemaInvariants() {
   const snapshotTaskOrderPatch = fs.readFileSync(snapshotTaskOrderPatchFile, "utf8");
   const ignoreContextDayPlansPatch = fs.readFileSync(ignoreContextDayPlansPatchFile, "utf8");
   const dailyReportCollectionTemplatesPatch = fs.readFileSync(dailyReportCollectionTemplatesPatchFile, "utf8");
+  const directProtocolPatch = fs.readFileSync(directProtocolPatchFile, "utf8");
+  const directSubjectTaskMutationPatch = fs.readFileSync(directSubjectTaskMutationPatchFile, "utf8");
+  const directTaskPlanningMutationPatch = fs.readFileSync(directTaskPlanningMutationPatchFile, "utf8");
+  const directRecurrenceMutationPatch = fs.readFileSync(directRecurrenceMutationPatchFile, "utf8");
+  const directTaskDomainRoutingPatch = fs.readFileSync(directTaskDomainRoutingPatchFile, "utf8");
   const schemaIntegrationTest = fs.readFileSync(schemaTestFile, "utf8");
+  const directCloudProtocolDoc = fs.readFileSync(
+    path.join(repoRoot, "docs", "direct-cloud-storage-protocol.md"),
+    "utf8",
+  );
   for (const expected of [
     "day_instance_date",
     "day_instance_kind",
@@ -210,6 +233,571 @@ function verifyStaticSchemaInvariants() {
   if ((schemaIntegrationTest.match(/\\ir 20261021_timegenie_today_task_instances\.sql/g) ?? []).length < 2
       || (schemaIntegrationTest.match(/\\ir 20261021b_timegenie_client_write_generation\.sql/g) ?? []).length < 2) {
     throw new Error("The schema integration test must prove the today-instance and client-generation patches are idempotent.");
+  }
+  for (const expected of [
+    "storage_protocol text not null default 'sync_v1'",
+    "storage_protocol in ('sync_v1','direct_v2')",
+    "create or replace function timegenie.storage_protocol_get",
+    "create or replace function timegenie.storage_protocol_upgrade_preflight",
+    "create or replace function timegenie.direct_cloud_context",
+    "create or replace function timegenie.direct_cloud_workbench_bootstrap",
+    "create or replace function timegenie.direct_cloud_task_list",
+    "create or replace function timegenie.direct_cloud_completed_tasks",
+    "create or replace function timegenie.direct_cloud_task_detail",
+    "create or replace function timegenie.direct_cloud_today_plan",
+    "create or replace function timegenie.direct_cloud_time_state",
+    "create or replace function timegenie.direct_cloud_time_history",
+    "create or replace function timegenie.direct_cloud_report_list",
+    "create or replace function timegenie.direct_cloud_report_detail",
+    "create or replace function timegenie.direct_cloud_report_templates",
+    "create or replace function timegenie.direct_cloud_report_preview",
+    "create or replace function timegenie.direct_cloud_sanitize_shared_json",
+    "create or replace function timegenie.direct_cloud_shared_configuration",
+    "direct_cloud_query_response(",
+    "create or replace function timegenie.direct_cloud_operation_get",
+    "create or replace function timegenie.upgrade_storage_protocol",
+    "create or replace function timegenie.assert_sync_v1_workspace",
+    "create or replace function timegenie.assert_direct_v2_workspace",
+    "CLIENT_UPGRADE_REQUIRED",
+    "workspace_reset",
+    "_pre_direct_v2",
+  ]) {
+    if (!directProtocolPatch.includes(expected)) {
+      throw new Error(`The direct cloud protocol patch is missing: ${expected}`);
+    }
+  }
+  if (!schema.includes("\\ir 20261022f_timegenie_direct_cloud_storage_protocol.sql")) {
+    throw new Error("The source schema must include the direct cloud storage protocol patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261022f_timegenie_direct_cloud_storage_protocol\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the direct cloud protocol patch is idempotent.");
+  }
+  for (const expected of [
+    "create or replace function timegenie.direct_cloud_subject_create",
+    "create or replace function timegenie.direct_cloud_subject_update",
+    "create or replace function timegenie.direct_cloud_subject_reorder",
+    "create or replace function timegenie.direct_cloud_subject_archive",
+    "create or replace function timegenie.direct_cloud_subject_restore",
+    "create or replace function timegenie.direct_cloud_task_create",
+    "create or replace function timegenie.direct_cloud_task_update",
+    "create or replace function timegenie.direct_cloud_task_move",
+    "create or replace function timegenie.direct_cloud_task_archive_subtree",
+    "create or replace function timegenie.direct_cloud_task_restore_subtree",
+    "direct_cloud_operation_result(",
+    "record_direct_cloud_operation(",
+    "operation_history_replace_item(",
+    "version_conflict",
+    "entity_deleted",
+    "task_depth_limit",
+  ]) {
+    if (!directSubjectTaskMutationPatch.toLowerCase().includes(expected)) {
+      throw new Error("The direct subject/task mutation patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261022g_timegenie_direct_cloud_subject_task_mutations.sql")) {
+    throw new Error("The source schema must include the direct subject/task mutation patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261022g_timegenie_direct_cloud_subject_task_mutations\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the direct subject/task mutation patch is idempotent.");
+  }
+  if (/grant\s+execute\s+on\s+function[^;]*\bto\s+(anon|service_role)/i.test(directSubjectTaskMutationPatch)) {
+    throw new Error("Direct subject/task mutations must only be executable by authenticated clients.");
+  }
+  for (const expected of [
+    "create or replace function timegenie.direct_cloud_task_daily_estimate_set",
+    "create or replace function timegenie.direct_cloud_task_daily_estimate_batch_set",
+    "create or replace function timegenie.direct_cloud_task_day_plan_set",
+    "create or replace function timegenie.direct_cloud_task_day_plan_batch_set",
+    "create or replace function timegenie.direct_cloud_today_instance_ensure",
+    "create or replace function timegenie.direct_cloud_today_instance_archive",
+    "direct_cloud_operation_result(",
+    "record_direct_cloud_operation(",
+    "version_conflict",
+    "changedcount",
+  ]) {
+    if (!directTaskPlanningMutationPatch.toLowerCase().includes(expected)) {
+      throw new Error("The direct task-planning mutation patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261022h_timegenie_direct_cloud_task_planning_mutations.sql")) {
+    throw new Error("The source schema must include the direct task-planning mutation patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261022h_timegenie_direct_cloud_task_planning_mutations\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the direct task-planning mutation patch is idempotent.");
+  }
+  if (/grant\s+execute\s+on\s+function[^;]*\bto\s+(anon|service_role)/i.test(directTaskPlanningMutationPatch)) {
+    throw new Error("Direct task-planning mutations must only be executable by authenticated clients.");
+  }
+  for (const expected of [
+    "create or replace function timegenie.direct_cloud_recurrence_save",
+    "create or replace function timegenie.direct_cloud_recurrence_close",
+    "create or replace function timegenie.direct_cloud_recurrence_day_generate",
+    "create or replace function timegenie.direct_cloud_recurrence_occurrence_set_status",
+    "create or replace function timegenie.direct_cloud_occurrence_ensure",
+    "direct_cloud_day_plan_apply(",
+    "direct_cloud_operation_result(",
+    "record_direct_cloud_operation(",
+    "task_not_leaf",
+    "task_completed",
+  ]) {
+    if (!directRecurrenceMutationPatch.toLowerCase().includes(expected)) {
+      throw new Error("The direct recurrence mutation patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261022i_timegenie_direct_cloud_recurrence_mutations.sql")) {
+    throw new Error("The source schema must include the direct recurrence mutation patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261022i_timegenie_direct_cloud_recurrence_mutations\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the direct recurrence mutation patch is idempotent.");
+  }
+  if (/grant\s+execute\s+on\s+function[^;]*\bto\s+(anon|service_role)/i.test(directRecurrenceMutationPatch)) {
+    throw new Error("Direct recurrence mutations must only be executable by authenticated clients.");
+  }
+  for (const expected of [
+    "create or replace function timegenie.direct_cloud_task_set_status",
+    "create or replace function timegenie.direct_cloud_today_recurring_update",
+    "create or replace function timegenie.direct_cloud_task_duplicate_subtree",
+    "direct_cloud_operation_result(",
+    "record_direct_cloud_operation(",
+  ]) {
+    if (!directTaskDomainRoutingPatch.toLowerCase().includes(expected)) {
+      throw new Error("The direct task-domain routing patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261022j_timegenie_direct_cloud_task_domain_routing.sql")) {
+    throw new Error("The source schema must include the direct task-domain routing patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261022j_timegenie_direct_cloud_task_domain_routing\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the direct task-domain routing patch is idempotent.");
+  }
+  if (/grant\s+execute\s+on\s+function[^;]*\bto\s+(anon|service_role)/i.test(directTaskDomainRoutingPatch)) {
+    throw new Error("Direct task-domain routing mutations must only be executable by authenticated clients.");
+  }
+  const directTimerMutationPatch = fs.readFileSync(directTimerMutationPatchFile, "utf8");
+  for (const expected of [
+    "create or replace function timegenie.direct_cloud_timer_start",
+    "create or replace function timegenie.direct_cloud_timer_pause",
+    "create or replace function timegenie.direct_cloud_timer_resume",
+    "create or replace function timegenie.direct_cloud_timer_stop",
+    "create or replace function timegenie.direct_cloud_timer_transition",
+    "create or replace function timegenie.direct_cloud_time_allocation_replace",
+    "direct_cloud_operation_result(",
+    "record_direct_cloud_operation(",
+    "direct_cloud_tracking_claim_lease(",
+    "'payload',coalesce(p_payload,'{}'::jsonb)-'leasetoken'",
+  ]) {
+    if (!directTimerMutationPatch.toLowerCase().includes(expected)) {
+      throw new Error("The direct timer mutation patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261022k_timegenie_direct_cloud_timer_mutations.sql")) {
+    throw new Error("The source schema must include the direct timer mutation patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261022k_timegenie_direct_cloud_timer_mutations\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the direct timer mutation patch is idempotent.");
+  }
+  if (/grant\s+execute\s+on\s+function[^;]*\bto\s+(anon|service_role)/i.test(directTimerMutationPatch)) {
+    throw new Error("Direct timer mutations must only be executable by authenticated clients.");
+  }
+  if ((directTimerMutationPatch.match(/direct_cloud_tracking_claim_lease\(/g) ?? []).length < 5) {
+    throw new Error("Every direct timer transition must claim the tracking lease.");
+  }
+  const directTimerRecoveryPatch = fs.readFileSync(directTimerRecoveryPatchFile, "utf8");
+  for (const expected of [
+    "create or replace function timegenie.direct_cloud_timer_recover_locked",
+    "create or replace function timegenie.direct_cloud_timer_recover",
+    "create or replace function timegenie.direct_cloud_timer_takeover",
+    "create or replace function timegenie.direct_cloud_tracking_acquire",
+    "create or replace function timegenie.direct_cloud_tracking_heartbeat",
+    "create or replace function timegenie.direct_cloud_tracking_claim_lease",
+    "create or replace function timegenie.direct_cloud_active_timer",
+    "direct_cloud_operation_result(",
+    "record_direct_cloud_operation(",
+    "interval '90 seconds'",
+    "direct-timer-resume:",
+    "LEASE_LOST",
+    "VERSION_CONFLICT",
+  ]) {
+    if (!directTimerRecoveryPatch.toLowerCase().includes(expected.toLowerCase())) {
+      throw new Error("The direct timer recovery patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261022l_timegenie_direct_cloud_timer_recovery.sql")) {
+    throw new Error("The source schema must include the direct timer recovery patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261022l_timegenie_direct_cloud_timer_recovery\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the direct timer recovery patch is idempotent.");
+  }
+  if (/grant\s+execute\s+on\s+function[^;]*\bto\s+(anon|service_role)/i.test(directTimerRecoveryPatch)) {
+    throw new Error("Direct timer recovery mutations must only be executable by authenticated clients.");
+  }
+  for (const expected of [
+    "direct time state read mutated a timer",
+    "direct time state read changed timer persistence",
+    "direct continuity recovery did not split the interrupted segment",
+    "direct continuity recovery did not use server time for the new segment",
+    "direct tracking acquire changed the timer or failed",
+    "direct lease heartbeat mutated a timer",
+    "direct lease heartbeat changed timer continuity fields",
+    "repeated direct continuity recovery created duplicate segments",
+    "direct timer takeover ignored an active lease",
+    "rejected direct timer takeover changed the timer",
+    "direct timer takeover did not adopt an expired lease",
+    "direct takeover lost the authoritative timer",
+    "direct lease heartbeat accepted a replaced holder",
+    "direct timer takeover accepted a stale version",
+    "direct calendar rollover did not split across days",
+    "direct calendar rollover durations are invalid",
+    "direct calendar rollover repeated and created duplicate slices",
+    "direct lease contention fixture has no running timer",
+    "non-holder direct timer write succeeded",
+    "LEASE_LOST did not return the authoritative active timer",
+    "rejected non-holder timer write left an operation record",
+    "rejected non-holder timer write changed the active timer",
+    "direct lease holder could not pause the shared timer",
+    "non-holder direct timer write succeeded after holder update",
+    "failed non-holder timer write changed the holder state",
+  ]) {
+    if (!schemaIntegrationTest.includes(expected)) {
+      throw new Error(`The schema integration test is missing direct timer recovery coverage: ${expected}`);
+    }
+  }
+  const directUnassignedMutationPatch = fs.readFileSync(directUnassignedMutationPatchFile, "utf8");
+  for (const expected of [
+    "create or replace function timegenie.direct_cloud_unassigned_session_snapshot",
+    "create or replace function timegenie.direct_cloud_day_time_summary",
+    "create or replace function timegenie.direct_cloud_unassigned_anchor_ensure_locked",
+    "create or replace function timegenie.direct_cloud_unassigned_ensure",
+    "create or replace function timegenie.direct_cloud_unassigned_resolve",
+    "create or replace function timegenie.direct_cloud_unassigned_state",
+    "direct_cloud_operation_result(",
+    "record_direct_cloud_operation(",
+    "workspace_day_end",
+    "resolutionvalue",
+    "direct-unassigned-entry:",
+  ]) {
+    if (!directUnassignedMutationPatch.replaceAll("_", "").toLowerCase().includes(expected.replaceAll("_", "").toLowerCase())) {
+      throw new Error("The direct unassigned mutation patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261022m_timegenie_direct_cloud_unassigned_mutations.sql")) {
+    throw new Error("The source schema must include the direct unassigned mutation patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261022m_timegenie_direct_cloud_unassigned_mutations\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the direct unassigned mutation patch is idempotent.");
+  }
+  if (/grant\s+execute\s+on\s+function[^;]*\bto\s+(anon|service_role)/i.test(directUnassignedMutationPatch)) {
+    throw new Error("Direct unassigned mutations must only be executable by authenticated clients.");
+  }
+  for (const expected of [
+    "direct devices did not converge on one unassigned anchor",
+    "direct unassigned created",
+    "direct unassigned work resolution was not atomic/idempotent",
+    "direct unassigned retry duplicated entry/operation",
+    "stale device resolved an already-classified anchor",
+    "rejected stale unassigned write recorded success",
+    "direct unassigned break classification changed calendar totals",
+    "direct unassigned discard classification is inconsistent",
+    "direct unassigned calendar rollover is inconsistent",
+    "calendar rollover created",
+  ]) {
+    if (!schemaIntegrationTest.includes(expected)) {
+      throw new Error(`The schema integration test is missing direct unassigned coverage: ${expected}`);
+    }
+  }
+  const directManualActualMutationPatch = fs.readFileSync(directManualActualMutationPatchFile, "utf8");
+  for (const expected of [
+    "create or replace function timegenie.direct_cloud_actual_adjustment_project",
+    "create or replace function timegenie.direct_cloud_actual_minutes",
+    "create or replace function timegenie.direct_cloud_actual_adjustment_snapshot",
+    "create or replace function timegenie.direct_cloud_manual_time_create",
+    "create or replace function timegenie.direct_cloud_actual_adjustment_batch_apply",
+    "create or replace function timegenie.direct_cloud_actual_adjustment_delete",
+    "actual_adjustment_fingerprint(",
+    "direct_cloud_operation_result(",
+    "record_direct_cloud_operation(",
+    "direct-manual-entry:",
+    "direct-actual-adjustment:",
+  ]) {
+    if (!directManualActualMutationPatch.toLowerCase().includes(expected.toLowerCase())) {
+      throw new Error("The direct manual/actual mutation patch is missing: " + expected);
+    }
+  }
+  const directTimeEntryMutationPatch = fs.readFileSync(directTimeEntryMutationPatchFile, "utf8");
+  for (const expected of [
+    "create or replace function timegenie.direct_cloud_time_history_page",
+    "create or replace function timegenie.direct_cloud_time_entry_update",
+    "create or replace function timegenie.direct_cloud_time_entry_disposition",
+    "direct_cloud_operation_result(",
+    "record_direct_cloud_operation(",
+    "expectedVersion",
+    "HISTORICAL_RECORD_READ_ONLY",
+  ]) {
+    if (!directTimeEntryMutationPatch.toLowerCase().includes(expected.toLowerCase())) {
+      throw new Error("The direct time-entry mutation patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261022o_timegenie_direct_cloud_time_entry_mutations.sql")) {
+    throw new Error("The source schema must include the direct time-entry mutation patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261022o_timegenie_direct_cloud_time_entry_mutations\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the direct time-entry mutation patch is idempotent.");
+  }
+  if (/grant\s+execute\s+on\s+function[^;]*\bto\s+(anon|service_role)/i.test(directTimeEntryMutationPatch)) {
+    throw new Error("Direct time-entry mutations must only be executable by authenticated clients.");
+  }
+  const directReportMutationPatch = fs.readFileSync(directReportMutationPatchFile, "utf8");
+  for (const expected of [
+    "create or replace function timegenie.direct_cloud_report_create",
+    "create or replace function timegenie.direct_cloud_report_scope_update",
+    "create or replace function timegenie.direct_cloud_report_content_save",
+    "create or replace function timegenie.direct_cloud_report_regenerate",
+    "create or replace function timegenie.direct_cloud_report_delete",
+    "create or replace function timegenie.direct_cloud_report_render",
+    "create or replace function timegenie.direct_cloud_report_replace_tasks",
+    "title_snapshot",
+    "path_snapshot",
+    "input_revision_hash",
+    "direct_cloud_operation_result(",
+    "record_direct_cloud_operation(",
+    "expectedversion",
+  ]) {
+    if (!directReportMutationPatch.toLowerCase().includes(expected.toLowerCase())) {
+      throw new Error("The direct report mutation patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261023a_timegenie_direct_cloud_report_mutations.sql")) {
+    throw new Error("The source schema must include the direct report mutation patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261023a_timegenie_direct_cloud_report_mutations\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the direct report mutation patch is idempotent.");
+  }
+  if (/grant\s+execute\s+on\s+function[^;]*\bto\s+(anon|service_role)/i.test(directReportMutationPatch)) {
+    throw new Error("Direct report mutations must only be executable by authenticated clients.");
+  }
+  const directReportTemplateMutationPatch = fs.readFileSync(directReportTemplateMutationPatchFile, "utf8");
+  for (const expected of [
+    "create or replace function timegenie.direct_cloud_report_template_create",
+    "create or replace function timegenie.direct_cloud_report_template_duplicate",
+    "create or replace function timegenie.direct_cloud_report_template_update",
+    "create or replace function timegenie.direct_cloud_report_template_set_default",
+    "create or replace function timegenie.direct_cloud_report_template_reorder",
+    "create or replace function timegenie.direct_cloud_report_template_delete",
+    "direct_cloud_report_template_validate",
+    "direct_cloud_operation_result(",
+    "record_direct_cloud_operation(",
+    "expectedversion",
+  ]) {
+    if (!directReportTemplateMutationPatch.toLowerCase().includes(expected.toLowerCase())) {
+      throw new Error("The direct report-template mutation patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261023b_timegenie_direct_cloud_report_template_mutations.sql")) {
+    throw new Error("The source schema must include the direct report-template mutation patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261023b_timegenie_direct_cloud_report_template_mutations\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the direct report-template mutation patch is idempotent.");
+  }
+  if (/grant\s+execute\s+on\s+function[^;]*\bto\s+(anon|service_role)/i.test(directReportTemplateMutationPatch)) {
+    throw new Error("Direct report-template mutations must only be executable by authenticated clients.");
+  }
+  const directSharedSettingsMutationPatch = fs.readFileSync(directSharedSettingsMutationPatchFile, "utf8");
+  for (const expected of [
+    "create or replace function timegenie.direct_cloud_shared_setting_update",
+    "create or replace function timegenie.direct_cloud_shared_settings_batch_update",
+    "create or replace function timegenie.direct_cloud_work_day_set",
+    "create or replace function timegenie.direct_cloud_subject_schedule_save",
+    "direct_cloud_shared_setting_validate",
+    "direct_cloud_subject_schedule_apply_day",
+    "direct_cloud_operation_result(",
+    "record_direct_cloud_operation(",
+    "expectedversion",
+  ]) {
+    if (!directSharedSettingsMutationPatch.toLowerCase().includes(expected.toLowerCase())) {
+      throw new Error("The direct shared-settings mutation patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261023c_timegenie_direct_cloud_shared_settings_mutations.sql")) {
+    throw new Error("The source schema must include the direct shared-settings mutation patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261023c_timegenie_direct_cloud_shared_settings_mutations\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the direct shared-settings mutation patch is idempotent.");
+  }
+  if (/grant\s+execute\s+on\s+function[^;]*\bto\s+(anon|service_role)/i.test(directSharedSettingsMutationPatch)) {
+    throw new Error("Direct shared-settings mutations must only be executable by authenticated clients.");
+  }
+  const directIntegrationMutationPatch = fs.readFileSync(directIntegrationMutationPatchFile, "utf8");
+  for (const expected of [
+    "create or replace function timegenie.direct_cloud_integration_config_save",
+    "create or replace function timegenie.direct_cloud_integration_state",
+    "create or replace function timegenie.direct_cloud_external_binding_upsert",
+    "create or replace function timegenie.direct_cloud_external_binding_delete",
+    "direct_cloud_integration_reject_sensitive",
+    "direct_cloud_sanitize_shared_json(config.config_json)",
+    "record_direct_cloud_operation(",
+    "operation_history_replace_item(",
+    "expectedversion",
+  ]) {
+    if (!directIntegrationMutationPatch.toLowerCase().includes(expected.toLowerCase())) {
+      throw new Error("The direct integration mutation patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261023d_timegenie_direct_cloud_integration_mutations.sql")) {
+    throw new Error("The source schema must include the direct integration mutation patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261023d_timegenie_direct_cloud_integration_mutations\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the direct integration mutation patch is idempotent.");
+  }
+  if (/grant\s+execute\s+on\s+function[^;]*\bto\s+(anon|service_role)/i.test(directIntegrationMutationPatch)) {
+    throw new Error("Direct integration mutations must only be executable by authenticated clients.");
+  }
+  for (const expected of [
+    "direct report create was not authoritative/idempotent",
+    "failed report scope update left partial data",
+    "historical report task snapshots changed after task rename",
+    "direct report content save was not versioned/idempotent",
+    "direct report regeneration did not restore generated content",
+    "direct report delete was not soft/idempotent",
+    "direct report-template create was not authoritative/idempotent",
+    "direct report-template validation accepted invalid placeholders",
+    "direct report-template duplicate did not preserve source content",
+    "stale report-template update was accepted",
+    "report-template default switch did not keep one default",
+    "failed report-template reorder left partial data",
+    "report-template deletion changed historical report binding",
+    "direct shared setting update was not authoritative/idempotent",
+    "sensitive shared setting was accepted",
+    "direct shared settings batch was not atomic/idempotent",
+    "stale shared setting from another device was accepted",
+    "failed shared settings batch left partial data",
+    "stale work-day update or version check failed",
+    "direct work-day creation is not authoritative",
+    "stale subject schedule update was accepted",
+    "subject work-schedule batch was not idempotent",
+    "failed subject work-schedule batch left partial data",
+    "direct integration config save was not authoritative/idempotent",
+    "direct integration state crossed the credential boundary",
+    "rejected integration credential changed cloud state",
+    "stale integration config from another device was accepted",
+    "direct Obsidian metadata save was not authoritative",
+    "direct external binding upsert was not authoritative/idempotent",
+    "stale external binding from another device was accepted",
+    "rejected external binding changed cloud state",
+    "direct external binding delete was not idempotent",
+  ]) {
+    if (!schemaIntegrationTest.includes(expected)) {
+      throw new Error("The schema integration test is missing direct report coverage: " + expected);
+    }
+  }
+  for (const expected of [
+    "direct time-entry correction was not authoritative/idempotent",
+    "direct time-entry disposition was not authoritative/idempotent",
+    "direct time-entry history page did not use authoritative cloud data",
+  ]) {
+    if (!schemaIntegrationTest.includes(expected)) {
+      throw new Error("The schema integration test is missing direct time-entry coverage: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261022n_timegenie_direct_cloud_manual_actual_mutations.sql")) {
+    throw new Error("The source schema must include the direct manual/actual mutation patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261022n_timegenie_direct_cloud_manual_actual_mutations\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the direct manual/actual mutation patch is idempotent.");
+  }
+  if (/grant\s+execute\s+on\s+function[^;]*\bto\s+(anon|service_role)/i.test(directManualActualMutationPatch)) {
+    throw new Error("Direct manual/actual mutations must only be executable by authenticated clients.");
+  }
+  for (const expected of [
+    "direct manual time was not atomic/idempotent",
+    "direct manual time retry duplicated entry/operation",
+    "direct actual snapshot did not use authoritative cloud data",
+    "direct actual batch did not atomically create task mapping and adjustments",
+    "direct actual batch retry duplicated task or adjustment",
+    "stale actual adjustment batch was accepted",
+    "failed actual adjustment batch left partial direct data",
+    "direct actual adjustment delete was not versioned/idempotent",
+  ]) {
+    if (!schemaIntegrationTest.includes(expected)) {
+      throw new Error(`The schema integration test is missing direct manual/actual coverage: ${expected}`);
+    }
+  }
+  for (const expected of [
+    "direct_cloud_task_list",
+    "direct_cloud_completed_tasks",
+    "direct_cloud_task_detail",
+    "direct_cloud_today_plan",
+    "direct_cloud_subject_create",
+    "direct_cloud_subject_update",
+    "direct_cloud_subject_reorder",
+    "direct_cloud_subject_archive",
+    "direct_cloud_subject_restore",
+    "direct_cloud_task_create",
+    "direct_cloud_task_update",
+    "direct_cloud_task_move",
+    "direct_cloud_task_archive_subtree",
+    "direct_cloud_task_restore_subtree",
+    "direct_cloud_task_duplicate_subtree",
+    "direct_cloud_task_set_status",
+    "direct_cloud_recurrence_occurrence_set_status",
+    "direct_cloud_today_recurring_update",
+    "direct_cloud_recurrence_save",
+    "direct_cloud_recurrence_close",
+    "direct_cloud_recurrence_day_generate",
+    "direct_cloud_task_daily_estimate_set",
+    "direct_cloud_task_daily_estimate_batch_set",
+    "direct_cloud_task_day_plan_set",
+    "direct_cloud_task_day_plan_batch_set",
+    "direct_cloud_task_plan_batch_apply",
+  ]) {
+    if (!directCloudProtocolDoc.includes(expected)) {
+      throw new Error(`The direct task/plan protocol documentation is missing: ${expected}`);
+    }
+  }
+  for (const expected of [
+    "4f000000-0000-0000-0000-000000000601",
+    "4f000000-0000-0000-0000-000000000606",
+    "64000000-0000-0000-0000-0000000000d1",
+    "53000000-0000-0000-0000-0000000000c1",
+  ]) {
+    if (!directCloudProtocolDoc.includes(expected) || !schemaIntegrationTest.includes(expected)) {
+      throw new Error(`The documented task/plan fixture must also execute in schema tests: ${expected}`);
+    }
+  }
+  if (/grant\s+execute\s+on\s+function[^;]*\bto\s+service_role/i.test(directProtocolPatch)) {
+    throw new Error("The direct cloud protocol must not grant RPC execution to service_role.");
+  }
+  for (const expected of [
+    "direct protocol upgrade was not idempotent",
+    "rejected legacy sync write changed business data",
+    "rejected legacy lease changed coordination state",
+    "direct context exposed another account workspace",
+    "direct context accepted a revoked device",
+    "direct context accepted an outdated client schema generation",
+    "direct shared configuration contract or credential boundary is invalid",
+    "direct shared configuration exposed another account workspace",
+    "direct shared configuration accepted a revoked device",
+    "representative direct query response exceeded its performance baseline",
+    "direct workbench bootstrap contract is invalid",
+    "direct active task tree contract is invalid",
+    "direct completed task cursor pagination is invalid",
+    "direct task detail contract is invalid",
+    "direct today-plan read contract is invalid",
+    "direct today-plan query performed an implicit business write",
+    "direct time state contract is invalid",
+    "direct time history cursor contract is invalid",
+    "direct report cursor contract is invalid",
+    "direct report detail contract is invalid",
+    "direct report preview contract is invalid",
+    "empty direct workbench bootstrap is invalid",
+    "empty workspace bootstrap bypassed row-level ownership",
+    "legacy restore prepare with safety snapshot was accepted",
+    "protocol upgrade accepted an unknown queue disposition",
+    "protocol upgrade accepted a stale workspace epoch",
+    "repeated direct operation was applied more than once",
+  ]) {
+    if (!schemaIntegrationTest.includes(expected)) {
+      throw new Error(`The schema integration test is missing direct protocol coverage: ${expected}`);
+    }
   }
   if (!schemaIntegrationTest.includes("old client write was accepted")
       || !schemaIntegrationTest.includes("CLIENT_UPGRADE_REQUIRED")) {

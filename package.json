@@ -44,6 +44,8 @@
         "test:supabase:schema": "node scripts/verify-supabase-schema.mjs",
         "test:cloud-data-protection-ui": "node scripts/verify-cloud-data-protection-ui.mjs",
         "test:cloud-schema-guidance": "node scripts/verify-cloud-schema-guidance.mjs",
+        "test:storage-boundaries": "node scripts/verify-storage-boundaries.mjs",
+        "test:direct-cloud-storage-ui": "node scripts/verify-direct-cloud-storage-ui.mjs",
         "test:supabase:planning-e2e": "cargo test --manifest-path src-tauri/Cargo.toml cloud_e2e::isolated_supabase_planning_two_device_flow -- --nocapture",
         "test:supabase:restore-e2e": "cargo test --manifest-path src-tauri/Cargo.toml cloud_e2e::isolated_workspace_restore -- --nocapture",
         "test:supabase:e2e": "node scripts/run-supabase-e2e.mjs",
