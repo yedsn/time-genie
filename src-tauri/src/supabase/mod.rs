@@ -2142,6 +2142,12 @@ struct WorkspaceRow {
     id: String,
     name: String,
     timezone: String,
+    #[serde(default = "default_workspace_epoch")]
+    workspace_epoch: i64,
+}
+
+fn default_workspace_epoch() -> i64 {
+    1
 }
 
 #[derive(Debug, Deserialize)]
@@ -4277,6 +4283,77 @@ mod tests {
         .unwrap();
         record_direct_cloud_access_success(cloud_workspace_id);
         (state.device_id, test_workspace_id(database))
+    }
+
+    #[test]
+    fn workspace_bootstrap_uses_server_epoch_before_initializing_defaults() {
+        let _guard = lock_test_session_state();
+        reset_test_credentials();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        let workspace_body = Box::leak(
+            json!([{
+                "id": cloud_workspace_id,
+                "name": "云端工作空间",
+                "timezone": "Asia/Shanghai",
+                "workspace_epoch": 7
+            }])
+            .to_string()
+            .into_boxed_str(),
+        );
+        let server = TestHttpServer::start(vec![
+            TestHttpResponse {
+                path: "/rest/v1/workspaces",
+                status: 200,
+                body: workspace_body,
+            },
+            TestHttpResponse {
+                path: "/rest/v1/rpc/workspace_initialize_defaults",
+                status: 200,
+                body: "{}",
+            },
+            TestHttpResponse {
+                path: "/rest/v1/workspace_changes",
+                status: 200,
+                body: r#"[{"change_seq":42}]"#,
+            },
+        ]);
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("bootstrap-epoch.sqlite3")).unwrap();
+        for (key, value) in [
+            ("supabase_project_url", json!(server.base_url())),
+            ("supabase_anon_key", json!("anon-test-key")),
+        ] {
+            settings::update_setting(
+                &database,
+                SettingsUpdate {
+                    scope: SettingsScope::Device,
+                    key: key.to_string(),
+                    value,
+                },
+            )
+            .unwrap();
+        }
+        save_session(
+            &database,
+            &test_session("bootstrap-epoch", Some(now_seconds() + 3600)),
+        )
+        .unwrap();
+
+        let workspace = workspace_bootstrap(&database).unwrap();
+
+        assert_eq!(workspace.id, cloud_workspace_id);
+        assert_eq!(workspace.latest_change_seq, 42);
+        let checkpoint =
+            read_direct_cloud_checkpoint(&database.open().unwrap(), &cloud_workspace_id);
+        assert_eq!(checkpoint.workspace_epoch, 7);
+        assert_eq!(checkpoint.change_seq, 42);
+        let requests = server.finish();
+        assert!(requests[0].contains("workspace_epoch"));
+        assert!(requests[1]
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("x-timegenie-workspace-epoch: 7")));
+        reset_test_credentials();
     }
 
     #[test]

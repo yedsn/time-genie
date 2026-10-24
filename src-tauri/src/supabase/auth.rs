@@ -400,6 +400,19 @@ fn workspace_bootstrap_with_session(
     }
     let workspace =
         workspace.ok_or_else(|| "VERSION_CONFLICT: Supabase 未返回可用工作空间".to_string())?;
+    let connection = database.open()?;
+    let device_id: String = connection
+        .query_row(
+            "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'device_id'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let mut checkpoint = read_direct_cloud_checkpoint(&connection, &workspace.id);
+    drop(connection);
+    checkpoint.device_id = device_id;
+    checkpoint.workspace_epoch = workspace.workspace_epoch.max(1);
+    write_direct_cloud_checkpoint(database, &checkpoint)?;
     let initialize_result = client.rpc_for_database(
         database,
         "workspace_initialize_defaults",
@@ -426,6 +439,11 @@ fn workspace_bootstrap_with_session(
         },
     )?;
     let latest_change_seq = latest_change_seq(database, client, session, &workspace.id)?;
+    let connection = database.open()?;
+    let mut checkpoint = read_direct_cloud_checkpoint(&connection, &workspace.id);
+    drop(connection);
+    checkpoint.change_seq = latest_change_seq;
+    write_direct_cloud_checkpoint(database, &checkpoint)?;
     Ok(CloudWorkspace {
         id: workspace.id,
         name: workspace.name,
@@ -451,7 +469,7 @@ fn read_workspace_with_session(
             database,
             client
                 .get(format!(
-                    "{}/rest/v1/workspaces?owner_user_id=eq.{}&deleted_at=is.null&select=id,name,timezone&limit=1",
+                    "{}/rest/v1/workspaces?owner_user_id=eq.{}&deleted_at=is.null&select=id,name,timezone,workspace_epoch&limit=1",
                     client.project_url, session.user_id
                 )),
             session,
