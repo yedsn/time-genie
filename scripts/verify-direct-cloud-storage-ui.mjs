@@ -28,6 +28,12 @@ for (const expected of [
   if (!workbench.includes(expected)) throw new Error(`直连云端设置界面缺少：${expected}`);
 }
 for (const expected of [
+  "cloudWorking.value = true;", "切换中...", "已切换到${label}",
+  "ElMessage.error(stripErrorCode", "storageState.value = await getStorageMode().catch",
+]) {
+  if (!workbench.includes(expected)) throw new Error(`存储模式切换反馈缺少：${expected}`);
+}
+for (const expected of [
   "async function handleCloudSnapshotRestored()",
   "store.clearCloudBusinessMemory();",
   "store.loadWorkspaceData()",

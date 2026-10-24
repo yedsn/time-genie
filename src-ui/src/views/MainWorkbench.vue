@@ -665,18 +665,28 @@ async function copyCloudDataToLocal() {
 
 async function offerStorageModeSwitch(target: "local" | "cloud") {
   const currentlyTarget = storageState.value?.mode === target;
-  if (currentlyTarget) return;
+  if (currentlyTarget || cloudWorking.value) return;
   const label = target === "cloud" ? "Supabase 云端" : "本地存储";
   try {
     await ElMessageBox.confirm(
-      `复制已经完成。是否现在切换到${label}？切换只改变当前使用的数据空间，不会再复制或同步数据。`,
-      "复制完成",
+      `是否现在切换到${label}？切换只改变当前使用的数据空间，不会复制、合并或同步另一个空间的数据。`,
+      "切换数据存储",
       { type: "success", confirmButtonText: `切换到${label}`, cancelButtonText: "保持当前模式", closeOnClickModal: false, customClass: "work-confirm-dialog" },
     );
   } catch { return; }
-  storageState.value = target === "cloud" ? await setCloudStorageMode() : await setLocalStorageMode();
-  settingsDraft.storageMode = target;
-  await Promise.all([store.loadWorkspaceData(), store.loadTimeData(), store.loadReports(), store.loadUnassignedState(), store.loadTodayOverview()]);
+  cloudWorking.value = true;
+  try {
+    storageState.value = target === "cloud" ? await setCloudStorageMode() : await setLocalStorageMode();
+    settingsDraft.storageMode = target;
+    store.clearCloudBusinessMemory();
+    await Promise.allSettled([store.loadWorkspaceData(), store.loadTimeData(), store.loadReports(), store.loadUnassignedState(), store.loadTodayOverview()]);
+    ElMessage.success(`已切换到${label}`);
+  } catch (error) {
+    storageState.value = await getStorageMode().catch(() => storageState.value);
+    ElMessage.error(stripErrorCode(error instanceof Error ? error.message : String(error)));
+  } finally {
+    cloudWorking.value = false;
+  }
 }
 
 async function clearPersistentCloudCache() {
@@ -1841,7 +1851,7 @@ async function handleCompletedTaskDelete(task: Task) {
                   <div class="settings-inline-actions"><button class="secondary-button compact" type="button" :disabled="Boolean(dataCopyWorking)" @click="previewDataCopy('cloud_to_local_snapshot')">{{ cloudToLocalCopyPreview ? '重新预览' : '预览替换影响' }}</button><button v-if="cloudToLocalCopyPreview" class="danger-button compact" type="button" :disabled="Boolean(dataCopyWorking) || !cloudToLocalCopyPreview.canExecute" @click="copyCloudDataToLocal"><LoaderCircle v-if="dataCopyWorking === 'cloud_to_local_snapshot'" class="sync-spin" :size="13" />创建备份并替换本地</button></div>
                 </article>
               </div>
-              <div class="storage-mode-switch-row"><span>当前使用：<strong>{{ storageState?.mode === 'cloud' ? 'Supabase 云端' : '本地存储' }}</strong></span><div class="settings-inline-actions"><button class="secondary-button compact" type="button" :disabled="storageState?.mode === 'local' || Boolean(dataCopyWorking)" @click="offerStorageModeSwitch('local')">使用本地存储</button><button class="secondary-button compact" type="button" :disabled="storageState?.mode === 'cloud' || Boolean(dataCopyWorking)" @click="offerStorageModeSwitch('cloud')">使用 Supabase 云端</button></div></div>
+              <div class="storage-mode-switch-row"><span>当前使用：<strong>{{ storageState?.mode === 'cloud' ? 'Supabase 云端' : '本地存储' }}</strong></span><div class="settings-inline-actions"><button class="secondary-button compact" type="button" :disabled="cloudWorking || storageState?.mode === 'local' || Boolean(dataCopyWorking)" @click="offerStorageModeSwitch('local')">使用本地存储</button><button class="secondary-button compact" type="button" :disabled="cloudWorking || storageState?.mode === 'cloud' || Boolean(dataCopyWorking)" @click="offerStorageModeSwitch('cloud')"><LoaderCircle v-if="cloudWorking" class="sync-spin" :size="13" />{{ cloudWorking ? '切换中...' : '使用 Supabase 云端' }}</button></div></div>
             </div>
             <div v-else class="storage-section storage-migration-section">
               <div class="storage-section-heading"><div><strong>迁移本地数据</strong><small>将本机 SQLite 数据安全迁移到云端</small></div><span>可选</span></div>

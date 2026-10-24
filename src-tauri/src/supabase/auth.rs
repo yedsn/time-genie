@@ -498,8 +498,16 @@ pub fn register_device(
     database: &Database,
     request: CloudDeviceRegisterRequest,
 ) -> Result<CloudDevice, String> {
-    let session = current_session(database)?;
     let workspace = workspace_bootstrap(database)?;
+    register_device_for_workspace(database, &workspace.id, request)
+}
+
+pub(crate) fn register_device_for_workspace(
+    database: &Database,
+    workspace_id: &str,
+    request: CloudDeviceRegisterRequest,
+) -> Result<CloudDevice, String> {
+    let session = current_session(database)?;
     let connection = database.open()?;
     let device_id: String = connection
         .query_row(
@@ -513,7 +521,7 @@ pub fn register_device(
         database,
         "device_authorize",
         json!({
-            "p_workspace_id": workspace.id,
+            "p_workspace_id": workspace_id,
             "p_device_id": device_id,
             "p_device_name": request.device_name.trim(),
             "p_platform": request.platform,

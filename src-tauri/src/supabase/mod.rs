@@ -3712,14 +3712,27 @@ pub fn direct_cloud_force_refresh_prepare(
 pub fn storage_mode_set_cloud(
     database: tauri::State<'_, Database>,
 ) -> Result<StorageModeSnapshot, String> {
+    storage_mode_set_cloud_for_database(&database)
+}
+
+fn storage_mode_set_cloud_for_database(database: &Database) -> Result<StorageModeSnapshot, String> {
+    let workspace = workspace_bootstrap(database)?;
     let connection = database.open()?;
-    let workspace_id = read_device_setting_string(&connection, "cloud_workspace_id")?
+    let device_name = read_device_setting_string(&connection, "device_name")?
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "CLOUD_NOT_CONFIGURED: 尚未初始化 Supabase 工作空间".to_string())?;
+        .unwrap_or_else(|| "当前设备".to_string());
     drop(connection);
-    current_session(&database)?;
+    register_device_for_workspace(
+        database,
+        &workspace.id,
+        CloudDeviceRegisterRequest {
+            device_name,
+            platform: std::env::consts::OS.to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+    )?;
     settings::update_setting(
-        &database,
+        database,
         SettingsUpdate {
             scope: SettingsScope::Device,
             key: "storage_mode".to_string(),
@@ -3728,13 +3741,13 @@ pub fn storage_mode_set_cloud(
     )?;
     crate::cloud_sync::enter_direct_cloud_mode();
     set_direct_cloud_access_runtime(
-        &workspace_id,
+        &workspace.id,
         DirectCloudAccessState::Connecting,
         Some("正在连接 Supabase 并加载云端数据".to_string()),
     );
-    if let Err(error) = direct_cloud_workbench_bootstrap(&database) {
+    if let Err(error) = direct_cloud_workbench_bootstrap(database) {
         let _ = settings::update_setting(
-            &database,
+            database,
             SettingsUpdate {
                 scope: SettingsScope::Device,
                 key: "storage_mode".to_string(),
@@ -3744,7 +3757,7 @@ pub fn storage_mode_set_cloud(
         crate::cloud_sync::disable_cloud_sync();
         return Err(error);
     }
-    storage_mode(&database)
+    storage_mode(database)
 }
 
 #[tauri::command]
@@ -4353,6 +4366,146 @@ mod tests {
         assert!(requests[1]
             .lines()
             .any(|line| line.eq_ignore_ascii_case("x-timegenie-workspace-epoch: 7")));
+        reset_test_credentials();
+    }
+
+    #[test]
+    fn cloud_mode_switch_repairs_a_saved_session_without_workspace_metadata() {
+        let _guard = lock_test_session_state();
+        reset_test_credentials();
+        let cloud_workspace_id = Uuid::now_v7().to_string();
+        let workspace_body = Box::leak(
+            json!([{
+                "id": cloud_workspace_id,
+                "name": "已恢复工作空间",
+                "timezone": "Asia/Shanghai",
+                "workspace_epoch": 7
+            }])
+            .to_string()
+            .into_boxed_str(),
+        );
+        let device_body = Box::leak(
+            json!({
+                "id": "device-cloud-repair",
+                "workspace_id": cloud_workspace_id,
+                "device_name": "当前设备",
+                "platform": "windows",
+                "app_version": env!("CARGO_PKG_VERSION"),
+                "last_seen_at": "2026-10-25T02:00:00Z",
+                "authorized_at": "2026-10-25T02:00:00Z",
+                "reauthorized_at": null,
+                "revoked_at": null
+            })
+            .to_string()
+            .into_boxed_str(),
+        );
+        let workbench_body = Box::leak(
+            json!({
+                "metadata": {
+                    "workspaceId": cloud_workspace_id,
+                    "deviceId": "device-cloud-repair",
+                    "storageProtocol": "direct_v2",
+                    "workspaceEpoch": 7,
+                    "changeSeq": 12,
+                    "serverTime": "2026-10-25T02:00:00Z",
+                    "domains": ["workbench"],
+                    "writable": true
+                },
+                "data": {
+                    "workspaceId": cloud_workspace_id,
+                    "workspaceName": "已恢复工作空间",
+                    "timezone": "Asia/Shanghai",
+                    "currentWorkDate": "2026-10-25",
+                    "currentDayStartAt": 1792876800000_i64,
+                    "currentDayEndAt": 1792963200000_i64,
+                    "subjects": [],
+                    "summary": {
+                        "subjectCount": 0,
+                        "openTaskCount": 0,
+                        "completedTaskCount": 0,
+                        "taskCount": 0
+                    },
+                    "device": {
+                        "id": "device-cloud-repair",
+                        "deviceName": "当前设备",
+                        "platform": "windows",
+                        "appVersion": env!("CARGO_PKG_VERSION"),
+                        "lastSeenAt": "2026-10-25T02:00:00Z",
+                        "authorizedAt": "2026-10-25T02:00:00Z",
+                        "reauthorizedAt": null,
+                        "writable": true
+                    }
+                }
+            })
+            .to_string()
+            .into_boxed_str(),
+        );
+        let server = TestHttpServer::start(vec![
+            TestHttpResponse {
+                path: "/rest/v1/workspaces",
+                status: 200,
+                body: workspace_body,
+            },
+            TestHttpResponse {
+                path: "/rest/v1/rpc/workspace_initialize_defaults",
+                status: 200,
+                body: "{}",
+            },
+            TestHttpResponse {
+                path: "/rest/v1/workspace_changes",
+                status: 200,
+                body: r#"[{"change_seq":12}]"#,
+            },
+            TestHttpResponse {
+                path: "/rest/v1/rpc/device_authorize",
+                status: 200,
+                body: device_body,
+            },
+            TestHttpResponse {
+                path: "/rest/v1/rpc/direct_cloud_workbench_bootstrap",
+                status: 200,
+                body: workbench_body,
+            },
+        ]);
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("cloud-switch-repair.sqlite3")).unwrap();
+        for (key, value) in [
+            ("supabase_project_url", json!(server.base_url())),
+            ("supabase_anon_key", json!("anon-test-key")),
+        ] {
+            settings::update_setting(
+                &database,
+                SettingsUpdate {
+                    scope: SettingsScope::Device,
+                    key: key.to_string(),
+                    value,
+                },
+            )
+            .unwrap();
+        }
+        save_session(
+            &database,
+            &test_session("cloud-switch-repair", Some(now_seconds() + 3600)),
+        )
+        .unwrap();
+        assert!(
+            read_device_setting_string(&database.open().unwrap(), "cloud_workspace_id")
+                .unwrap()
+                .is_none()
+        );
+
+        let state = storage_mode_set_cloud_for_database(&database).unwrap();
+
+        assert_eq!(state.mode, "cloud");
+        assert_eq!(state.workspace_id, cloud_workspace_id);
+        assert_eq!(state.workspace_epoch, 7);
+        assert_eq!(state.last_change_seq, 12);
+        let requests = server.finish();
+        assert_eq!(requests.len(), 5);
+        assert!(requests[1].contains("x-timegenie-workspace-epoch: 7"));
+        assert!(requests[3].contains("x-timegenie-workspace-epoch: 7"));
+        assert!(requests[4].contains("x-timegenie-workspace-epoch: 7"));
         reset_test_credentials();
     }
 
