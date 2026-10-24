@@ -422,7 +422,6 @@ pub fn run() {
             restart_app,
             database::database_status,
             data_protection::data_backup_export,
-            data_protection::data_backup_export_rescue,
             data_protection::data_backup_preview,
             data_protection::data_backup_import,
             data_protection::data_backup_history_list,

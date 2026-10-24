@@ -1065,14 +1065,6 @@ fn discard_superseded_sessions(
                 params![boundary, workspace_id, session_id],
             )
             .map_err(|error| error.to_string())?;
-        transaction
-            .execute(
-                "DELETE FROM sync_outbox
-                 WHERE workspace_id=?1 AND entity_type='unassigned_session' AND entity_id=?2
-                   AND state IN ('pending','failed','conflict')",
-                params![workspace_id, session_id],
-            )
-            .map_err(|error| error.to_string())?;
     }
     Ok(session_ids)
 }
@@ -1330,7 +1322,7 @@ fn processed_result<T: for<'de> Deserialize<'de>>(
 ) -> Result<Option<T>, String> {
     let json: Option<String> = connection
         .query_row(
-            "SELECT result_json FROM processed_operations WHERE workspace_id = ?1 AND operation_id = ?2",
+            "SELECT result_json FROM local_request_results WHERE workspace_id = ?1 AND request_id = ?2",
             params![workspace_id, operation_id],
             |row| row.get(0),
         )
@@ -1350,7 +1342,7 @@ fn save_processed_result<T: Serialize>(
 ) -> Result<(), String> {
     transaction
         .execute(
-            "INSERT INTO processed_operations(workspace_id, operation_id, device_id, operation_type, result_json, processed_at)
+            "INSERT INTO local_request_results(workspace_id, request_id, device_id, request_type, result_json, processed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![workspace_id, operation_id, device_id, operation_type, serde_json::to_string(result).map_err(|error| error.to_string())?, now_millis()],
         )
@@ -1518,6 +1510,22 @@ mod tests {
     use crate::tasks::{create_task, TaskCreateRequest};
     use serde_json::json;
     use tempfile::tempdir;
+
+    fn assert_legacy_sync_runtime_removed(database: &Database) {
+        let connection = database.open().unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name IN (
+                   'sync_outbox','local_sync_state','cloud_deferred_entities',
+                   'legacy_abandoned_outbox','processed_operations','sync_items','sync_runs'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
 
     fn setup() -> (Database, String) {
         let directory = tempdir().unwrap();
@@ -1864,15 +1872,8 @@ mod tests {
             let refreshed = get_state(&database).unwrap().unwrap();
             assert_eq!(refreshed.session_id, first.session_id);
         }
+        assert_legacy_sync_runtime_removed(&database);
         let connection = database.open().unwrap();
-        let outbox_count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sync_outbox WHERE entity_type='unassigned_session'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(outbox_count, 0);
         let shared_count: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM unassigned_sessions WHERE shared_source='cloud'",
@@ -1909,32 +1910,14 @@ mod tests {
         let first = get_state_with_cloud_context(&database, Some(&state))
             .unwrap()
             .unwrap();
-        let initial_outbox: i64 = database
-            .open()
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1 AND entity_type='unassigned_session'",
-                [&cloud_workspace_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(initial_outbox, 0);
+        assert_legacy_sync_runtime_removed(&database);
         for _ in 0..10 {
             let refreshed = get_state_with_cloud_context(&database, Some(&state))
                 .unwrap()
                 .unwrap();
             assert_eq!(refreshed.session_id, first.session_id);
         }
-        let final_outbox: i64 = database
-            .open()
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1 AND entity_type='unassigned_session'",
-                [&cloud_workspace_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(final_outbox, initial_outbox);
+        assert_legacy_sync_runtime_removed(&database);
     }
 
     #[test]
@@ -2002,12 +1985,6 @@ mod tests {
                 params![local_workspace_id, stale_heartbeat],
             )
             .unwrap();
-        connection
-            .execute(
-                "DELETE FROM sync_outbox WHERE workspace_id=?1 AND entity_type='unassigned_session'",
-                [&cloud_workspace_id],
-            )
-            .unwrap();
         drop(connection);
 
         let (refreshed, sync_changed) =
@@ -2018,16 +1995,7 @@ mod tests {
         assert_eq!(refreshed.current_segment_started_at, Some(anchor));
         assert_eq!(refreshed.version, initial.version);
         assert!(!sync_changed);
-        let queued: i64 = database
-            .open()
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1 AND entity_type='unassigned_session'",
-                [&cloud_workspace_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(queued, 0);
+        assert_legacy_sync_runtime_removed(&database);
     }
 
     #[test]
@@ -2067,14 +2035,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(after, before);
-        let queued: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sync_outbox WHERE entity_type='unassigned_session'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(queued, 0);
+        drop(connection);
+        assert_legacy_sync_runtime_removed(&database);
     }
 
     #[test]
@@ -2329,14 +2291,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(completed_status, "done");
-        let outbox_count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1",
-                [&cloud_workspace_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(outbox_count, 0);
+        drop(connection);
+        assert_legacy_sync_runtime_removed(&database);
     }
 
     #[test]
@@ -2441,10 +2397,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(predecessor.as_deref(), Some(second.session_id.as_str()));
-        let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(outbox_count, 0);
+        drop(connection);
+        assert_legacy_sync_runtime_removed(&database);
     }
 
     fn shanghai_millis(value: &str) -> i64 {

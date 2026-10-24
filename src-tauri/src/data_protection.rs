@@ -369,19 +369,15 @@ pub const PROTECTED_ENTITIES: &[ProtectedEntity] = &[
 #[cfg(test)]
 pub const EXCLUDED_TABLES: &[&str] = &[
     "devices",
-    "processed_operations",
     "device_settings",
     "legacy_sync_cleanup_diagnostics",
-    "local_sync_state",
-    "sync_outbox",
-    "legacy_abandoned_outbox",
-    "cloud_deferred_entities",
+    "local_request_results",
     "tracking_runtime_state",
     "device_hooks",
     "device_hook_runs",
     "local_report_outputs",
-    "sync_runs",
-    "sync_items",
+    "integration_runs",
+    "integration_run_items",
     "actual_adjustment_batches",
     "plan_import_batches",
     "plan_import_items",
@@ -480,16 +476,6 @@ struct WorkspaceMetadata {
 #[serde(rename_all = "camelCase")]
 pub struct BackupExportRequest {
     pub path: String,
-    #[serde(default)]
-    pub rescue: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BackupRescueExportRequest {
-    pub path: String,
-    #[serde(default)]
-    pub disposition_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -590,14 +576,23 @@ pub fn export_backup(
     database: &crate::database::Database,
     request: BackupExportRequest,
 ) -> Result<BackupExportResult, String> {
-    export_backup_with_policy(database, request, false, None)
+    export_backup_with_policy(database, request, false)
 }
 
 fn export_backup_with_policy(
     database: &crate::database::Database,
     request: BackupExportRequest,
-    allow_import_safety_rescue: bool,
+    safety_backup: bool,
+) -> Result<BackupExportResult, String> {
+    export_backup_with_policy_for_workspace(database, request, safety_backup, None, None)
+}
+
+fn export_backup_with_policy_for_workspace(
+    database: &crate::database::Database,
+    request: BackupExportRequest,
+    safety_backup: bool,
     disposition_reason: Option<String>,
+    legacy_workspace_override: Option<&str>,
 ) -> Result<BackupExportResult, String> {
     let target = validated_backup_target(&request.path)?;
     let frozen_at = now_millis();
@@ -627,47 +622,34 @@ fn export_backup_with_policy(
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    let sync_state = cloud_workspace_id
-        .as_deref()
-        .and_then(|workspace_id| {
-            transaction
+    let legacy_workspace_id = legacy_workspace_override
+        .filter(|value| !value.trim().is_empty())
+        .or(cloud_workspace_id.as_deref());
+    let legacy_rescue = legacy_workspace_override.is_some();
+    let (source_workspace_epoch, pending_operation_count, legacy_sync_diagnostics) =
+        if legacy_rescue {
+            let workspace_id = legacy_workspace_id
+                .ok_or_else(|| "RESCUE_BACKUP_NOT_AVAILABLE: 缺少旧云端工作空间标记".to_string())?;
+            let source_workspace_epoch = transaction
                 .query_row(
-                    "SELECT workspace_epoch,epoch_blocked FROM local_sync_state WHERE workspace_id=?1",
+                    "SELECT workspace_epoch FROM local_sync_state WHERE workspace_id=?1",
                     [workspace_id],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+                    |row| row.get(0),
                 )
-                .optional()
-                .ok()
-                .flatten()
-        })
-        .unwrap_or((1, false));
-    let pending_operation_count = if let Some(workspace_id) = cloud_workspace_id.as_deref() {
-        transaction
-            .query_row(
-                "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1 AND state IN ('pending','sending','failed','conflict')",
-                [workspace_id],
-                |row| row.get(0),
+                .unwrap_or(1);
+            let diagnostics = build_legacy_sync_diagnostics(
+                &transaction,
+                Some(workspace_id),
+                disposition_reason.as_deref(),
+            )?;
+            (
+                source_workspace_epoch,
+                diagnostics.queue_counts.total,
+                Some(diagnostics),
             )
-            .map_err(|error| error.to_string())?
-    } else {
-        0
-    };
-    let rescue = request.rescue
-        || (allow_import_safety_rescue && source_mode == "cloud" && pending_operation_count > 0);
-    if source_mode == "cloud" && pending_operation_count > 0 && !rescue {
-        return Err("SYNC_PENDING: 云端模式仍有待处理修改，请先同步或改用设备救援备份".to_string());
-    }
-    if rescue
-        && (source_mode != "cloud"
-            || (request.rescue
-                && !allow_import_safety_rescue
-                && (!sync_state.1 || pending_operation_count == 0)))
-    {
-        return Err(
-            "RESCUE_BACKUP_NOT_AVAILABLE: 仅旧世代阻塞且存在未处理修改的设备可导出救援备份"
-                .to_string(),
-        );
-    }
+        } else {
+            (1, 0, None)
+        };
     let workspace: WorkspaceMetadata = transaction
         .query_row(
             "SELECT name,timezone FROM workspaces WHERE id=?1",
@@ -682,21 +664,12 @@ fn export_backup_with_policy(
         .map_err(|error| error.to_string())?;
     let mut tables = export_tables(&transaction, &local_workspace_id)?;
     freeze_active_tracking(&mut tables, frozen_at)?;
-    let legacy_sync_diagnostics = if rescue {
-        Some(build_legacy_sync_diagnostics(
-            &transaction,
-            cloud_workspace_id.as_deref(),
-            disposition_reason.as_deref(),
-        )?)
-    } else {
-        None
-    };
     transaction.commit().map_err(|error| error.to_string())?;
     let entity_counts = tables
         .iter()
         .map(|(table, rows)| (table.clone(), rows.len()))
         .collect::<BTreeMap<_, _>>();
-    let backup_kind = if rescue {
+    let backup_kind = if legacy_rescue {
         BACKUP_KIND_RESCUE
     } else {
         BACKUP_KIND_STANDARD
@@ -709,13 +682,12 @@ fn export_backup_with_policy(
         backup_kind: backup_kind.to_string(),
         source_mode: source_mode.clone(),
         source_workspace_marker: sha256_hex(
-            cloud_workspace_id
-                .as_deref()
+            legacy_workspace_id
                 .unwrap_or(&local_workspace_id)
                 .as_bytes(),
         ),
-        source_workspace_epoch: sync_state.0,
-        cloud_consistent: source_mode != "cloud" || pending_operation_count == 0,
+        source_workspace_epoch,
+        cloud_consistent: pending_operation_count == 0,
         pending_operation_count,
         entity_counts: entity_counts.clone(),
         excluded_categories: EXCLUDED_CATEGORIES
@@ -743,11 +715,7 @@ fn export_backup_with_policy(
         database,
         &result,
         bytes.len() as i64,
-        if allow_import_safety_rescue {
-            "safety"
-        } else {
-            "manual"
-        },
+        if safety_backup { "safety" } else { "manual" },
     )?;
     Ok(result)
 }
@@ -756,34 +724,86 @@ pub(crate) fn export_automatic_safety_backup(
     database: &crate::database::Database,
     path: String,
 ) -> Result<BackupExportResult, String> {
-    export_backup_with_policy(
-        database,
-        BackupExportRequest {
-            path,
-            rescue: false,
-        },
-        true,
-        None,
-    )
+    export_backup_with_policy(database, BackupExportRequest { path }, true)
 }
 
-pub(crate) fn export_automatic_legacy_rescue_backup(
+pub(crate) fn export_legacy_sync_retirement_rescue_if_needed(
     database: &crate::database::Database,
-    disposition_reason: &str,
-) -> Result<BackupExportResult, String> {
+) -> Result<Option<BackupExportResult>, String> {
+    const MARKER_KEY: &str = "legacy_sync_retirement_rescue_v1";
+    let connection = database.open()?;
+    let outbox_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_outbox')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !outbox_exists {
+        return Ok(None);
+    }
+    let legacy_workspace_id: Option<String> = connection
+        .query_row(
+            "SELECT workspace_id FROM sync_outbox
+             WHERE state IN ('pending','sending','failed','conflict')
+             GROUP BY workspace_id ORDER BY MIN(created_at),workspace_id LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(legacy_workspace_id) = legacy_workspace_id else {
+        return Ok(None);
+    };
+    let existing_marker: Option<String> = connection
+        .query_row(
+            "SELECT value_json FROM device_settings WHERE key=?1",
+            [MARKER_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    drop(connection);
+    if existing_marker
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| value.get("path").and_then(Value::as_str).map(PathBuf::from))
+        .is_some_and(|path| path.is_file())
+    {
+        return Ok(None);
+    }
+
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
     let path = database.data_directory().join("backups").join(format!(
-        "timegenie-before-cloud-authority-reset-{timestamp}.timegenie-backup"
+        "timegenie-before-legacy-sync-retirement-{timestamp}.timegenie-backup"
     ));
-    export_backup_with_policy(
+    let result = export_backup_with_policy_for_workspace(
         database,
         BackupExportRequest {
             path: path.display().to_string(),
-            rescue: false,
         },
         true,
-        Some(disposition_reason.to_string()),
-    )
+        Some("升级为双模式架构，旧队列仅留存本机救援备份且不再上传".to_string()),
+        Some(&legacy_workspace_id),
+    )?;
+    database
+        .open()?
+        .execute(
+            "INSERT INTO device_settings(key,value_json,updated_at) VALUES(?1,?2,?3)
+             ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+            params![
+                MARKER_KEY,
+                json!({
+                    "path": result.path,
+                    "checksum": result.checksum,
+                    "createdAt": result.created_at,
+                })
+                .to_string(),
+                now_millis(),
+            ],
+        )
+        .map_err(|error| format!("无法记录旧同步退役救援备份: {error}"))?;
+    Ok(Some(result))
 }
 
 pub fn preview_backup(
@@ -843,10 +863,8 @@ fn import_backup_with_safety_path(
         database,
         BackupExportRequest {
             path: safety_path.display().to_string(),
-            rescue: false,
         },
         true,
-        None,
     )?;
     let workspace_id = restore_validated_backup(database, &validated)?;
     Ok(BackupImportResult {
@@ -862,22 +880,6 @@ pub fn data_backup_export(
     request: BackupExportRequest,
 ) -> Result<BackupExportResult, String> {
     export_backup(&database, request)
-}
-
-#[tauri::command]
-pub fn data_backup_export_rescue(
-    database: tauri::State<'_, crate::database::Database>,
-    request: BackupRescueExportRequest,
-) -> Result<BackupExportResult, String> {
-    export_backup_with_policy(
-        &database,
-        BackupExportRequest {
-            path: request.path,
-            rescue: true,
-        },
-        false,
-        request.disposition_reason,
-    )
 }
 
 #[tauri::command]
@@ -1956,7 +1958,7 @@ fn delete_workspace_data(transaction: &Transaction<'_>, workspace_id: &str) -> R
         )
         .map_err(|error| error.to_string())?;
     for table in [
-        "sync_items",
+        "integration_run_items",
         "plan_import_items",
         "daily_report_import_items",
         "daily_report_import_sources",
@@ -1972,7 +1974,7 @@ fn delete_workspace_data(transaction: &Transaction<'_>, workspace_id: &str) -> R
         "task_daily_estimates",
         "task_recurrence_rules",
         "task_occurrences",
-        "sync_runs",
+        "integration_runs",
         "plan_import_batches",
         "daily_report_import_batches",
         "reports",
@@ -1985,10 +1987,7 @@ fn delete_workspace_data(transaction: &Transaction<'_>, workspace_id: &str) -> R
         "app_settings",
         "integration_configs",
         "external_bindings",
-        "cloud_deferred_entities",
-        "sync_outbox",
-        "local_sync_state",
-        "processed_operations",
+        "local_request_results",
         "tracking_runtime_state",
         "subjects",
         "devices",
@@ -2545,7 +2544,13 @@ mod tests {
         assert!(PROTECTED_ENTITIES
             .windows(2)
             .all(|pair| pair[0].import_order < pair[1].import_order));
-        for excluded in ["devices", "sync_outbox", "device_hooks", "local_sync_state"] {
+        for excluded in [
+            "devices",
+            "local_request_results",
+            "device_hooks",
+            "integration_runs",
+            "integration_run_items",
+        ] {
             assert!(EXCLUDED_TABLES.contains(&excluded));
             assert!(!PROTECTED_ENTITIES
                 .iter()
@@ -2736,7 +2741,6 @@ mod tests {
             &database,
             BackupExportRequest {
                 path: path.display().to_string(),
-                rescue: false,
             },
         )
         .unwrap();
@@ -2830,19 +2834,6 @@ mod tests {
             &format!("subject_daily_report_directory:{subject_id}"),
             json!("D:/secret/daily-report-directory"),
         );
-        let device_id: String = connection
-            .query_row(
-                "SELECT id FROM devices WHERE workspace_id=?1",
-                [&workspace_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,payload_json,state,attempt_count,created_at,workspace_epoch) VALUES('op-secret',?1,?2,'update','tasks','task-secret','{\"token\":\"replay-secret\"}','pending',0,1,1)",
-                params![workspace_id, device_id],
-            )
-            .unwrap();
         connection
             .execute(
                 "UPDATE legacy_sync_cleanup_diagnostics SET cleanup_reason='password=cleanup-diagnostic-secret' WHERE table_name='tracking_leases'",
@@ -2856,7 +2847,6 @@ mod tests {
             &database,
             BackupExportRequest {
                 path: path.display().to_string(),
-                rescue: false,
             },
         )
         .unwrap();
@@ -2866,10 +2856,8 @@ mod tests {
             "actual-anon-secret",
             "secret.supabase.co",
             "keyring://real-secret",
-            "replay-secret",
             "secret.exe",
             "hook-secret",
-            "op-secret",
             "cleanup-diagnostic-secret",
             "D:/secret/daily-report-directory",
         ] {
@@ -2911,7 +2899,6 @@ mod tests {
             &database,
             BackupExportRequest {
                 path: path.display().to_string(),
-                rescue: false,
             },
         )
         .unwrap();
@@ -2924,141 +2911,8 @@ mod tests {
     }
 
     #[test]
-    fn cloud_pending_requires_epoch_block_for_rescue_export() {
+    fn backup_audit_scans_standard_archive_for_secrets_and_runtime_metadata() {
         let (directory, database, workspace_id, _) = test_database();
-        let cloud_workspace_id = "cloud-workspace";
-        let connection = database.open().unwrap();
-        let device_id: String = connection
-            .query_row(
-                "SELECT id FROM devices WHERE workspace_id=?1",
-                [&workspace_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        connection.execute("INSERT INTO local_sync_state(workspace_id,device_id,last_change_seq,workspace_epoch,epoch_blocked) VALUES(?1,?2,0,3,0)",params![cloud_workspace_id,device_id]).unwrap();
-        connection.execute("INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,payload_json,state,attempt_count,created_at,workspace_epoch,error_json) VALUES('pending-op',?1,?2,'update','tasks','{}','pending',0,1,3,?3)",params![cloud_workspace_id,device_id,json!({"message":"VERSION_CONFLICT: token=rescue-error-secret"}).to_string()]).unwrap();
-        drop(connection);
-        set_device_setting(&database, "storage_mode", json!("cloud"));
-        set_device_setting(&database, "cloud_workspace_id", json!(cloud_workspace_id));
-        let standard = directory.path().join("blocked-standard.timegenie-backup");
-        let error = export_backup(
-            &database,
-            BackupExportRequest {
-                path: standard.display().to_string(),
-                rescue: false,
-            },
-        )
-        .unwrap_err();
-        assert!(error.contains("SYNC_PENDING"));
-        let rescue = directory.path().join("rescue.timegenie-backup");
-        let error = export_backup(
-            &database,
-            BackupExportRequest {
-                path: rescue.display().to_string(),
-                rescue: true,
-            },
-        )
-        .unwrap_err();
-        assert!(error.contains("RESCUE_BACKUP_NOT_AVAILABLE"));
-        database.open().unwrap().execute("UPDATE local_sync_state SET epoch_blocked=1,epoch_blocked_reason='WORKSPACE_EPOCH_STALE',epoch_blocked_at=1 WHERE workspace_id=?1",[cloud_workspace_id]).unwrap();
-        let result = export_backup(
-            &database,
-            BackupExportRequest {
-                path: rescue.display().to_string(),
-                rescue: true,
-            },
-        )
-        .unwrap();
-        assert_eq!(result.backup_kind, BACKUP_KIND_RESCUE);
-        assert!(!result.cloud_consistent);
-        let validated = validate_backup_path(&rescue).unwrap();
-        assert_eq!(validated.manifest.source_workspace_epoch, 3);
-        assert_eq!(validated.manifest.pending_operation_count, 1);
-        let diagnostics = validated.manifest.legacy_sync_diagnostics.unwrap();
-        assert_eq!(diagnostics.queue_counts.pending, 1);
-        assert_eq!(diagnostics.queue_counts.total, 1);
-        assert_eq!(diagnostics.operations.len(), 1);
-        assert_eq!(diagnostics.operations[0].operation_type, "update");
-        assert_eq!(diagnostics.operations[0].entity_type, "tasks");
-        assert_eq!(
-            diagnostics.operations[0].error_code.as_deref(),
-            Some("VERSION_CONFLICT")
-        );
-        assert!(diagnostics.business_data_included);
-        assert!(diagnostics.raw_payload_excluded);
-        assert!(!diagnostics.disposition_reason.trim().is_empty());
-        let abandon = validate_rescue_backup_for_abandon(&rescue).unwrap();
-        assert_eq!(abandon.pending_operation_count, 1);
-        assert_eq!(abandon.legacy_queue_operation_count, 1);
-        let archive_text = read_json_archive(fs::File::open(&rescue).unwrap())
-            .unwrap()
-            .values()
-            .map(Value::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(!archive_text.contains("rescue-error-secret"));
-
-        let reasoned = directory.path().join("reasoned-rescue.timegenie-backup");
-        export_backup_with_policy(
-            &database,
-            BackupExportRequest {
-                path: reasoned.display().to_string(),
-                rescue: true,
-            },
-            false,
-            Some("用户确认导出后放弃旧修改".to_string()),
-        )
-        .unwrap();
-        let reasoned = validate_backup_path(&reasoned).unwrap();
-        assert_eq!(
-            reasoned
-                .manifest
-                .legacy_sync_diagnostics
-                .unwrap()
-                .disposition_reason,
-            "用户确认导出后放弃旧修改"
-        );
-    }
-
-    #[test]
-    fn automatic_cloud_authority_reset_backup_handles_pending_legacy_queue() {
-        let (directory, database, workspace_id, _) = test_database();
-        let cloud_workspace_id = "cloud-authority-reset-workspace";
-        let connection = database.open().unwrap();
-        let device_id: String = connection
-            .query_row(
-                "SELECT id FROM devices WHERE workspace_id=?1",
-                [&workspace_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        connection.execute(
-            "INSERT INTO local_sync_state(workspace_id,device_id,last_change_seq,workspace_epoch) VALUES(?1,?2,0,1)",
-            params![cloud_workspace_id, device_id],
-        ).unwrap();
-        connection.execute(
-            "INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,payload_json,state,attempt_count,created_at,workspace_epoch) VALUES('authority-reset-op',?1,?2,'task_update','task','{}','pending',0,1,1)",
-            params![cloud_workspace_id, device_id],
-        ).unwrap();
-        drop(connection);
-        set_device_setting(&database, "storage_mode", json!("cloud"));
-        set_device_setting(&database, "cloud_workspace_id", json!(cloud_workspace_id));
-
-        let result =
-            export_automatic_legacy_rescue_backup(&database, "用户确认放弃本机旧云端数据").unwrap();
-        let backup_path = PathBuf::from(&result.path);
-        assert!(backup_path.starts_with(directory.path().join("backups")));
-        let validated = validate_rescue_backup_for_abandon(&backup_path).unwrap();
-        assert_eq!(validated.pending_operation_count, 1);
-        assert_eq!(validated.legacy_queue_operation_count, 1);
-        let history = backup_history_list(&database).unwrap();
-        assert_eq!(history[0].origin, "safety");
-    }
-
-    #[test]
-    fn backup_audit_scans_standard_and_rescue_archives_for_secrets_and_replay_payloads() {
-        let (directory, database, workspace_id, _) = test_database();
-        let cloud_workspace_id = "audit-cloud-workspace";
         let device_id: String;
         {
             let connection = database.open().unwrap();
@@ -3118,7 +2972,11 @@ mod tests {
             json!("anon-audit-secret-1d9"),
         );
         set_device_setting(&database, "storage_mode", json!("cloud"));
-        set_device_setting(&database, "cloud_workspace_id", json!(cloud_workspace_id));
+        set_device_setting(
+            &database,
+            "cloud_workspace_id",
+            json!("audit-cloud-workspace"),
+        );
         crate::supabase::install_test_session_for_database(&database, "audit-user-secret-2f81")
             .unwrap();
 
@@ -3127,43 +2985,11 @@ mod tests {
             &database,
             BackupExportRequest {
                 path: standard.display().to_string(),
-                rescue: false,
             },
         )
         .unwrap();
         assert_eq!(standard_result.backup_kind, BACKUP_KIND_STANDARD);
         assert!(standard_result.cloud_consistent);
-
-        {
-            let connection = database.open().unwrap();
-            connection
-                .execute(
-                    "INSERT INTO local_sync_state(workspace_id,device_id,last_change_seq,workspace_epoch,epoch_blocked,epoch_blocked_reason) VALUES(?1,?2,0,2,1,'WORKSPACE_EPOCH_STALE')",
-                    params![cloud_workspace_id, device_id],
-                )
-                .unwrap();
-            connection
-                .execute(
-                    "INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,payload_json,state,attempt_count,created_at,workspace_epoch) VALUES('op-audit-replay',?1,?2,'update','task','task-audit',?3,'pending',0,1,1)",
-                    params![
-                        cloud_workspace_id,
-                        device_id,
-                        json!({ "token": "replay-secret-8d1e" }).to_string()
-                    ],
-                )
-                .unwrap();
-        }
-        let rescue = directory.path().join("audit-rescue.timegenie-backup");
-        let rescue_result = export_backup(
-            &database,
-            BackupExportRequest {
-                path: rescue.display().to_string(),
-                rescue: true,
-            },
-        )
-        .unwrap();
-        assert_eq!(rescue_result.backup_kind, BACKUP_KIND_RESCUE);
-        assert!(!rescue_result.cloud_consistent);
 
         let forbidden = [
             "seatable-real-token-7f3a",
@@ -3176,11 +3002,9 @@ mod tests {
             "audit-user-secret-2f81",
             "access-audit-user-secret-2f81",
             "refresh-audit-user-secret-2f81",
-            "op-audit-replay",
-            "replay-secret-8d1e",
             "audit-device-name-5c7",
         ];
-        for (label, path) in [("standard", &standard), ("rescue", &rescue)] {
+        for (label, path) in [("standard", &standard)] {
             let entries = read_json_archive(fs::File::open(path).unwrap()).unwrap();
             let text = entries
                 .iter()
@@ -3232,9 +3056,6 @@ mod tests {
         }
         let validated_standard = validate_backup_path(&standard).unwrap();
         assert_eq!(validated_standard.manifest.pending_operation_count, 0);
-        let validated_rescue = validate_backup_path(&rescue).unwrap();
-        assert_eq!(validated_rescue.manifest.pending_operation_count, 1);
-        assert!(!validated_rescue.manifest.cloud_consistent);
     }
 
     #[test]
@@ -3255,7 +3076,6 @@ mod tests {
             &database,
             BackupExportRequest {
                 path: source.display().to_string(),
-                rescue: false,
             },
         )
         .unwrap();
@@ -3349,7 +3169,6 @@ mod tests {
             &database,
             BackupExportRequest {
                 path: source.display().to_string(),
-                rescue: false,
             },
         )
         .unwrap();
@@ -3392,20 +3211,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(restored_mode, "local");
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM local_sync_state", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
+        let legacy_runtime_tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN (
+                   'sync_outbox','local_sync_state','cloud_deferred_entities',
+                   'legacy_abandoned_outbox','processed_operations','sync_items','sync_runs'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_runtime_tables, 0);
         let (state, ended_at, duration, origin): (String, Option<i64>, i64, Option<String>) = connection.query_row("SELECT state,ended_at,duration_seconds,origin_unassigned_session_id FROM time_entries WHERE id='running-entry'",[],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
         assert_eq!(state, "paused");
         assert!(ended_at.is_none());
@@ -3473,7 +3289,6 @@ mod tests {
             &database,
             BackupExportRequest {
                 path: source.display().to_string(),
-                rescue: false,
             },
         )
         .unwrap();
@@ -3514,7 +3329,6 @@ mod tests {
             &database,
             BackupExportRequest {
                 path: source.display().to_string(),
-                rescue: false,
             },
         )
         .unwrap();

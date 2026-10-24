@@ -174,7 +174,7 @@ pub fn preview_report_write(
     };
     connection
         .execute(
-            "INSERT INTO sync_runs(
+            "INSERT INTO integration_runs(
                id, workspace_id, provider, operation_type, state, request_json, preview_json, created_at
              ) VALUES (?1, ?2, 'obsidian', 'report_write', 'preview', ?3, ?4, ?5)",
             params![
@@ -188,7 +188,7 @@ pub fn preview_report_write(
         .map_err(|error| error.to_string())?;
     connection
         .execute(
-            "INSERT INTO sync_items(
+            "INSERT INTO integration_run_items(
                id, workspace_id, run_id, entity_type, entity_id, action, state, before_json, after_json
              ) VALUES (?1, ?2, ?3, 'report', ?4, 'write_file', 'pending', ?5, ?6)",
             params![
@@ -222,7 +222,7 @@ pub fn execute_report_write(
         .map_err(|error| error.to_string())?;
     let preview_json: String = connection
         .query_row(
-            "SELECT preview_json FROM sync_runs
+            "SELECT preview_json FROM integration_runs
              WHERE id = ?1 AND workspace_id = ?2 AND provider = 'obsidian'
                AND operation_type = 'report_write' AND state = 'preview'",
             params![request.run_id, workspace_id],
@@ -296,13 +296,13 @@ pub fn execute_report_write(
         .map_err(|error| error.to_string())?;
     transaction
         .execute(
-            "UPDATE sync_runs SET state = 'succeeded', success_count = 1, started_at = ?1, completed_at = ?1 WHERE id = ?2",
+            "UPDATE integration_runs SET state = 'succeeded', success_count = 1, started_at = ?1, completed_at = ?1 WHERE id = ?2",
             params![written_at, request.run_id],
         )
         .map_err(|error| error.to_string())?;
     transaction
         .execute(
-            "UPDATE sync_items SET state = 'succeeded' WHERE run_id = ?1",
+            "UPDATE integration_run_items SET state = 'succeeded' WHERE run_id = ?1",
             [&request.run_id],
         )
         .map_err(|error| error.to_string())?;
@@ -1392,8 +1392,12 @@ mod tests {
         .unwrap();
 
         let connection = database.open().unwrap();
-        let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+        let legacy_sync_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
 
         assert_eq!(confirmed.tasks.len(), 2);
@@ -1401,7 +1405,7 @@ mod tests {
             .tasks
             .iter()
             .all(|task| task.planned_date.as_deref() == Some("2026-10-03")));
-        assert_eq!(outbox_count, 0);
+        assert_eq!(legacy_sync_table_count, 0);
     }
 
     #[test]

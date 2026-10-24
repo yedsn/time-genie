@@ -7,6 +7,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 const DATABASE_FILE_NAME: &str = "timegenie.sqlite3";
+const LEGACY_SYNC_CLEANUP_MIGRATION_VERSION: i64 = 32;
 
 struct Migration {
     version: i64,
@@ -170,6 +171,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "remove_unused_legacy_cloud_mirrors",
         sql: include_str!("../migrations/0031_remove_unused_legacy_cloud_mirrors.sql"),
     },
+    Migration {
+        version: 32,
+        name: "remove_legacy_sync_runtime",
+        sql: include_str!("../migrations/0032_remove_legacy_sync_runtime.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -194,6 +200,10 @@ impl Database {
             path: app_data_dir.join(DATABASE_FILE_NAME),
         };
         let mut connection = database.open()?;
+        apply_migrations_before_legacy_cleanup(&mut connection)?;
+        drop(connection);
+        crate::data_protection::export_legacy_sync_retirement_rescue_if_needed(&database)?;
+        let mut connection = database.open()?;
         apply_migrations(&mut connection)?;
         ensure_initial_data(&mut connection)?;
         crate::work_calendar::validate_all_workspace_timezones(&connection)?;
@@ -208,6 +218,10 @@ impl Database {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
         let database = Self { path };
+        let mut connection = database.open()?;
+        apply_migrations_before_legacy_cleanup(&mut connection)?;
+        drop(connection);
+        crate::data_protection::export_legacy_sync_retirement_rescue_if_needed(&database)?;
         let mut connection = database.open()?;
         apply_migrations(&mut connection)?;
         ensure_initial_data(&mut connection)?;
@@ -297,6 +311,17 @@ fn configure_connection(connection: &Connection) -> Result<(), String> {
 }
 
 fn apply_migrations(connection: &mut Connection) -> Result<(), String> {
+    apply_migrations_through(connection, None)
+}
+
+fn apply_migrations_before_legacy_cleanup(connection: &mut Connection) -> Result<(), String> {
+    apply_migrations_through(connection, Some(LEGACY_SYNC_CLEANUP_MIGRATION_VERSION - 1))
+}
+
+fn apply_migrations_through(
+    connection: &mut Connection,
+    maximum_version: Option<i64>,
+) -> Result<(), String> {
     connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -308,6 +333,9 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), String> {
         .map_err(|error| format!("无法创建迁移记录表: {error}"))?;
 
     for migration in MIGRATIONS {
+        if maximum_version.is_some_and(|maximum| migration.version > maximum) {
+            break;
+        }
         let applied = connection
             .query_row(
                 "SELECT 1 FROM schema_migrations WHERE version = ?1",
@@ -604,14 +632,12 @@ mod tests {
         "report_templates",
         "reports",
         "report_tasks",
-        "sync_runs",
-        "sync_items",
+        "integration_runs",
+        "integration_run_items",
         "app_settings",
         "device_settings",
         "integration_configs",
-        "local_sync_state",
-        "sync_outbox",
-        "cloud_deferred_entities",
+        "local_request_results",
         "local_report_outputs",
         "device_hooks",
         "device_hook_runs",
@@ -677,6 +703,168 @@ mod tests {
             .unwrap();
         assert_eq!(migration_count, latest_migration_version());
         assert_eq!(workspace_count, 1);
+    }
+
+    #[test]
+    fn upgrade_with_legacy_queue_creates_one_rescue_backup_and_continues() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("legacy-queue-upgrade.sqlite3");
+        let database = Database { path: path.clone() };
+        let mut connection = database.open().unwrap();
+        apply_migrations_before_legacy_cleanup(&mut connection).unwrap();
+        ensure_initial_data(&mut connection).unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        connection.execute(
+            "INSERT INTO sync_outbox(
+                 operation_id,workspace_id,device_id,operation_type,entity_type,payload_json,
+                 state,attempt_count,created_at,error_json
+             ) VALUES
+                 ('pending-upgrade',?1,?2,'task_update','task','{\"secret\":\"payload-token\"}','pending',0,1,NULL),
+                 ('conflict-upgrade',?1,?2,'task_update','task','{}','conflict',1,2,
+                  '{\"message\":\"VERSION_CONFLICT: bearer-secret\"}')",
+            params![workspace_id, device_id],
+        ).unwrap();
+        drop(connection);
+
+        let upgraded = Database::initialize_at(path.clone()).unwrap();
+        assert_eq!(
+            upgraded.status().unwrap().schema_version,
+            latest_migration_version()
+        );
+        let history = upgraded.open().unwrap().query_row(
+            "SELECT path,backup_kind,origin FROM local_backup_history ORDER BY recorded_at DESC LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+        ).unwrap();
+        assert_eq!(history.1, "stale_epoch_rescue");
+        assert_eq!(history.2, "safety");
+        let validated =
+            crate::data_protection::validate_rescue_backup_for_abandon(Path::new(&history.0))
+                .unwrap();
+        assert_eq!(validated.pending_operation_count, 2);
+        assert_eq!(validated.legacy_queue_operation_count, 2);
+        let archive_text =
+            crate::data_protection::read_json_archive(fs::File::open(&history.0).unwrap())
+                .unwrap()
+                .values()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+        assert!(!archive_text.contains("payload-token"));
+        assert!(!archive_text.contains("bearer-secret"));
+        let connection = upgraded.open().unwrap();
+        for removed in [
+            "sync_outbox",
+            "local_sync_state",
+            "cloud_deferred_entities",
+            "legacy_abandoned_outbox",
+            "processed_operations",
+            "sync_items",
+            "sync_runs",
+        ] {
+            let exists: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [removed],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 0, "legacy table {removed} should be removed");
+        }
+        drop(connection);
+
+        Database::initialize_at(path).unwrap();
+        let backup_count: i64 = upgraded
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM local_backup_history WHERE backup_kind='stale_epoch_rescue'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(backup_count, 1);
+    }
+
+    #[test]
+    fn final_cleanup_preserves_local_business_and_renames_non_sync_runtime_data() {
+        let directory = tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("final-cleanup-preserves-local.sqlite3");
+        let database = Database { path: path.clone() };
+        let mut connection = database.open().unwrap();
+        apply_migrations_before_legacy_cleanup(&mut connection).unwrap();
+        ensure_initial_data(&mut connection).unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let device_id: String = connection
+            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        connection.execute(
+            "INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version)
+             VALUES('preserved-task',?1,?2,'保留本地事项','open','manual',99,1,1,1)",
+            params![workspace_id, subject_id],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO processed_operations(workspace_id,operation_id,device_id,operation_type,result_json,processed_at)
+             VALUES(?1,'local-request',?2,'timer_start','{\"ok\":true}',1)",
+            params![workspace_id, device_id],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO sync_runs(id,workspace_id,provider,operation_type,state,request_json,preview_json,created_at)
+             VALUES('integration-run',?1,'seatable','task_sync','preview','{}','{}',1)",
+            [&workspace_id],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO sync_items(id,workspace_id,run_id,entity_type,entity_id,action,state)
+             VALUES('integration-item',?1,'integration-run','task','preserved-task','update','pending')",
+            [&workspace_id],
+        ).unwrap();
+        drop(connection);
+
+        let upgraded = Database::initialize_at(path).unwrap();
+        let connection = upgraded.open().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT title FROM tasks WHERE id='preserved-task'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "保留本地事项"
+        );
+        assert_eq!(connection.query_row("SELECT request_type FROM local_request_results WHERE request_id='local-request'", [], |row| row.get::<_, String>(0)).unwrap(), "timer_start");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT provider FROM integration_runs WHERE id='integration-run'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "seatable"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT action FROM integration_run_items WHERE id='integration-item'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "update"
+        );
     }
 
     #[test]

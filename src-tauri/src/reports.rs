@@ -2266,7 +2266,7 @@ fn latest_reimbursement_summary(
 ) -> Result<String, String> {
     let mut statement = connection
         .prepare(
-            "SELECT preview_json FROM sync_runs
+            "SELECT preview_json FROM integration_runs
              WHERE workspace_id = ?1 AND provider = 'seatable'
                AND operation_type = 'reimbursements_query' AND state = 'succeeded'
              ORDER BY completed_at DESC, created_at DESC",
@@ -3155,7 +3155,7 @@ fn processed_result<T: for<'de> Deserialize<'de>>(
     operation_id: &str,
 ) -> Result<Option<T>, String> {
     let json: Option<String> = connection
-        .query_row("SELECT result_json FROM processed_operations WHERE workspace_id = ?1 AND operation_id = ?2", params![workspace_id, operation_id], |row| row.get(0))
+        .query_row("SELECT result_json FROM local_request_results WHERE workspace_id = ?1 AND request_id = ?2", params![workspace_id, operation_id], |row| row.get(0))
         .optional().map_err(|error| error.to_string())?;
     json.map(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))
         .transpose()
@@ -3170,7 +3170,7 @@ fn save_processed_result<T: Serialize>(
     result: &T,
 ) -> Result<(), String> {
     transaction.execute(
-        "INSERT INTO processed_operations(workspace_id, operation_id, device_id, operation_type, result_json, processed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO local_request_results(workspace_id, request_id, device_id, request_type, result_json, processed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![workspace_id, operation_id, device_id, operation_type, serde_json::to_string(result).map_err(|error| error.to_string())?, now_millis()],
     ).map(|_| ()).map_err(|error| error.to_string())
 }
@@ -4760,8 +4760,12 @@ mod tests {
         .unwrap();
 
         let connection = database.open().unwrap();
-        let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+        let legacy_sync_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         let deleted_at: Option<i64> = connection
             .query_row(
@@ -4773,7 +4777,7 @@ mod tests {
         assert_eq!(saved.markdown, "# 云端事务报告\n\n本地已保存。");
         assert_eq!(template.content, "# {{日期}}\n{{今日事项}}");
         assert!(deleted_at.is_some());
-        assert_eq!(outbox_count, 0);
+        assert_eq!(legacy_sync_table_count, 0);
     }
 
     #[test]
@@ -6584,7 +6588,7 @@ mod tests {
             .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
             .unwrap();
         connection.execute(
-            "INSERT INTO sync_runs(id, workspace_id, provider, operation_type, state, request_json, preview_json, success_count, created_at, started_at, completed_at)
+            "INSERT INTO integration_runs(id, workspace_id, provider, operation_type, state, request_json, preview_json, success_count, created_at, started_at, completed_at)
              VALUES (?1, ?2, 'seatable', 'reimbursements_query', 'succeeded', '{}', ?3, 2, 1, 1, 1)",
             params![
                 Uuid::now_v7().to_string(),

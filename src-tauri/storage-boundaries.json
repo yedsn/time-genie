@@ -53,7 +53,6 @@
       ],
       "dataProtection": [
         "data_protection::data_backup_export",
-        "data_protection::data_backup_export_rescue",
         "data_protection::data_backup_preview",
         "data_protection::data_backup_import",
         "data_protection::data_backup_history_list",
@@ -133,19 +132,13 @@
       "device_hooks",
       "device_settings",
       "devices",
+      "integration_run_items",
+      "integration_runs",
       "legacy_sync_cleanup_diagnostics",
       "local_backup_history",
+      "local_request_results",
       "local_report_outputs",
       "schema_migrations"
-    ],
-    "legacySync": [
-      "cloud_deferred_entities",
-      "legacy_abandoned_outbox",
-      "local_sync_state",
-      "processed_operations",
-      "sync_items",
-      "sync_outbox",
-      "sync_runs"
     ]
   }
 }

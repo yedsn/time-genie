@@ -2409,7 +2409,7 @@ fn processed_result<T: for<'de> Deserialize<'de>>(
 ) -> Result<Option<T>, String> {
     let json: Option<String> = connection
         .query_row(
-            "SELECT result_json FROM processed_operations WHERE workspace_id = ?1 AND operation_id = ?2",
+            "SELECT result_json FROM local_request_results WHERE workspace_id = ?1 AND request_id = ?2",
             params![workspace_id, operation_id],
             |row| row.get(0),
         )
@@ -2429,7 +2429,7 @@ fn save_processed_result<T: Serialize>(
 ) -> Result<(), String> {
     transaction
         .execute(
-            "INSERT INTO processed_operations(workspace_id, operation_id, device_id, operation_type, result_json, processed_at)
+            "INSERT INTO local_request_results(workspace_id, request_id, device_id, request_type, result_json, processed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![workspace_id, operation_id, device_id, operation_type, serde_json::to_string(result).map_err(|error| error.to_string())?, now_millis()],
         )
@@ -2942,6 +2942,22 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
+    fn assert_legacy_sync_runtime_removed(database: &Database) {
+        let connection = database.open().unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name IN (
+                   'sync_outbox','local_sync_state','cloud_deferred_entities',
+                   'legacy_abandoned_outbox','processed_operations','sync_items','sync_runs'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
     fn test_work_date() -> String {
         let timezone =
             crate::work_calendar::validate_timezone(crate::work_calendar::DEFAULT_TIMEZONE)
@@ -3438,10 +3454,8 @@ mod tests {
             (status.as_str(), active_state.as_str()),
             ("done", "running")
         );
-        let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(outbox_count, 0);
+        drop(connection);
+        assert_legacy_sync_runtime_removed(&database);
     }
 
     #[test]
@@ -3809,11 +3823,7 @@ mod tests {
         let repeated =
             transition_timer_with_cloud_operation(&database, request, Some(&state)).unwrap();
         assert_eq!(repeated.active_entry.id, first.active_entry.id);
-        let connection = database.open().unwrap();
-        let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(outbox_count, 0);
+        assert_legacy_sync_runtime_removed(&database);
     }
 
     #[test]
@@ -3855,10 +3865,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(day_plan_count, 1);
-        let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(outbox_count, 0);
+        drop(connection);
+        assert_legacy_sync_runtime_removed(&database);
     }
 
     #[test]
@@ -3983,10 +3991,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(occurrence_count, 1);
-        let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(outbox_count, 0);
+        drop(connection);
+        assert_legacy_sync_runtime_removed(&database);
     }
 
     fn seed_history_entry(
@@ -4304,11 +4310,7 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        let outbox_before: i64 = database
-            .open()
-            .unwrap()
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
-            .unwrap();
+        assert_legacy_sync_runtime_removed(&database);
 
         let result = list_time_entry_history(
             &database,
@@ -4341,13 +4343,8 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        let outbox_after: i64 = database
-            .open()
-            .unwrap()
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
-            .unwrap();
         assert_eq!(after, before);
-        assert_eq!(outbox_after, outbox_before);
+        assert_legacy_sync_runtime_removed(&database);
     }
 
     #[test]
@@ -4475,10 +4472,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(completed_status, "done");
-        let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(outbox_count, 0);
+        drop(connection);
+        assert_legacy_sync_runtime_removed(&database);
     }
 
     #[test]
@@ -4520,15 +4515,7 @@ mod tests {
         assert_eq!(active.id, entry.id);
         assert_eq!(active.state, "running");
 
-        let connection = database.open().unwrap();
-        let outbox_count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1",
-                [cloud_workspace_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(outbox_count, 0);
+        assert_legacy_sync_runtime_removed(&database);
     }
 
     #[test]
@@ -4564,23 +4551,14 @@ mod tests {
             Some((&state, "timer_start", None)),
         )
         .unwrap();
-        let before: i64 = database
-            .open()
-            .unwrap()
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
-            .unwrap();
+        assert_legacy_sync_runtime_removed(&database);
 
         for _ in 0..12 {
             let refreshed = get_timer_state(&database).unwrap().unwrap();
             assert_eq!(refreshed.id, started.id);
         }
 
-        let after: i64 = database
-            .open()
-            .unwrap()
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(after, before);
+        assert_legacy_sync_runtime_removed(&database);
     }
 
     #[test]
@@ -4667,10 +4645,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(segment_count, 2);
-        let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(outbox_count, 0);
+        drop(connection);
+        assert_legacy_sync_runtime_removed(&database);
     }
 
     #[test]
@@ -4789,14 +4765,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(segment_count, 3);
-        let outbox_count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1",
-                [cloud_workspace_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(outbox_count, 0);
+        drop(connection);
+        assert_legacy_sync_runtime_removed(&database);
     }
 
     #[test]
@@ -5728,10 +5698,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(occurrence_status, "done");
-        let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(outbox_count, 0);
+        drop(connection);
+        assert_legacy_sync_runtime_removed(&database);
     }
 
     #[test]
@@ -6189,14 +6157,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(segment_count, 3);
-        let outbox_count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1",
-                [&cloud_workspace_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(outbox_count, 0);
+        drop(connection);
+        assert_legacy_sync_runtime_removed(&database);
     }
 
     #[test]
@@ -6318,12 +6280,7 @@ mod tests {
         );
         drop(connection);
         coordinate_active_timer(&database, boundary + 30_000).unwrap();
-        let count: i64 = database
-            .open()
-            .unwrap()
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 0);
+        assert_legacy_sync_runtime_removed(&database);
     }
 
     #[test]

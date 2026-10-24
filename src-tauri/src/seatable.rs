@@ -427,7 +427,7 @@ fn preview_task_sync_with(
     let now = now_millis();
     connection
         .execute(
-            "INSERT INTO sync_runs(id, workspace_id, provider, operation_type, state, request_json, preview_json, created_at)
+            "INSERT INTO integration_runs(id, workspace_id, provider, operation_type, state, request_json, preview_json, created_at)
              VALUES (?1, ?2, 'seatable', 'task_sync', 'preview', ?3, ?4, ?5)",
             params![
                 run_id,
@@ -441,7 +441,7 @@ fn preview_task_sync_with(
     for item in &preview.items {
         connection
             .execute(
-                "INSERT INTO sync_items(id, workspace_id, run_id, entity_type, entity_id, action, state, external_id, after_json)
+                "INSERT INTO integration_run_items(id, workspace_id, run_id, entity_type, entity_id, action, state, external_id, after_json)
                  VALUES (?1, ?2, ?3, 'task', ?4, ?5, 'pending', ?6, ?7)",
                 params![item.item_id, workspace_id, run_id, item.task_id, item.action, item.external_id, item.row.to_string()],
             )
@@ -547,7 +547,7 @@ fn execute_task_sync_with(
     ) = connection
         .query_row(
             "SELECT state, preview_json, success_count, failed_count, skipped_count
-             FROM sync_runs WHERE id = ?1 AND workspace_id = ?2 AND provider = 'seatable' AND operation_type = 'task_sync'",
+             FROM integration_runs WHERE id = ?1 AND workspace_id = ?2 AND provider = 'seatable' AND operation_type = 'task_sync'",
             params![request.run_id, workspace_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
@@ -569,7 +569,7 @@ fn execute_task_sync_with(
     let now = now_millis();
     connection
         .execute(
-            "UPDATE sync_runs SET state = 'running', started_at = ?1, error_code = NULL, error_message = NULL WHERE id = ?2",
+            "UPDATE integration_runs SET state = 'running', started_at = ?1, error_code = NULL, error_message = NULL WHERE id = ?2",
             params![now, request.run_id],
         )
         .map_err(|error| error.to_string())?;
@@ -581,7 +581,7 @@ fn execute_task_sync_with(
             skipped += 1;
             connection
                 .execute(
-                    "UPDATE sync_items SET state = 'succeeded' WHERE id = ?1",
+                    "UPDATE integration_run_items SET state = 'succeeded' WHERE id = ?1",
                     [&item.item_id],
                 )
                 .map_err(|error| error.to_string())?;
@@ -608,7 +608,7 @@ fn execute_task_sync_with(
                     .transaction()
                     .map_err(|error| error.to_string())?;
                 transaction.execute(
-                    "UPDATE sync_items SET state = 'succeeded', external_id = ?1, error_code = NULL, error_message = NULL WHERE id = ?2",
+                    "UPDATE integration_run_items SET state = 'succeeded', external_id = ?1, error_code = NULL, error_message = NULL WHERE id = ?2",
                     params![external_id, item.item_id],
                 ).map_err(|error| error.to_string())?;
                 transaction.execute(
@@ -622,7 +622,7 @@ fn execute_task_sync_with(
             Err(error) => {
                 failed += 1;
                 connection.execute(
-                    "UPDATE sync_items SET state = 'failed', error_code = 'SEATABLE_WRITE_FAILED', error_message = ?1 WHERE id = ?2",
+                    "UPDATE integration_run_items SET state = 'failed', error_code = 'SEATABLE_WRITE_FAILED', error_message = ?1 WHERE id = ?2",
                     params![error, item.item_id],
                 ).map_err(|db_error| db_error.to_string())?;
             }
@@ -636,7 +636,7 @@ fn execute_task_sync_with(
         "failed"
     };
     connection.execute(
-        "UPDATE sync_runs SET state = ?1, success_count = ?2, failed_count = ?3, skipped_count = ?4, completed_at = ?5 WHERE id = ?6",
+        "UPDATE integration_runs SET state = ?1, success_count = ?2, failed_count = ?3, skipped_count = ?4, completed_at = ?5 WHERE id = ?6",
         params![state, success, failed, skipped, now_millis(), request.run_id],
     ).map_err(|error| error.to_string())?;
     Ok(SyncExecutionResult {
@@ -658,7 +658,7 @@ fn retry_failed_with(
     let connection = database.open()?;
     let preview_json: String = connection
         .query_row(
-            "SELECT preview_json FROM sync_runs WHERE id = ?1",
+            "SELECT preview_json FROM integration_runs WHERE id = ?1",
             [&request.run_id],
             |row| row.get(0),
         )
@@ -667,7 +667,7 @@ fn retry_failed_with(
         serde_json::from_str(&preview_json).map_err(|error| error.to_string())?;
     let mut failed_ids = HashSet::new();
     let mut statement = connection
-        .prepare("SELECT id FROM sync_items WHERE run_id = ?1 AND state = 'failed'")
+        .prepare("SELECT id FROM integration_run_items WHERE run_id = ?1 AND state = 'failed'")
         .map_err(|error| error.to_string())?;
     for id in statement
         .query_map([&request.run_id], |row| row.get::<_, String>(0))
@@ -696,18 +696,18 @@ fn retry_failed_with(
     );
     let workspace_id: String = connection
         .query_row(
-            "SELECT workspace_id FROM sync_runs WHERE id = ?1",
+            "SELECT workspace_id FROM integration_runs WHERE id = ?1",
             [&request.run_id],
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
     connection.execute(
-        "INSERT INTO sync_runs(id, workspace_id, provider, operation_type, state, request_json, preview_json, created_at) VALUES (?1, ?2, 'seatable', 'task_sync', 'preview', '{}', ?3, ?4)",
+        "INSERT INTO integration_runs(id, workspace_id, provider, operation_type, state, request_json, preview_json, created_at) VALUES (?1, ?2, 'seatable', 'task_sync', 'preview', '{}', ?3, ?4)",
         params![new_id, workspace_id, serde_json::to_string(&preview).map_err(|error| error.to_string())?, now_millis()],
     ).map_err(|error| error.to_string())?;
     for item in &preview.items {
         connection.execute(
-            "INSERT INTO sync_items(id, workspace_id, run_id, entity_type, entity_id, action, state, external_id, after_json) VALUES (?1, ?2, ?3, 'task', ?4, ?5, 'pending', ?6, ?7)",
+            "INSERT INTO integration_run_items(id, workspace_id, run_id, entity_type, entity_id, action, state, external_id, after_json) VALUES (?1, ?2, ?3, 'task', ?4, ?5, 'pending', ?6, ?7)",
             params![item.item_id, workspace_id, new_id, item.task_id, item.action, item.external_id, item.row.to_string()],
         ).map_err(|error| error.to_string())?;
     }
@@ -1240,7 +1240,7 @@ fn query_reimbursements_with(
     let rows = client.list_rows(&config.reimbursement_table, None)?;
     let result = build_reimbursement_result(request.clone(), config, subject_name, rows);
     connection.execute(
-        "INSERT INTO sync_runs(id, workspace_id, provider, operation_type, state, request_json, preview_json, success_count, created_at, started_at, completed_at)
+        "INSERT INTO integration_runs(id, workspace_id, provider, operation_type, state, request_json, preview_json, success_count, created_at, started_at, completed_at)
          VALUES (?1, ?2, 'seatable', 'reimbursements_query', 'succeeded', ?3, ?4, ?5, ?6, ?6, ?6)",
         params![Uuid::now_v7().to_string(), workspace_id, serde_json::to_string(&request).map_err(|error| error.to_string())?, serde_json::to_string(&result).map_err(|error| error.to_string())?, result.items.len() as i64, now_millis()],
     ).map_err(|error| error.to_string())?;
@@ -1523,7 +1523,7 @@ pub fn seatable_task_sync_execute(
             let (_, config) = load_config(&connection)?;
             let workspace_id: String = connection
                 .query_row(
-                    "SELECT workspace_id FROM sync_runs WHERE id = ?1",
+                    "SELECT workspace_id FROM integration_runs WHERE id = ?1",
                     [&request.run_id],
                     |row| row.get(0),
                 )
@@ -1571,7 +1571,7 @@ pub fn seatable_sync_retry_failed(
             let (_, config) = load_config(&connection)?;
             let workspace_id: String = connection
                 .query_row(
-                    "SELECT workspace_id FROM sync_runs WHERE id = ?1",
+                    "SELECT workspace_id FROM integration_runs WHERE id = ?1",
                     [&request.run_id],
                     |row| row.get(0),
                 )
@@ -1949,13 +1949,17 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+        let legacy_sync_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
 
         assert_eq!(result.success_count, 1);
         assert!(!external_id.is_empty());
-        assert_eq!(outbox_count, 0);
+        assert_eq!(legacy_sync_table_count, 0);
     }
 
     #[test]
@@ -2096,11 +2100,16 @@ mod tests {
                 .unwrap();
         }
         drop(connection);
-        let outbox_before: i64 = database
+        let legacy_sync_table_count: i64 = database
             .open()
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
+        assert_eq!(legacy_sync_table_count, 0);
         let context = DirectSeatableContext {
             workspace_id: "20000000-0000-0000-0000-0000000000aa".to_string(),
             config: config(),
@@ -2155,12 +2164,16 @@ mod tests {
         assert_eq!(result.state, "succeeded");
         assert_eq!(result.success_count, 1);
         assert_eq!(store.0.lock().unwrap()[0]["version"], json!(1));
-        let outbox_after: i64 = database
+        let legacy_sync_table_count: i64 = database
             .open()
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert_eq!(outbox_before, outbox_after);
+        assert_eq!(legacy_sync_table_count, 0);
         assert_eq!(client.create_calls.lock().unwrap()["任务一"], 1);
     }
 }

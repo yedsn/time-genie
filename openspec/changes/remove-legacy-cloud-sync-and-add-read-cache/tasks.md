@@ -14,10 +14,10 @@
 
 ## 3. 安全退役本地旧同步数据
 
-- [ ] 3.1 实现升级前旧队列检测和一次性脱敏救援备份，确保有待处理数据时不会抛出 `LEGACY_QUEUE_BLOCKED`、不会上传旧操作；使用含 pending/conflict 队列的迁移测试验证备份生成和继续升级。
-- [ ] 3.2 新增最终 SQLite 清理 migration，删除 `sync_outbox`、`local_sync_state`、`cloud_deferred_entities`、`legacy_abandoned_outbox`、`processed_operations`、`sync_items`、`sync_runs` 及关联索引，保留本地业务表和设备元数据；运行空库、旧库和本地模式数据保留测试。
-- [ ] 3.3 从 `database.rs`、`data_protection.rs` 和存储边界清单中删除旧同步运行时表、cloud-consistent 队列判断、epoch-blocked 救援与队列恢复逻辑，保留普通本地备份和显式完整复制；运行数据保护测试验证备份导入导出不回建旧表。
-- [ ] 3.4 更新数据库迁移文档，说明历史 migration 继续保留、最终清理 migration 的数据处置与救援备份位置，并通过文档验证脚本或人工核对确认。
+- [x] 3.1 实现升级前旧队列检测和一次性脱敏救援备份，确保有待处理数据时不会抛出 `LEGACY_QUEUE_BLOCKED`、不会上传旧操作；使用含 pending/conflict 队列的迁移测试验证备份生成和继续升级。
+- [x] 3.2 新增最终 SQLite 清理 migration，删除 `sync_outbox`、`local_sync_state`、`cloud_deferred_entities`、`legacy_abandoned_outbox`、`processed_operations`、`sync_items`、`sync_runs` 及关联索引，保留本地业务表和设备元数据；运行空库、旧库和本地模式数据保留测试。
+- [x] 3.3 从 `database.rs`、`data_protection.rs` 和存储边界清单中删除旧同步运行时表、cloud-consistent 队列判断、epoch-blocked 救援与队列恢复逻辑，保留普通本地备份和显式完整复制；运行数据保护测试验证备份导入导出不回建旧表。
+- [x] 3.4 更新数据库迁移文档，说明历史 migration 继续保留、最终清理 migration 的数据处置与救援备份位置，并通过文档验证脚本或人工核对确认。
 
 ## 4. 删除旧同步协调器
 

@@ -5404,154 +5404,6 @@ pub fn storage_protocol_upgrade_after_rescue(
     })
 }
 
-pub fn storage_protocol_reset_to_cloud_authority(
-    database: &Database,
-    request: StorageProtocolAuthorityResetRequest,
-) -> Result<StorageProtocolAbandonResult, String> {
-    if !request.confirmed {
-        return Err("CLOUD_AUTHORITY_RESET_NOT_CONFIRMED: 必须确认放弃本机旧云端修改".to_string());
-    }
-    Uuid::parse_str(request.operation_id.trim())
-        .map_err(|_| "VALIDATION_ERROR: 云端切换操作标识无效".to_string())?;
-    let preflight = storage_protocol_upgrade_preflight(database)?;
-    let create_safety_snapshot = request.create_safety_snapshot.unwrap_or(true);
-    if preflight.queue.total == 0 {
-        if preflight.local_protocol != crate::storage_contract::LEGACY_SYNC_PROTOCOL {
-            return Err("CLOUD_PROTOCOL_UNSUPPORTED: 本机当前协议不允许重置旧云端数据".to_string());
-        }
-        let switched = if preflight.already_direct {
-            StorageProtocolUpgradeServerResult {
-                upgraded: false,
-                already_direct: true,
-                workspace_epoch: preflight.workspace_epoch,
-                storage_protocol: Some(crate::storage_contract::DIRECT_CLOUD_PROTOCOL.to_string()),
-                change_seq: Some(storage_mode(database)?.last_change_seq),
-                safety_snapshot_id: None,
-            }
-        } else {
-            if preflight.storage_protocol != crate::storage_contract::LEGACY_SYNC_PROTOCOL
-                || !preflight.server_upgrade_allowed
-            {
-                return Err(
-                    "CLOUD_PROTOCOL_UNSUPPORTED: 云端当前协议不允许切换为直连模式".to_string(),
-                );
-            }
-            let session = current_session(database)?;
-            let value = client(database)?.rpc_for_database(
-                database,
-                "upgrade_storage_protocol",
-                json!({
-                    "p_workspace_id": preflight.workspace_id,
-                    "p_device_id": preflight.device_id,
-                    "p_operation_id": request.operation_id,
-                    "p_expected_epoch": preflight.workspace_epoch,
-                    "p_old_sync_disposition": "queue_drained",
-                    "p_create_safety_snapshot": create_safety_snapshot,
-                }),
-                &session,
-            )?;
-            serde_json::from_value(value)
-                .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 协议切换响应无效: {error}"))?
-        };
-        let protocol = switched.storage_protocol.as_deref().unwrap_or_else(|| {
-            if switched.already_direct {
-                crate::storage_contract::DIRECT_CLOUD_PROTOCOL
-            } else {
-                ""
-            }
-        });
-        if (!switched.upgraded && !switched.already_direct)
-            || protocol != crate::storage_contract::DIRECT_CLOUD_PROTOCOL
-        {
-            return Err("CLOUD_RESPONSE_INVALID: 云端未确认切换为直连模式".to_string());
-        }
-        let final_change_seq = switched
-            .change_seq
-            .unwrap_or(0)
-            .max(storage_mode(database)?.last_change_seq);
-        persist_direct_protocol_state(
-            database,
-            &preflight.workspace_id,
-            switched.workspace_epoch,
-            final_change_seq,
-        )?;
-        return Ok(StorageProtocolAbandonResult {
-            upgraded: switched.upgraded,
-            already_direct: switched.already_direct,
-            workspace_epoch: switched.workspace_epoch,
-            storage_protocol: crate::storage_contract::DIRECT_CLOUD_PROTOCOL.to_string(),
-            change_seq: switched.change_seq,
-            safety_snapshot_id: switched.safety_snapshot_id,
-            quarantined_operations: 0,
-            rescue_backup_path: String::new(),
-            rescue_backup_checksum: String::new(),
-            last_change_seq: final_change_seq,
-        });
-    }
-
-    let backup = crate::data_protection::export_automatic_legacy_rescue_backup(
-        database,
-        "用户确认放弃本机旧云端数据并直接使用 Supabase 权威数据",
-    )?;
-    if preflight.already_direct {
-        let backup_path = std::path::PathBuf::from(&backup.path);
-        let validated = crate::data_protection::validate_rescue_backup_for_abandon(&backup_path)?;
-        return crate::cloud_sync::with_cloud_sync_operation_lock(|| {
-            let refreshed = storage_protocol_upgrade_preflight(database)?;
-            if !refreshed.already_direct {
-                return Err("CLOUD_PROTOCOL_CHANGED: 云端协议状态发生变化，请重新执行".to_string());
-            }
-            validate_rescue_backup_matches_upgrade(&validated, &refreshed)?;
-            let reason = format!(
-                "云端已是 direct_v2；用户确认放弃本机旧修改；救援备份校验通过（{}）",
-                validated.created_at
-            );
-            let (batch_id, quarantined) = quarantine_legacy_queue(
-                database,
-                &refreshed.workspace_id,
-                &validated.checksum,
-                &reason,
-            )?;
-            let final_change_seq = storage_mode(database)?.last_change_seq;
-            if let Err(error) = persist_direct_protocol_state(
-                database,
-                &refreshed.workspace_id,
-                refreshed.workspace_epoch,
-                final_change_seq,
-            ) {
-                return match restore_quarantined_legacy_queue(database, &batch_id) {
-                    Ok(()) => Err(format!("{error}；本机旧队列已恢复")),
-                    Err(restore_error) => Err(format!(
-                        "{error}；本机旧队列恢复失败，已保留隔离区 {batch_id}: {restore_error}"
-                    )),
-                };
-            }
-            Ok(StorageProtocolAbandonResult {
-                upgraded: false,
-                already_direct: true,
-                workspace_epoch: refreshed.workspace_epoch,
-                storage_protocol: crate::storage_contract::DIRECT_CLOUD_PROTOCOL.to_string(),
-                change_seq: Some(final_change_seq),
-                safety_snapshot_id: None,
-                quarantined_operations: quarantined,
-                rescue_backup_path: backup_path.display().to_string(),
-                rescue_backup_checksum: validated.checksum,
-                last_change_seq: final_change_seq,
-            })
-        });
-    }
-    storage_protocol_upgrade_after_rescue(
-        database,
-        StorageProtocolAbandonRequest {
-            operation_id: request.operation_id,
-            rescue_backup_path: backup.path,
-            confirmed: true,
-            confirmation_text: "放弃旧修改".to_string(),
-            create_safety_snapshot: Some(create_safety_snapshot),
-        },
-    )
-}
-
 fn auth_blocked_reason(database: &Database) -> Result<Option<String>, String> {
     let state = storage_mode(database)?;
     if state.mode != "cloud" {
@@ -7884,14 +7736,6 @@ pub fn storage_protocol_upgrade_after_rescue_command(
     request: StorageProtocolAbandonRequest,
 ) -> Result<StorageProtocolAbandonResult, String> {
     storage_protocol_upgrade_after_rescue(&database, request)
-}
-
-#[tauri::command]
-pub fn storage_protocol_reset_to_cloud_authority_command(
-    database: tauri::State<'_, Database>,
-    request: StorageProtocolAuthorityResetRequest,
-) -> Result<StorageProtocolAbandonResult, String> {
-    storage_protocol_reset_to_cloud_authority(&database, request)
 }
 
 #[tauri::command]
@@ -14122,27 +13966,6 @@ mod tests {
         let wrong_text =
             storage_protocol_upgrade_after_rescue(&database, request(true, "确认")).unwrap_err();
         assert!(wrong_text.starts_with("ABANDON_CONFIRMATION_MISMATCH:"));
-    }
-
-    #[test]
-    fn cloud_authority_reset_requires_confirmation_before_any_remote_check() {
-        let directory = tempdir().unwrap();
-        let database = Database::initialize_at(
-            directory
-                .path()
-                .join("authority-reset-confirmation.sqlite3"),
-        )
-        .unwrap();
-        let error = storage_protocol_reset_to_cloud_authority(
-            &database,
-            StorageProtocolAuthorityResetRequest {
-                operation_id: Uuid::now_v7().to_string(),
-                confirmed: false,
-                create_safety_snapshot: Some(true),
-            },
-        )
-        .unwrap_err();
-        assert!(error.starts_with("CLOUD_AUTHORITY_RESET_NOT_CONFIRMED:"));
     }
 
     #[test]

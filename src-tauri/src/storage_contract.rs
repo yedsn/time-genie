@@ -115,19 +115,11 @@ pub fn business_data_fingerprint(database: &Database) -> Result<String, String> 
         .and_then(Value::as_array)
         .ok_or_else(|| "存储边界清单缺少 localBusiness".to_string())?;
     let connection = database.open()?;
-    let mut parts = Vec::with_capacity(tables.len() + 2);
+    let mut parts = Vec::with_capacity(tables.len());
     for table in tables {
         let table = table
             .as_str()
             .ok_or_else(|| "localBusiness 表名无效".to_string())?;
-        let count: i64 = connection
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                row.get(0)
-            })
-            .map_err(|error| format!("读取 {table} 失败: {error}"))?;
-        parts.push(format!("{table}:{count}"));
-    }
-    for table in ["sync_outbox", "local_sync_state"] {
         let count: i64 = connection
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                 row.get(0)
@@ -316,27 +308,23 @@ mod tests {
     }
 
     #[test]
-    fn storage_snapshot_maps_reauthentication_without_legacy_protocol_routing() {
+    fn storage_snapshot_ignores_legacy_protocol_marker_without_runtime_tables() {
         let database = test_database();
-        let (workspace_id, device_id) = configure_cloud_context(&database, DIRECT_CLOUD_PROTOCOL);
-        database
-            .open()
-            .unwrap()
-            .execute(
-                "INSERT INTO local_sync_state(workspace_id,device_id,last_change_seq,auth_blocked,auth_blocked_reason,workspace_epoch) VALUES(?1,?2,0,1,'device_revoked',1)",
-                params![workspace_id, device_id],
-            )
-            .unwrap();
-        let reauth =
-            crate::supabase::storage_mode_from_connection(&database.open().unwrap(), true).unwrap();
-        assert_eq!(reauth.cloud_access_state, "reauth_required");
-        assert!(!reauth.cloud_writable);
-
+        configure_cloud_context(&database, DIRECT_CLOUD_PROTOCOL);
         set_device_value(&database, "cloud_storage_protocol", "future_v9");
         assert_eq!(
             storage_backend(&database).unwrap(),
             StorageBackend::DirectSupabase
         );
+        let connection = database.open().unwrap();
+        let legacy_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('sync_outbox','local_sync_state')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_table_count, 0);
     }
 
     #[test]

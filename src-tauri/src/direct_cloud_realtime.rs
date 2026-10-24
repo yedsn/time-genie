@@ -1,11 +1,39 @@
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
+use tauri::{AppHandle, Emitter};
+use tokio::sync::Notify;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
 
+use crate::database::Database;
+
+const REALTIME_HEARTBEAT_SECONDS: u64 = 25;
 const REALTIME_RECONNECT_SECONDS: u64 = 5;
 pub(crate) const REALTIME_RECONNECT_MAX_SECONDS: u64 = 60;
+
+#[derive(Debug, Clone)]
+pub(crate) struct RealtimeConnectionConfig {
+    pub(crate) workspace_id: String,
+    pub(crate) storage_protocol: String,
+    pub(crate) project_url: String,
+    pub(crate) anon_key: String,
+    pub(crate) access_token: String,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RealtimeListenerHooks {
+    pub(crate) load_config: fn(&Database) -> Result<Option<RealtimeConnectionConfig>, String>,
+    pub(crate) is_enabled: fn() -> bool,
+    pub(crate) on_error: fn(&AppHandle, &Database, &str),
+    pub(crate) on_connected: fn(&Database, &AppHandle, &str),
+    pub(crate) on_legacy_change: fn(Option<i64>),
+    pub(crate) workspace_epoch: fn(&Database, &str) -> i64,
+    pub(crate) covered_change_seq: fn(&Database) -> i64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -114,4 +142,234 @@ pub(crate) fn realtime_reconnect_delay(attempt: u32, jitter_seed: u64) -> Durati
     Duration::from_millis(
         (base_millis + jitter_seed % jitter_window).min(REALTIME_RECONNECT_MAX_SECONDS * 1_000),
     )
+}
+
+pub(crate) fn spawn_realtime_listener(
+    database: Database,
+    app: AppHandle,
+    mode_wakeup: Arc<Notify>,
+    hooks: RealtimeListenerHooks,
+) {
+    tauri::async_runtime::spawn(async move {
+        let mut reconnect_attempt = 0_u32;
+        loop {
+            while !(hooks.is_enabled)() {
+                mode_wakeup.notified().await;
+            }
+            let config_database = database.clone();
+            let config =
+                tauri::async_runtime::spawn_blocking(move || (hooks.load_config)(&config_database))
+                    .await;
+            let config = match config {
+                Ok(Ok(Some(config))) => config,
+                Ok(Ok(None)) => {
+                    tokio::time::sleep(Duration::from_secs(REALTIME_RECONNECT_SECONDS)).await;
+                    reconnect_attempt = 0;
+                    continue;
+                }
+                Ok(Err(error)) => {
+                    (hooks.on_error)(&app, &database, &error);
+                    tokio::time::sleep(Duration::from_secs(REALTIME_RECONNECT_SECONDS)).await;
+                    continue;
+                }
+                Err(error) => {
+                    (hooks.on_error)(
+                        &app,
+                        &database,
+                        &format!("SYNC_WORKER_ERROR: Realtime 配置读取失败: {error}"),
+                    );
+                    tokio::time::sleep(Duration::from_secs(REALTIME_RECONNECT_SECONDS)).await;
+                    continue;
+                }
+            };
+            if let Err(error) =
+                run_realtime_connection(&database, &app, &config, &mode_wakeup, hooks).await
+            {
+                if (hooks.is_enabled)() {
+                    (hooks.on_error)(&app, &database, &error);
+                }
+            }
+            if !(hooks.is_enabled)() {
+                reconnect_attempt = 0;
+                continue;
+            }
+            crate::direct_cloud_observability::record_realtime_reconnect(&config.workspace_id);
+            let jitter_seed = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let delay = realtime_reconnect_delay(reconnect_attempt, jitter_seed);
+            reconnect_attempt = reconnect_attempt.saturating_add(1);
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = mode_wakeup.notified() => {}
+            }
+        }
+    });
+}
+
+async fn run_realtime_connection(
+    database: &Database,
+    app: &AppHandle,
+    config: &RealtimeConnectionConfig,
+    mode_wakeup: &Arc<Notify>,
+    hooks: RealtimeListenerHooks,
+) -> Result<(), String> {
+    let url = realtime_url(&config.project_url, &config.anon_key)?;
+    let (socket, _) = connect_async(url.as_str())
+        .await
+        .map_err(|error| format!("NETWORK_ERROR: Supabase Realtime 连接失败: {error}"))?;
+    let (mut writer, mut reader) = socket.split();
+    let topic = format!(
+        "realtime:{}:workspace_changes:{}",
+        crate::supabase::CLOUD_SCHEMA,
+        config.workspace_id
+    );
+    writer
+        .send(Message::Text(
+            json!({
+                "topic": topic,
+                "event": "phx_join",
+                "payload": {
+                    "config": {
+                        "broadcast": { "ack": false, "self": false },
+                        "presence": { "key": "" },
+                        "postgres_changes": [{
+                            "event": "*",
+                            "schema": crate::supabase::CLOUD_SCHEMA,
+                            "table": "workspace_changes",
+                            "filter": format!("workspace_id=eq.{}", config.workspace_id)
+                        }],
+                        "private": false
+                    },
+                    "access_token": config.access_token
+                },
+                "ref": "1",
+                "join_ref": "1"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .map_err(|error| format!("NETWORK_ERROR: Supabase Realtime 订阅失败: {error}"))?;
+
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(REALTIME_HEARTBEAT_SECONDS));
+    heartbeat.tick().await;
+    let mut heartbeat_ref = 2_u64;
+    loop {
+        tokio::select! {
+            _ = mode_wakeup.notified() => {
+                if !(hooks.is_enabled)() {
+                    let _ = writer.send(Message::Close(None)).await;
+                    return Ok(());
+                }
+            }
+            _ = heartbeat.tick() => {
+                let heartbeat_database = database.clone();
+                let workspace_id = config.workspace_id.clone();
+                let current_workspace = tauri::async_runtime::spawn_blocking(move || {
+                    (hooks.load_config)(&heartbeat_database)
+                        .map(|value| value.map(|value| value.workspace_id))
+                })
+                .await
+                .map_err(|error| format!("SYNC_WORKER_ERROR: Realtime 状态读取失败: {error}"))??;
+                if current_workspace.as_deref() != Some(workspace_id.as_str()) {
+                    let _ = writer.send(Message::Close(None)).await;
+                    return Ok(());
+                }
+                let reference = heartbeat_ref.to_string();
+                heartbeat_ref = heartbeat_ref.wrapping_add(1);
+                writer.send(Message::Text(json!({
+                    "topic": "phoenix", "event": "heartbeat", "payload": {}, "ref": reference
+                }).to_string().into())).await
+                    .map_err(|error| format!("NETWORK_ERROR: Supabase Realtime 心跳失败: {error}"))?;
+            }
+            incoming = reader.next() => match incoming {
+                Some(Ok(Message::Text(text))) => {
+                    let message: Value = serde_json::from_str(text.as_ref()).unwrap_or(Value::Null);
+                    let event = message.get("event").and_then(Value::as_str).unwrap_or_default();
+                    let join_reply = event == "phx_reply"
+                        && message.get("ref").and_then(Value::as_str) == Some("1");
+                    if join_reply && message.pointer("/payload/status").and_then(Value::as_str) == Some("error") {
+                        let reason = message.pointer("/payload/response/reason")
+                            .and_then(Value::as_str).unwrap_or("频道订阅被拒绝");
+                        return Err(format!("CLOUD_REQUEST_FAILED: Supabase Realtime {reason}"));
+                    } else if join_reply && message.pointer("/payload/status").and_then(Value::as_str) == Some("ok") {
+                        (hooks.on_connected)(database, app, &config.storage_protocol);
+                    } else if event == "postgres_changes" {
+                        if config.storage_protocol == crate::storage_contract::DIRECT_CLOUD_PROTOCOL {
+                            if let Some(invalidation) = realtime_workspace_invalidation(
+                                &message,
+                                &config.workspace_id,
+                                (hooks.workspace_epoch)(database, &config.workspace_id),
+                            ) {
+                                if invalidation.change_seq > (hooks.covered_change_seq)(database) {
+                                    let _ = app.emit("work-data-changed", &invalidation);
+                                }
+                            }
+                        } else {
+                            (hooks.on_legacy_change)(realtime_change_seq(&message));
+                        }
+                    } else if event == "phx_error" || event == "phx_close" {
+                        return Err("NETWORK_ERROR: Supabase Realtime 频道已断开".to_string());
+                    }
+                }
+                Some(Ok(Message::Ping(payload))) => {
+                    writer.send(Message::Pong(payload)).await
+                        .map_err(|error| format!("NETWORK_ERROR: Supabase Realtime 响应失败: {error}"))?;
+                }
+                Some(Ok(Message::Close(_))) | None => {
+                    return Err("NETWORK_ERROR: Supabase Realtime 连接已关闭".to_string());
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    return Err(format!("NETWORK_ERROR: Supabase Realtime 读取失败: {error}"));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn realtime_change_seq_accepts_supabase_payload_shapes() {
+        assert_eq!(
+            realtime_change_seq(&json!({"payload":{"data":{"record":{"change_seq":42}}}})),
+            Some(42)
+        );
+        assert_eq!(
+            realtime_change_seq(&json!({"payload":{"record":{"change_seq":"43"}}})),
+            Some(43)
+        );
+        assert_eq!(realtime_change_seq(&json!({"payload":{}})), None);
+    }
+
+    #[test]
+    fn realtime_invalidation_carries_sequence_and_epoch_only_for_matching_workspace() {
+        let message = json!({"payload":{"record":{
+            "change_seq":42,"workspace_id":"workspace-1","entity_type":"tasks",
+            "changed_by_device_id":"device-1","title":"不得进入通知"
+        }}});
+        let invalidation = realtime_workspace_invalidation(&message, "workspace-1", 7).unwrap();
+        assert_eq!(invalidation.change_seq, 42);
+        assert_eq!(invalidation.workspace_epoch, 7);
+        assert_eq!(invalidation.domains, vec!["tasks"]);
+        assert!(realtime_workspace_invalidation(&message, "workspace-2", 7).is_none());
+    }
+
+    #[test]
+    fn realtime_reconnect_backoff_is_jittered_and_bounded() {
+        let first = realtime_reconnect_delay(0, 123);
+        let later = realtime_reconnect_delay(4, 456);
+        assert!(first >= Duration::from_secs(REALTIME_RECONNECT_SECONDS));
+        assert!(later > first);
+        assert!(later <= Duration::from_secs(REALTIME_RECONNECT_MAX_SECONDS));
+        assert_ne!(
+            realtime_reconnect_delay(1, 1),
+            realtime_reconnect_delay(1, 2)
+        );
+    }
 }

@@ -3776,7 +3776,6 @@ fn isolated_workspace_restore_blocks_old_epoch_and_allows_rescue_then_discard() 
         &device_b,
         BackupExportRequest {
             path: rescue_path.display().to_string(),
-            rescue: true,
         },
     )
     .unwrap();

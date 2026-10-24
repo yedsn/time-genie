@@ -3,28 +3,24 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Notify;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
 
 use crate::database::Database;
-use crate::direct_cloud_realtime::{
-    realtime_change_seq, realtime_reconnect_delay, realtime_url, realtime_workspace_invalidation,
-    WorkspaceInvalidation,
-};
 #[cfg(test)]
-use crate::direct_cloud_realtime::{realtime_refresh_domains, REALTIME_RECONNECT_MAX_SECONDS};
+use crate::direct_cloud_realtime::{realtime_refresh_domains, realtime_url};
+use crate::direct_cloud_realtime::{
+    RealtimeConnectionConfig, RealtimeListenerHooks, WorkspaceInvalidation,
+};
 use crate::supabase::{
     client, current_session, direct_cloud_workbench_bootstrap, ensure_current_device_authorized,
-    mark_auth_blocked, storage_mode, CLOUD_SCHEMA,
+    mark_auth_blocked, storage_mode,
 };
 
-const REALTIME_HEARTBEAT_SECONDS: u64 = 25;
 const REALTIME_RECONNECT_SECONDS: u64 = 5;
 const OUTBOX_SENDING_STALE_AFTER_MILLIS: i64 = 5 * 60 * 1000;
 const OUTBOX_RETRY_MAX_BACKOFF_MILLIS: i64 = 60 * 1000;
@@ -359,237 +355,78 @@ fn clear_tracking_lease_tokens() {
 }
 
 fn spawn_realtime_listener(database: Database, app: AppHandle) {
-    let mode_wakeup = cloud_mode_wakeup();
-    tauri::async_runtime::spawn(async move {
-        let mut reconnect_attempt = 0_u32;
-        loop {
-            while !CLOUD_SYNC_ENABLED.load(Ordering::Acquire) {
-                mode_wakeup.notified().await;
-            }
-            let config_database = database.clone();
-            let config = tauri::async_runtime::spawn_blocking(move || {
-                let state = storage_mode(&config_database)?;
-                if state.mode != "cloud" || !state.online {
-                    return Ok(None);
-                }
-                let api = client(&config_database)?;
-                let session = current_session(&config_database)?;
-                let anon_key = api.anon_key().to_string();
-                Ok::<_, String>(Some((
-                    state.workspace_id,
-                    state.storage_protocol,
-                    api.project_url,
-                    anon_key,
-                    session.access_token,
-                )))
-            })
-            .await;
-            let (workspace_id, storage_protocol, project_url, anon_key, access_token) = match config
-            {
-                Ok(Ok(Some(config))) => config,
-                Ok(Ok(None)) => {
-                    tokio::time::sleep(Duration::from_secs(REALTIME_RECONNECT_SECONDS)).await;
-                    reconnect_attempt = 0;
-                    continue;
-                }
-                Ok(Err(error)) => {
-                    emit_cloud_error(&app, &database, &error);
-                    tokio::time::sleep(Duration::from_secs(REALTIME_RECONNECT_SECONDS)).await;
-                    continue;
-                }
-                Err(error) => {
-                    emit_cloud_error(
-                        &app,
-                        &database,
-                        &format!("SYNC_WORKER_ERROR: Realtime 配置读取失败: {error}"),
-                    );
-                    tokio::time::sleep(Duration::from_secs(REALTIME_RECONNECT_SECONDS)).await;
-                    continue;
-                }
-            };
-            if let Err(error) = run_realtime_connection(
-                &database,
-                &app,
-                &workspace_id,
-                &storage_protocol,
-                &project_url,
-                &anon_key,
-                &access_token,
-            )
-            .await
-            {
-                if CLOUD_SYNC_ENABLED.load(Ordering::Acquire) {
-                    emit_cloud_error(&app, &database, &error);
-                }
-            }
-            if !CLOUD_SYNC_ENABLED.load(Ordering::Acquire) {
-                reconnect_attempt = 0;
-                continue;
-            }
-            crate::direct_cloud_observability::record_realtime_reconnect(&workspace_id);
-            let delay = realtime_reconnect_delay(reconnect_attempt, now_millis() as u64);
-            reconnect_attempt = reconnect_attempt.saturating_add(1);
-            tokio::select! {
-                _ = tokio::time::sleep(delay) => {}
-                _ = mode_wakeup.notified() => {}
-            }
-        }
-    });
+    crate::direct_cloud_realtime::spawn_realtime_listener(
+        database,
+        app,
+        cloud_mode_wakeup(),
+        RealtimeListenerHooks {
+            load_config: realtime_connection_config,
+            is_enabled: realtime_enabled,
+            on_error: emit_cloud_error,
+            on_connected: handle_realtime_connected,
+            on_legacy_change: handle_legacy_realtime_change,
+            workspace_epoch: realtime_workspace_epoch,
+            covered_change_seq: realtime_covered_change_seq,
+        },
+    );
 }
 
-async fn run_realtime_connection(
+fn realtime_connection_config(
     database: &Database,
-    app: &AppHandle,
-    workspace_id: &str,
-    storage_protocol: &str,
-    project_url: &str,
-    anon_key: &str,
-    access_token: &str,
-) -> Result<(), String> {
-    let realtime_url = realtime_url(project_url, anon_key)?;
-    let (socket, _) = connect_async(realtime_url.as_str())
-        .await
-        .map_err(|error| format!("NETWORK_ERROR: Supabase Realtime 连接失败: {error}"))?;
-    let (mut writer, mut reader) = socket.split();
-    let topic = format!("realtime:{CLOUD_SCHEMA}:workspace_changes:{workspace_id}");
-    writer
-        .send(Message::Text(
-            json!({
-                "topic": topic,
-                "event": "phx_join",
-                "payload": {
-                    "config": {
-                        "broadcast": { "ack": false, "self": false },
-                        "presence": { "key": "" },
-                        "postgres_changes": [{
-                            "event": "*",
-                            "schema": CLOUD_SCHEMA,
-                            "table": "workspace_changes",
-                            "filter": format!("workspace_id=eq.{workspace_id}")
-                        }],
-                        "private": false
-                    },
-                    "access_token": access_token
-                },
-                "ref": "1",
-                "join_ref": "1"
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .map_err(|error| format!("NETWORK_ERROR: Supabase Realtime 订阅失败: {error}"))?;
+) -> Result<Option<RealtimeConnectionConfig>, String> {
+    let state = storage_mode(database)?;
+    if state.mode != "cloud" || !state.online {
+        return Ok(None);
+    }
+    let api = client(database)?;
+    let session = current_session(database)?;
+    Ok(Some(RealtimeConnectionConfig {
+        workspace_id: state.workspace_id,
+        storage_protocol: state.storage_protocol,
+        project_url: api.project_url,
+        anon_key: api.anon_key().to_string(),
+        access_token: session.access_token,
+    }))
+}
 
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(REALTIME_HEARTBEAT_SECONDS));
-    heartbeat.tick().await;
-    let mut heartbeat_ref = 2_u64;
-    let mode_wakeup = cloud_mode_wakeup();
-    loop {
-        tokio::select! {
-            _ = mode_wakeup.notified() => {
-                if !CLOUD_SYNC_ENABLED.load(Ordering::Acquire) {
-                    let _ = writer.send(Message::Close(None)).await;
-                    return Ok(());
-                }
-            }
-            _ = heartbeat.tick() => {
-                let heartbeat_database = database.clone();
-                let current_state = tauri::async_runtime::spawn_blocking(move || storage_mode(&heartbeat_database))
-                    .await
-                    .map_err(|error| format!("SYNC_WORKER_ERROR: Realtime 状态读取失败: {error}"))??;
-                if current_state.mode != "cloud" || current_state.workspace_id != workspace_id {
-                    let _ = writer.send(Message::Close(None)).await;
-                    return Ok(());
-                }
-                let reference = heartbeat_ref.to_string();
-                heartbeat_ref = heartbeat_ref.wrapping_add(1);
-                writer.send(Message::Text(json!({
-                    "topic": "phoenix",
-                    "event": "heartbeat",
-                    "payload": {},
-                    "ref": reference
-                }).to_string().into())).await
-                    .map_err(|error| format!("NETWORK_ERROR: Supabase Realtime 心跳失败: {error}"))?;
-            }
-            incoming = reader.next() => {
-                match incoming {
-                    Some(Ok(Message::Text(text))) => {
-                        let message: Value = serde_json::from_str(text.as_ref()).unwrap_or(Value::Null);
-                        let event = message.get("event").and_then(Value::as_str).unwrap_or_default();
-                        let join_failed = event == "phx_reply"
-                            && message.get("ref").and_then(Value::as_str) == Some("1")
-                            && message.pointer("/payload/status").and_then(Value::as_str) == Some("error");
-                        if join_failed {
-                            let reason = message
-                                .pointer("/payload/response/reason")
-                                .and_then(Value::as_str)
-                                .unwrap_or("频道订阅被拒绝");
-                            return Err(format!("CLOUD_REQUEST_FAILED: Supabase Realtime {reason}"));
-                        } else if event == "phx_reply"
-                            && message.get("ref").and_then(Value::as_str) == Some("1")
-                            && message.pointer("/payload/status").and_then(Value::as_str) == Some("ok")
-                        {
-                            if storage_protocol
-                                != crate::storage_contract::DIRECT_CLOUD_PROTOCOL
-                            {
-                                signal_cloud_sync(SYNC_SIGNAL_CONNECTION_READY, None);
-                            } else {
-                                spawn_direct_cloud_catch_up(database, app);
-                            }
-                        } else if event == "postgres_changes" {
-                            if storage_protocol
-                                == crate::storage_contract::DIRECT_CLOUD_PROTOCOL
-                            {
-                                if let Some(invalidation) = realtime_workspace_invalidation(
-                                    &message,
-                                    workspace_id,
-                                    current_workspace_epoch(database, workspace_id).unwrap_or(1),
-                                ) {
-                                    let covered_change_seq = crate::supabase::storage_mode(database)
-                                        .map(|status| status.last_change_seq)
-                                        .unwrap_or_default();
-                                    if invalidation.change_seq > covered_change_seq {
-                                        let _ = app.emit("work-data-changed", &invalidation);
-                                    }
-                                }
-                            } else {
-                                signal_cloud_sync(
-                                    SYNC_SIGNAL_REMOTE_HINT,
-                                    realtime_change_seq(&message),
-                                );
-                            }
-                        } else if event == "phx_error" || event == "phx_close" {
-                            return Err("NETWORK_ERROR: Supabase Realtime 频道已断开".to_string());
-                        }
-                    }
-                    Some(Ok(Message::Ping(payload))) => {
-                        writer.send(Message::Pong(payload)).await
-                            .map_err(|error| format!("NETWORK_ERROR: Supabase Realtime 响应失败: {error}"))?;
-                    }
-                    Some(Ok(Message::Close(_))) | None => {
-                        return Err("NETWORK_ERROR: Supabase Realtime 连接已关闭".to_string());
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(error)) => {
-                        return Err(format!("NETWORK_ERROR: Supabase Realtime 读取失败: {error}"));
-                    }
-                }
-            }
-        }
+fn realtime_enabled() -> bool {
+    CLOUD_SYNC_ENABLED.load(Ordering::Acquire)
+}
+
+fn handle_realtime_connected(database: &Database, app: &AppHandle, storage_protocol: &str) {
+    if storage_protocol == crate::storage_contract::DIRECT_CLOUD_PROTOCOL {
+        spawn_direct_cloud_catch_up(database, app);
+    } else {
+        signal_cloud_sync(SYNC_SIGNAL_CONNECTION_READY, None);
     }
 }
 
-fn current_workspace_epoch(database: &Database, workspace_id: &str) -> Result<i64, String> {
+fn handle_legacy_realtime_change(change_seq: Option<i64>) {
+    signal_cloud_sync(SYNC_SIGNAL_REMOTE_HINT, change_seq);
+}
+
+fn realtime_workspace_epoch(database: &Database, workspace_id: &str) -> i64 {
     database
-        .open()?
-        .query_row(
-            "SELECT workspace_epoch FROM local_sync_state WHERE workspace_id=?1",
-            [workspace_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map(|value| value.unwrap_or(1))
-        .map_err(|error| error.to_string())
+        .open()
+        .ok()
+        .and_then(|connection| {
+            connection
+                .query_row(
+                    "SELECT workspace_epoch FROM local_sync_state WHERE workspace_id=?1",
+                    [workspace_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+        })
+        .unwrap_or(1)
+}
+
+fn realtime_covered_change_seq(database: &Database) -> i64 {
+    storage_mode(database)
+        .map(|status| status.last_change_seq)
+        .unwrap_or_default()
 }
 
 fn emit_cloud_refresh_domains(

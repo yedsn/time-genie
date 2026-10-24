@@ -108,11 +108,7 @@ export type DataBackupHistoryItem = {
 };
 
 export async function exportDataBackup(path: string): Promise<DataBackupExportResult> {
-  return await invoke("data_backup_export", { request: { path, rescue: false } });
-}
-
-export async function exportRescueDataBackup(path: string, dispositionReason?: string): Promise<DataBackupExportResult> {
-  return await invoke("data_backup_export_rescue", { request: { path, dispositionReason } });
+  return await invoke("data_backup_export", { request: { path } });
 }
 
 export async function previewDataBackup(path: string): Promise<DataBackupPreview> {
