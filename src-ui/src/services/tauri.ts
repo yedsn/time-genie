@@ -202,7 +202,6 @@ export type CloudSessionSnapshot = {
 export type StorageModeSnapshot = {
   mode: "local" | "cloud";
   storageProtocol: "local" | "direct_v2" | string;
-  configuredCloudProtocol: "direct_v2" | string;
   storageBackend: "local_sqlite" | "direct_supabase" | string;
   cloudAccessState: "local_writable" | "online_writable" | "offline_readonly" | "degraded_readonly" | "reauth_required" | string;
   cloudWritable: boolean;
@@ -210,19 +209,16 @@ export type StorageModeSnapshot = {
   workspaceId: string;
   deviceId: string;
   online: boolean;
-  syncState: "synced" | "pending" | "conflict" | "error" | string;
   syncing?: boolean;
   saving?: boolean;
-  pendingOperations: number;
-  conflictCount: number;
   lastChangeSeq: number;
   lastSyncedAt?: number;
+  cacheSource?: "memory" | "persistent" | string;
+  cacheFetchedAt?: number;
   lastError?: string;
   authBlocked: boolean;
   authBlockedReason?: string;
   workspaceEpoch: number;
-  epochBlocked: boolean;
-  epochBlockedReason?: string;
 };
 
 export type DirectCloudReleaseMetrics = {
@@ -1721,6 +1717,10 @@ export async function setCloudStorageMode(): Promise<StorageModeSnapshot> {
   return await invoke("storage_mode_set_cloud");
 }
 
+export async function clearCloudReadCache(): Promise<StorageModeSnapshot> {
+  return await invoke("cloud_read_cache_clear");
+}
+
 export async function configureCloud(projectUrl: string, anonKey: string): Promise<StorageModeSnapshot> {
   return await invoke("cloud_configure", { request: { projectUrl, anonKey } });
 }
@@ -1794,12 +1794,6 @@ export async function discardCloudDataCopyExport(packageId: string): Promise<{ p
 
 export async function replaceLocalWithCloudDataCopy(confirmed: boolean): Promise<DataCopyReplaceLocalResult> {
   return await invoke("storage_copy_replace_local", { request: { confirmed } });
-}
-
-export async function executeStorageMigration(direction: StorageMigrationPreview["direction"] = "local_to_cloud"): Promise<StorageModeSnapshot> {
-  return await invoke("storage_migration_execute", {
-    request: { direction, confirmed: true },
-  });
 }
 
 export async function listCloudDevices(): Promise<CloudDevice[]> {

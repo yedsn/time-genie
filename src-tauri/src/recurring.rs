@@ -943,7 +943,11 @@ mod tests {
         .unwrap();
         let connection = database.open().unwrap();
         let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(changed.task_id, task_id);
         assert_eq!(changed.frequency, "weekdays");
@@ -1016,7 +1020,11 @@ mod tests {
             .unwrap();
         assert_eq!(historical, ("weekdays".to_string(), Some(today_text), 3));
         let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(next.frequency, "weekly");
         assert_eq!(next.weekdays_mask, Some(1_i64 << tomorrow_weekday));
@@ -1066,7 +1074,11 @@ mod tests {
             .unwrap();
         assert_eq!(rule_count, 0);
         let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(outbox_count, 0);
     }
@@ -1111,7 +1123,11 @@ mod tests {
             .unwrap();
         assert_eq!(stored, (Some(today_text.clone()), 2));
         let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(outbox_count, 0);
     }

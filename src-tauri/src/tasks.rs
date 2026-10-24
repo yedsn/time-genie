@@ -3818,7 +3818,11 @@ mod tests {
             .unwrap();
         assert_eq!(occurrence, ("open".to_string(), 3));
         let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(outbox_count, 0);
     }
@@ -3907,7 +3911,11 @@ mod tests {
 
         let connection = database.open().unwrap();
         let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(task.title, "云端模式事务入队事项");
         assert_eq!(outbox_count, 0);
@@ -3964,7 +3972,11 @@ mod tests {
         .unwrap();
         let connection = database.open().unwrap();
         let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         let estimate_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM task_daily_estimates WHERE task_id=?1 AND work_date='2026-10-05'", [&task_id], |row| row.get(0))
@@ -3990,7 +4002,11 @@ mod tests {
         let count: i64 = database
             .open()
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(count, 0);
     }
@@ -4035,7 +4051,11 @@ mod tests {
             .unwrap();
         assert_eq!(occurrence, ("scheduled".to_string(), "open".to_string()));
         let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(outbox_count, 0);
     }
@@ -4165,7 +4185,7 @@ mod tests {
         assert_eq!(tomorrow_occurrence_count, 0);
         let occurrence_outbox_count: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM sync_outbox WHERE entity_type = 'task_occurrence'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
                 [],
                 |row| row.get(0),
             )
@@ -4173,7 +4193,7 @@ mod tests {
         assert_eq!(occurrence_outbox_count, 0);
         let estimate_outbox_count: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM sync_outbox WHERE entity_type = 'task_daily_estimate'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
                 [],
                 |row| row.get(0),
             )
@@ -4314,7 +4334,11 @@ mod tests {
 
         let connection = database.open().unwrap();
         let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         let deleted_at: Option<i64> = connection
             .query_row(
@@ -5680,7 +5704,7 @@ mod tests {
         );
         let queued: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM sync_outbox WHERE entity_type='task'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
                 [],
                 |row| row.get(0),
             )
@@ -5816,7 +5840,11 @@ mod tests {
         let outbox_count: i64 = database
             .open()
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(outbox_count, 0);
     }
@@ -6180,7 +6208,13 @@ mod tests {
         )
         .unwrap();
         let connection = database.open().unwrap();
-        let queued: i64 = connection.query_row("SELECT COUNT(*) FROM sync_outbox WHERE operation_type='task_plan_batch_apply' AND entity_type='task'", [], |row| row.get(0)).unwrap();
+        let queued: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(queued, 0);
         let deleted_at: Option<i64> = connection
             .query_row(
@@ -6306,7 +6340,11 @@ mod tests {
         let outbox_count: i64 = database
             .open()
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(outbox_count, 0);
     }

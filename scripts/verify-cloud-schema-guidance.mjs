@@ -3,7 +3,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const rust = fs.readFileSync(path.join(repoRoot, "src-tauri/src/supabase.rs"), "utf8");
+const supabaseDir = path.join(repoRoot, "src-tauri/src/supabase");
+const rust = fs
+  .readdirSync(supabaseDir)
+  .filter((name) => name.endsWith(".rs"))
+  .map((name) => fs.readFileSync(path.join(supabaseDir, name), "utf8"))
+  .join("\n");
 const lib = fs.readFileSync(path.join(repoRoot, "src-tauri/src/lib.rs"), "utf8");
 const service = fs.readFileSync(path.join(repoRoot, "src-ui/src/services/tauri.ts"), "utf8");
 const workbench = fs.readFileSync(path.join(repoRoot, "src-ui/src/views/MainWorkbench.vue"), "utf8");

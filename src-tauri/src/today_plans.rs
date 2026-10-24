@@ -1244,7 +1244,6 @@ mod tests {
         let cloud_state = crate::supabase::StorageModeSnapshot {
             mode: "cloud".to_string(),
             storage_protocol: crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string(),
-            configured_cloud_protocol: crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string(),
             storage_backend: "legacy_sync_sqlite".to_string(),
             cloud_access_state: "legacy_sync".to_string(),
             cloud_writable: true,
@@ -1252,17 +1251,14 @@ mod tests {
             workspace_id: Uuid::now_v7().to_string(),
             device_id: Uuid::now_v7().to_string(),
             online: true,
-            sync_state: "idle".to_string(),
-            pending_operations: 0,
-            conflict_count: 0,
             last_change_seq: 0,
             last_synced_at: None,
+            cache_source: None,
+            cache_fetched_at: None,
             last_error: None,
             auth_blocked: false,
             auth_blocked_reason: None,
             workspace_epoch: 1,
-            epoch_blocked: false,
-            epoch_blocked_reason: None,
         };
 
         set_day_plan_for_cloud_test(
@@ -1287,9 +1283,8 @@ mod tests {
             .unwrap();
         let parent_outbox_count: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM sync_outbox
-                 WHERE entity_type='task_day_plan' AND entity_id=?1",
-                [format!("{}|{date}", parent.id)],
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
                 |row| row.get(0),
             )
             .unwrap();
@@ -1302,9 +1297,8 @@ mod tests {
             .unwrap();
         let child_outbox_count: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM sync_outbox
-                 WHERE entity_type='task_day_plan' AND entity_id=?1",
-                [format!("{}|{date}", child.id)],
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
                 |row| row.get(0),
             )
             .unwrap();

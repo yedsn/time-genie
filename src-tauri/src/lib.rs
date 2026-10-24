@@ -15,6 +15,7 @@ mod actual_time_adjustments;
 mod automation_hooks;
 #[cfg(test)]
 mod cloud_e2e;
+mod cloud_read_cache;
 mod cloud_sync;
 mod daily_report_import;
 mod data_protection;
@@ -446,6 +447,7 @@ pub fn run() {
             supabase::direct_cloud_client_metric_record,
             supabase::storage_mode_set_local,
             supabase::storage_mode_set_cloud,
+            supabase::cloud_read_cache_clear,
             supabase::cloud_configure,
             supabase::cloud_project_probe,
             supabase::cloud_sign_in_password,
@@ -475,7 +477,6 @@ pub fn run() {
             supabase::storage_copy_export_cloud_chunk,
             supabase::storage_copy_export_cloud_discard,
             supabase::storage_copy_replace_local,
-            supabase::storage_migration_execute,
             subjects::subject_list,
             subjects::subject_create,
             subjects::subject_rename,
@@ -1797,7 +1798,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_tray_timer_actions_use_local_cache_and_queue_outbox() {
+    fn cloud_tray_timer_actions_never_write_local_business_tables() {
         let directory = tempfile::tempdir().unwrap();
         let database =
             Database::initialize_at(directory.path().join("cloud-tray-timer.sqlite3")).unwrap();
@@ -1821,45 +1822,21 @@ mod tests {
         )
         .unwrap();
 
-        let started = execute_tray_timer_action(&database, TrayTimerAction::Start).unwrap();
-        assert_eq!(started["state"], "running");
-        assert!(time_tracking::get_timer_state(&database).unwrap().is_some());
-
-        let stopped = execute_tray_timer_action(&database, TrayTimerAction::Stop).unwrap();
-        assert_eq!(stopped["state"], "ended");
-        assert_eq!(stopped["allocatedMinutes"], 0);
-        assert!(time_tracking::get_timer_state(&database).unwrap().is_none());
+        assert!(execute_tray_timer_action(&database, TrayTimerAction::Start).is_err());
 
         let connection = database.open().unwrap();
-        let queued = connection
-            .prepare(
-                "SELECT operation_type, entity_type, entity_id, base_version, payload_version, coalesced_count, payload_json FROM sync_outbox WHERE workspace_id = ?1 ORDER BY created_at, rowid",
-            )
-            .unwrap()
-            .query_map([cloud_workspace_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, String>(6)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
+        let local_time_entries: i64 = connection
+            .query_row("SELECT COUNT(*) FROM time_entries", [], |row| row.get(0))
             .unwrap();
-
-        assert_eq!(queued.len(), 1);
-        let timer = queued.iter().find(|row| row.1 == "time_entry").unwrap();
-        assert_eq!(timer.0, "timer_stop");
-        assert_eq!(timer.2.as_deref(), stopped["id"].as_str());
-        assert_eq!(timer.3, None);
-        assert_eq!(timer.4, stopped["version"].as_i64());
-        assert_eq!(timer.5, 2);
-        let payload: serde_json::Value = serde_json::from_str(&timer.6).unwrap();
-        assert_eq!(payload["state"], "ended");
-        assert!(queued.iter().all(|row| row.1 != "unassigned_session"));
+        let legacy_tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(local_time_entries, 0);
+        assert_eq!(legacy_tables, 0);
+        assert!(cloud_workspace_id.parse::<uuid::Uuid>().is_ok());
     }
 }

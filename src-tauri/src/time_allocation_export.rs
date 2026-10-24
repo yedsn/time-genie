@@ -1093,7 +1093,7 @@ mod tests {
             insert_allocation(&fixture, "allocation", "entry", &fixture.task_id, 30, None);
             let connection = fixture.database.open().unwrap();
             let before: (i64, i64, i64) = connection
-                .query_row("SELECT (SELECT version FROM time_entries WHERE id='entry'), (SELECT version FROM time_allocations WHERE id='allocation'), (SELECT COUNT(*) FROM sync_outbox)",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))
+                .query_row("SELECT (SELECT version FROM time_entries WHERE id='entry'), (SELECT version FROM time_allocations WHERE id='allocation'), (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox')",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))
                 .unwrap();
             drop(connection);
             let directory = tempdir().unwrap();
@@ -1112,7 +1112,7 @@ mod tests {
             assert!(target.exists());
             let connection = fixture.database.open().unwrap();
             let after: (i64, i64, i64) = connection
-                .query_row("SELECT (SELECT version FROM time_entries WHERE id='entry'), (SELECT version FROM time_allocations WHERE id='allocation'), (SELECT COUNT(*) FROM sync_outbox)",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))
+                .query_row("SELECT (SELECT version FROM time_entries WHERE id='entry'), (SELECT version FROM time_allocations WHERE id='allocation'), (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox')",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))
                 .unwrap();
             assert_eq!(before, after);
         }
@@ -1284,7 +1284,7 @@ mod tests {
         let connection = fixture.database.open().unwrap();
         let before: (String, i64, i64) = connection
             .query_row(
-                "SELECT storage_mode, (SELECT COUNT(*) FROM sync_outbox), (SELECT CAST(value AS INTEGER) FROM app_metadata WHERE key='global_revision') FROM workspaces WHERE id=?1",
+                "SELECT storage_mode, (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'), (SELECT CAST(value AS INTEGER) FROM app_metadata WHERE key='global_revision') FROM workspaces WHERE id=?1",
                 [&fixture.workspace_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -1309,7 +1309,7 @@ mod tests {
         let connection = fixture.database.open().unwrap();
         let after: (String, i64, i64) = connection
             .query_row(
-                "SELECT storage_mode, (SELECT COUNT(*) FROM sync_outbox), (SELECT CAST(value AS INTEGER) FROM app_metadata WHERE key='global_revision') FROM workspaces WHERE id=?1",
+                "SELECT storage_mode, (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'), (SELECT CAST(value AS INTEGER) FROM app_metadata WHERE key='global_revision') FROM workspaces WHERE id=?1",
                 [&fixture.workspace_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )

@@ -16,6 +16,16 @@ use crate::database::Database;
 use crate::settings::{self, SettingsScope, SettingsUpdate};
 
 const SESSION_PROVIDER: &str = "supabase";
+
+mod auth;
+mod copy;
+mod direct;
+mod snapshot;
+
+pub(crate) use auth::*;
+pub(crate) use copy::*;
+pub(crate) use direct::*;
+pub(crate) use snapshot::*;
 const SESSION_ACCOUNT: &str = "supabase:session";
 #[cfg(not(test))]
 const SESSION_CREDENTIAL_SERVICE: &str = "timegenie";
@@ -88,129 +98,11 @@ pub struct CloudDevice {
     pub current: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct LegacyQueueCounts {
-    pub pending: i64,
-    pub sending: i64,
-    pub failed: i64,
-    pub conflict: i64,
-    pub total: i64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StorageProtocolUpgradeServerPreflight {
-    workspace_id: String,
-    device_id: String,
-    storage_protocol: String,
-    workspace_epoch: i64,
-    server_upgrade_allowed: bool,
-    already_direct: bool,
-    requires_local_queue_disposition: bool,
-    allowed_queue_dispositions: Vec<String>,
-    server_time: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StorageProtocolUpgradePreflight {
-    pub workspace_id: String,
-    pub device_id: String,
-    pub storage_protocol: String,
-    pub local_protocol: String,
-    pub workspace_epoch: i64,
-    pub local_workspace_epoch: i64,
-    pub server_upgrade_allowed: bool,
-    pub already_direct: bool,
-    pub requires_local_queue_disposition: bool,
-    pub allowed_queue_dispositions: Vec<String>,
-    pub devices: Vec<CloudDevice>,
-    pub queue: LegacyQueueCounts,
-    pub can_upgrade_with_drained_queue: bool,
-    pub blocked_reasons: Vec<String>,
-    pub server_time: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StorageProtocolUpgradeRequest {
-    pub operation_id: String,
-    #[serde(default)]
-    pub create_safety_snapshot: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StorageProtocolUpgradeResult {
-    pub upgraded: bool,
-    pub already_direct: bool,
-    pub workspace_epoch: i64,
-    pub storage_protocol: String,
-    pub change_seq: Option<i64>,
-    pub safety_snapshot_id: Option<String>,
-    pub pushed_operations: i64,
-    pub last_change_seq: i64,
-    pub refreshed_domains: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StorageProtocolAbandonRequest {
-    pub operation_id: String,
-    pub rescue_backup_path: String,
-    pub confirmed: bool,
-    pub confirmation_text: String,
-    #[serde(default)]
-    pub create_safety_snapshot: Option<bool>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StorageProtocolAuthorityResetRequest {
-    pub operation_id: String,
-    pub confirmed: bool,
-    #[serde(default)]
-    pub create_safety_snapshot: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StorageProtocolAbandonResult {
-    pub upgraded: bool,
-    pub already_direct: bool,
-    pub workspace_epoch: i64,
-    pub storage_protocol: String,
-    pub change_seq: Option<i64>,
-    pub safety_snapshot_id: Option<String>,
-    pub quarantined_operations: i64,
-    pub rescue_backup_path: String,
-    pub rescue_backup_checksum: String,
-    pub last_change_seq: i64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StorageProtocolUpgradeServerResult {
-    #[serde(default)]
-    upgraded: bool,
-    #[serde(default)]
-    already_direct: bool,
-    workspace_epoch: i64,
-    #[serde(default)]
-    storage_protocol: Option<String>,
-    #[serde(default)]
-    change_seq: Option<i64>,
-    #[serde(default)]
-    safety_snapshot_id: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageModeSnapshot {
     pub mode: String,
     pub storage_protocol: String,
-    pub configured_cloud_protocol: String,
     pub storage_backend: String,
     pub cloud_access_state: String,
     pub cloud_writable: bool,
@@ -218,17 +110,73 @@ pub struct StorageModeSnapshot {
     pub workspace_id: String,
     pub device_id: String,
     pub online: bool,
-    pub sync_state: String,
-    pub pending_operations: i64,
-    pub conflict_count: i64,
     pub last_change_seq: i64,
     pub last_synced_at: Option<i64>,
+    pub cache_source: Option<String>,
+    pub cache_fetched_at: Option<i64>,
     pub last_error: Option<String>,
     pub auth_blocked: bool,
     pub auth_blocked_reason: Option<String>,
     pub workspace_epoch: i64,
-    pub epoch_blocked: bool,
-    pub epoch_blocked_reason: Option<String>,
+}
+
+const DIRECT_CLOUD_CHECKPOINT_SETTING: &str = "direct_cloud_checkpoint";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectCloudCheckpoint {
+    workspace_id: String,
+    device_id: String,
+    change_seq: i64,
+    workspace_epoch: i64,
+    fetched_at: Option<i64>,
+    last_error: Option<String>,
+    auth_blocked_reason: Option<String>,
+}
+
+fn read_direct_cloud_checkpoint(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+) -> DirectCloudCheckpoint {
+    connection
+        .query_row(
+            "SELECT value_json FROM device_settings WHERE key=?1",
+            [DIRECT_CLOUD_CHECKPOINT_SETTING],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<DirectCloudCheckpoint>(&raw).ok())
+        .filter(|checkpoint| checkpoint.workspace_id == workspace_id)
+        .unwrap_or_else(|| DirectCloudCheckpoint {
+            workspace_id: workspace_id.to_string(),
+            workspace_epoch: 1,
+            ..DirectCloudCheckpoint::default()
+        })
+}
+
+fn write_direct_cloud_checkpoint(
+    database: &Database,
+    checkpoint: &DirectCloudCheckpoint,
+) -> Result<(), String> {
+    let value_json = serde_json::to_string(checkpoint).map_err(|error| error.to_string())?;
+    database
+        .open()?
+        .execute(
+            "INSERT INTO device_settings(key,value_json,updated_at) VALUES(?1,?2,?3)
+             ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+            params![DIRECT_CLOUD_CHECKPOINT_SETTING, value_json, now_seconds() * 1_000],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn workspace_epoch_from_metadata(database: &Database, workspace_id: &str) -> i64 {
+    database
+        .open()
+        .map(|connection| read_direct_cloud_checkpoint(&connection, workspace_id).workspace_epoch)
+        .unwrap_or(1)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,7 +307,7 @@ pub struct DataCopyExportChunk {
     pub row_count: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataCopyExportChunkRequest {
     pub package_id: String,
@@ -400,7 +348,7 @@ struct DataCopyExportPreviewResponse {
 }
 
 #[derive(Debug, Clone)]
-struct DataCopyChunk {
+pub(crate) struct DataCopyChunk {
     chunk_index: usize,
     entity_name: String,
     content_text: String,
@@ -1334,13 +1282,13 @@ struct DirectCloudTimerRecoveryData {
     no_op: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DirectCloudActiveTimerData {
     active_entry: Option<crate::time_tracking::TimeEntryDto>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DirectCloudUnassignedStateData {
     anchor: Option<crate::unassigned::UnassignedStateDto>,
@@ -2174,13 +2122,6 @@ pub struct MigrationPreviewRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MigrationExecuteRequest {
-    pub direction: String,
-    pub confirmed: bool,
-}
-
-#[derive(Debug, Deserialize)]
 struct AuthResponse {
     access_token: String,
     refresh_token: String,
@@ -2208,7 +2149,7 @@ struct ChangeSeqRow {
 }
 
 #[derive(Debug, Deserialize)]
-struct DeviceRow {
+pub(crate) struct DeviceRow {
     id: String,
     workspace_id: String,
     device_name: String,
@@ -2220,9 +2161,8 @@ struct DeviceRow {
     revoked_at: Option<String>,
 }
 
-/// Ordinary business edits always target the local SQLite cache first. In
-/// cloud mode they are appended to `sync_outbox` by the owning command and
-/// become authoritative only after Supabase accepts the operation.
+/// Local mode writes SQLite; cloud mode mutations are accepted only when the
+/// direct Supabase connection is writable.
 pub fn ensure_repository_write_mode(database: &Database) -> Result<(), String> {
     let connection = database.open()?;
     let mode: String = connection
@@ -2243,23 +2183,18 @@ pub fn ensure_repository_write_mode(database: &Database) -> Result<(), String> {
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    let blocked = workspace_id
+    let blocked_reason = workspace_id
         .as_deref()
-        .and_then(|workspace_id| {
-            connection
-                .query_row(
-                    "SELECT auth_blocked, auth_blocked_reason FROM local_sync_state WHERE workspace_id = ?1",
-                    [workspace_id],
-                    |row| Ok((row.get::<_, bool>(0)?, row.get::<_, Option<String>>(1)?)),
-                )
-                .optional()
-                .ok()
-                .flatten()
-        });
-    if let Some((true, reason)) = blocked {
+        .map(|workspace_id| read_direct_cloud_checkpoint(&connection, workspace_id))
+        .and_then(|checkpoint| checkpoint.auth_blocked_reason);
+    if let Some(reason) = blocked_reason {
         return Err(format!(
             "AUTH_BLOCKED: {}",
-            reason.unwrap_or_else(|| "云端授权已失效，请重新登录并确认待同步修改".to_string())
+            if reason.trim().is_empty() {
+                "云端授权已失效，请重新登录".to_string()
+            } else {
+                reason
+            }
         ));
     }
     Ok(())
@@ -2380,13 +2315,7 @@ fn cloud_workspace_context(
     if workspace_id.trim().is_empty() || device_id.trim().is_empty() {
         return Err("CLOUD_DEVICE_REQUIRED: 请先完成云端设备注册".to_string());
     }
-    let workspace_epoch = connection
-        .query_row(
-            "SELECT workspace_epoch FROM local_sync_state WHERE workspace_id=?1",
-            [&workspace_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(1);
+    let workspace_epoch = read_direct_cloud_checkpoint(&connection, &workspace_id).workspace_epoch;
     drop(connection);
     let session = session(&workspace_id)?;
     Ok((
@@ -2428,11 +2357,6 @@ fn direct_cloud_read_context(database: &Database) -> Result<DirectCloudReadConte
     if mode != "cloud" {
         return Err("CLOUD_MODE_REQUIRED: 云端查询仅在云端模式可用".to_string());
     }
-    let protocol = read_device_setting_string(&connection, "cloud_storage_protocol")?
-        .unwrap_or_else(|| crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string());
-    if protocol != crate::storage_contract::DIRECT_CLOUD_PROTOCOL {
-        return Err("CLOUD_PROTOCOL_UNSUPPORTED: 当前工作空间尚未启用直连云端存储".to_string());
-    }
     let workspace_id = read_device_setting_string(&connection, "cloud_workspace_id")?
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "CLOUD_NOT_CONFIGURED: 尚未初始化 Supabase 工作空间".to_string())?;
@@ -2443,15 +2367,7 @@ fn direct_cloud_read_context(database: &Database) -> Result<DirectCloudReadConte
             |row| row.get(0),
         )
         .map_err(|_| "CLOUD_DEVICE_REQUIRED: 请先完成云端设备注册".to_string())?;
-    let workspace_epoch = connection
-        .query_row(
-            "SELECT workspace_epoch FROM local_sync_state WHERE workspace_id=?1",
-            [&workspace_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .unwrap_or(1);
+    let workspace_epoch = read_direct_cloud_checkpoint(&connection, &workspace_id).workspace_epoch;
     drop(connection);
     let session = match session(&workspace_id) {
         Ok(session) => session,
@@ -2470,26 +2386,13 @@ fn direct_cloud_read_context(database: &Database) -> Result<DirectCloudReadConte
 
 fn data_copy_target_context(database: &Database) -> Result<DirectCloudReadContext, String> {
     let connection = database.open()?;
-    let protocol = read_device_setting_string(&connection, "cloud_storage_protocol")?
-        .unwrap_or_else(|| crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string());
-    if protocol != crate::storage_contract::DIRECT_CLOUD_PROTOCOL {
-        return Err("CLOUD_PROTOCOL_UNSUPPORTED: 云端目标尚未启用直连存储协议".to_string());
-    }
     let workspace_id = read_device_setting_string(&connection, "cloud_workspace_id")?
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "CLOUD_NOT_CONFIGURED: 尚未初始化 Supabase 工作空间".to_string())?;
     let device_id = read_device_setting_string(&connection, "device_id")?
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "CLOUD_DEVICE_REQUIRED: 请先完成云端设备注册".to_string())?;
-    let workspace_epoch = connection
-        .query_row(
-            "SELECT workspace_epoch FROM local_sync_state WHERE workspace_id=?1",
-            [&workspace_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .unwrap_or(1);
+    let workspace_epoch = read_direct_cloud_checkpoint(&connection, &workspace_id).workspace_epoch;
     drop(connection);
     let session = match session(&workspace_id) {
         Ok(session) => session,
@@ -2586,13 +2489,25 @@ fn direct_cloud_access_state_for_error(error: &str) -> (DirectCloudAccessState, 
     )
 }
 
-fn direct_cloud_query<T: for<'de> Deserialize<'de>>(
+fn direct_cloud_query<T: for<'de> Deserialize<'de> + Serialize>(
     database: &Database,
     function: &str,
     context: &DirectCloudReadContext,
     mut body: Value,
 ) -> Result<DirectCloudQueryResponse<T>, String> {
     let started_at = Instant::now();
+    let account_id = context.session.user_id.as_str();
+    let query_key = format!("{function}:{}", stable_json_hash(&body)?);
+    let cache_key = crate::cloud_read_cache::CloudReadCacheKey {
+        account_id,
+        workspace_id: &context.workspace_id,
+        domain: if function == "direct_cloud_workbench_bootstrap" {
+            "workspace"
+        } else {
+            direct_cloud_cache_domain(function)
+        },
+        query_key: &query_key,
+    };
     let body_object = body
         .as_object_mut()
         .ok_or_else(|| "CLOUD_REQUEST_INVALID: 云端查询参数必须是对象".to_string())?;
@@ -2613,6 +2528,25 @@ fn direct_cloud_query<T: for<'de> Deserialize<'de>>(
         Err(error) => {
             record_direct_cloud_access_error(&context.workspace_id, &error);
             crate::direct_cloud_observability::record_query_error(&context.workspace_id, &error);
+            if let Ok(cache) = crate::cloud_read_cache::CloudReadCache::for_database(database) {
+                if let Ok(Some(snapshot)) = cache.read(&cache_key, now_seconds() * 1_000) {
+                    if snapshot.workspace_epoch == context.workspace_epoch {
+                        if let Ok(response) =
+                            serde_json::from_value::<DirectCloudQueryResponse<T>>(snapshot.payload)
+                        {
+                            set_direct_cloud_access_runtime(
+                                &context.workspace_id,
+                                DirectCloudAccessState::OfflineReadonly,
+                                Some(format!(
+                                    "正在显示云端只读缓存，最后更新于 {}",
+                                    snapshot.fetched_at
+                                )),
+                            );
+                            return Ok(response);
+                        }
+                    }
+                }
+            }
             return Err(error);
         }
     };
@@ -2640,7 +2574,62 @@ fn direct_cloud_query<T: for<'de> Deserialize<'de>>(
         &context.workspace_id,
         started_at.elapsed().as_secs_f64() * 1000.0,
     );
+    if let Ok(cache) = crate::cloud_read_cache::CloudReadCache::for_database(database) {
+        if let Ok(payload) = serde_json::to_value(&response) {
+            let _ = cache.save(
+                &cache_key,
+                &crate::cloud_read_cache::CloudReadCacheSnapshot {
+                    payload,
+                    workspace_epoch: response.metadata.workspace_epoch,
+                    change_seq: response.metadata.change_seq,
+                    fetched_at: now_seconds() * 1_000,
+                },
+                now_seconds() * 1_000,
+            );
+        }
+    }
     Ok(response)
+}
+
+fn stable_json_hash(value: &Value) -> Result<String, String> {
+    let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    Ok(format!("{:016x}", fnv1a64(&bytes)))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn direct_cloud_cache_domain(function: &str) -> &str {
+    if function.contains("report") {
+        "reports"
+    } else if function.contains("unassigned") {
+        "unassigned"
+    } else if function.contains("timer")
+        || function.contains("time_")
+        || function.contains("unassigned")
+        || function.contains("actual_adjustment")
+    {
+        "time"
+    } else if function.contains("setting")
+        || function.contains("integration")
+        || function.contains("binding")
+        || function.contains("schedule")
+    {
+        "settings"
+    } else if function.contains("today") || function.contains("plan") || function.contains("recurr")
+    {
+        "planning"
+    } else if function.contains("subject") {
+        "subjects"
+    } else {
+        "tasks"
+    }
 }
 
 pub fn direct_cloud_mutation<T: for<'de> Deserialize<'de>>(
@@ -2657,10 +2646,8 @@ fn ensure_direct_cloud_writable(database: &Database, workspace_id: &str) -> Resu
     let connection = database.open()?;
     let mode = read_device_setting_string(&connection, "storage_mode")?
         .unwrap_or_else(|| "local".to_string());
-    let protocol = read_device_setting_string(&connection, "cloud_storage_protocol")?
-        .unwrap_or_else(|| crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string());
     drop(connection);
-    if mode != "cloud" || protocol != crate::storage_contract::DIRECT_CLOUD_PROTOCOL {
+    if mode != "cloud" {
         return Err("CLOUD_MODE_REQUIRED: 当前操作需要直连云端存储".to_string());
     }
     let runtime = direct_cloud_access_runtime(workspace_id).unwrap_or(DirectCloudAccessRuntime {
@@ -2751,6 +2738,14 @@ fn direct_cloud_mutation_with_context<T: for<'de> Deserialize<'de>>(
             error
         })?;
     record_direct_cloud_checkpoint(database, &response.metadata)?;
+    if let Ok(cache) = crate::cloud_read_cache::CloudReadCache::for_database(database) {
+        let _ =
+            cache.invalidate_domain(&context.session.user_id, &context.workspace_id, "workspace");
+        for domain in &response.metadata.domains {
+            let _ =
+                cache.invalidate_domain(&context.session.user_id, &context.workspace_id, domain);
+        }
+    }
     record_direct_cloud_access_success(&context.workspace_id);
     crate::direct_cloud_observability::record_mutation(
         &context.workspace_id,
@@ -2767,33 +2762,30 @@ fn record_direct_cloud_checkpoint(
     if metadata.workspace_id.trim().is_empty() {
         return Ok(());
     }
-    database
-        .open()?
-        .execute(
-            "INSERT INTO local_sync_state(workspace_id, device_id, last_change_seq, last_full_sync_at, workspace_epoch)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(workspace_id) DO UPDATE SET
-               device_id=excluded.device_id,
-               last_change_seq=CASE
-                 WHEN local_sync_state.workspace_epoch <> excluded.workspace_epoch THEN excluded.last_change_seq
-                 ELSE MAX(local_sync_state.last_change_seq, excluded.last_change_seq)
-               END,
-               last_full_sync_at=excluded.last_full_sync_at,
-               last_error=NULL,
-               workspace_epoch=excluded.workspace_epoch,
-               epoch_blocked=0,
-               epoch_blocked_reason=NULL,
-               epoch_blocked_at=NULL",
-            params![
-                metadata.workspace_id,
-                metadata.device_id,
-                metadata.change_seq,
-                now_seconds() * 1_000,
-                metadata.workspace_epoch
-            ],
-        )
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    let connection = database.open()?;
+    let previous = read_direct_cloud_checkpoint(&connection, &metadata.workspace_id);
+    drop(connection);
+    if previous.workspace_epoch != metadata.workspace_epoch {
+        if let Ok(cache) = crate::cloud_read_cache::CloudReadCache::for_database(database) {
+            let _ = cache.clear_workspace(&metadata.workspace_id);
+        }
+    }
+    write_direct_cloud_checkpoint(
+        database,
+        &DirectCloudCheckpoint {
+            workspace_id: metadata.workspace_id.clone(),
+            device_id: metadata.device_id.clone(),
+            change_seq: if previous.workspace_epoch == metadata.workspace_epoch {
+                previous.change_seq.max(metadata.change_seq)
+            } else {
+                metadata.change_seq
+            },
+            workspace_epoch: metadata.workspace_epoch,
+            fetched_at: Some(now_seconds() * 1_000),
+            last_error: None,
+            auth_blocked_reason: None,
+        },
+    )
 }
 
 fn direct_tracking_lease_key(context: &DirectCloudReadContext) -> (String, String) {
@@ -2817,3481 +2809,6 @@ fn store_direct_tracking_lease_token(context: &DirectCloudReadContext, token: &s
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.insert(direct_tracking_lease_key(context), token.to_string());
-}
-
-pub fn direct_cloud_workbench_bootstrap(
-    database: &Database,
-) -> Result<DirectCloudWorkbenchResponse, String> {
-    let context = direct_cloud_read_context(database)?;
-    direct_cloud_query(
-        database,
-        "direct_cloud_workbench_bootstrap",
-        &context,
-        json!({}),
-    )
-}
-
-pub fn direct_cloud_subject_list(
-    database: &Database,
-) -> Result<Vec<crate::subjects::SubjectDto>, String> {
-    Ok(direct_cloud_workbench_bootstrap(database)?
-        .data
-        .subjects
-        .into_iter()
-        .map(|subject| crate::subjects::SubjectDto {
-            id: subject.id,
-            name: subject.name,
-            sort_order: subject.sort_order,
-            open_task_count: subject.open_task_count,
-            version: subject.version,
-        })
-        .collect())
-}
-
-pub fn direct_cloud_subject_create(
-    database: &Database,
-    request: crate::subjects::SubjectCreateRequest,
-) -> Result<crate::subjects::SubjectCreateResult, String> {
-    let response = direct_cloud_mutation::<crate::subjects::SubjectCreateResult>(
-        database,
-        "direct_cloud_subject_create",
-        None,
-        json!({
-            "id": Uuid::now_v7().to_string(),
-            "name": request.name,
-        }),
-    )?;
-    Ok(response.data)
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DirectCloudSubjectData {
-    subject: crate::subjects::SubjectDto,
-}
-
-pub fn direct_cloud_subject_rename(
-    database: &Database,
-    request: crate::subjects::SubjectRenameRequest,
-) -> Result<crate::subjects::SubjectDto, String> {
-    let response = direct_cloud_mutation::<DirectCloudSubjectData>(
-        database,
-        "direct_cloud_subject_update",
-        None,
-        json!({
-            "id": request.subject_id,
-            "name": request.name,
-            "expectedVersion": request.expected_version,
-        }),
-    )?;
-    Ok(response.data.subject)
-}
-
-pub fn direct_cloud_task_list(
-    database: &Database,
-    request: DirectCloudTaskQuery,
-) -> Result<DirectCloudTaskListResponse, String> {
-    let context = direct_cloud_read_context(database)?;
-    direct_cloud_query(
-        database,
-        "direct_cloud_task_list",
-        &context,
-        json!({
-            "p_subject_id": request.subject_id,
-            "p_include_completed": request.include_completed.unwrap_or(true),
-            "p_planned_date": request.planned_date,
-            "p_query": request.query,
-        }),
-    )
-}
-
-pub fn direct_cloud_completed_tasks(
-    database: &Database,
-    request: DirectCloudCompletedTasksQuery,
-) -> Result<DirectCloudCompletedTasksResponse, String> {
-    let context = direct_cloud_read_context(database)?;
-    direct_cloud_query(
-        database,
-        "direct_cloud_completed_tasks",
-        &context,
-        json!({
-            "p_subject_id": request.subject_id,
-            "p_cursor_completed_at": request.cursor_completed_at,
-            "p_cursor_id": request.cursor_id,
-            "p_limit": request.limit.unwrap_or(20).clamp(1,100),
-        }),
-    )
-}
-
-pub fn direct_cloud_task_detail(
-    database: &Database,
-    task_id: String,
-) -> Result<DirectCloudTaskDetailResponse, String> {
-    let context = direct_cloud_read_context(database)?;
-    direct_cloud_query(
-        database,
-        "direct_cloud_task_detail",
-        &context,
-        json!({"p_task_id": task_id}),
-    )
-}
-
-pub fn direct_cloud_today_plan(
-    database: &Database,
-    subject_id: String,
-    work_date: String,
-) -> Result<DirectCloudTodayPlanResponse, String> {
-    let context = direct_cloud_read_context(database)?;
-    direct_cloud_query(
-        database,
-        "direct_cloud_today_plan",
-        &context,
-        json!({"p_subject_id": subject_id, "p_work_date": work_date}),
-    )
-}
-
-pub fn direct_cloud_today_overview(
-    database: &Database,
-    request: crate::today_overview::TodayWorkOverviewRequest,
-) -> Result<crate::today_overview::TodayWorkOverviewDto, String> {
-    let context = direct_cloud_read_context(database)?;
-    let history_days = request.history_days.unwrap_or(30).clamp(1, 90);
-    let response = direct_cloud_query::<crate::today_overview::TodayWorkOverviewDto>(
-        database,
-        "direct_cloud_today_overview",
-        &context,
-        json!({
-            "p_subject_id": request.subject_id,
-            "p_today_date": request.today_date,
-            "p_history_days": history_days,
-            "p_trend_days": request.trend_days.unwrap_or(14).clamp(1, history_days),
-        }),
-    )?;
-    Ok(response.data)
-}
-
-pub fn direct_cloud_time_state(
-    database: &Database,
-    work_date: String,
-) -> Result<DirectCloudTimeStateResponse, String> {
-    let context = direct_cloud_read_context(database)?;
-    direct_cloud_query(
-        database,
-        "direct_cloud_time_state",
-        &context,
-        json!({"p_work_date": work_date}),
-    )
-}
-
-pub fn direct_cloud_time_entry_list_for_command(
-    database: &Database,
-    request: crate::time_tracking::TimeEntryListRequest,
-) -> Result<crate::time_tracking::TimeEntryListResult, String> {
-    let response = direct_cloud_time_state(database, request.work_date)?;
-    let entries = response
-        .data
-        .entries
-        .into_iter()
-        .filter(|entry| request.include_breaks || entry.kind != "break")
-        .collect::<Vec<_>>();
-    let raw_minutes = entries
-        .iter()
-        .filter(|entry| entry.kind == "work")
-        .map(|entry| entry.settlement_minutes)
-        .sum();
-    let allocated_minutes = entries
-        .iter()
-        .filter(|entry| entry.kind == "work")
-        .map(|entry| entry.allocated_minutes)
-        .sum();
-    let break_minutes = entries
-        .iter()
-        .filter(|entry| entry.kind == "break")
-        .map(|entry| entry.settlement_minutes)
-        .sum();
-    Ok(crate::time_tracking::TimeEntryListResult {
-        entries,
-        raw_minutes,
-        allocated_minutes,
-        pending_minutes: (raw_minutes - allocated_minutes).max(0),
-        break_minutes,
-        revision: response.metadata.change_seq,
-    })
-}
-
-pub fn direct_cloud_active_timer(
-    database: &Database,
-) -> Result<Option<crate::time_tracking::TimeEntryDto>, String> {
-    let context = direct_cloud_read_context(database)?;
-    let response = direct_cloud_query::<DirectCloudActiveTimerData>(
-        database,
-        "direct_cloud_active_timer",
-        &context,
-        json!({}),
-    )?;
-    Ok(response.data.active_entry)
-}
-
-pub fn direct_cloud_time_history_for_command(
-    database: &Database,
-    request: crate::time_tracking::TimeEntryHistoryRequest,
-) -> Result<crate::time_tracking::TimeEntryHistoryResult, String> {
-    let context = direct_cloud_read_context(database)?;
-    let response = direct_cloud_query::<DirectCloudTimeHistoryPageData>(
-        database,
-        "direct_cloud_time_history_page",
-        &context,
-        json!({
-            "p_page": request.page,
-            "p_include_breaks": request.include_breaks,
-        }),
-    )?;
-    let groups = response
-        .data
-        .groups
-        .into_iter()
-        .map(|group| {
-            let raw_minutes = group
-                .entries
-                .iter()
-                .filter(|entry| entry.kind == "work")
-                .map(|entry| entry.settlement_minutes)
-                .sum();
-            let allocated_minutes = group
-                .entries
-                .iter()
-                .filter(|entry| entry.kind == "work")
-                .map(|entry| entry.allocated_minutes)
-                .sum();
-            let break_minutes = group
-                .entries
-                .iter()
-                .filter(|entry| entry.kind == "break")
-                .map(|entry| entry.settlement_minutes)
-                .sum();
-            let adjustment_minutes = group
-                .adjustments
-                .iter()
-                .map(|adjustment| adjustment.delta_minutes)
-                .sum::<i64>();
-            crate::time_tracking::TimeEntryHistoryDayDto {
-                work_date: group.work_date,
-                entry_count: group.entries.len() as i64,
-                raw_minutes,
-                allocated_minutes,
-                pending_minutes: (raw_minutes - allocated_minutes).max(0),
-                break_minutes,
-                entries: group.entries,
-                adjustment_minutes,
-                final_actual_minutes: (allocated_minutes + adjustment_minutes).max(0),
-                adjustments: group.adjustments,
-            }
-        })
-        .collect();
-    Ok(crate::time_tracking::TimeEntryHistoryResult {
-        page: response.data.page,
-        page_size: response.data.page_size,
-        total_days: response.data.total_days,
-        total_pages: response.data.total_pages,
-        groups,
-        revision: response.metadata.change_seq,
-    })
-}
-
-pub fn direct_cloud_unassigned_state(
-    database: &Database,
-    session_id: Option<String>,
-) -> Result<Option<crate::unassigned::UnassignedStateDto>, String> {
-    let context = direct_cloud_read_context(database)?;
-    let response = direct_cloud_query::<DirectCloudUnassignedStateData>(
-        database,
-        "direct_cloud_unassigned_state",
-        &context,
-        json!({"p_session_id": session_id}),
-    )?;
-    let _ = response.data.work_date;
-    Ok(response.data.anchor)
-}
-
-pub fn direct_cloud_unassigned_ensure(
-    database: &Database,
-) -> Result<Option<crate::unassigned::UnassignedStateDto>, String> {
-    let context = direct_cloud_read_context(database)?;
-    let state_response = direct_cloud_query::<DirectCloudUnassignedStateData>(
-        database,
-        "direct_cloud_unassigned_state",
-        &context,
-        json!({"p_session_id": null}),
-    )?;
-    if state_response.data.anchor.is_some() {
-        return Ok(state_response.data.anchor);
-    }
-    if state_response.data.active_timer {
-        return Ok(None);
-    }
-    let operation_id = direct_timer_operation_id(
-        "direct_cloud_unassigned_ensure",
-        state_response.data.work_date.as_bytes(),
-    );
-    let response = direct_cloud_mutation_with_context::<DirectCloudUnassignedEnsureData>(
-        database,
-        &context,
-        "direct_cloud_unassigned_ensure",
-        Some(operation_id),
-        json!({}),
-    )?;
-    let _ = response.data.server_time;
-    Ok(response.data.anchor)
-}
-
-pub fn direct_cloud_unassigned_resolve_work(
-    database: &Database,
-    request: crate::unassigned::ResolveWorkRequest,
-) -> Result<crate::unassigned::UnassignedResolveResult, String> {
-    direct_cloud_unassigned_resolve(
-        database,
-        request.operation_id,
-        "work",
-        json!({
-            "sessionId": request.session_id,
-            "expectedVersion": request.expected_version,
-            "resolutionType": "work",
-            "allocations": request.allocations,
-        }),
-    )
-}
-
-pub fn direct_cloud_unassigned_resolve_session(
-    database: &Database,
-    request: crate::unassigned::ResolveSessionRequest,
-    resolution_type: &str,
-) -> Result<crate::unassigned::UnassignedResolveResult, String> {
-    direct_cloud_unassigned_resolve(
-        database,
-        request.operation_id,
-        resolution_type,
-        json!({
-            "sessionId": request.session_id,
-            "expectedVersion": request.expected_version,
-            "resolutionType": resolution_type,
-            "allocations": [],
-        }),
-    )
-}
-
-fn direct_cloud_unassigned_resolve(
-    database: &Database,
-    operation_id: String,
-    resolution_type: &str,
-    payload: Value,
-) -> Result<crate::unassigned::UnassignedResolveResult, String> {
-    let response = direct_cloud_mutation::<DirectCloudUnassignedResolveData>(
-        database,
-        "direct_cloud_unassigned_resolve",
-        Some(operation_id),
-        payload,
-    )?;
-    let generated_entry_id = response
-        .data
-        .generated_entry
-        .as_ref()
-        .map(|entry| entry.id.clone());
-    let _ = response.data.server_time;
-    Ok(crate::unassigned::UnassignedResolveResult {
-        session_id: response.data.session.session_id,
-        generated_entry_id,
-        resolution_type: resolution_type.to_string(),
-        elapsed_seconds: response.data.session.elapsed_seconds,
-        required_minutes: response.data.session.required_minutes,
-        next_session: response.data.next_session,
-    })
-}
-
-pub fn direct_cloud_actual_adjustment_snapshot(
-    database: &Database,
-    request: crate::actual_time_adjustments::ActualAdjustmentSnapshotRequest,
-) -> Result<crate::actual_time_adjustments::ActualAdjustmentSnapshotDto, String> {
-    let context = direct_cloud_read_context(database)?;
-    let response = direct_cloud_query(
-        database,
-        "direct_cloud_actual_adjustment_snapshot",
-        &context,
-        json!({
-            "p_subject_id": request.subject_id,
-            "p_work_date": request.work_date,
-            "p_execution_only": request.execution_only.unwrap_or(false),
-        }),
-    )?;
-    Ok(response.data)
-}
-
-pub fn direct_cloud_report_list(
-    database: &Database,
-    request: DirectCloudReportListQuery,
-) -> Result<DirectCloudReportListResponse, String> {
-    let context = direct_cloud_read_context(database)?;
-    direct_cloud_query(
-        database,
-        "direct_cloud_report_list",
-        &context,
-        json!({
-            "p_report_type": request.report_type,
-            "p_subject_id": request.subject_id,
-            "p_query": request.query,
-            "p_cursor_updated_at": request.cursor_updated_at,
-            "p_cursor_id": request.cursor_id,
-            "p_limit": request.limit.unwrap_or(20).clamp(1,100),
-        }),
-    )
-}
-
-pub fn direct_cloud_report_detail(
-    database: &Database,
-    report_id: String,
-) -> Result<DirectCloudReportDetailResponse, String> {
-    let context = direct_cloud_read_context(database)?;
-    direct_cloud_query(
-        database,
-        "direct_cloud_report_detail",
-        &context,
-        json!({"p_report_id": report_id}),
-    )
-}
-
-pub fn direct_cloud_report_templates(
-    database: &Database,
-    report_type: Option<String>,
-) -> Result<DirectCloudReportTemplatesResponse, String> {
-    let context = direct_cloud_read_context(database)?;
-    direct_cloud_query(
-        database,
-        "direct_cloud_report_templates",
-        &context,
-        json!({"p_report_type": report_type}),
-    )
-}
-
-pub fn direct_cloud_report_preview(
-    database: &Database,
-    request: DirectCloudReportPreviewQuery,
-) -> Result<DirectCloudReportPreviewResponse, String> {
-    let context = direct_cloud_read_context(database)?;
-    direct_cloud_query(
-        database,
-        "direct_cloud_report_preview",
-        &context,
-        json!({
-            "p_report_type": request.report_type,
-            "p_reference_date": request.reference_date,
-            "p_subject_id": request.subject_id,
-            "p_template_id": request.template_id,
-        }),
-    )
-}
-
-fn direct_cloud_json_mutation(
-    database: &Database,
-    function: &str,
-    operation_id: String,
-    payload: Value,
-) -> Result<Value, String> {
-    Ok(direct_cloud_mutation::<Value>(database, function, Some(operation_id), payload)?.data)
-}
-
-pub fn direct_cloud_report_create_mutation(
-    database: &Database,
-    operation_id: String,
-    payload: Value,
-) -> Result<Value, String> {
-    direct_cloud_json_mutation(
-        database,
-        "direct_cloud_report_create",
-        operation_id,
-        payload,
-    )
-}
-
-pub fn direct_cloud_report_scope_update_mutation(
-    database: &Database,
-    operation_id: String,
-    payload: Value,
-) -> Result<Value, String> {
-    direct_cloud_json_mutation(
-        database,
-        "direct_cloud_report_scope_update",
-        operation_id,
-        payload,
-    )
-}
-
-pub fn direct_cloud_report_content_save_mutation(
-    database: &Database,
-    operation_id: String,
-    payload: Value,
-) -> Result<Value, String> {
-    direct_cloud_json_mutation(
-        database,
-        "direct_cloud_report_content_save",
-        operation_id,
-        payload,
-    )
-}
-
-pub fn direct_cloud_report_regenerate_mutation(
-    database: &Database,
-    operation_id: String,
-    payload: Value,
-) -> Result<Value, String> {
-    direct_cloud_json_mutation(
-        database,
-        "direct_cloud_report_regenerate",
-        operation_id,
-        payload,
-    )
-}
-
-pub fn direct_cloud_report_delete_mutation(
-    database: &Database,
-    operation_id: String,
-    payload: Value,
-) -> Result<Value, String> {
-    direct_cloud_json_mutation(
-        database,
-        "direct_cloud_report_delete",
-        operation_id,
-        payload,
-    )
-}
-
-pub fn direct_cloud_report_template_create_mutation(
-    database: &Database,
-    operation_id: String,
-    payload: Value,
-) -> Result<Value, String> {
-    direct_cloud_json_mutation(
-        database,
-        "direct_cloud_report_template_create",
-        operation_id,
-        payload,
-    )
-}
-
-pub fn direct_cloud_report_template_duplicate_mutation(
-    database: &Database,
-    operation_id: String,
-    payload: Value,
-) -> Result<Value, String> {
-    direct_cloud_json_mutation(
-        database,
-        "direct_cloud_report_template_duplicate",
-        operation_id,
-        payload,
-    )
-}
-
-pub fn direct_cloud_report_template_update_mutation(
-    database: &Database,
-    operation_id: String,
-    payload: Value,
-) -> Result<Value, String> {
-    direct_cloud_json_mutation(
-        database,
-        "direct_cloud_report_template_update",
-        operation_id,
-        payload,
-    )
-}
-
-pub fn direct_cloud_report_template_set_default_mutation(
-    database: &Database,
-    operation_id: String,
-    payload: Value,
-) -> Result<Value, String> {
-    direct_cloud_json_mutation(
-        database,
-        "direct_cloud_report_template_set_default",
-        operation_id,
-        payload,
-    )
-}
-
-pub fn direct_cloud_report_template_reorder_mutation(
-    database: &Database,
-    operation_id: String,
-    payload: Value,
-) -> Result<Value, String> {
-    direct_cloud_json_mutation(
-        database,
-        "direct_cloud_report_template_reorder",
-        operation_id,
-        payload,
-    )
-}
-
-pub fn direct_cloud_report_template_delete_mutation(
-    database: &Database,
-    operation_id: String,
-    payload: Value,
-) -> Result<Value, String> {
-    direct_cloud_json_mutation(
-        database,
-        "direct_cloud_report_template_delete",
-        operation_id,
-        payload,
-    )
-}
-
-pub fn direct_cloud_shared_setting_update_mutation(
-    database: &Database,
-    operation_id: String,
-    payload: Value,
-) -> Result<Value, String> {
-    direct_cloud_json_mutation(
-        database,
-        "direct_cloud_shared_setting_update",
-        operation_id,
-        payload,
-    )
-}
-
-pub fn direct_cloud_subject_schedule_save_mutation(
-    database: &Database,
-    operation_id: String,
-    payload: Value,
-) -> Result<Value, String> {
-    direct_cloud_json_mutation(
-        database,
-        "direct_cloud_subject_schedule_save",
-        operation_id,
-        payload,
-    )
-}
-
-pub fn direct_cloud_integration_config_save_mutation(
-    database: &Database,
-    operation_id: String,
-    payload: Value,
-) -> Result<Value, String> {
-    direct_cloud_json_mutation(
-        database,
-        "direct_cloud_integration_config_save",
-        operation_id,
-        payload,
-    )
-}
-
-pub fn direct_cloud_external_binding_upsert_mutation(
-    database: &Database,
-    operation_id: String,
-    payload: Value,
-) -> Result<Value, String> {
-    direct_cloud_json_mutation(
-        database,
-        "direct_cloud_external_binding_upsert",
-        operation_id,
-        payload,
-    )
-}
-
-pub fn direct_cloud_external_binding_delete_mutation(
-    database: &Database,
-    operation_id: String,
-    payload: Value,
-) -> Result<Value, String> {
-    direct_cloud_json_mutation(
-        database,
-        "direct_cloud_external_binding_delete",
-        operation_id,
-        payload,
-    )
-}
-
-pub fn direct_cloud_plan_import_confirm_mutation(
-    database: &Database,
-    operation_id: String,
-    payload: Value,
-) -> Result<Value, String> {
-    direct_cloud_json_mutation(
-        database,
-        "direct_cloud_plan_import_confirm",
-        operation_id,
-        payload,
-    )
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DirectCloudDailyReportImportedFingerprints {
-    fingerprints: Vec<String>,
-}
-
-pub fn direct_cloud_daily_report_imported_fingerprints(
-    database: &Database,
-    subject_id: String,
-    source_date: String,
-    target_kind: String,
-    source_path_hash: String,
-    fingerprints: Vec<String>,
-) -> Result<Vec<String>, String> {
-    let context = direct_cloud_read_context(database)?;
-    let response = direct_cloud_query::<DirectCloudDailyReportImportedFingerprints>(
-        database,
-        "direct_cloud_daily_report_imported_fingerprints",
-        &context,
-        json!({
-            "p_subject_id": subject_id,
-            "p_source_date": source_date,
-            "p_target_kind": target_kind,
-            "p_source_path_hash": source_path_hash,
-            "p_fingerprints": fingerprints,
-        }),
-    )?;
-    Ok(response.data.fingerprints)
-}
-
-pub fn direct_cloud_daily_report_import_confirm_mutation(
-    database: &Database,
-    operation_id: String,
-    payload: Value,
-) -> Result<Value, String> {
-    direct_cloud_json_mutation(
-        database,
-        "direct_cloud_daily_report_import_confirm",
-        operation_id,
-        payload,
-    )
-}
-
-pub fn direct_cloud_time_allocation_export(
-    database: &Database,
-    request: crate::time_allocation_export::TimeAllocationExportRequest,
-) -> Result<Vec<crate::time_allocation_export::TimeAllocationExportRow>, String> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct ExportData {
-        rows: Vec<crate::time_allocation_export::TimeAllocationExportRow>,
-    }
-    let context = direct_cloud_read_context(database)?;
-    let response = direct_cloud_query::<ExportData>(
-        database,
-        "direct_cloud_time_allocation_export",
-        &context,
-        json!({
-            "p_start_date": request.start_date,
-            "p_end_date": request.end_date,
-            "p_include_special_time": request.include_special_time,
-        }),
-    )?;
-    Ok(response.data.rows)
-}
-
-pub fn direct_cloud_shared_configuration(
-    database: &Database,
-) -> Result<DirectCloudSharedConfigurationResponse, String> {
-    let context = direct_cloud_read_context(database)?;
-    direct_cloud_query(
-        database,
-        "direct_cloud_shared_configuration",
-        &context,
-        json!({}),
-    )
-}
-
-pub fn workspace_snapshot_create(
-    database: &Database,
-    request: CloudWorkspaceSnapshotCreateRequest,
-) -> Result<CloudWorkspaceSnapshot, String> {
-    let (state, session) = cloud_workspace_context(database, "云端快照")?;
-    let snapshot_type = request
-        .snapshot_type
-        .unwrap_or_else(|| "manual".to_string());
-    if !matches!(
-        snapshot_type.as_str(),
-        "manual" | "automatic" | "pre_restore"
-    ) {
-        return Err("VALIDATION_ERROR: 不支持的镜像类型".to_string());
-    }
-    let name = request.name.trim();
-    if name.is_empty() || name.chars().count() > 120 {
-        return Err("VALIDATION_ERROR: 镜像名称应为 1 到 120 个字符".to_string());
-    }
-    let value = client(database)?.rpc_for_database_with_timeout(
-        database,
-        "workspace_snapshot_create",
-        json!({
-            "p_workspace_id": state.workspace_id,
-            "p_device_id": state.device_id,
-            "p_operation_id": Uuid::now_v7().to_string(),
-            "p_snapshot_type": snapshot_type,
-            "p_name": name,
-            "p_note": request.note.and_then(|note| {
-                let note = note.trim().to_string();
-                (!note.is_empty()).then_some(note)
-            }),
-            "p_lazy": request.lazy.unwrap_or(false),
-        }),
-        &session,
-        SNAPSHOT_TIMEOUT_SECONDS,
-    )?;
-    serde_json::from_value(value)
-        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 镜像创建响应无效: {error}"))
-}
-
-pub fn workspace_snapshot_list(database: &Database) -> Result<Vec<CloudWorkspaceSnapshot>, String> {
-    let (state, session) = cloud_workspace_context(database, "云端快照")?;
-    let value = client(database)?.rpc_for_database(
-        database,
-        "workspace_snapshot_list",
-        json!({"p_workspace_id": state.workspace_id, "p_device_id": state.device_id}),
-        &session,
-    )?;
-    serde_json::from_value(value)
-        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 镜像列表响应无效: {error}"))
-}
-
-pub fn workspace_snapshot_set_protected(
-    database: &Database,
-    request: CloudWorkspaceSnapshotProtectRequest,
-) -> Result<CloudWorkspaceSnapshot, String> {
-    let (state, session) = cloud_workspace_context(database, "云端快照")?;
-    let value = client(database)?.rpc_for_database(
-        database,
-        "workspace_snapshot_set_protected",
-        json!({
-            "p_workspace_id": state.workspace_id,
-            "p_device_id": state.device_id,
-            "p_snapshot_id": request.snapshot_id,
-            "p_protected": request.protected,
-        }),
-        &session,
-    )?;
-    serde_json::from_value(value)
-        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 镜像保护响应无效: {error}"))
-}
-
-pub fn workspace_snapshot_delete(
-    database: &Database,
-    request: CloudWorkspaceSnapshotIdRequest,
-) -> Result<CloudWorkspaceSnapshotDeleteResult, String> {
-    let (state, session) = cloud_workspace_context(database, "云端快照")?;
-    let value = client(database)?.rpc_for_database(
-        database,
-        "workspace_snapshot_delete",
-        json!({
-            "p_workspace_id": state.workspace_id,
-            "p_device_id": state.device_id,
-            "p_snapshot_id": request.snapshot_id,
-        }),
-        &session,
-    )?;
-    serde_json::from_value(value)
-        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 镜像删除响应无效: {error}"))
-}
-
-pub fn workspace_snapshot_preview(
-    database: &Database,
-    request: CloudWorkspaceSnapshotIdRequest,
-) -> Result<CloudWorkspaceSnapshotPreview, String> {
-    let (state, session) = cloud_workspace_context(database, "云端快照")?;
-    let value = client(database)?.rpc_for_database(
-        database,
-        "workspace_snapshot_preview",
-        json!({
-            "p_workspace_id": state.workspace_id,
-            "p_device_id": state.device_id,
-            "p_snapshot_id": request.snapshot_id,
-        }),
-        &session,
-    )?;
-    serde_json::from_value(value)
-        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 快照详情响应无效: {error}"))
-}
-
-fn validate_automatic_snapshot_time(value: &str) -> Result<&str, String> {
-    let trimmed = value.trim();
-    let mut parts = trimmed.split(':');
-    let hour = parts.next().and_then(|part| part.parse::<u32>().ok());
-    let minute = parts.next().and_then(|part| part.parse::<u32>().ok());
-    let valid = trimmed.len() == 5
-        && trimmed.as_bytes()[2] == b':'
-        && parts.next().is_none()
-        && hour.is_some_and(|hour| hour < 24)
-        && minute.is_some_and(|minute| minute < 60);
-    if valid {
-        Ok(trimmed)
-    } else {
-        Err("VALIDATION_ERROR: 自动快照时间格式必须为 HH:MM".to_string())
-    }
-}
-
-fn validate_snapshot_retention_days(value: i64) -> Result<i64, String> {
-    if (1..=365).contains(&value) {
-        Ok(value)
-    } else {
-        Err("VALIDATION_ERROR: 快照最长保留天数必须在 1 到 365 天之间".to_string())
-    }
-}
-
-#[cfg(test)]
-mod snapshot_setting_tests {
-    use super::{validate_automatic_snapshot_time, validate_snapshot_retention_days};
-
-    #[test]
-    fn accepts_only_24_hour_clock_times() {
-        assert_eq!(validate_automatic_snapshot_time("00:00").unwrap(), "00:00");
-        assert_eq!(validate_automatic_snapshot_time("03:00").unwrap(), "03:00");
-        assert_eq!(validate_automatic_snapshot_time("23:59").unwrap(), "23:59");
-        assert!(validate_automatic_snapshot_time("24:00").is_err());
-        assert!(validate_automatic_snapshot_time("03:60").is_err());
-        assert!(validate_automatic_snapshot_time("3:00").is_err());
-        assert!(validate_automatic_snapshot_time("03:00:00").is_err());
-        assert!(validate_automatic_snapshot_time("daily").is_err());
-    }
-
-    #[test]
-    fn accepts_snapshot_retention_between_one_and_365_days() {
-        assert_eq!(validate_snapshot_retention_days(1).unwrap(), 1);
-        assert_eq!(validate_snapshot_retention_days(7).unwrap(), 7);
-        assert_eq!(validate_snapshot_retention_days(365).unwrap(), 365);
-        assert!(validate_snapshot_retention_days(0).is_err());
-        assert!(validate_snapshot_retention_days(366).is_err());
-    }
-}
-
-pub fn workspace_snapshot_settings_get(
-    database: &Database,
-) -> Result<CloudWorkspaceSnapshotSettings, String> {
-    let (state, session) = cloud_workspace_context(database, "云端快照")?;
-    let value = client(database)?.rpc_for_database(
-        database,
-        "workspace_snapshot_settings_get",
-        json!({"p_workspace_id": state.workspace_id, "p_device_id": state.device_id}),
-        &session,
-    )?;
-    serde_json::from_value(value)
-        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 快照设置响应无效: {error}"))
-}
-
-pub fn workspace_snapshot_settings_update(
-    database: &Database,
-    request: CloudWorkspaceSnapshotSettingsUpdateRequest,
-) -> Result<CloudWorkspaceSnapshotSettings, String> {
-    let (state, session) = cloud_workspace_context(database, "云端快照")?;
-    let time = validate_automatic_snapshot_time(&request.automatic_snapshot_time)?;
-    let retention_days = validate_snapshot_retention_days(request.snapshot_retention_days)?;
-    let value = client(database)?.rpc_for_database(
-        database,
-        "workspace_snapshot_settings_update",
-        json!({
-            "p_workspace_id": state.workspace_id,
-            "p_device_id": state.device_id,
-            "p_operation_id": Uuid::now_v7().to_string(),
-            "p_automatic_snapshot_enabled": request.automatic_snapshot_enabled,
-            "p_automatic_snapshot_time": time,
-            "p_snapshot_retention_days": retention_days,
-        }),
-        &session,
-    )?;
-    serde_json::from_value(value)
-        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 快照设置保存响应无效: {error}"))
-}
-
-fn ensure_local_restore_gate(database: &Database, workspace_id: &str) -> Result<(), String> {
-    let connection = database.open()?;
-    let dirty: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1 AND state IN ('pending','sending','failed','conflict')",
-        [workspace_id], |row| row.get(0),
-    ).map_err(|error| error.to_string())?;
-    if dirty > 0 {
-        return Err(
-            "SYNC_PENDING: 当前设备仍有待同步、失败或冲突操作，不能开始云端回滚".to_string(),
-        );
-    }
-    let active_timer: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM time_entries WHERE state IN ('running','paused') AND deleted_at IS NULL)", [], |row| row.get(0),
-    ).map_err(|error| error.to_string())?;
-    if active_timer {
-        return Err("RESTORE_ACTIVE_TIMER: 请先结束当前活动计时".to_string());
-    }
-    Ok(())
-}
-
-fn uses_direct_cloud_protocol(database: &Database) -> Result<bool, String> {
-    let connection = database.open()?;
-    Ok(
-        read_device_setting_string(&connection, "cloud_storage_protocol")?.as_deref()
-            == Some(crate::storage_contract::DIRECT_CLOUD_PROTOCOL),
-    )
-}
-
-fn record_direct_restore_checkpoint(
-    database: &Database,
-    workspace_id: &str,
-    device_id: &str,
-    workspace_epoch: i64,
-    reset_change_seq: i64,
-) -> Result<(), String> {
-    let connection = database.open()?;
-    connection
-        .execute(
-            "INSERT INTO local_sync_state(
-                 workspace_id,device_id,last_change_seq,last_full_sync_at,last_error,
-                 auth_blocked,auth_blocked_reason,auth_blocked_at,workspace_epoch,
-                 epoch_blocked,epoch_blocked_reason,epoch_blocked_at
-               ) VALUES(?1,?2,?3,NULL,NULL,0,NULL,NULL,?4,0,NULL,NULL)
-               ON CONFLICT(workspace_id) DO UPDATE SET
-                 device_id=excluded.device_id,
-                 last_change_seq=excluded.last_change_seq,
-                 last_full_sync_at=NULL,
-                 last_error=NULL,
-                 auth_blocked=0,
-                 auth_blocked_reason=NULL,
-                 auth_blocked_at=NULL,
-                 workspace_epoch=excluded.workspace_epoch,
-                 epoch_blocked=0,
-                 epoch_blocked_reason=NULL,
-                 epoch_blocked_at=NULL",
-            params![workspace_id, device_id, reset_change_seq, workspace_epoch],
-        )
-        .map_err(|error| {
-            format!("RESTORE_CHECKPOINT_UPDATE_FAILED: 无法保存恢复后的云端世代: {error}")
-        })?;
-    record_direct_cloud_access_success(workspace_id);
-    Ok(())
-}
-
-pub fn workspace_restore_prepare(
-    database: &Database,
-    request: CloudWorkspaceRestorePrepareRequest,
-) -> Result<CloudWorkspaceRestorePrepareResult, String> {
-    let (state, session) = cloud_workspace_context(database, "云端回滚")?;
-    if !uses_direct_cloud_protocol(database)? {
-        ensure_local_restore_gate(database, &state.workspace_id)?;
-    }
-    let direct_cloud = uses_direct_cloud_protocol(database)?;
-    let function = if direct_cloud {
-        "direct_cloud_workspace_restore_prepare"
-    } else {
-        "workspace_restore_prepare"
-    };
-    let value = client(database)?.rpc_for_database_with_epoch_and_timeout(database, function, json!({
-        "p_workspace_id":state.workspace_id,"p_device_id":state.device_id,"p_target_snapshot_id":request.snapshot_id,"p_expected_epoch":state.workspace_epoch,
-        "p_create_safety_snapshot":request.create_safety_snapshot
-    }), &session, state.workspace_epoch, RESTORE_TIMEOUT_SECONDS)?;
-    serde_json::from_value(value)
-        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 回滚准备响应无效: {error}"))
-}
-
-pub fn workspace_restore_commit(
-    database: &Database,
-    request: CloudWorkspaceRestoreCommitRequest,
-) -> Result<CloudWorkspaceRestoreResult, String> {
-    crate::cloud_sync::with_cloud_sync_operation_lock(|| {
-        workspace_restore_commit_locked(database, request)
-    })
-}
-
-fn workspace_restore_commit_locked(
-    database: &Database,
-    request: CloudWorkspaceRestoreCommitRequest,
-) -> Result<CloudWorkspaceRestoreResult, String> {
-    let (state, session) = cloud_workspace_context(database, "云端回滚")?;
-    let direct_cloud = uses_direct_cloud_protocol(database)?;
-    if !direct_cloud {
-        ensure_local_restore_gate(database, &state.workspace_id)?;
-    }
-    let function = if direct_cloud {
-        "direct_cloud_workspace_restore_commit"
-    } else {
-        "workspace_restore_commit"
-    };
-    let value = client(database)?.rpc_for_database_with_epoch_and_timeout(database, function, json!({
-        "p_workspace_id":state.workspace_id,"p_device_id":state.device_id,"p_lock_token":request.lock_token,
-        "p_target_snapshot_id":request.target_snapshot_id,"p_target_content_hash":request.target_content_hash,
-        "p_prepared_epoch":request.prepared_epoch,"p_operation_id":Uuid::now_v7().to_string(),"p_confirmed":true
-    }), &session, request.prepared_epoch, RESTORE_TIMEOUT_SECONDS)?;
-    let mut restored: CloudWorkspaceRestoreResult = serde_json::from_value(value)
-        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 回滚提交响应无效: {error}"))?;
-    if !restored.restored {
-        return Err("CLOUD_RESPONSE_INVALID: 云端没有确认恢复成功".to_string());
-    }
-    if direct_cloud {
-        record_direct_restore_checkpoint(
-            database,
-            &state.workspace_id,
-            &state.device_id,
-            restored.workspace_epoch,
-            restored.reset_change_seq,
-        )?;
-        restored.local_cache_rebuilt = false;
-        return Ok(restored);
-    }
-    crate::cloud_sync::rebuild_local_cache_after_workspace_restore_locked(
-        database,
-        restored.workspace_epoch,
-        restored.reset_change_seq,
-    )
-    .map_err(|error| {
-        format!("RESTORE_LOCAL_REBUILD_FAILED: 云端已恢复成功，但当前设备重新下载失败：{error}")
-    })?;
-    restored.local_cache_rebuilt = true;
-    Ok(restored)
-}
-
-pub fn workspace_restore_cancel(
-    database: &Database,
-    request: CloudWorkspaceRestoreCancelRequest,
-) -> Result<Value, String> {
-    let (state, session) = cloud_workspace_context(database, "云端回滚")?;
-    client(database)?.rpc_for_database_with_epoch(database, "workspace_restore_cancel", json!({
-        "p_workspace_id":state.workspace_id,"p_device_id":state.device_id,"p_lock_token":request.lock_token
-    }), &session, state.workspace_epoch)
-}
-
-pub(crate) fn storage_mode_from_connection(
-    connection: &rusqlite::Connection,
-    online: bool,
-) -> Result<StorageModeSnapshot, String> {
-    let local_workspace_id: String = connection
-        .query_row(
-            "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    let device_id: String = connection
-        .query_row(
-            "SELECT id FROM devices WHERE workspace_id = ?1 AND revoked_at IS NULL ORDER BY created_at LIMIT 1",
-            [&local_workspace_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    let mode: String = connection
-        .query_row(
-            "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'storage_mode'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or_else(|_| "local".to_string());
-    let configured_cloud_protocol = crate::storage_contract::DIRECT_CLOUD_PROTOCOL.to_string();
-    let storage_protocol = if mode == "cloud" {
-        configured_cloud_protocol.clone()
-    } else {
-        "local".to_string()
-    };
-    let workspace_id = if mode == "cloud" {
-        connection
-            .query_row(
-                "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'cloud_workspace_id'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|_| "CLOUD_NOT_CONFIGURED: 尚未初始化 Supabase 工作空间".to_string())?
-    } else {
-        local_workspace_id.clone()
-    };
-    let (last_change_seq, last_synced_at, last_error, workspace_epoch): (i64, Option<i64>, Option<String>, i64) = connection
-        .query_row(
-            "SELECT last_change_seq, last_full_sync_at, last_error, workspace_epoch FROM local_sync_state WHERE workspace_id = ?1",
-            [&workspace_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap_or((0, None, None, 1));
-    let cloud_workspace_id: Option<String> = connection
-        .query_row(
-            "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'cloud_workspace_id'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?;
-    let (auth_blocked, auth_blocked_reason) = cloud_workspace_id
-        .as_deref()
-        .and_then(|cloud_workspace_id| {
-            connection
-                .query_row(
-                    "SELECT auth_blocked, auth_blocked_reason FROM local_sync_state WHERE workspace_id = ?1",
-                    [cloud_workspace_id],
-                    |row| Ok((row.get::<_, bool>(0)?, row.get::<_, Option<String>>(1)?)),
-                )
-                .optional()
-                .ok()
-                .flatten()
-        })
-        .unwrap_or((false, None));
-    let direct_cloud = mode == "cloud";
-    let runtime_access = direct_cloud
-        .then(|| direct_cloud_access_runtime(&workspace_id))
-        .flatten();
-    let (cloud_access_state, cloud_writable, read_only_reason) = if mode == "local" {
-        ("local_writable".to_string(), true, None)
-    } else if auth_blocked {
-        (
-            "reauth_required".to_string(),
-            false,
-            Some(
-                auth_blocked_reason
-                    .clone()
-                    .unwrap_or_else(|| "云端授权已失效，请重新登录".to_string()),
-            ),
-        )
-    } else if !online {
-        let state = runtime_access
-            .as_ref()
-            .map(|runtime| runtime.state)
-            .filter(|state| *state == DirectCloudAccessState::ReauthRequired)
-            .unwrap_or(DirectCloudAccessState::OfflineReadonly);
-        let reason = runtime_access
-            .as_ref()
-            .and_then(|runtime| runtime.reason.clone())
-            .or_else(|| Some("当前无法连接 Supabase，云端数据暂时只读".to_string()));
-        (state.as_str().to_string(), state.writable(), reason)
-    } else {
-        let runtime = runtime_access.unwrap_or(DirectCloudAccessRuntime {
-            state: DirectCloudAccessState::Connecting,
-            reason: Some("正在连接 Supabase 并加载云端数据".to_string()),
-        });
-        (
-            runtime.state.as_str().to_string(),
-            runtime.state.writable(),
-            runtime.reason,
-        )
-    };
-    Ok(StorageModeSnapshot {
-        online: mode == "local" || online,
-        sync_state: if last_error.is_some() {
-            "error".to_string()
-        } else {
-            "synced".to_string()
-        },
-        storage_backend: if mode == "local" {
-            "local_sqlite".to_string()
-        } else {
-            "direct_supabase".to_string()
-        },
-        mode,
-        storage_protocol,
-        configured_cloud_protocol,
-        cloud_access_state,
-        cloud_writable,
-        read_only_reason,
-        workspace_id,
-        device_id,
-        pending_operations: 0,
-        conflict_count: 0,
-        last_change_seq,
-        last_synced_at,
-        last_error,
-        auth_blocked,
-        auth_blocked_reason,
-        workspace_epoch,
-        epoch_blocked: false,
-        epoch_blocked_reason: None,
-    })
-}
-
-pub fn configure(database: &Database, request: CloudConfigureRequest) -> Result<(), String> {
-    let project_url = validate_project_url(&request.project_url)?;
-    let anon_key = request.anon_key.trim();
-    if anon_key.is_empty() {
-        return Err("VALIDATION_ERROR: Supabase anon key 不能为空".to_string());
-    }
-    if is_service_role_key(anon_key) {
-        return Err("SECURITY_ERROR: 不允许把 Supabase service_role key 放入桌面应用".to_string());
-    }
-    let replacing_existing_connection =
-        cloud_configuration_is_changing(database, &project_url, anon_key)?;
-    ensure_can_replace_cloud_configuration(database, &project_url, anon_key)?;
-    let http = Client::builder()
-        .timeout(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECONDS))
-        .build()
-        .map_err(|error| format!("NETWORK_ERROR: 无法初始化 Supabase 客户端: {error}"))?;
-    let response = send_auth_settings_request(&http, &project_url, anon_key)?;
-    if !response.status().is_success() {
-        return Err(map_http_error(response, "CLOUD_NOT_CONFIGURED"));
-    }
-    settings::update_setting(
-        database,
-        SettingsUpdate {
-            scope: SettingsScope::Device,
-            key: "supabase_project_url".to_string(),
-            value: json!(project_url),
-        },
-    )?;
-    settings::update_setting(
-        database,
-        SettingsUpdate {
-            scope: SettingsScope::Device,
-            key: "supabase_anon_key".to_string(),
-            value: json!(anon_key),
-        },
-    )?;
-    if replacing_existing_connection {
-        clear_all_saved_sessions(database)?;
-    }
-    Ok(())
-}
-
-pub const CLOUD_PROJECT_READY: &str = "ready";
-pub const CLOUD_PROJECT_UNCONFIGURED: &str = "unconfigured";
-pub const CLOUD_PROJECT_SCHEMA_MISSING: &str = "schema_missing";
-pub const CLOUD_PROJECT_SCHEMA_NOT_EXPOSED: &str = "schema_not_exposed";
-pub const CLOUD_PROJECT_UNREACHABLE: &str = "unreachable";
-
-/// Checks whether the connected Supabase project already has the TimeGenie
-/// schema, using only the anon key. The desktop client never holds DDL rights,
-/// so an uninitialized project can only be reported to the user, not repaired by
-/// the app itself.
-pub fn probe_cloud_project(database: &Database) -> Result<CloudProjectProbe, String> {
-    let client = match client(database) {
-        Ok(client) => client,
-        Err(error) if error.starts_with("CLOUD_NOT_CONFIGURED") => {
-            return Ok(CloudProjectProbe {
-                state: CLOUD_PROJECT_UNCONFIGURED.to_string(),
-                message: "尚未配置 Supabase 项目地址和 anon key".to_string(),
-            });
-        }
-        Err(error) => return Err(error),
-    };
-    let url = format!(
-        "{}/rest/v1/workspaces?select=id&limit=1",
-        client.project_url
-    );
-    let mut request = client
-        .http
-        .get(url)
-        .header("apikey", &client.anon_key)
-        .bearer_auth(&client.anon_key)
-        .header("Accept-Profile", CLOUD_SCHEMA);
-    if let Ok(session) = current_session(database) {
-        request = request.bearer_auth(session.access_token);
-    }
-    let response = request.send();
-    match response {
-        Ok(response) => {
-            let status = response.status();
-            let body = response.text().unwrap_or_default();
-            Ok(classify_probe_response(status, &body))
-        }
-        Err(error) => Ok(CloudProjectProbe {
-            state: CLOUD_PROJECT_UNREACHABLE.to_string(),
-            message: map_supabase_request_error(error),
-        }),
-    }
-}
-
-fn classify_probe_response(status: StatusCode, body: &str) -> CloudProjectProbe {
-    let classified = classify_http_error(status, body, "CLOUD_REQUEST_FAILED");
-    let state = if classified.starts_with("CLOUD_SCHEMA_MISSING") {
-        CLOUD_PROJECT_SCHEMA_MISSING
-    } else if classified.starts_with("CLOUD_SCHEMA_NOT_EXPOSED") {
-        CLOUD_PROJECT_SCHEMA_NOT_EXPOSED
-    } else if classified.starts_with("NETWORK_ERROR")
-        || classified.starts_with("CLOUD_TIMEOUT")
-        || classified.starts_with("CLOUD_SERVICE_UNAVAILABLE")
-    {
-        CLOUD_PROJECT_UNREACHABLE
-    } else {
-        CLOUD_PROJECT_READY
-    };
-    let message = if state == CLOUD_PROJECT_READY {
-        "云端项目已初始化，可以登录并同步".to_string()
-    } else {
-        classified
-    };
-    CloudProjectProbe {
-        state: state.to_string(),
-        message,
-    }
-}
-
-pub fn sign_in_password(
-    database: &Database,
-    request: CloudSignInRequest,
-) -> Result<CloudSessionSnapshot, String> {
-    if request.email.trim().is_empty() || request.password.is_empty() {
-        return Err("AUTH_FAILED: 邮箱和密码不能为空".to_string());
-    }
-    let client = client(database)?;
-    let response = client.auth_token(
-        "password",
-        json!({ "email": request.email.trim(), "password": request.password }),
-    )?;
-    if !response.status().is_success() {
-        return Err(map_auth_error(response, "AUTH_FAILED"));
-    }
-    let auth: AuthResponse = response
-        .json()
-        .map_err(|error| format!("AUTH_FAILED: Supabase 登录响应无效: {error}"))?;
-    let user = auth
-        .user
-        .ok_or_else(|| "AUTH_FAILED: 登录响应缺少用户信息".to_string())?;
-    let session = CloudSession {
-        user_id: user.id,
-        email: user.email,
-        access_token: auth.access_token,
-        refresh_token: auth.refresh_token,
-        expires_at: auth.expires_in.map(|seconds| now_seconds() + seconds),
-    };
-    save_session(database, &session)?;
-    let _ = workspace_bootstrap_with_session(database, &client, &session)?;
-    crate::cloud_sync::wake_after_connection_ready();
-    Ok(session_snapshot(&session))
-}
-
-pub fn sign_out(database: &Database) -> Result<(), String> {
-    sign_out_with_scope(database, false)
-}
-
-pub fn sign_out_all(database: &Database) -> Result<(), String> {
-    sign_out_with_scope(database, true)
-}
-
-fn sign_out_with_scope(database: &Database, all_devices: bool) -> Result<(), String> {
-    let session = current_session(database)?;
-    let state = storage_mode(database)?;
-    let api = client(database)?;
-    let cloud_workspace_id: Option<String> = database
-        .open()?
-        .query_row(
-            "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'cloud_workspace_id'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?;
-    if let Some(cloud_workspace_id) = cloud_workspace_id {
-        if all_devices {
-            api.rpc_for_database(
-                database,
-                "device_revoke_all",
-                json!({ "p_workspace_id": cloud_workspace_id }),
-                &session,
-            )?;
-        } else {
-            let authorization = api.rpc_for_database(
-                database,
-                "device_authorization_get",
-                json!({ "p_workspace_id": cloud_workspace_id, "p_device_id": state.device_id }),
-                &session,
-            )?;
-            if authorization.get("authorized").and_then(Value::as_bool) == Some(true) {
-                api.rpc_for_database(
-                    database,
-                    "device_revoke",
-                    json!({ "p_workspace_id": cloud_workspace_id, "p_device_id": state.device_id }),
-                    &session,
-                )?;
-            }
-        }
-    }
-    let logout_result = api.auth_logout(&session, if all_devices { "global" } else { "local" });
-    clear_saved_session_for_workspace(database, &local_workspace_id(database)?)?;
-    mark_auth_blocked(
-        database,
-        if all_devices {
-            "all_devices_signed_out"
-        } else {
-            "current_device_signed_out"
-        },
-    )?;
-    settings::update_setting(
-        database,
-        SettingsUpdate {
-            scope: SettingsScope::Device,
-            key: "storage_mode".to_string(),
-            value: json!("local"),
-        },
-    )?;
-    logout_result
-}
-
-fn ensure_no_pending_cloud_work(database: &Database) -> Result<(), String> {
-    let state = storage_mode(database)?;
-    if state.mode == "cloud" && (state.pending_operations > 0 || state.conflict_count > 0) {
-        return Err(
-            "OFFLINE_RESTRICTED: 请先同步或处理云端冲突，再退出账号或切换到本地模式".to_string(),
-        );
-    }
-    Ok(())
-}
-
-fn ensure_can_replace_cloud_configuration(
-    database: &Database,
-    project_url: &str,
-    anon_key: &str,
-) -> Result<(), String> {
-    let connection = database.open()?;
-    let mode: String = connection
-        .query_row(
-            "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'storage_mode'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or_else(|_| "local".to_string());
-    if mode != "cloud" {
-        return Ok(());
-    }
-    drop(connection);
-
-    if cloud_configuration_is_changing(database, project_url, anon_key)? {
-        ensure_no_pending_cloud_work(database).map_err(|error| {
-            if error.starts_with("OFFLINE_RESTRICTED:") {
-                "OFFLINE_RESTRICTED: 请先同步或处理云端冲突，再更换 Supabase 项目或公开 key"
-                    .to_string()
-            } else {
-                error
-            }
-        })?;
-    }
-    Ok(())
-}
-
-fn cloud_configuration_is_changing(
-    database: &Database,
-    project_url: &str,
-    anon_key: &str,
-) -> Result<bool, String> {
-    let connection = database.open()?;
-    let current_project_url: Option<String> = connection
-        .query_row(
-            "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'supabase_project_url'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?;
-    let current_anon_key: Option<String> = connection
-        .query_row(
-            "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'supabase_anon_key'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?;
-    Ok(current_project_url
-        .as_deref()
-        .is_some_and(|current| current != project_url)
-        || current_anon_key
-            .as_deref()
-            .is_some_and(|current| current != anon_key))
-}
-
-fn send_auth_settings_request(
-    http: &Client,
-    project_url: &str,
-    anon_key: &str,
-) -> Result<reqwest::blocking::Response, String> {
-    let url = format!("{project_url}/auth/v1/settings");
-    let response = http
-        .get(&url)
-        .header("apikey", anon_key)
-        .send()
-        .map_err(|error| format!("NETWORK_ERROR: 无法连接 Supabase 项目: {error}"))?;
-    if matches!(
-        response.status(),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-    ) {
-        return http
-            .get(url)
-            .header("apikey", anon_key)
-            .bearer_auth(anon_key)
-            .send()
-            .map_err(|error| format!("NETWORK_ERROR: 无法连接 Supabase 项目: {error}"));
-    }
-    Ok(response)
-}
-
-pub fn session_snapshot_for_database(database: &Database) -> Result<CloudSessionSnapshot, String> {
-    match current_session(database) {
-        Ok(session) => match validate_remote_session(database, &session) {
-            Ok(()) => match validate_current_device_authorization(database, &session) {
-                Ok(()) => Ok(session_snapshot(&session)),
-                Err(error) if should_preserve_saved_session(&error) => {
-                    offline_session_snapshot(database, session_reason_code(&error))
-                }
-                Err(error) => Ok(reauth_required_snapshot(session_reason_code(&error))),
-            },
-            Err(error) if should_preserve_saved_session(&error) => {
-                offline_session_snapshot(database, session_reason_code(&error))
-            }
-            Err(error) => Ok(reauth_required_snapshot(session_reason_code(&error))),
-        },
-        Err(error) if should_preserve_saved_session(&error) => Ok(offline_session_snapshot(
-            database,
-            session_reason_code(&error),
-        )?),
-        Err(error) => Ok(reauth_required_snapshot(session_reason_code(&error))),
-    }
-}
-
-fn validate_current_device_authorization(
-    database: &Database,
-    session: &CloudSession,
-) -> Result<(), String> {
-    let state = storage_mode(database)?;
-    if state.mode != "cloud" {
-        return Ok(());
-    }
-    let api = client(database)?;
-    let response = api
-        .post(format!(
-            "{}/rest/v1/rpc/device_authorization_get",
-            api.project_url
-        ))
-        .bearer_auth(&session.access_token)
-        .json(&json!({ "p_workspace_id": state.workspace_id, "p_device_id": state.device_id }))
-        .send()
-        .map_err(|error| format!("NETWORK_ERROR: Supabase 设备授权校验失败: {error}"))?;
-    if !response.status().is_success() {
-        let error = map_http_error(response, "CLOUD_REQUEST_FAILED");
-        return Err(if error.starts_with("AUTH_FAILED:") {
-            error.replacen("AUTH_FAILED:", "AUTH_UNVERIFIED:", 1)
-        } else {
-            error
-        });
-    }
-    let value: Value = response
-        .json()
-        .map_err(|error| format!("NETWORK_ERROR: 设备授权响应无效: {error}"))?;
-    if value.get("authorized").and_then(Value::as_bool) == Some(true) {
-        return Ok(());
-    }
-    clear_saved_session_for_workspace(database, &local_workspace_id(database)?)?;
-    mark_auth_blocked(database, "device_revoked")?;
-    Err("DEVICE_REVOKED: 当前设备的云端授权已被撤销，请重新登录".to_string())
-}
-
-fn validate_remote_session(database: &Database, session: &CloudSession) -> Result<(), String> {
-    let api = client(database)?;
-    let response = api
-        .http
-        .get(format!("{}/auth/v1/user", api.project_url))
-        .header("apikey", api.anon_key())
-        .bearer_auth(&session.access_token)
-        .send()
-        .map_err(|error| format!("NETWORK_ERROR: Supabase 会话校验失败: {error}"))?;
-    if response.status().is_success() {
-        return Ok(());
-    }
-    if matches!(
-        response.status(),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-    ) {
-        return refresh_current_session(database).map(|_| ());
-    }
-    Err(map_http_error(response, "AUTH_UNVERIFIED"))
-}
-
-pub fn workspace_bootstrap(database: &Database) -> Result<CloudWorkspace, String> {
-    let session = current_session(database)?;
-    let client = client(database)?;
-    workspace_bootstrap_with_session(database, &client, &session)
-}
-
-fn workspace_bootstrap_with_session(
-    database: &Database,
-    client: &SupabaseClient,
-    session: &CloudSession,
-) -> Result<CloudWorkspace, String> {
-    let mut workspace = read_workspace_with_session(database, client, session)?;
-    let workspace_already_existed = workspace.is_some();
-    if workspace.is_none() {
-        let response = client.request_for_database(
-            database,
-            client
-                .post(format!("{}/rest/v1/workspaces", client.project_url))
-                .header("Prefer", "return=representation")
-                .json(&json!({
-                    "owner_user_id": session.user_id,
-                    "name": "我的工作台",
-                    "timezone": "Asia/Shanghai"
-                })),
-            session,
-        )?;
-        let created: Vec<WorkspaceRow> = response
-            .json::<Vec<WorkspaceRow>>()
-            .map_err(|error| format!("NETWORK_ERROR: 创建 Supabase 工作空间失败: {error}"))?;
-        workspace = created.into_iter().next();
-    }
-    let workspace =
-        workspace.ok_or_else(|| "VERSION_CONFLICT: Supabase 未返回可用工作空间".to_string())?;
-    let initialize_result = client.rpc_for_database(
-        database,
-        "workspace_initialize_defaults",
-        json!({ "p_workspace_id": workspace.id.clone() }),
-        session,
-    );
-    if let Err(error) = initialize_result {
-        // Older cloud projects can have the named report-template columns but
-        // still expose a pre-upgrade bootstrap function that inserts templates
-        // without `name`. Existing workspaces already have their business data,
-        // so allow them to continue to snapshot download until the cloud SQL
-        // patch is deployed. A newly-created workspace must still initialize
-        // successfully or it would be left incomplete.
-        if !(workspace_already_existed && is_legacy_report_template_bootstrap_error(&error)) {
-            return Err(error);
-        }
-    }
-    settings::update_setting(
-        database,
-        SettingsUpdate {
-            scope: SettingsScope::Device,
-            key: "cloud_workspace_id".to_string(),
-            value: json!(workspace.id),
-        },
-    )?;
-    let latest_change_seq = latest_change_seq(database, client, session, &workspace.id)?;
-    Ok(CloudWorkspace {
-        id: workspace.id,
-        name: workspace.name,
-        timezone: workspace.timezone,
-        latest_change_seq,
-    })
-}
-
-fn is_legacy_report_template_bootstrap_error(error: &str) -> bool {
-    let normalized = error.to_ascii_lowercase();
-    normalized.contains("null value in column \"name\"")
-        && normalized.contains("report_templates")
-        && normalized.contains("not-null constraint")
-}
-
-fn read_workspace_with_session(
-    database: &Database,
-    client: &SupabaseClient,
-    session: &CloudSession,
-) -> Result<Option<WorkspaceRow>, String> {
-    let workspaces: Vec<WorkspaceRow> = client
-        .request_for_database(
-            database,
-            client
-                .get(format!(
-                    "{}/rest/v1/workspaces?owner_user_id=eq.{}&deleted_at=is.null&select=id,name,timezone&limit=1",
-                    client.project_url, session.user_id
-                )),
-            session,
-        )?
-        .json()
-        .map_err(|error| format!("NETWORK_ERROR: 读取 Supabase 工作空间失败: {error}"))?;
-    Ok(workspaces.into_iter().next())
-}
-
-fn workspace_preview(database: &Database) -> Result<Option<CloudWorkspace>, String> {
-    let session = current_session(database)?;
-    let client = client(database)?;
-    let Some(workspace) = read_workspace_with_session(database, &client, &session)? else {
-        return Ok(None);
-    };
-    let latest_change_seq = latest_change_seq(database, &client, &session, &workspace.id)?;
-    Ok(Some(CloudWorkspace {
-        id: workspace.id,
-        name: workspace.name,
-        timezone: workspace.timezone,
-        latest_change_seq,
-    }))
-}
-
-pub fn register_device(
-    database: &Database,
-    request: CloudDeviceRegisterRequest,
-) -> Result<CloudDevice, String> {
-    let session = current_session(database)?;
-    let workspace = workspace_bootstrap(database)?;
-    let connection = database.open()?;
-    let device_id: String = connection
-        .query_row(
-            "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'device_id'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    let client = client(database)?;
-    let value = client.rpc_for_database(
-        database,
-        "device_authorize",
-        json!({
-            "p_workspace_id": workspace.id,
-            "p_device_id": device_id,
-            "p_device_name": request.device_name.trim(),
-            "p_platform": request.platform,
-            "p_app_version": request.app_version
-        }),
-        &session,
-    )?;
-    let device: DeviceRow = serde_json::from_value(value)
-        .map_err(|error| format!("NETWORK_ERROR: 注册设备响应无效: {error}"))?;
-    Ok(CloudDevice {
-        id: device.id,
-        workspace_id: device.workspace_id,
-        device_name: device.device_name,
-        platform: device.platform,
-        app_version: device.app_version,
-        last_seen_at: device.last_seen_at,
-        authorized_at: device.authorized_at,
-        reauthorized_at: device.reauthorized_at,
-        revoked_at: device.revoked_at,
-        current: true,
-    })
-}
-
-pub fn list_devices(database: &Database) -> Result<Vec<CloudDevice>, String> {
-    let session = current_session(database)?;
-    let state = storage_mode(database)?;
-    let value = client(database)?.rpc_for_database(
-        database,
-        "device_list",
-        json!({ "p_workspace_id": state.workspace_id }),
-        &session,
-    )?;
-    let rows: Vec<DeviceRow> = serde_json::from_value(value)
-        .map_err(|error| format!("NETWORK_ERROR: 设备列表响应无效: {error}"))?;
-    Ok(rows
-        .into_iter()
-        .map(|row| cloud_device_from_row(row, &state.device_id))
-        .collect())
-}
-
-fn cloud_device_from_row(row: DeviceRow, current_device_id: &str) -> CloudDevice {
-    CloudDevice {
-        current: row.id == current_device_id,
-        id: row.id,
-        workspace_id: row.workspace_id,
-        device_name: row.device_name,
-        platform: row.platform,
-        app_version: row.app_version,
-        last_seen_at: row.last_seen_at,
-        authorized_at: row.authorized_at,
-        reauthorized_at: row.reauthorized_at,
-        revoked_at: row.revoked_at,
-    }
-}
-
-pub fn revoke_device(database: &Database, device_id: &str) -> Result<Vec<CloudDevice>, String> {
-    let session = current_session(database)?;
-    let state = storage_mode(database)?;
-    client(database)?.rpc_for_database(
-        database,
-        "device_revoke",
-        json!({ "p_workspace_id": state.workspace_id, "p_device_id": device_id }),
-        &session,
-    )?;
-    if device_id == state.device_id {
-        let _ = client(database)?.auth_logout(&session, "local");
-        clear_saved_session_for_workspace(database, &local_workspace_id(database)?)?;
-        mark_auth_blocked(database, "device_revoked")?;
-        settings::update_setting(
-            database,
-            SettingsUpdate {
-                scope: SettingsScope::Device,
-                key: "storage_mode".to_string(),
-                value: json!("local"),
-            },
-        )?;
-        return Ok(Vec::new());
-    }
-    list_devices(database)
-}
-
-pub(crate) fn ensure_current_device_authorized(database: &Database) -> Result<(), String> {
-    let state = storage_mode(database)?;
-    if state.mode != "cloud" {
-        return Ok(());
-    }
-    let session = current_session(database)?;
-    let value = client(database)?.rpc_for_database(
-        database,
-        "device_authorization_get",
-        json!({ "p_workspace_id": state.workspace_id, "p_device_id": state.device_id }),
-        &session,
-    )?;
-    if value.get("authorized").and_then(Value::as_bool) == Some(true) {
-        if auth_blocked_reason(database)?.is_some() {
-            if state.storage_protocol == crate::storage_contract::DIRECT_CLOUD_PROTOCOL {
-                quarantine_direct_v2_auth_resume_queue(database, &state.workspace_id)?;
-                return Ok(());
-            }
-            return Err(
-                "AUTH_RESUME_REQUIRED: 登录已恢复，请确认如何处理此前保留的待同步修改".to_string(),
-            );
-        }
-        return Ok(());
-    }
-    let _ = client(database)?.auth_logout(&session, "local");
-    clear_saved_session_for_workspace(database, &local_workspace_id(database)?)?;
-    mark_auth_blocked(database, "device_revoked")?;
-    Err("DEVICE_REVOKED: 当前设备的云端授权已被撤销，请重新登录".to_string())
-}
-
-fn legacy_queue_counts(
-    connection: &rusqlite::Connection,
-    workspace_id: &str,
-) -> Result<LegacyQueueCounts, String> {
-    connection
-        .query_row(
-            "SELECT
-               SUM(CASE WHEN state='pending' THEN 1 ELSE 0 END),
-               SUM(CASE WHEN state='sending' THEN 1 ELSE 0 END),
-               SUM(CASE WHEN state='failed' THEN 1 ELSE 0 END),
-               SUM(CASE WHEN state='conflict' THEN 1 ELSE 0 END),
-               COUNT(*)
-             FROM sync_outbox
-             WHERE workspace_id=?1",
-            [workspace_id],
-            |row| {
-                Ok(LegacyQueueCounts {
-                    pending: row.get::<_, Option<i64>>(0)?.unwrap_or(0),
-                    sending: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                    failed: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                    conflict: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
-                    total: row.get(4)?,
-                })
-            },
-        )
-        .map_err(|error| error.to_string())
-}
-
-pub fn storage_protocol_upgrade_preflight(
-    database: &Database,
-) -> Result<StorageProtocolUpgradePreflight, String> {
-    let connection = database.open()?;
-    let workspace_id = read_device_setting_string(&connection, "cloud_workspace_id")?
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "CLOUD_NOT_CONFIGURED: 尚未初始化 Supabase 工作空间".to_string())?;
-    let local_protocol = read_device_setting_string(&connection, "cloud_storage_protocol")?
-        .unwrap_or_else(|| crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string());
-    let device_id = read_device_setting_string(&connection, "device_id")?
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "CLOUD_DEVICE_REQUIRED: 请先完成云端设备注册".to_string())?;
-    let local_workspace_epoch = connection
-        .query_row(
-            "SELECT workspace_epoch FROM local_sync_state WHERE workspace_id=?1",
-            [&workspace_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .unwrap_or(1);
-    let queue = legacy_queue_counts(&connection, &workspace_id)?;
-    drop(connection);
-
-    let session = current_session(database)?;
-    let server: StorageProtocolUpgradeServerPreflight =
-        serde_json::from_value(client(database)?.rpc_for_database(
-            database,
-            "storage_protocol_upgrade_preflight",
-            json!({ "p_workspace_id": workspace_id, "p_device_id": device_id }),
-            &session,
-        )?)
-        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 协议升级预检响应无效: {error}"))?;
-    if server.workspace_id != workspace_id || server.device_id != device_id {
-        return Err("CLOUD_RESPONSE_INVALID: 协议升级预检工作空间或设备不一致".to_string());
-    }
-    let devices = list_devices(database)?;
-    Ok(build_storage_protocol_upgrade_preflight(
-        server,
-        local_protocol,
-        local_workspace_epoch,
-        devices,
-        queue,
-    ))
-}
-
-fn build_storage_protocol_upgrade_preflight(
-    server: StorageProtocolUpgradeServerPreflight,
-    local_protocol: String,
-    local_workspace_epoch: i64,
-    devices: Vec<CloudDevice>,
-    queue: LegacyQueueCounts,
-) -> StorageProtocolUpgradePreflight {
-    let mut blocked_reasons = Vec::new();
-    if server.workspace_epoch != local_workspace_epoch {
-        blocked_reasons.push(format!(
-            "本机工作空间世代为 {local_workspace_epoch}，云端为 {}，请先完成最后一次旧协议刷新",
-            server.workspace_epoch
-        ));
-    }
-    if queue.total > 0 {
-        blocked_reasons.push(format!(
-            "当前设备仍有 {} 条旧同步操作（等待 {}、发送中 {}、失败 {}、冲突 {}）",
-            queue.total, queue.pending, queue.sending, queue.failed, queue.conflict
-        ));
-    }
-    if !server.server_upgrade_allowed && !server.already_direct {
-        blocked_reasons.push("云端当前协议不允许升级到 direct_v2".to_string());
-    }
-    let can_upgrade_with_drained_queue = server.server_upgrade_allowed
-        && server.workspace_epoch == local_workspace_epoch
-        && queue.total == 0;
-    StorageProtocolUpgradePreflight {
-        workspace_id: server.workspace_id,
-        device_id: server.device_id,
-        storage_protocol: server.storage_protocol,
-        local_protocol,
-        workspace_epoch: server.workspace_epoch,
-        local_workspace_epoch,
-        server_upgrade_allowed: server.server_upgrade_allowed,
-        already_direct: server.already_direct,
-        requires_local_queue_disposition: server.requires_local_queue_disposition,
-        allowed_queue_dispositions: server.allowed_queue_dispositions,
-        devices,
-        queue,
-        can_upgrade_with_drained_queue,
-        blocked_reasons,
-        server_time: server.server_time,
-    }
-}
-
-fn ensure_upgrade_preflight_can_drain(
-    preflight: &StorageProtocolUpgradePreflight,
-) -> Result<(), String> {
-    if preflight.already_direct {
-        return Err(
-            "CLOUD_PROTOCOL_UNSUPPORTED: 云端工作空间已启用直连协议，请重新打开应用加载直连数据"
-                .to_string(),
-        );
-    }
-    if preflight.storage_protocol != crate::storage_contract::LEGACY_SYNC_PROTOCOL
-        || !preflight.server_upgrade_allowed
-    {
-        return Err("CLOUD_PROTOCOL_UNSUPPORTED: 云端当前协议不允许执行旧队列升级".to_string());
-    }
-    if preflight.local_protocol != crate::storage_contract::LEGACY_SYNC_PROTOCOL {
-        return Err("CLOUD_PROTOCOL_UNSUPPORTED: 本机当前协议不允许执行旧队列升级".to_string());
-    }
-    Ok(())
-}
-
-fn run_legacy_queue_upgrade_flow<D, R, S>(
-    initial: &StorageProtocolUpgradePreflight,
-    drain: D,
-    recheck: R,
-    switch: S,
-) -> Result<
-    (
-        StorageProtocolUpgradeServerResult,
-        StorageProtocolUpgradePreflight,
-        crate::cloud_sync::LegacyQueueDrainResult,
-    ),
-    String,
->
-where
-    D: FnOnce() -> Result<crate::cloud_sync::LegacyQueueDrainResult, String>,
-    R: FnOnce() -> Result<StorageProtocolUpgradePreflight, String>,
-    S: FnOnce(
-        &StorageProtocolUpgradePreflight,
-    ) -> Result<StorageProtocolUpgradeServerResult, String>,
-{
-    ensure_upgrade_preflight_can_drain(initial)?;
-    let drained = drain()?;
-    let refreshed = recheck()?;
-    ensure_upgrade_preflight_can_drain(&refreshed)?;
-    if refreshed.workspace_id != initial.workspace_id || refreshed.device_id != initial.device_id {
-        return Err("CLOUD_RESPONSE_INVALID: 升级预检工作空间或设备发生变化".to_string());
-    }
-    if refreshed.queue.total != 0 {
-        return Err(format!(
-            "LEGACY_QUEUE_BLOCKED: 最终刷新后仍有 {} 条旧同步操作，协议未切换",
-            refreshed.queue.total
-        ));
-    }
-    if refreshed.workspace_epoch != refreshed.local_workspace_epoch {
-        return Err(format!(
-            "WORKSPACE_EPOCH_STALE: 最终刷新后本机世代 {} 与云端 {} 不一致，协议未切换",
-            refreshed.local_workspace_epoch, refreshed.workspace_epoch
-        ));
-    }
-    let switched = switch(&refreshed)?;
-    let reported_protocol = switched.storage_protocol.as_deref().unwrap_or_else(|| {
-        if switched.already_direct {
-            crate::storage_contract::DIRECT_CLOUD_PROTOCOL
-        } else {
-            ""
-        }
-    });
-    if !switched.upgraded && !switched.already_direct {
-        return Err("CLOUD_RESPONSE_INVALID: 云端未确认存储协议切换".to_string());
-    }
-    if reported_protocol != crate::storage_contract::DIRECT_CLOUD_PROTOCOL {
-        return Err("CLOUD_RESPONSE_INVALID: 云端返回的存储协议不是 direct_v2".to_string());
-    }
-    if switched.workspace_epoch != refreshed.workspace_epoch {
-        return Err(format!(
-            "WORKSPACE_EPOCH_STALE: 切换期间云端世代从 {} 变为 {}，请重新预检",
-            refreshed.workspace_epoch, switched.workspace_epoch
-        ));
-    }
-    Ok((switched, refreshed, drained))
-}
-
-fn apply_legacy_queue_upgrade_result(
-    database: &Database,
-    result: &StorageProtocolUpgradeServerResult,
-    drained: &crate::cloud_sync::LegacyQueueDrainResult,
-    preflight: &StorageProtocolUpgradePreflight,
-) -> Result<StorageProtocolUpgradeResult, String> {
-    let final_change_seq = result
-        .change_seq
-        .unwrap_or(drained.last_change_seq)
-        .max(drained.last_change_seq);
-    persist_direct_protocol_state(
-        database,
-        &preflight.workspace_id,
-        result.workspace_epoch,
-        final_change_seq,
-    )?;
-    Ok(StorageProtocolUpgradeResult {
-        upgraded: result.upgraded,
-        already_direct: result.already_direct,
-        workspace_epoch: result.workspace_epoch,
-        storage_protocol: crate::storage_contract::DIRECT_CLOUD_PROTOCOL.to_string(),
-        change_seq: result.change_seq,
-        safety_snapshot_id: result.safety_snapshot_id.clone(),
-        pushed_operations: drained.pushed,
-        last_change_seq: final_change_seq,
-        refreshed_domains: drained.domains.clone(),
-    })
-}
-
-fn persist_direct_protocol_state(
-    database: &Database,
-    workspace_id: &str,
-    workspace_epoch: i64,
-    final_change_seq: i64,
-) -> Result<(), String> {
-    let connection = database.open()?;
-    connection
-        .execute(
-            "INSERT INTO device_settings(key,value_json,updated_at) VALUES(?1,?2,1)
-             ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
-            params![
-                "cloud_storage_protocol",
-                serde_json::to_string(crate::storage_contract::DIRECT_CLOUD_PROTOCOL)
-                    .map_err(|error| error.to_string())?
-            ],
-        )
-        .map_err(|error| format!("LOCAL_PROTOCOL_UPDATE_FAILED: 无法保存直连协议: {error}"))?;
-    connection
-        .execute(
-            "UPDATE local_sync_state
-             SET workspace_epoch=?2, last_change_seq=MAX(last_change_seq, ?3),
-                 epoch_blocked=0, epoch_blocked_reason=NULL, last_error=NULL
-             WHERE workspace_id=?1",
-            params![workspace_id, workspace_epoch, final_change_seq],
-        )
-        .map_err(|error| format!("LOCAL_PROTOCOL_UPDATE_FAILED: 无法保存直连协议状态: {error}"))?;
-    set_direct_cloud_access_runtime(
-        workspace_id,
-        DirectCloudAccessState::Connecting,
-        Some("存储协议已切换，正在加载云端权威数据".to_string()),
-    );
-    crate::cloud_sync::enter_direct_cloud_mode();
-    Ok(())
-}
-
-pub fn storage_protocol_upgrade_with_drained_queue(
-    database: &Database,
-    request: StorageProtocolUpgradeRequest,
-) -> Result<StorageProtocolUpgradeResult, String> {
-    Uuid::parse_str(request.operation_id.trim())
-        .map_err(|_| "VALIDATION_ERROR: 协议升级操作标识无效".to_string())?;
-    let initial = storage_protocol_upgrade_preflight(database)?;
-    ensure_upgrade_preflight_can_drain(&initial)?;
-    let operation_id = request.operation_id;
-    let create_safety_snapshot = request.create_safety_snapshot.unwrap_or(true);
-    crate::cloud_sync::drain_legacy_queue_then(database, |drained| {
-        let (switched, refreshed, drained) = run_legacy_queue_upgrade_flow(
-            &initial,
-            || Ok(drained.clone()),
-            || storage_protocol_upgrade_preflight(database),
-            |preflight| {
-                let session = current_session(database)?;
-                let value = client(database)?.rpc_for_database(
-                    database,
-                    "upgrade_storage_protocol",
-                    json!({
-                        "p_workspace_id": preflight.workspace_id,
-                        "p_device_id": preflight.device_id,
-                        "p_operation_id": operation_id,
-                        "p_expected_epoch": preflight.workspace_epoch,
-                        "p_old_sync_disposition": "queue_drained",
-                        "p_create_safety_snapshot": create_safety_snapshot,
-                    }),
-                    &session,
-                )?;
-                serde_json::from_value(value)
-                    .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 协议升级响应无效: {error}"))
-            },
-        )?;
-        apply_legacy_queue_upgrade_result(database, &switched, &drained, &refreshed)
-    })
-}
-
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
-
-fn quarantine_legacy_queue(
-    database: &Database,
-    workspace_id: &str,
-    rescue_backup_checksum: &str,
-    reason: &str,
-) -> Result<(String, i64), String> {
-    let mut connection = database.open()?;
-    let transaction = connection
-        .transaction()
-        .map_err(|error| error.to_string())?;
-    let count: i64 = transaction
-        .query_row(
-            "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1 AND state IN ('pending','sending','failed','conflict')",
-            [workspace_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    if count == 0 {
-        return Err("LEGACY_QUEUE_EMPTY: 当前设备没有可放弃的旧同步操作".to_string());
-    }
-    let batch_id = Uuid::now_v7().to_string();
-    let quarantined_at = now_millis();
-    let inserted = transaction
-        .execute(
-            "INSERT INTO legacy_abandoned_outbox(
-                operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,
-                base_version,payload_json,state,attempt_count,created_at,last_attempt_at,
-                error_json,payload_version,depends_on_operation_id,coalesced_count,
-                recovery_kind,recovery_context_json,recovery_updated_at,workspace_epoch,
-                quarantine_batch_id,quarantine_reason,rescue_backup_checksum,quarantined_at
-             )
-             SELECT operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,
-                    base_version,payload_json,state,attempt_count,created_at,last_attempt_at,
-                    error_json,payload_version,depends_on_operation_id,coalesced_count,
-                    recovery_kind,recovery_context_json,recovery_updated_at,workspace_epoch,
-                    ?2,?3,?4,?5
-             FROM sync_outbox
-             WHERE workspace_id=?1 AND state IN ('pending','sending','failed','conflict')",
-            params![
-                workspace_id,
-                batch_id,
-                reason,
-                rescue_backup_checksum,
-                quarantined_at
-            ],
-        )
-        .map_err(|error| format!("LEGACY_QUEUE_ISOLATION_FAILED: {error}"))?;
-    if inserted as i64 != count {
-        return Err(format!(
-            "LEGACY_QUEUE_ISOLATION_FAILED: 预期隔离 {count} 条，实际 {inserted} 条"
-        ));
-    }
-    transaction
-        .execute(
-            "DELETE FROM sync_outbox WHERE workspace_id=?1 AND state IN ('pending','sending','failed','conflict')",
-            [workspace_id],
-        )
-        .map_err(|error| format!("LEGACY_QUEUE_ISOLATION_FAILED: {error}"))?;
-    transaction
-        .commit()
-        .map_err(|error| format!("LEGACY_QUEUE_ISOLATION_FAILED: {error}"))?;
-    Ok((batch_id, count))
-}
-
-fn quarantine_direct_v2_auth_resume_queue(
-    database: &Database,
-    workspace_id: &str,
-) -> Result<i64, String> {
-    let mut connection = database.open()?;
-    let transaction = connection
-        .transaction()
-        .map_err(|error| error.to_string())?;
-    let mode = read_device_setting_string(&transaction, "storage_mode")?
-        .unwrap_or_else(|| "local".to_string());
-    let protocol = read_device_setting_string(&transaction, "cloud_storage_protocol")?
-        .unwrap_or_else(|| crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string());
-    let configured_workspace_id =
-        read_device_setting_string(&transaction, "cloud_workspace_id")?.unwrap_or_default();
-    if mode != "cloud"
-        || protocol != crate::storage_contract::DIRECT_CLOUD_PROTOCOL
-        || configured_workspace_id != workspace_id
-    {
-        return Err(
-            "AUTH_RESUME_REQUIRED: 存储模式已变化，请重新确认旧同步修改的处理方式".to_string(),
-        );
-    }
-
-    let count: i64 = transaction
-        .query_row(
-            "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1 AND state IN ('pending','sending','failed','conflict')",
-            [workspace_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    if count > 0 {
-        let batch_id = Uuid::now_v7().to_string();
-        let quarantined_at = now_millis();
-        let quarantine_checksum = crate::data_protection::sha256_hex(
-            format!("direct_v2_auth_resume:{workspace_id}:{batch_id}:{count}:{quarantined_at}")
-                .as_bytes(),
-        );
-        let reason = "direct_v2 登录恢复：旧同步队列不再适用，已隔离并以云端权威数据为准";
-        let inserted = transaction
-            .execute(
-                "INSERT INTO legacy_abandoned_outbox(
-                    operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,
-                    base_version,payload_json,state,attempt_count,created_at,last_attempt_at,
-                    error_json,payload_version,depends_on_operation_id,coalesced_count,
-                    recovery_kind,recovery_context_json,recovery_updated_at,workspace_epoch,
-                    quarantine_batch_id,quarantine_reason,rescue_backup_checksum,quarantined_at
-                 )
-                 SELECT operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,
-                        base_version,payload_json,state,attempt_count,created_at,last_attempt_at,
-                        error_json,payload_version,depends_on_operation_id,coalesced_count,
-                        recovery_kind,recovery_context_json,recovery_updated_at,workspace_epoch,
-                        ?2,?3,?4,?5
-                 FROM sync_outbox
-                 WHERE workspace_id=?1 AND state IN ('pending','sending','failed','conflict')",
-                params![
-                    workspace_id,
-                    batch_id,
-                    reason,
-                    quarantine_checksum,
-                    quarantined_at
-                ],
-            )
-            .map_err(|error| format!("DIRECT_CLOUD_LEGACY_QUEUE_ISOLATION_FAILED: {error}"))?;
-        if inserted as i64 != count {
-            return Err(format!(
-                "DIRECT_CLOUD_LEGACY_QUEUE_ISOLATION_FAILED: 预期隔离 {count} 条，实际 {inserted} 条"
-            ));
-        }
-        let deleted = transaction
-            .execute(
-                "DELETE FROM sync_outbox WHERE workspace_id=?1 AND state IN ('pending','sending','failed','conflict')",
-                [workspace_id],
-            )
-            .map_err(|error| format!("DIRECT_CLOUD_LEGACY_QUEUE_ISOLATION_FAILED: {error}"))?;
-        if deleted as i64 != count {
-            return Err(format!(
-                "DIRECT_CLOUD_LEGACY_QUEUE_ISOLATION_FAILED: 预期移除 {count} 条，实际 {deleted} 条"
-            ));
-        }
-    }
-
-    transaction
-        .execute(
-            "UPDATE local_sync_state
-             SET auth_blocked=0,auth_blocked_reason=NULL,auth_blocked_at=NULL,last_error=NULL
-             WHERE workspace_id=?1",
-            [workspace_id],
-        )
-        .map_err(|error| format!("DIRECT_CLOUD_AUTH_RESUME_FAILED: {error}"))?;
-    transaction
-        .commit()
-        .map_err(|error| format!("DIRECT_CLOUD_AUTH_RESUME_FAILED: {error}"))?;
-    Ok(count)
-}
-
-fn restore_quarantined_legacy_queue(database: &Database, batch_id: &str) -> Result<(), String> {
-    let mut connection = database.open()?;
-    let transaction = connection
-        .transaction()
-        .map_err(|error| error.to_string())?;
-    transaction
-        .execute(
-            "INSERT INTO sync_outbox(
-                operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,
-                base_version,payload_json,state,attempt_count,created_at,last_attempt_at,
-                error_json,payload_version,depends_on_operation_id,coalesced_count,
-                recovery_kind,recovery_context_json,recovery_updated_at,workspace_epoch
-             )
-             SELECT operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,
-                    base_version,payload_json,state,attempt_count,created_at,last_attempt_at,
-                    error_json,payload_version,depends_on_operation_id,coalesced_count,
-                    recovery_kind,recovery_context_json,recovery_updated_at,workspace_epoch
-             FROM legacy_abandoned_outbox
-             WHERE quarantine_batch_id=?1
-             ORDER BY created_at,operation_type,entity_type",
-            [batch_id],
-        )
-        .map_err(|error| format!("LEGACY_QUEUE_RESTORE_FAILED: {error}"))?;
-    transaction
-        .execute(
-            "DELETE FROM legacy_abandoned_outbox WHERE quarantine_batch_id=?1",
-            [batch_id],
-        )
-        .map_err(|error| format!("LEGACY_QUEUE_RESTORE_FAILED: {error}"))?;
-    transaction
-        .commit()
-        .map_err(|error| format!("LEGACY_QUEUE_RESTORE_FAILED: {error}"))?;
-    Ok(())
-}
-
-fn validate_rescue_backup_matches_upgrade(
-    backup: &crate::data_protection::ValidatedRescueBackup,
-    preflight: &StorageProtocolUpgradePreflight,
-) -> Result<(), String> {
-    if backup.source_workspace_marker
-        != crate::data_protection::sha256_hex(preflight.workspace_id.as_bytes())
-    {
-        return Err("RESCUE_BACKUP_WORKSPACE_MISMATCH: 救援备份不属于当前云端工作空间".to_string());
-    }
-    if backup.pending_operation_count != preflight.queue.total {
-        return Err(format!(
-            "RESCUE_BACKUP_STALE: 备份包含 {} 条旧操作，当前队列为 {} 条，请重新导出救援备份",
-            backup.pending_operation_count, preflight.queue.total
-        ));
-    }
-    if preflight.queue.total == 0 {
-        return Err("LEGACY_QUEUE_EMPTY: 旧同步队列为空，请改用完成队列后升级".to_string());
-    }
-    Ok(())
-}
-
-fn run_abandon_queue_upgrade_flow<Q, R, S, C>(
-    preflight: &StorageProtocolUpgradePreflight,
-    backup: &crate::data_protection::ValidatedRescueBackup,
-    quarantine: Q,
-    restore: R,
-    switch: S,
-    server_still_legacy: C,
-) -> Result<(StorageProtocolUpgradeServerResult, String, i64), String>
-where
-    Q: FnOnce() -> Result<(String, i64), String>,
-    R: FnOnce(&str) -> Result<(), String>,
-    S: FnOnce(
-        &StorageProtocolUpgradePreflight,
-    ) -> Result<StorageProtocolUpgradeServerResult, String>,
-    C: FnOnce() -> Result<bool, String>,
-{
-    ensure_upgrade_preflight_can_drain(preflight)?;
-    validate_rescue_backup_matches_upgrade(backup, preflight)?;
-    let (batch_id, quarantined) = quarantine()?;
-    if quarantined != preflight.queue.total {
-        let _ = restore(&batch_id);
-        return Err(format!(
-            "LEGACY_QUEUE_CHANGED: 隔离时发现 {} 条旧操作，预检为 {} 条，旧队列已恢复",
-            quarantined, preflight.queue.total
-        ));
-    }
-    let switched = match switch(preflight) {
-        Ok(switched) => switched,
-        Err(error) => {
-            let still_legacy = server_still_legacy().unwrap_or(false);
-            if still_legacy {
-                return match restore(&batch_id) {
-                    Ok(()) => Err(format!("{error}；旧队列已恢复到 sync_v1")),
-                    Err(restore_error) => Err(format!(
-                        "{error}；旧队列恢复失败，已保留隔离区 {batch_id}: {restore_error}"
-                    )),
-                };
-            }
-            return Err(format!(
-                "{error}；无法确认云端仍为 sync_v1，旧队列保留在隔离区 {batch_id}"
-            ));
-        }
-    };
-    let protocol = switched.storage_protocol.as_deref().unwrap_or_else(|| {
-        if switched.already_direct {
-            crate::storage_contract::DIRECT_CLOUD_PROTOCOL
-        } else {
-            ""
-        }
-    });
-    if (!switched.upgraded && !switched.already_direct)
-        || protocol != crate::storage_contract::DIRECT_CLOUD_PROTOCOL
-    {
-        return Err(format!(
-            "CLOUD_RESPONSE_INVALID: 云端未确认 direct_v2；旧队列保留在隔离区 {batch_id}"
-        ));
-    }
-    if switched.workspace_epoch != preflight.workspace_epoch {
-        return Err(format!(
-            "WORKSPACE_EPOCH_STALE: 切换期间云端世代从 {} 变为 {}；旧队列保留在隔离区 {batch_id}",
-            preflight.workspace_epoch, switched.workspace_epoch
-        ));
-    }
-    Ok((switched, batch_id, quarantined))
-}
-
-pub fn storage_protocol_upgrade_after_rescue(
-    database: &Database,
-    request: StorageProtocolAbandonRequest,
-) -> Result<StorageProtocolAbandonResult, String> {
-    if !request.confirmed {
-        return Err("ABANDON_NOT_CONFIRMED: 放弃旧修改需要明确确认".to_string());
-    }
-    if request.confirmation_text.trim() != "放弃旧修改" {
-        return Err("ABANDON_CONFIRMATION_MISMATCH: 请输入“放弃旧修改”完成二次确认".to_string());
-    }
-    Uuid::parse_str(request.operation_id.trim())
-        .map_err(|_| "VALIDATION_ERROR: 协议升级操作标识无效".to_string())?;
-    let backup_path = std::path::PathBuf::from(&request.rescue_backup_path);
-    let backup = crate::data_protection::validate_rescue_backup_for_abandon(&backup_path)?;
-    let initial = storage_protocol_upgrade_preflight(database)?;
-    ensure_upgrade_preflight_can_drain(&initial)?;
-    validate_rescue_backup_matches_upgrade(&backup, &initial)?;
-    let operation_id = request.operation_id;
-    let create_safety_snapshot = request.create_safety_snapshot.unwrap_or(true);
-    let reason = format!(
-        "用户二次确认放弃旧修改；救援备份校验通过（{}）",
-        backup.created_at
-    );
-    crate::cloud_sync::with_cloud_sync_operation_lock(|| {
-        let refreshed = storage_protocol_upgrade_preflight(database)?;
-        ensure_upgrade_preflight_can_drain(&refreshed)?;
-        validate_rescue_backup_matches_upgrade(&backup, &refreshed)?;
-        let (switched, _batch_id, quarantined) = run_abandon_queue_upgrade_flow(
-            &refreshed,
-            &backup,
-            || {
-                quarantine_legacy_queue(
-                    database,
-                    &refreshed.workspace_id,
-                    &backup.checksum,
-                    &reason,
-                )
-            },
-            |batch_id| restore_quarantined_legacy_queue(database, batch_id),
-            |preflight| {
-                let session = current_session(database)?;
-                let value = client(database)?.rpc_for_database(
-                    database,
-                    "upgrade_storage_protocol",
-                    json!({
-                        "p_workspace_id": preflight.workspace_id,
-                        "p_device_id": preflight.device_id,
-                        "p_operation_id": operation_id,
-                        "p_expected_epoch": preflight.workspace_epoch,
-                        "p_old_sync_disposition": "abandoned_with_rescue",
-                        "p_create_safety_snapshot": create_safety_snapshot,
-                    }),
-                    &session,
-                )?;
-                serde_json::from_value(value)
-                    .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 协议升级响应无效: {error}"))
-            },
-            || {
-                Ok(
-                    storage_protocol_upgrade_preflight(database)?.storage_protocol
-                        == crate::storage_contract::LEGACY_SYNC_PROTOCOL,
-                )
-            },
-        )?;
-        let final_change_seq = switched
-            .change_seq
-            .unwrap_or(0)
-            .max(storage_mode(database)?.last_change_seq);
-        persist_direct_protocol_state(
-            database,
-            &refreshed.workspace_id,
-            switched.workspace_epoch,
-            final_change_seq,
-        )?;
-        Ok(StorageProtocolAbandonResult {
-            upgraded: switched.upgraded,
-            already_direct: switched.already_direct,
-            workspace_epoch: switched.workspace_epoch,
-            storage_protocol: crate::storage_contract::DIRECT_CLOUD_PROTOCOL.to_string(),
-            change_seq: switched.change_seq,
-            safety_snapshot_id: switched.safety_snapshot_id,
-            quarantined_operations: quarantined,
-            rescue_backup_path: backup_path.display().to_string(),
-            rescue_backup_checksum: backup.checksum,
-            last_change_seq: final_change_seq,
-        })
-    })
-}
-
-fn auth_blocked_reason(database: &Database) -> Result<Option<String>, String> {
-    let state = storage_mode(database)?;
-    if state.mode != "cloud" {
-        return Ok(None);
-    }
-    database
-        .open()?
-        .query_row(
-            "SELECT auth_blocked_reason FROM local_sync_state WHERE workspace_id = ?1 AND auth_blocked <> 0",
-            [state.workspace_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())
-}
-
-pub fn resume_pending_sync(database: &Database) -> Result<StorageModeSnapshot, String> {
-    let connection = database.open()?;
-    let workspace_id: String = connection
-        .query_row(
-            "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'cloud_workspace_id'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|_| "CLOUD_NOT_CONFIGURED: 尚未初始化 Supabase 工作空间".to_string())?;
-    let device_id: String = connection
-        .query_row(
-            "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'device_id'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    drop(connection);
-    let session = current_session(database)?;
-    let value = client(database)?.rpc_for_database(
-        database,
-        "device_authorization_get",
-        json!({ "p_workspace_id": workspace_id, "p_device_id": device_id }),
-        &session,
-    )?;
-    if value.get("authorized").and_then(Value::as_bool) != Some(true) {
-        return Err("DEVICE_REVOKED: 当前设备尚未重新授权".to_string());
-    }
-    let state = storage_mode(database)?;
-    if state.mode == "cloud"
-        && state.storage_protocol == crate::storage_contract::DIRECT_CLOUD_PROTOCOL
-    {
-        quarantine_direct_v2_auth_resume_queue(database, &workspace_id)?;
-        return storage_mode(database);
-    }
-    clear_auth_blocked(database)?;
-    settings::update_setting(
-        database,
-        SettingsUpdate {
-            scope: SettingsScope::Device,
-            key: "storage_mode".to_string(),
-            value: json!("cloud"),
-        },
-    )?;
-    crate::cloud_sync::wake_after_connection_ready();
-    storage_mode(database)
-}
-
-pub fn migration_preview(
-    database: &Database,
-    request: MigrationPreviewRequest,
-) -> Result<MigrationPreview, String> {
-    if request.direction != "local_to_cloud" && request.direction != "cloud_to_local_snapshot" {
-        return Err("VALIDATION_ERROR: 不支持的迁移方向".to_string());
-    }
-    let connection = database.open()?;
-    let source_workspace_id: String = connection
-        .query_row(
-            "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    drop(connection);
-    let entity_names = crate::data_protection::data_package_copy_entity_names()?;
-    let local = local_snapshot(database, &source_workspace_id)?;
-    let workspace = workspace_preview(database)?;
-    let cloud_counts = if let Some(workspace) = &workspace {
-        if request.direction == "cloud_to_local_snapshot" {
-            let context = data_copy_target_context(database)?;
-            let value = client(database)?.rpc_for_database_with_epoch(
-                database,
-                "data_copy_export_preview",
-                json!({
-                    "p_workspace_id": context.workspace_id,
-                    "p_device_id": context.device_id,
-                    "p_expected_epoch": context.workspace_epoch,
-                }),
-                &context.session,
-                context.workspace_epoch,
-            )?;
-            let preview: DataCopyExportPreviewResponse = serde_json::from_value(value)
-                .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 云端复制预览无效: {error}"))?;
-            if preview.workspace_id != workspace.id
-                || preview.package_version != crate::data_protection::DATA_PACKAGE_FORMAT_VERSION
-                || preview.workspace_epoch != context.workspace_epoch
-                || preview.change_seq < 0
-            {
-                return Err("CLOUD_RESPONSE_INVALID: 云端复制预览元数据不一致".to_string());
-            }
-            preview.entity_counts
-        } else {
-            let session = current_session(database)?;
-            let snapshot = client(database)?.rpc_for_database(
-                database,
-                "cloud_snapshot_get",
-                json!({ "p_workspace_id": workspace.id.clone() }),
-                &session,
-            )?;
-            entity_names
-                .iter()
-                .map(|entity| {
-                    (
-                        entity.clone(),
-                        snapshot
-                            .get(entity)
-                            .and_then(Value::as_array)
-                            .map(|rows| rows.len() as i64)
-                            .unwrap_or(0),
-                    )
-                })
-                .collect()
-        }
-    } else {
-        HashMap::new()
-    };
-    let entities = entity_names
-        .iter()
-        .map(|entity| MigrationEntityCount {
-            entity: entity.clone(),
-            local_count: local
-                .get(entity)
-                .and_then(Value::as_array)
-                .map(|rows| rows.len() as i64)
-                .unwrap_or(0),
-            cloud_count: cloud_counts.get(entity).copied(),
-        })
-        .collect::<Vec<_>>();
-    let (
-        source_entity_count,
-        target_entity_count,
-        target_is_empty,
-        replace_entity_count,
-        safety_snapshot_required,
-    ) = migration_preview_impact(&request.direction, &entities);
-    let cloud_has_business_data = entities
-        .iter()
-        .map(|entity| entity.cloud_count.unwrap_or(0))
-        .sum::<i64>()
-        > 0;
-    let conflicts = migration_conflicts(
-        &request.direction,
-        workspace.is_some(),
-        cloud_has_business_data,
-    );
-    let (preview_source_workspace_id, preview_target_workspace_id) =
-        if request.direction == "cloud_to_local_snapshot" {
-            (
-                workspace
-                    .as_ref()
-                    .map(|workspace| workspace.id.clone())
-                    .unwrap_or_default(),
-                Some(source_workspace_id),
-            )
-        } else {
-            (
-                source_workspace_id,
-                workspace.as_ref().map(|workspace| workspace.id.clone()),
-            )
-        };
-    Ok(MigrationPreview {
-        direction: request.direction,
-        source_workspace_id: preview_source_workspace_id,
-        target_workspace_id: preview_target_workspace_id,
-        package_version: crate::data_protection::DATA_PACKAGE_FORMAT_VERSION,
-        entities,
-        source_entity_count,
-        target_entity_count,
-        target_is_empty,
-        replace_entity_count,
-        safety_snapshot_required,
-        can_execute: conflicts.is_empty(),
-        conflicts,
-    })
-}
-
-fn migration_preview_impact(
-    direction: &str,
-    entities: &[MigrationEntityCount],
-) -> (i64, i64, bool, i64, bool) {
-    let local_entity_count = entities.iter().map(|entity| entity.local_count).sum();
-    let cloud_entity_count = entities
-        .iter()
-        .map(|entity| entity.cloud_count.unwrap_or(0))
-        .sum();
-    let (source_entity_count, target_entity_count) = if direction == "cloud_to_local_snapshot" {
-        (cloud_entity_count, local_entity_count)
-    } else {
-        (local_entity_count, cloud_entity_count)
-    };
-    let target_is_empty = target_entity_count == 0;
-    (
-        source_entity_count,
-        target_entity_count,
-        target_is_empty,
-        target_entity_count,
-        direction == "local_to_cloud" && !target_is_empty,
-    )
-}
-
-fn build_data_copy_chunks(snapshot: &Value) -> Result<(Vec<DataCopyChunk>, String), String> {
-    let mut chunks = Vec::new();
-    for entity_name in crate::data_protection::data_package_copy_entity_names()? {
-        let rows = snapshot
-            .get(&entity_name)
-            .and_then(Value::as_array)
-            .ok_or_else(|| format!("DATA_PACKAGE_ENTITY_MISSING: {entity_name}"))?;
-        let mut pending = Vec::<Value>::new();
-        for row in rows {
-            let mut candidate = pending.clone();
-            candidate.push(row.clone());
-            let candidate_value = Value::Array(candidate);
-            let candidate_bytes = crate::data_protection::canonical_json_bytes(&candidate_value)?;
-            if candidate_bytes.len() > DATA_COPY_CHUNK_MAX_BYTES {
-                if pending.is_empty() {
-                    return Err(format!("DATA_PACKAGE_ROW_TOO_LARGE: {entity_name}"));
-                }
-                push_data_copy_chunk(&mut chunks, &entity_name, std::mem::take(&mut pending))?;
-                pending.push(row.clone());
-            } else {
-                pending = candidate_value.as_array().cloned().unwrap_or_default();
-            }
-        }
-        push_data_copy_chunk(&mut chunks, &entity_name, pending)?;
-    }
-    if chunks.len() > 256 {
-        return Err("DATA_PACKAGE_TOO_MANY_CHUNKS: 数据包分块超过 256 个".to_string());
-    }
-    let hash_chain = chunks
-        .iter()
-        .map(|chunk| chunk.content_hash.as_str())
-        .collect::<String>();
-    Ok((
-        chunks,
-        crate::data_protection::sha256_hex(hash_chain.as_bytes()),
-    ))
-}
-
-fn push_data_copy_chunk(
-    chunks: &mut Vec<DataCopyChunk>,
-    entity_name: &str,
-    rows: Vec<Value>,
-) -> Result<(), String> {
-    let value = Value::Array(rows);
-    let bytes = crate::data_protection::canonical_json_bytes(&value)?;
-    if bytes.len() > DATA_COPY_CHUNK_MAX_BYTES {
-        return Err(format!("DATA_PACKAGE_CHUNK_TOO_LARGE: {entity_name}"));
-    }
-    let content_text = String::from_utf8(bytes.clone())
-        .map_err(|error| format!("DATA_PACKAGE_ENCODING_INVALID: {error}"))?;
-    chunks.push(DataCopyChunk {
-        chunk_index: chunks.len(),
-        entity_name: entity_name.to_string(),
-        content_text,
-        content_hash: crate::data_protection::sha256_hex(&bytes),
-        row_count: value.as_array().map(Vec::len).unwrap_or(0),
-    });
-    Ok(())
-}
-
-pub fn stage_local_data_copy(database: &Database) -> Result<DataCopyStageResult, String> {
-    let context = data_copy_target_context(database)?;
-    let connection = database.open()?;
-    let source_workspace_id: String = connection
-        .query_row(
-            "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    drop(connection);
-
-    let snapshot = local_snapshot(database, &source_workspace_id)?;
-    let (chunks, content_hash) = build_data_copy_chunks(&snapshot)?;
-    let api = client(database)?;
-    let begin = api.rpc_for_database(
-        database,
-        "data_copy_stage_begin",
-        json!({
-            "p_workspace_id": context.workspace_id,
-            "p_device_id": context.device_id,
-            "p_expected_epoch": context.workspace_epoch,
-            "p_package_version": crate::data_protection::DATA_PACKAGE_FORMAT_VERSION,
-            "p_expected_chunk_count": chunks.len(),
-            "p_expected_content_hash": content_hash,
-        }),
-        &context.session,
-    )?;
-    let package_id = begin
-        .get("packageId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "CLOUD_RESPONSE_INVALID: staging begin 缺少 packageId".to_string())?
-        .to_string();
-
-    let upload_result = (|| {
-        for chunk in &chunks {
-            api.rpc_for_database(
-                database,
-                "data_copy_stage_chunk_put",
-                json!({
-                    "p_workspace_id": context.workspace_id,
-                    "p_device_id": context.device_id,
-                    "p_expected_epoch": context.workspace_epoch,
-                    "p_package_id": package_id,
-                    "p_chunk_index": chunk.chunk_index,
-                    "p_entity_name": chunk.entity_name,
-                    "p_content_text": chunk.content_text,
-                    "p_content_hash": chunk.content_hash,
-                    "p_row_count": chunk.row_count,
-                }),
-                &context.session,
-            )?;
-        }
-        api.rpc_for_database(
-            database,
-            "data_copy_stage_validate",
-            json!({
-                "p_workspace_id": context.workspace_id,
-                "p_device_id": context.device_id,
-                "p_expected_epoch": context.workspace_epoch,
-                "p_package_id": package_id,
-            }),
-            &context.session,
-        )
-    })();
-    let validated = match upload_result {
-        Ok(value) => value,
-        Err(error) => {
-            let _ = api.rpc_for_database(
-                database,
-                "data_copy_stage_discard",
-                json!({
-                    "p_workspace_id": context.workspace_id,
-                    "p_device_id": context.device_id,
-                    "p_expected_epoch": context.workspace_epoch,
-                    "p_package_id": package_id,
-                }),
-                &context.session,
-            );
-            return Err(error);
-        }
-    };
-    let entity_counts = serde_json::from_value(
-        validated
-            .get("entityCounts")
-            .cloned()
-            .unwrap_or_else(|| json!({})),
-    )
-    .map_err(|error| format!("CLOUD_RESPONSE_INVALID: staging entityCounts 无效: {error}"))?;
-    Ok(DataCopyStageResult {
-        package_id,
-        status: validated
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("validated")
-            .to_string(),
-        entity_counts,
-        content_hash,
-        chunk_count: chunks.len(),
-    })
-}
-
-pub fn replace_staged_local_data_copy(
-    database: &Database,
-    request: DataCopyReplaceRequest,
-) -> Result<DataCopyReplaceResult, String> {
-    crate::cloud_sync::with_cloud_sync_operation_lock(|| {
-        replace_staged_local_data_copy_locked(database, request)
-    })
-}
-
-fn replace_staged_local_data_copy_locked(
-    database: &Database,
-    request: DataCopyReplaceRequest,
-) -> Result<DataCopyReplaceResult, String> {
-    if !request.confirmed {
-        return Err(
-            "DATA_COPY_REPLACE_CONFIRMATION_REQUIRED: 完整替换云端数据必须明确确认".to_string(),
-        );
-    }
-    let package_id = Uuid::parse_str(request.package_id.trim())
-        .map_err(|_| "VALIDATION_ERROR: packageId 必须是 UUID".to_string())?;
-    let operation_id = Uuid::parse_str(request.operation_id.trim())
-        .map_err(|_| "VALIDATION_ERROR: operationId 必须是 UUID".to_string())?;
-    let content_hash = request.content_hash.trim().to_ascii_lowercase();
-    if content_hash.len() != 64 || !content_hash.bytes().all(|value| value.is_ascii_hexdigit()) {
-        return Err("VALIDATION_ERROR: contentHash 必须是 SHA-256 十六进制值".to_string());
-    }
-
-    let context = data_copy_target_context(database)?;
-    let body = json!({
-        "p_workspace_id": context.workspace_id,
-        "p_device_id": context.device_id,
-        "p_expected_epoch": context.workspace_epoch,
-        "p_package_id": package_id,
-        "p_expected_content_hash": content_hash,
-        "p_operation_id": operation_id,
-        "p_confirmed": true,
-    });
-    let api = client(database)?;
-    let value = match api.rpc_for_database_with_epoch_and_timeout(
-        database,
-        "data_copy_replace_commit",
-        body.clone(),
-        &context.session,
-        context.workspace_epoch,
-        RESTORE_TIMEOUT_SECONDS,
-    ) {
-        Ok(value) => value,
-        Err(error)
-            if error.starts_with("NETWORK_ERROR:")
-                || error.starts_with("CLOUD_TIMEOUT:")
-                || error.starts_with("CLOUD_SERVICE_UNAVAILABLE:") =>
-        {
-            api.rpc_for_database_with_epoch_and_timeout(
-                database,
-                "data_copy_replace_commit",
-                body,
-                &context.session,
-                context.workspace_epoch,
-                RESTORE_TIMEOUT_SECONDS,
-            )
-            .map_err(|retry_error| {
-                record_direct_cloud_access_error(&context.workspace_id, &retry_error);
-                retry_error
-            })?
-        }
-        Err(error) => {
-            record_direct_cloud_access_error(&context.workspace_id, &error);
-            return Err(error);
-        }
-    };
-    let replaced: DataCopyReplaceResult = serde_json::from_value(value).map_err(|error| {
-        let error = format!("CLOUD_RESPONSE_INVALID: data_copy_replace_commit 响应无效: {error}");
-        record_direct_cloud_access_error(&context.workspace_id, &error);
-        error
-    })?;
-    if !replaced.replaced
-        || replaced.package_id != package_id.to_string()
-        || replaced.content_hash != content_hash
-        || replaced.previous_epoch != context.workspace_epoch
-        || replaced.workspace_epoch <= replaced.previous_epoch
-    {
-        let error = "CLOUD_RESPONSE_INVALID: 云端没有返回一致的数据复制替换结果".to_string();
-        record_direct_cloud_access_error(&context.workspace_id, &error);
-        return Err(error);
-    }
-    record_data_copy_replace_checkpoint(database, &context, &replaced)?;
-    record_direct_cloud_access_success(&context.workspace_id);
-    Ok(replaced)
-}
-
-fn record_data_copy_replace_checkpoint(
-    database: &Database,
-    context: &DirectCloudReadContext,
-    result: &DataCopyReplaceResult,
-) -> Result<(), String> {
-    database
-        .open()?
-        .execute(
-            "INSERT INTO local_sync_state(workspace_id, device_id, last_change_seq, last_full_sync_at, workspace_epoch)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(workspace_id) DO UPDATE SET
-               device_id=excluded.device_id,
-               last_change_seq=excluded.last_change_seq,
-               last_full_sync_at=excluded.last_full_sync_at,
-               last_error=NULL,
-               workspace_epoch=excluded.workspace_epoch,
-               epoch_blocked=0,
-               epoch_blocked_reason=NULL,
-               epoch_blocked_at=NULL",
-            params![
-                context.workspace_id,
-                context.device_id,
-                result.reset_change_seq,
-                now_seconds() * 1_000,
-                result.workspace_epoch,
-            ],
-        )
-        .map_err(|error| error.to_string())?;
-    DIRECT_TRACKING_LEASE_TOKENS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(&direct_tracking_lease_key(context));
-    Ok(())
-}
-
-pub fn begin_cloud_data_copy_export(database: &Database) -> Result<DataCopyExportManifest, String> {
-    let context = data_copy_target_context(database)?;
-    let value = client(database)?.rpc_for_database_with_epoch_and_timeout(
-        database,
-        "data_copy_export_begin",
-        json!({
-            "p_workspace_id": context.workspace_id,
-            "p_device_id": context.device_id,
-            "p_expected_epoch": context.workspace_epoch,
-        }),
-        &context.session,
-        context.workspace_epoch,
-        SNAPSHOT_TIMEOUT_SECONDS,
-    )?;
-    let manifest: DataCopyExportManifest = serde_json::from_value(value)
-        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 云端导出清单无效: {error}"))?;
-    validate_data_copy_export_manifest(&manifest, context.workspace_epoch)?;
-    Ok(manifest)
-}
-
-pub fn get_cloud_data_copy_export_chunk(
-    database: &Database,
-    request: DataCopyExportChunkRequest,
-) -> Result<DataCopyExportChunk, String> {
-    let package_id = Uuid::parse_str(request.package_id.trim())
-        .map_err(|_| "VALIDATION_ERROR: packageId 必须是 UUID".to_string())?;
-    if request.chunk_index >= 256 {
-        return Err("VALIDATION_ERROR: chunkIndex 超出范围".to_string());
-    }
-    let context = data_copy_target_context(database)?;
-    let value = client(database)?.rpc_for_database_with_epoch(
-        database,
-        "data_copy_export_chunk_get",
-        json!({
-            "p_workspace_id": context.workspace_id,
-            "p_device_id": context.device_id,
-            "p_package_id": package_id,
-            "p_chunk_index": request.chunk_index,
-        }),
-        &context.session,
-        context.workspace_epoch,
-    )?;
-    let chunk: DataCopyExportChunk = serde_json::from_value(value)
-        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: 云端导出分块无效: {error}"))?;
-    validate_data_copy_export_chunk(&chunk, &package_id.to_string(), request.chunk_index)?;
-    Ok(chunk)
-}
-
-pub fn discard_cloud_data_copy_export(
-    database: &Database,
-    request: DataCopyExportDiscardRequest,
-) -> Result<Value, String> {
-    let package_id = Uuid::parse_str(request.package_id.trim())
-        .map_err(|_| "VALIDATION_ERROR: packageId 必须是 UUID".to_string())?;
-    let context = data_copy_target_context(database)?;
-    client(database)?.rpc_for_database_with_epoch(
-        database,
-        "data_copy_export_discard",
-        json!({
-            "p_workspace_id": context.workspace_id,
-            "p_device_id": context.device_id,
-            "p_package_id": package_id,
-        }),
-        &context.session,
-        context.workspace_epoch,
-    )
-}
-
-pub fn replace_local_with_cloud_data_copy(
-    database: &Database,
-    request: DataCopyReplaceLocalRequest,
-) -> Result<DataCopyReplaceLocalResult, String> {
-    crate::cloud_sync::with_cloud_sync_operation_lock(|| {
-        replace_local_with_cloud_data_copy_locked(database, request)
-    })
-}
-
-fn replace_local_with_cloud_data_copy_locked(
-    database: &Database,
-    request: DataCopyReplaceLocalRequest,
-) -> Result<DataCopyReplaceLocalResult, String> {
-    if !request.confirmed {
-        return Err(
-            "DATA_COPY_REPLACE_CONFIRMATION_REQUIRED: 完整替换本地数据必须明确确认".to_string(),
-        );
-    }
-    let manifest = begin_cloud_data_copy_export(database)?;
-    let download_result = download_cloud_data_copy(database, &manifest);
-    let _ = discard_cloud_data_copy_export(
-        database,
-        DataCopyExportDiscardRequest {
-            package_id: manifest.package_id.clone(),
-        },
-    );
-    let snapshot = download_result?;
-    replace_local_with_downloaded_data_copy(database, &manifest, snapshot)
-}
-
-fn replace_local_with_downloaded_data_copy(
-    database: &Database,
-    manifest: &DataCopyExportManifest,
-    snapshot: Value,
-) -> Result<DataCopyReplaceLocalResult, String> {
-    let safety_directory = database.data_directory().join("backups");
-    let safety_path = safety_directory.join(format!(
-        "timegenie-before-cloud-copy-{}-{}.timegenie-backup",
-        now_seconds(),
-        Uuid::now_v7()
-    ));
-    let safety_backup = crate::data_protection::export_automatic_safety_backup(
-        database,
-        safety_path.display().to_string(),
-    )?;
-
-    let workspace_id =
-        crate::data_protection::replace_local_business_data_from_copy(database, &snapshot)?;
-    Ok(DataCopyReplaceLocalResult {
-        replaced: true,
-        package_id: manifest.package_id.clone(),
-        content_hash: manifest.content_hash.clone(),
-        safety_backup_path: safety_backup.path,
-        workspace_id,
-        entity_counts: manifest.entity_counts.clone(),
-    })
-}
-
-fn download_cloud_data_copy(
-    database: &Database,
-    manifest: &DataCopyExportManifest,
-) -> Result<Value, String> {
-    download_data_copy_from_fetch(manifest, |chunk_index| {
-        get_cloud_data_copy_export_chunk(
-            database,
-            DataCopyExportChunkRequest {
-                package_id: manifest.package_id.clone(),
-                chunk_index,
-            },
-        )
-    })
-}
-
-fn download_data_copy_from_fetch<F>(
-    manifest: &DataCopyExportManifest,
-    mut fetch: F,
-) -> Result<Value, String>
-where
-    F: FnMut(usize) -> Result<DataCopyExportChunk, String>,
-{
-    let entity_names = crate::data_protection::data_package_copy_entity_names()?;
-    let mut snapshot = entity_names
-        .iter()
-        .map(|entity| (entity.clone(), Value::Array(Vec::new())))
-        .collect::<serde_json::Map<_, _>>();
-    let mut hash_chain = String::with_capacity(manifest.chunk_count * 64);
-    for chunk_index in 0..manifest.chunk_count {
-        let chunk = fetch(chunk_index)?;
-        validate_data_copy_export_chunk(&chunk, &manifest.package_id, chunk_index)?;
-        let rows: Vec<Value> = serde_json::from_str(&chunk.content_text).map_err(|_| {
-            "DATA_PACKAGE_CHUNK_JSON_INVALID: 云端导出分块不是有效 JSON".to_string()
-        })?;
-        snapshot
-            .get_mut(&chunk.entity_name)
-            .and_then(Value::as_array_mut)
-            .ok_or_else(|| {
-                format!(
-                    "DATA_PACKAGE_ENTITY_MISSING: 云端导出包含未知实体 {}",
-                    chunk.entity_name
-                )
-            })?
-            .extend(rows);
-        hash_chain.push_str(&chunk.content_hash);
-    }
-    if crate::data_protection::sha256_hex(hash_chain.as_bytes()) != manifest.content_hash {
-        return Err("DATA_PACKAGE_CONTENT_HASH_MISMATCH: 云端导出整包哈希校验失败".to_string());
-    }
-    for entity_name in entity_names {
-        let actual_count = snapshot
-            .get(&entity_name)
-            .and_then(Value::as_array)
-            .map(Vec::len)
-            .unwrap_or_default() as i64;
-        if manifest.entity_counts.get(&entity_name).copied() != Some(actual_count) {
-            return Err(format!(
-                "DATA_PACKAGE_ENTITY_COUNT_MISMATCH: {entity_name} 实体数量与清单不一致"
-            ));
-        }
-    }
-    Ok(Value::Object(snapshot))
-}
-
-fn validate_data_copy_export_manifest(
-    manifest: &DataCopyExportManifest,
-    expected_epoch: i64,
-) -> Result<(), String> {
-    Uuid::parse_str(&manifest.package_id)
-        .map_err(|_| "CLOUD_RESPONSE_INVALID: 云端导出 packageId 无效".to_string())?;
-    if manifest.package_version != crate::data_protection::DATA_PACKAGE_FORMAT_VERSION
-        || manifest.workspace_epoch != expected_epoch
-        || manifest.change_seq < 0
-        || !(22..=256).contains(&manifest.chunk_count)
-        || manifest.content_hash.len() != 64
-        || !manifest
-            .content_hash
-            .bytes()
-            .all(|value| value.is_ascii_hexdigit())
-    {
-        return Err("CLOUD_RESPONSE_INVALID: 云端导出清单元数据不一致".to_string());
-    }
-    let expected_entities = crate::data_protection::data_package_copy_entity_names()?;
-    if manifest.entity_counts.len() != expected_entities.len()
-        || expected_entities.iter().any(|entity| {
-            manifest
-                .entity_counts
-                .get(entity)
-                .is_none_or(|count| *count < 0)
-        })
-    {
-        return Err("CLOUD_RESPONSE_INVALID: 云端导出实体目录不完整".to_string());
-    }
-    Ok(())
-}
-
-fn validate_data_copy_export_chunk(
-    chunk: &DataCopyExportChunk,
-    package_id: &str,
-    chunk_index: usize,
-) -> Result<(), String> {
-    if chunk.package_id != package_id
-        || chunk.chunk_index != chunk_index
-        || !crate::data_protection::data_package_copy_entity_names()?.contains(&chunk.entity_name)
-        || chunk.content_text.as_bytes().len() > DATA_COPY_CHUNK_MAX_BYTES
-        || crate::data_protection::sha256_hex(chunk.content_text.as_bytes()) != chunk.content_hash
-    {
-        return Err("DATA_PACKAGE_CHUNK_HASH_MISMATCH: 云端导出分块校验失败".to_string());
-    }
-    let rows: Value = serde_json::from_str(&chunk.content_text)
-        .map_err(|_| "DATA_PACKAGE_CHUNK_JSON_INVALID: 云端导出分块不是有效 JSON".to_string())?;
-    if rows.as_array().map(Vec::len) != Some(chunk.row_count) {
-        return Err("DATA_PACKAGE_ROW_COUNT_MISMATCH: 云端导出分块行数不一致".to_string());
-    }
-    Ok(())
-}
-
-fn migration_conflicts(
-    direction: &str,
-    cloud_workspace_exists: bool,
-    cloud_has_business_data: bool,
-) -> Vec<String> {
-    let mut conflicts = Vec::new();
-    if direction == "cloud_to_local_snapshot" && !cloud_workspace_exists {
-        conflicts
-            .push("当前账号还没有可使用的云端工作空间，不能用空云端快照覆盖本机数据".to_string());
-    }
-    if direction == "cloud_to_local_snapshot" && cloud_workspace_exists && !cloud_has_business_data
-    {
-        conflicts.push(
-            "云端工作空间还没有事项、计时或报告数据，不能用空云端快照覆盖本机数据".to_string(),
-        );
-    }
-    conflicts
-}
-
-pub fn migration_execute(
-    database: &Database,
-    request: MigrationExecuteRequest,
-) -> Result<StorageModeSnapshot, String> {
-    if !request.confirmed {
-        return Err("MIGRATION_NOT_CONFIRMED: 迁移必须明确确认后执行".to_string());
-    }
-    ensure_no_pending_cloud_work(database)?;
-    let preview = migration_preview(
-        database,
-        MigrationPreviewRequest {
-            direction: request.direction.clone(),
-        },
-    )?;
-    if !preview.can_execute {
-        return Err("MIGRATION_BLOCKED: 当前数据存在未处理冲突".to_string());
-    }
-    if request.direction == "local_to_cloud" {
-        let session = current_session(database)?;
-        let workspace = workspace_bootstrap(database)?;
-        let connection = database.open()?;
-        let device_name: String = connection
-            .query_row(
-                "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'device_name'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or_else(|_| "当前设备".to_string());
-        drop(connection);
-        register_device(
-            database,
-            CloudDeviceRegisterRequest {
-                device_name,
-                platform: std::env::consts::OS.to_string(),
-                app_version: env!("CARGO_PKG_VERSION").to_string(),
-            },
-        )?;
-        let snapshot = local_snapshot(database, &preview.source_workspace_id)?;
-        let client = client(database)?;
-        client.rpc_for_database(
-            database,
-            "migration_import_snapshot",
-            json!({
-                "p_workspace_id": workspace.id,
-                "p_operation_id": Uuid::now_v7().to_string(),
-                "p_device_id": storage_mode(database)?.device_id,
-                "p_snapshot": snapshot
-            }),
-            &session,
-        )?;
-        let cloud_workspace_id = workspace.id.clone();
-        settings::update_setting(
-            database,
-            SettingsUpdate {
-                scope: SettingsScope::Device,
-                key: "storage_mode".to_string(),
-                value: json!("cloud"),
-            },
-        )?;
-        initialize_sync_state(
-            database,
-            &cloud_workspace_id,
-            &storage_mode(database)?.device_id,
-        )?;
-        crate::cloud_sync::pull_snapshot(database)?;
-        crate::cloud_sync::wake_after_connection_ready();
-    } else if request.direction == "cloud_to_local_snapshot" {
-        let workspace = workspace_bootstrap(database)?;
-        let connection = database.open()?;
-        let device_name: String = connection
-            .query_row(
-                "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'device_name'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or_else(|_| "当前设备".to_string());
-        drop(connection);
-        register_device(
-            database,
-            CloudDeviceRegisterRequest {
-                device_name,
-                platform: std::env::consts::OS.to_string(),
-                app_version: env!("CARGO_PKG_VERSION").to_string(),
-            },
-        )?;
-        settings::update_setting(
-            database,
-            SettingsUpdate {
-                scope: SettingsScope::Device,
-                key: "cloud_workspace_id".to_string(),
-                value: json!(workspace.id),
-            },
-        )?;
-        settings::update_setting(
-            database,
-            SettingsUpdate {
-                scope: SettingsScope::Device,
-                key: "storage_mode".to_string(),
-                value: json!("cloud"),
-            },
-        )?;
-        initialize_sync_state(database, &workspace.id, &storage_mode(database)?.device_id)?;
-        crate::cloud_sync::pull_snapshot(database)?;
-        crate::cloud_sync::wake_after_connection_ready();
-    }
-    storage_mode(database)
-}
-
-fn initialize_sync_state(
-    database: &Database,
-    workspace_id: &str,
-    device_id: &str,
-) -> Result<(), String> {
-    database
-        .open()?
-        .execute(
-            "INSERT INTO local_sync_state(workspace_id, device_id, last_change_seq, last_full_sync_at, last_error)
-             VALUES (?1, ?2, 0, NULL, NULL)
-             ON CONFLICT(workspace_id) DO UPDATE SET device_id = excluded.device_id, last_error = NULL",
-            params![workspace_id, device_id],
-        )
-        .map(|_| ())
-        .map_err(|error| error.to_string())
 }
 
 pub fn latest_change_seq(
@@ -6436,19 +2953,7 @@ impl SupabaseClient {
         let workspace_epoch = body
             .get("p_workspace_id")
             .and_then(Value::as_str)
-            .and_then(|workspace_id| {
-                database
-                    .open()
-                    .ok()?
-                    .query_row(
-                        "SELECT workspace_epoch FROM local_sync_state WHERE workspace_id=?1",
-                        [workspace_id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()
-                    .ok()
-                    .flatten()
-            })
+            .map(|workspace_id| workspace_epoch_from_metadata(database, workspace_id))
             .unwrap_or(1);
         self.request_for_database(
             database,
@@ -6472,19 +2977,7 @@ impl SupabaseClient {
         let workspace_epoch = body
             .get("p_workspace_id")
             .and_then(Value::as_str)
-            .and_then(|workspace_id| {
-                database
-                    .open()
-                    .ok()?
-                    .query_row(
-                        "SELECT workspace_epoch FROM local_sync_state WHERE workspace_id=?1",
-                        [workspace_id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()
-                    .ok()
-                    .flatten()
-            })
+            .map(|workspace_id| workspace_epoch_from_metadata(database, workspace_id))
             .unwrap_or(1);
         self.request_for_database(
             database,
@@ -6586,652 +3079,6 @@ pub(crate) fn current_session(database: &Database) -> Result<CloudSession, Strin
 }
 
 #[cfg(debug_assertions)]
-fn dev_cloud_session_from_env() -> Option<CloudSession> {
-    if std::env::var_os("TG_DEV_CLOUD_SESSION").is_none() {
-        return None;
-    }
-    let user_id = std::env::var("TG_DEV_CLOUD_USER_ID").ok()?;
-    let access_token =
-        std::env::var("TG_DEV_CLOUD_ACCESS_TOKEN").unwrap_or_else(|_| format!("access-{user_id}"));
-    Some(CloudSession {
-        user_id: user_id.clone(),
-        email: Some(format!("{user_id}@timegenie.test")),
-        access_token,
-        refresh_token: format!("refresh-{user_id}"),
-        expires_at: Some(now_seconds() + 24 * 60 * 60),
-    })
-}
-
-#[cfg(debug_assertions)]
-pub(crate) fn configure_dev_cloud_from_env(database: &Database) -> Result<(), String> {
-    if std::env::var_os("TG_DEV_CLOUD_SESSION").is_none() {
-        return Ok(());
-    }
-    let project_url = std::env::var("TG_DEV_CLOUD_URL")
-        .map_err(|_| "TG_DEV_CLOUD_URL is required".to_string())?;
-    let anon_key =
-        std::env::var("TG_DEV_CLOUD_ANON_KEY").unwrap_or_else(|_| "dev-anon-key".to_string());
-    let workspace_id = std::env::var("TG_DEV_CLOUD_WORKSPACE_ID")
-        .map_err(|_| "TG_DEV_CLOUD_WORKSPACE_ID is required".to_string())?;
-    let subject_id = std::env::var("TG_DEV_CLOUD_SUBJECT_ID")
-        .map_err(|_| "TG_DEV_CLOUD_SUBJECT_ID is required".to_string())?;
-    let template_prefix = std::env::var("TG_DEV_CLOUD_TEMPLATE_PREFIX")
-        .unwrap_or_else(|_| "91000000-0000-0000-0000-00000000000".to_string());
-    let mut connection = database.open()?;
-    let transaction = connection
-        .transaction()
-        .map_err(|error| error.to_string())?;
-    let local_workspace_id: String = transaction
-        .query_row(
-            "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    let now = chrono::Utc::now().timestamp_millis();
-    if std::env::var_os("TG_DEV_CLOUD_RESET_DATA").is_some() {
-        for table in [
-            "report_tasks",
-            "reports",
-            "time_allocations",
-            "time_segments",
-            "time_entries",
-            "unassigned_segments",
-            "unassigned_sessions",
-            "task_occurrences",
-            "task_recurrence_rules",
-            "task_daily_estimates",
-            "task_status_events",
-            "tasks",
-            "external_bindings",
-            "subjects",
-            "report_templates",
-        ] {
-            transaction
-                .execute(
-                    &format!("DELETE FROM {table} WHERE workspace_id = ?1"),
-                    [&local_workspace_id],
-                )
-                .map_err(|error| error.to_string())?;
-        }
-        transaction
-            .execute(
-                "INSERT INTO subjects(id,workspace_id,name,sort_order,created_at,updated_at,version) VALUES (?1,?2,'验收主体',10,?3,?3,1)",
-                params![subject_id, local_workspace_id, now],
-            )
-            .map_err(|error| error.to_string())?;
-        for (suffix, report_type, content) in [
-            ("1", "daily", "# {{日期}}\n\n{{今日事项}}\n"),
-            ("2", "weekly", "# {{日期范围}}\n\n{{每日情况}}\n"),
-            ("3", "monthly", "# {{日期范围}}\n\n{{每日情况}}\n"),
-        ] {
-            transaction
-                .execute(
-                    "INSERT INTO report_templates(id,workspace_id,report_type,subject_id,content,is_builtin,created_at,updated_at,version) VALUES (?1,?2,?3,NULL,?4,1,?5,?5,1)",
-                    params![format!("{template_prefix}{suffix}"), local_workspace_id, report_type, content, now],
-                )
-                .map_err(|error| error.to_string())?;
-        }
-    }
-    for (key, value) in [
-        ("supabase_project_url", json!(project_url)),
-        ("supabase_anon_key", json!(anon_key)),
-        ("cloud_workspace_id", json!(workspace_id)),
-        ("storage_mode", json!("cloud")),
-    ] {
-        transaction
-            .execute(
-                "INSERT INTO device_settings(key,value_json,updated_at) VALUES (?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
-                params![key, value.to_string(), now],
-            )
-            .map_err(|error| error.to_string())?;
-    }
-    let device_id: String = transaction
-        .query_row(
-            "SELECT id FROM devices WHERE workspace_id=?1 AND revoked_at IS NULL ORDER BY created_at LIMIT 1",
-            [&local_workspace_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    transaction
-        .execute(
-            "INSERT INTO local_sync_state(workspace_id,device_id,last_change_seq,last_error,auth_blocked) VALUES (?1,?2,0,NULL,0) ON CONFLICT(workspace_id) DO UPDATE SET device_id=excluded.device_id,last_error=NULL,auth_blocked=0,auth_blocked_reason=NULL,auth_blocked_at=NULL",
-            params![workspace_id, device_id],
-        )
-        .map_err(|error| error.to_string())?;
-    transaction.commit().map_err(|error| error.to_string())
-}
-
-fn local_workspace_id(database: &Database) -> Result<String, String> {
-    database
-        .open()?
-        .query_row(
-            "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())
-}
-
-fn refresh_current_session(database: &Database) -> Result<CloudSession, String> {
-    current_session_with_refresh(database, true, false)
-}
-
-fn current_session_with_refresh(
-    database: &Database,
-    force_refresh: bool,
-    keep_existing_after_refresh_error: bool,
-) -> Result<CloudSession, String> {
-    let connection = database.open()?;
-    let workspace_id: String = connection
-        .query_row(
-            "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    let existing = session(&workspace_id)?;
-    if !force_refresh
-        && existing
-            .expires_at
-            .is_none_or(|expires_at| expires_at > now_seconds() + 60)
-    {
-        return Ok(existing);
-    }
-    let _refresh_guard = SESSION_REFRESH_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| "AUTH_REQUIRED: Supabase 会话刷新锁不可用".to_string())?;
-    let existing = session(&workspace_id)?;
-    if !force_refresh
-        && existing
-            .expires_at
-            .is_none_or(|expires_at| expires_at > now_seconds() + 60)
-    {
-        return Ok(existing);
-    }
-    let api = client(database)?;
-    let response = match api.auth_token(
-        "refresh_token",
-        json!({ "refresh_token": existing.refresh_token }),
-    ) {
-        Ok(response) => response,
-        Err(error)
-            if keep_existing_after_refresh_error
-                && should_keep_existing_session_after_refresh_error(&error) =>
-        {
-            return Ok(existing)
-        }
-        Err(error) => return Err(error),
-    };
-    if !response.status().is_success() {
-        let error = map_refresh_auth_error(response);
-        if keep_existing_after_refresh_error
-            && should_keep_existing_session_after_refresh_error(&error)
-        {
-            return Ok(existing);
-        }
-        if should_keep_existing_session_after_refresh_error(&error) {
-            return Err(error);
-        }
-        if is_definitive_auth_invalid(&error) {
-            clear_saved_session_for_workspace(database, &workspace_id)?;
-            mark_auth_blocked(database, "auth_session_revoked")?;
-        }
-        return Err(error);
-    }
-    let auth: AuthResponse = response
-        .json()
-        .map_err(|error| format!("NETWORK_ERROR: Supabase 刷新响应无效: {error}"))?;
-    let refresh_token = if auth.refresh_token.is_empty() {
-        existing.refresh_token.clone()
-    } else {
-        auth.refresh_token
-    };
-    let refreshed = CloudSession {
-        user_id: auth
-            .user
-            .as_ref()
-            .map(|user| user.id.clone())
-            .unwrap_or(existing.user_id),
-        email: auth.user.and_then(|user| user.email).or(existing.email),
-        access_token: auth.access_token,
-        refresh_token,
-        expires_at: auth.expires_in.map(|seconds| now_seconds() + seconds),
-    };
-    save_session(database, &refreshed)?;
-    validate_current_device_authorization(database, &refreshed)?;
-    Ok(refreshed)
-}
-
-fn should_keep_existing_session_after_refresh_error(error: &str) -> bool {
-    should_preserve_saved_session(error)
-}
-
-fn should_preserve_saved_session(error: &str) -> bool {
-    error.starts_with("NETWORK_ERROR:")
-        || error.starts_with("CREDENTIAL_UNAVAILABLE:")
-        || error.starts_with("AUTH_UNVERIFIED:")
-}
-
-fn is_business_request_auth_error(error: &str) -> bool {
-    error.starts_with("AUTH_FAILED:")
-}
-
-fn is_definitive_auth_invalid(error: &str) -> bool {
-    error.starts_with("AUTH_INVALID:") || error.starts_with("DEVICE_REVOKED:")
-}
-
-fn session(workspace_id: &str) -> Result<CloudSession, String> {
-    if let Some(cached) = cached_session(workspace_id) {
-        return Ok(cached);
-    }
-    let accounts = session_account_candidates(workspace_id);
-    let (serialized, from_legacy) = match read_session_credential(&accounts[0]) {
-        Ok(serialized) => (serialized, false),
-        Err(stable_error) if stable_error == "NO_ENTRY" => {
-            (read_session_credential(&accounts[1])?, true)
-        }
-        Err(error) => return Err(error),
-    };
-    let session: CloudSession = serde_json::from_str(&serialized)
-        .map_err(|error| format!("AUTH_INVALID: Supabase 会话损坏，请重新登录: {error}"))?;
-    if from_legacy {
-        write_session_credential(SESSION_ACCOUNT, &serialized)
-            .map_err(|error| format!("CREDENTIAL_UNAVAILABLE: 无法迁移 Supabase 会话: {error}"))?;
-    }
-    cache_session(workspace_id, &session)?;
-    Ok(session)
-}
-
-fn save_session(database: &Database, session: &CloudSession) -> Result<(), String> {
-    let connection = database.open()?;
-    let workspace_id: String = connection
-        .query_row(
-            "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    let serialized = serde_json::to_string(session).map_err(|error| error.to_string())?;
-    write_session_credential(SESSION_ACCOUNT, &serialized)
-        .map_err(|error| format!("保存 Supabase 会话失败: {error}"))?;
-    // Keep the legacy workspace-scoped entry so older settings views still report
-    // that a session exists and existing installations can migrate gradually.
-    let _ = write_session_credential(&format!("{SESSION_PROVIDER}:{workspace_id}"), &serialized);
-    save_session_metadata(database, session)?;
-    cache_session(&workspace_id, session)
-}
-
-#[cfg(all(not(test), windows))]
-fn session_entry(account: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new_with_target(
-        &format!("{SESSION_CREDENTIAL_TARGET_PREFIX}:{account}"),
-        SESSION_CREDENTIAL_SERVICE,
-        account,
-    )
-    .map_err(|error| format!("无法访问系统凭据库: {error}"))
-}
-
-#[cfg(all(not(test), not(windows)))]
-fn session_entry(account: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new(SESSION_CREDENTIAL_SERVICE, account)
-        .map_err(|error| format!("无法访问系统凭据库: {error}"))
-}
-
-#[cfg(not(test))]
-fn legacy_session_entry(account: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new(SESSION_CREDENTIAL_SERVICE, account)
-        .map_err(|error| format!("无法访问系统凭据库: {error}"))
-}
-
-fn session_account_candidates(workspace_id: &str) -> [String; 2] {
-    [
-        SESSION_ACCOUNT.to_string(),
-        format!("{SESSION_PROVIDER}:{workspace_id}"),
-    ]
-}
-
-fn read_session_credential(account: &str) -> Result<String, String> {
-    #[cfg(test)]
-    {
-        return TEST_CREDENTIAL_STORE.with(|store| {
-            let store = store.borrow();
-            if store.fail_reads {
-                return Err(
-                    "CREDENTIAL_UNAVAILABLE: 本机凭据暂时无法读取: test failure".to_string()
-                );
-            }
-            store
-                .values
-                .get(account)
-                .cloned()
-                .ok_or_else(|| "NO_ENTRY".to_string())
-        });
-    }
-    #[cfg(not(test))]
-    {
-        let entry = session_entry(account)?;
-        match entry.get_password() {
-            Ok(serialized) => Ok(serialized),
-            Err(keyring::Error::NoEntry) => {
-                let legacy = legacy_session_entry(account)?;
-                let serialized = legacy.get_password().map_err(|error| match error {
-                    keyring::Error::NoEntry => "NO_ENTRY".to_string(),
-                    _ => format!("CREDENTIAL_UNAVAILABLE: 本机凭据暂时无法读取: {error}"),
-                })?;
-                entry.set_password(&serialized).map_err(|error| {
-                    format!("CREDENTIAL_UNAVAILABLE: 无法迁移 Supabase 会话: {error}")
-                })?;
-                let _ = legacy.delete_credential();
-                Ok(serialized)
-            }
-            Err(error) => Err(format!(
-                "CREDENTIAL_UNAVAILABLE: 本机凭据暂时无法读取: {error}"
-            )),
-        }
-    }
-}
-
-fn write_session_credential(account: &str, serialized: &str) -> Result<(), String> {
-    #[cfg(test)]
-    {
-        return TEST_CREDENTIAL_STORE.with(|store| {
-            let mut store = store.borrow_mut();
-            if store.fail_writes {
-                return Err("test credential write failure".to_string());
-            }
-            store
-                .values
-                .insert(account.to_string(), serialized.to_string());
-            Ok(())
-        });
-    }
-    #[cfg(not(test))]
-    {
-        let entry = session_entry(account)?;
-        entry
-            .set_password(serialized)
-            .map_err(|error| error.to_string())?;
-        let persisted = entry
-            .get_password()
-            .map_err(|error| format!("写入后无法读取系统凭据: {error}"))?;
-        if persisted != serialized {
-            return Err("系统凭据写入校验失败".to_string());
-        }
-        Ok(())
-    }
-}
-
-fn delete_session_credential(account: &str) -> Result<(), String> {
-    #[cfg(test)]
-    {
-        return TEST_CREDENTIAL_STORE.with(|store| {
-            let mut store = store.borrow_mut();
-            if store.fail_deletes {
-                return Err("test credential delete failure".to_string());
-            }
-            store.values.remove(account);
-            Ok(())
-        });
-    }
-    #[cfg(not(test))]
-    {
-        let mut first_error = None;
-        for entry in [session_entry(account)?, legacy_session_entry(account)?] {
-            match entry.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => {}
-                Err(error) if first_error.is_none() => first_error = Some(error.to_string()),
-                Err(_) => {}
-            }
-        }
-        first_error.map_or(Ok(()), Err)
-    }
-}
-
-fn clear_saved_session_for_workspace(
-    database: &Database,
-    workspace_id: &str,
-) -> Result<(), String> {
-    for account in session_account_candidates(workspace_id) {
-        delete_session_credential(&account)
-            .map_err(|error| format!("删除 Supabase 会话失败: {error}"))?;
-    }
-    remove_cached_session(workspace_id);
-    clear_session_metadata(database)?;
-    Ok(())
-}
-
-fn clear_all_saved_sessions(database: &Database) -> Result<(), String> {
-    let connection = database.open()?;
-    let workspaces = connection
-        .prepare("SELECT id FROM workspaces WHERE deleted_at IS NULL")
-        .map_err(|error| error.to_string())?
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    drop(connection);
-
-    delete_session_credential(SESSION_ACCOUNT)
-        .map_err(|error| format!("删除 Supabase 会话失败: {error}"))?;
-    if let Some(cache) = SESSION_CACHE.get() {
-        if let Ok(mut cache) = cache.lock() {
-            cache.clear();
-        }
-    }
-    for workspace_id in workspaces {
-        let legacy_account = format!("{SESSION_PROVIDER}:{workspace_id}");
-        delete_session_credential(&legacy_account)
-            .map_err(|error| format!("删除 Supabase 会话失败: {error}"))?;
-    }
-    Ok(())
-}
-
-fn cached_session(workspace_id: &str) -> Option<CloudSession> {
-    SESSION_CACHE
-        .get()
-        .and_then(|cache| cache.lock().ok())
-        .and_then(|cache| cache.get(workspace_id).cloned())
-}
-
-fn cache_session(workspace_id: &str, session: &CloudSession) -> Result<(), String> {
-    SESSION_CACHE
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map_err(|_| "AUTH_REQUIRED: Supabase 会话缓存不可用".to_string())?
-        .insert(workspace_id.to_string(), session.clone());
-    Ok(())
-}
-
-fn remove_cached_session(workspace_id: &str) {
-    if let Some(cache) = SESSION_CACHE.get() {
-        if let Ok(mut cache) = cache.lock() {
-            cache.remove(workspace_id);
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn clear_cached_session_for_test(database: &Database) {
-    if let Ok(workspace_id) = local_workspace_id(database) {
-        remove_cached_session(&workspace_id);
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn force_cached_session_expiry_for_test(database: &Database) -> Result<(), String> {
-    let workspace_id = local_workspace_id(database)?;
-    let mut session = session(&workspace_id)?;
-    session.expires_at = Some(0);
-    cache_session(&workspace_id, &session)
-}
-
-#[cfg(test)]
-pub(crate) fn install_test_session_for_database(
-    database: &Database,
-    user_id: &str,
-) -> Result<(), String> {
-    save_session(
-        database,
-        &CloudSession {
-            user_id: user_id.to_string(),
-            email: Some(format!("{user_id}@example.com")),
-            access_token: format!("access-{user_id}"),
-            refresh_token: format!("refresh-{user_id}"),
-            expires_at: Some(now_seconds() + 3600),
-        },
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn install_serialized_test_session_for_database(
-    database: &Database,
-    serialized: &str,
-) -> Result<(), String> {
-    let session: CloudSession = serde_json::from_str(serialized)
-        .map_err(|error| format!("AUTH_INVALID: Supabase 测试会话损坏: {error}"))?;
-    if session.user_id.trim().is_empty()
-        || session.access_token.trim().is_empty()
-        || session.refresh_token.trim().is_empty()
-    {
-        return Err("AUTH_INVALID: Supabase 测试会话缺少必要字段".to_string());
-    }
-    save_session(database, &session)
-}
-
-fn session_snapshot(session: &CloudSession) -> CloudSessionSnapshot {
-    CloudSessionSnapshot {
-        signed_in: true,
-        status: "authenticated".to_string(),
-        reason: None,
-        user_id: Some(session.user_id.clone()),
-        email: session.email.clone(),
-        expires_at: session.expires_at,
-    }
-}
-
-fn offline_session_snapshot(
-    database: &Database,
-    reason: Option<String>,
-) -> Result<CloudSessionSnapshot, String> {
-    let metadata = session_metadata(database)?;
-    Ok(CloudSessionSnapshot {
-        signed_in: metadata.is_some(),
-        status: if metadata.is_some() {
-            "offline_saved".to_string()
-        } else {
-            "reauth_required".to_string()
-        },
-        reason,
-        user_id: metadata.as_ref().map(|value| value.user_id.clone()),
-        email: metadata.as_ref().and_then(|value| value.email.clone()),
-        expires_at: metadata.and_then(|value| value.expires_at),
-    })
-}
-
-fn reauth_required_snapshot(reason: Option<String>) -> CloudSessionSnapshot {
-    CloudSessionSnapshot {
-        signed_in: false,
-        status: "reauth_required".to_string(),
-        reason,
-        user_id: None,
-        email: None,
-        expires_at: None,
-    }
-}
-
-fn session_reason_code(error: &str) -> Option<String> {
-    error
-        .split_once(':')
-        .map(|(code, _)| code.to_ascii_lowercase())
-}
-
-fn save_session_metadata(database: &Database, session: &CloudSession) -> Result<(), String> {
-    let metadata = CloudSessionMetadata {
-        user_id: session.user_id.clone(),
-        email: session.email.clone(),
-        expires_at: session.expires_at,
-    };
-    settings::update_setting(
-        database,
-        SettingsUpdate {
-            scope: SettingsScope::Device,
-            key: SESSION_METADATA_SETTING.to_string(),
-            value: serde_json::to_value(metadata).map_err(|error| error.to_string())?,
-        },
-    )
-    .map(|_| ())
-}
-
-fn session_metadata(database: &Database) -> Result<Option<CloudSessionMetadata>, String> {
-    let connection = database.open()?;
-    let serialized: Option<String> = connection
-        .query_row(
-            "SELECT value_json FROM device_settings WHERE key = ?1",
-            [SESSION_METADATA_SETTING],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?;
-    serialized
-        .map(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))
-        .transpose()
-}
-
-fn clear_session_metadata(database: &Database) -> Result<(), String> {
-    database
-        .open()?
-        .execute(
-            "DELETE FROM device_settings WHERE key = ?1",
-            [SESSION_METADATA_SETTING],
-        )
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
-pub(crate) fn mark_auth_blocked(database: &Database, reason: &str) -> Result<(), String> {
-    let state = storage_mode(database)?;
-    let connection = database.open()?;
-    let cloud_workspace_id: Option<String> = connection
-        .query_row(
-            "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'cloud_workspace_id'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?;
-    let Some(cloud_workspace_id) = cloud_workspace_id else {
-        return Ok(());
-    };
-    let last_change_seq = connection
-        .query_row(
-            "SELECT last_change_seq FROM local_sync_state WHERE workspace_id = ?1",
-            [&cloud_workspace_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(state.last_change_seq);
-    connection
-        .execute(
-            "INSERT INTO local_sync_state(workspace_id, device_id, last_change_seq, last_error, auth_blocked, auth_blocked_reason, auth_blocked_at)
-             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)
-             ON CONFLICT(workspace_id) DO UPDATE SET auth_blocked = 1, auth_blocked_reason = excluded.auth_blocked_reason, auth_blocked_at = excluded.auth_blocked_at, last_error = excluded.last_error",
-            params![cloud_workspace_id, state.device_id, last_change_seq, format!("AUTH_BLOCKED: {reason}"), reason, now_seconds() * 1000],
-        )
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
-pub(crate) fn clear_auth_blocked(database: &Database) -> Result<(), String> {
-    database
-        .open()?
-        .execute(
-            "UPDATE local_sync_state SET auth_blocked = 0, auth_blocked_reason = NULL, auth_blocked_at = NULL WHERE auth_blocked <> 0",
-            [],
-        )
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
 
 fn validate_project_url(value: &str) -> Result<String, String> {
     let value = value.trim().trim_end_matches('/');
@@ -7559,7 +3406,9 @@ pub fn storage_mode_get(
 pub fn storage_mode_set_local(
     database: tauri::State<'_, Database>,
 ) -> Result<StorageModeSnapshot, String> {
-    ensure_no_pending_cloud_work(&database)?;
+    if let Ok(cache) = crate::cloud_read_cache::CloudReadCache::for_database(&database) {
+        let _ = cache.clear_all();
+    }
     settings::update_setting(
         &database,
         SettingsUpdate {
@@ -7573,21 +3422,23 @@ pub fn storage_mode_set_local(
 }
 
 #[tauri::command]
+pub fn cloud_read_cache_clear(
+    database: tauri::State<'_, Database>,
+) -> Result<StorageModeSnapshot, String> {
+    crate::cloud_read_cache::CloudReadCache::for_database(&database)?.clear_all()?;
+    storage_mode(&database)
+}
+
+#[tauri::command]
 pub fn storage_mode_set_cloud(
     database: tauri::State<'_, Database>,
 ) -> Result<StorageModeSnapshot, String> {
     let connection = database.open()?;
-    let protocol = read_device_setting_string(&connection, "cloud_storage_protocol")?
-        .unwrap_or_else(|| crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string());
     let workspace_id = read_device_setting_string(&connection, "cloud_workspace_id")?
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "CLOUD_NOT_CONFIGURED: 尚未初始化 Supabase 工作空间".to_string())?;
     drop(connection);
-    if protocol != crate::storage_contract::DIRECT_CLOUD_PROTOCOL {
-        return Err("CLOUD_PROTOCOL_UNSUPPORTED: 当前云端工作空间尚未启用直连存储协议".to_string());
-    }
     current_session(&database)?;
-    ensure_no_pending_cloud_work(&database)?;
     settings::update_setting(
         &database,
         SettingsUpdate {
@@ -7706,36 +3557,6 @@ pub fn cloud_device_revoke(
     request: CloudDeviceRevokeRequest,
 ) -> Result<Vec<CloudDevice>, String> {
     revoke_device(&database, &request.device_id)
-}
-
-#[tauri::command]
-pub fn cloud_sync_resume_after_reauth(
-    database: tauri::State<'_, Database>,
-) -> Result<StorageModeSnapshot, String> {
-    resume_pending_sync(&database)
-}
-
-#[tauri::command]
-pub fn storage_protocol_upgrade_preflight_get(
-    database: tauri::State<'_, Database>,
-) -> Result<StorageProtocolUpgradePreflight, String> {
-    storage_protocol_upgrade_preflight(&database)
-}
-
-#[tauri::command]
-pub fn storage_protocol_upgrade_with_drained_queue_command(
-    database: tauri::State<'_, Database>,
-    request: StorageProtocolUpgradeRequest,
-) -> Result<StorageProtocolUpgradeResult, String> {
-    storage_protocol_upgrade_with_drained_queue(&database, request)
-}
-
-#[tauri::command]
-pub fn storage_protocol_upgrade_after_rescue_command(
-    database: tauri::State<'_, Database>,
-    request: StorageProtocolAbandonRequest,
-) -> Result<StorageProtocolAbandonResult, String> {
-    storage_protocol_upgrade_after_rescue(&database, request)
 }
 
 #[tauri::command]
@@ -7900,14 +3721,6 @@ pub fn storage_copy_replace_local(
         crate::direct_cloud_observability::record_copy_failure(&workspace_id, &error);
         error
     })
-}
-
-#[tauri::command]
-pub fn storage_migration_execute(
-    database: tauri::State<'_, Database>,
-    request: MigrationExecuteRequest,
-) -> Result<StorageModeSnapshot, String> {
-    migration_execute(&database, request)
 }
 
 #[cfg(test)]
@@ -8176,14 +3989,19 @@ mod tests {
             .unwrap();
         }
         let state = storage_mode(database).unwrap();
-        database
-            .open()
-            .unwrap()
-            .execute(
-                "INSERT INTO local_sync_state(workspace_id, device_id, last_change_seq) VALUES (?1, ?2, 0)",
-                params![cloud_workspace_id, state.device_id],
-            )
-            .unwrap();
+        write_direct_cloud_checkpoint(
+            database,
+            &DirectCloudCheckpoint {
+                workspace_id: cloud_workspace_id.to_string(),
+                device_id: state.device_id.clone(),
+                change_seq: 0,
+                workspace_epoch: 1,
+                fetched_at: None,
+                last_error: None,
+                auth_blocked_reason: None,
+            },
+        )
+        .unwrap();
         record_direct_cloud_access_success(cloud_workspace_id);
         (state.device_id, test_workspace_id(database))
     }
@@ -8367,7 +4185,7 @@ mod tests {
     }
 
     #[test]
-    fn current_device_logout_preserves_local_data_and_outbox_even_when_auth_logout_fails() {
+    fn current_device_logout_preserves_local_data_when_auth_logout_fails() {
         let _guard = lock_test_session_state();
         reset_test_credentials();
         let server = TestHttpServer::start(vec![
@@ -8391,7 +4209,7 @@ mod tests {
         let database =
             Database::initialize_at(directory.path().join("current-logout.sqlite3")).unwrap();
         let cloud_workspace_id = Uuid::now_v7().to_string();
-        let (device_id, local_workspace_id) =
+        let (_, local_workspace_id) =
             configure_test_cloud_state(&database, &server.base_url(), &cloud_workspace_id);
         save_session(
             &database,
@@ -8399,7 +4217,6 @@ mod tests {
         )
         .unwrap();
         let task_id = Uuid::now_v7().to_string();
-        let operation_id = Uuid::now_v7().to_string();
         {
             let connection = database.open().unwrap();
             let subject_id: String = connection
@@ -8408,10 +4225,6 @@ mod tests {
             connection.execute(
                 "INSERT INTO tasks(id, workspace_id, subject_id, title, status, source_type, sort_order, created_at, updated_at, version) VALUES (?1, ?2, ?3, '保留事项', 'open', 'manual', 10, 1, 1, 1)",
                 params![task_id, local_workspace_id, subject_id],
-            ).unwrap();
-            connection.execute(
-                "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, payload_json, state, created_at) VALUES (?1, ?2, ?3, 'task_create', 'task', ?4, '{}', 'pending', 1)",
-                params![operation_id, cloud_workspace_id, device_id, task_id],
             ).unwrap();
         }
         let error = sign_out(&database).unwrap_err();
@@ -8436,22 +4249,12 @@ mod tests {
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT COUNT(*) FROM sync_outbox WHERE operation_id = ?1",
-                    [&operation_id],
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                    [],
                     |row| row.get::<_, i64>(0)
                 )
                 .unwrap(),
-            1
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT auth_blocked FROM local_sync_state WHERE workspace_id = ?1",
-                    [&cloud_workspace_id],
-                    |row| row.get::<_, bool>(0)
-                )
-                .unwrap(),
-            true
+            0
         );
     }
 
@@ -8899,28 +4702,18 @@ mod tests {
 
         record_direct_cloud_checkpoint(&database, &metadata(12, 1)).unwrap();
         record_direct_cloud_checkpoint(&database, &metadata(9, 1)).unwrap();
-        let same_epoch: (i64, i64) = database
-            .open()
-            .unwrap()
-            .query_row(
-                "SELECT last_change_seq, workspace_epoch FROM local_sync_state WHERE workspace_id=?1",
-                [workspace_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(same_epoch, (12, 1));
+        let connection = database.open().unwrap();
+        let same_epoch = read_direct_cloud_checkpoint(&connection, workspace_id);
+        assert_eq!((same_epoch.change_seq, same_epoch.workspace_epoch), (12, 1));
+        drop(connection);
 
         record_direct_cloud_checkpoint(&database, &metadata(3, 2)).unwrap();
-        let restored_epoch: (i64, i64) = database
-            .open()
-            .unwrap()
-            .query_row(
-                "SELECT last_change_seq, workspace_epoch FROM local_sync_state WHERE workspace_id=?1",
-                [workspace_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(restored_epoch, (3, 2));
+        let connection = database.open().unwrap();
+        let restored_epoch = read_direct_cloud_checkpoint(&connection, workspace_id);
+        assert_eq!(
+            (restored_epoch.change_seq, restored_epoch.workspace_epoch),
+            (3, 2)
+        );
     }
 
     #[test]
@@ -8961,29 +4754,6 @@ mod tests {
             Database::initialize_at(directory.path().join("direct-snapshot.sqlite3")).unwrap();
         let cloud_workspace_id = "20000000-0000-0000-0000-0000000000f2";
         configure_test_cloud_state(&database, &server.base_url(), cloud_workspace_id);
-        database
-            .open()
-            .unwrap()
-            .execute_batch(
-                "UPDATE local_sync_state
-                   SET last_error='旧同步失败'
-                 WHERE workspace_id='20000000-0000-0000-0000-0000000000f2';
-                 INSERT INTO sync_outbox(
-                   operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,
-                   payload_json,state,created_at,error_json
-                 )
-                 SELECT
-                   '40000000-0000-0000-0000-0000000000f2',
-                   '20000000-0000-0000-0000-0000000000f2',
-                   json_extract(value_json,'$'),
-                   'legacy_probe','task','60000000-0000-0000-0000-0000000000f2',
-                   '{}','failed',1,'{\"message\":\"旧同步队列故障\"}'
-                 FROM device_settings WHERE key='device_id';
-                 INSERT INTO device_settings(key,value_json,updated_at)
-                 VALUES('cloud_storage_protocol','\"direct_v2\"',1)
-                 ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json;",
-            )
-            .unwrap();
         cache_session(
             cloud_workspace_id,
             &test_session("direct-snapshot", Some(now_seconds() + 3600)),
@@ -9058,12 +4828,12 @@ mod tests {
         .unwrap();
         let server = TestHttpServer::start(vec![
             TestHttpResponse {
-                path: "/rest/v1/rpc/workspace_restore_prepare",
+                path: "/rest/v1/rpc/direct_cloud_workspace_restore_prepare",
                 status: 200,
                 body: Box::leak(prepare_body.into_boxed_str()),
             },
             TestHttpResponse {
-                path: "/rest/v1/rpc/workspace_restore_commit",
+                path: "/rest/v1/rpc/direct_cloud_workspace_restore_commit",
                 status: 200,
                 body: Box::leak(commit_body.into_boxed_str()),
             },
@@ -9076,25 +4846,19 @@ mod tests {
         let device_id = read_device_setting_string(&database.open().unwrap(), "device_id")
             .unwrap()
             .unwrap();
-        database
-            .open()
-            .unwrap()
-            .execute_batch(&format!(
-                "UPDATE local_sync_state SET workspace_epoch=4,last_change_seq=41,last_error='旧同步故障'
-                 WHERE workspace_id='{cloud_workspace_id}';
-                 INSERT INTO sync_outbox(
-                   operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,
-                   payload_json,state,created_at,error_json,workspace_epoch
-                 ) VALUES(
-                   '40000000-0000-0000-0000-0000000000f3','{cloud_workspace_id}','{device_id}',
-                   'legacy_probe','task','60000000-0000-0000-0000-0000000000f3',
-                   '{{}}','failed',1,'{{\"message\":\"旧同步队列故障\"}}',4
-                 );
-                 INSERT INTO device_settings(key,value_json,updated_at)
-                 VALUES('cloud_storage_protocol','\"direct_v2\"',1)
-                 ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json;"
-            ))
-            .unwrap();
+        write_direct_cloud_checkpoint(
+            &database,
+            &DirectCloudCheckpoint {
+                workspace_id: cloud_workspace_id.to_string(),
+                device_id: device_id.clone(),
+                change_seq: 41,
+                workspace_epoch: 4,
+                fetched_at: None,
+                last_error: Some("旧连接故障".to_string()),
+                auth_blocked_reason: None,
+            },
+        )
+        .unwrap();
         cache_session(
             cloud_workspace_id,
             &test_session("direct-restore", Some(now_seconds() + 3600)),
@@ -9136,30 +4900,20 @@ mod tests {
         assert!(restored.restored);
         assert!(!restored.local_cache_rebuilt);
         let connection = database.open().unwrap();
-        let checkpoint: (i64, i64, Option<String>) = connection
-            .query_row(
-                "SELECT workspace_epoch,last_change_seq,last_error FROM local_sync_state WHERE workspace_id=?1",
-                [cloud_workspace_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(checkpoint, (5, 99, None));
+        let checkpoint = read_direct_cloud_checkpoint(&connection, cloud_workspace_id);
         assert_eq!(
-            connection
-                .query_row(
-                    "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1 AND state='failed'",
-                    [cloud_workspace_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            1
+            (
+                checkpoint.workspace_epoch,
+                checkpoint.change_seq,
+                checkpoint.last_error
+            ),
+            (5, 99, None)
         );
-        drop(connection);
 
         let requests = server.finish();
         assert_eq!(requests.len(), 2);
-        assert!(requests[0].contains("workspace_restore_prepare"));
-        assert!(requests[1].contains("workspace_restore_commit"));
+        assert!(requests[0].contains("direct_cloud_workspace_restore_prepare"));
+        assert!(requests[1].contains("direct_cloud_workspace_restore_commit"));
         assert!(!requests
             .iter()
             .any(|request| request.contains("cloud_snapshot_get")));
@@ -10016,7 +5770,11 @@ mod tests {
         let outbox_before: i64 = database
             .open()
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
 
         let manifest: Value =
@@ -10069,7 +5827,11 @@ mod tests {
         let outbox_after: i64 = database
             .open()
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(outbox_before, outbox_after);
 
@@ -10199,7 +5961,11 @@ mod tests {
         let outbox_before: i64 = database
             .open()
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         let manifest: Value =
             serde_json::from_str(crate::storage_contract::STORAGE_BOUNDARIES_JSON).unwrap();
@@ -10248,7 +6014,11 @@ mod tests {
         let outbox_after: i64 = database
             .open()
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(outbox_before, outbox_after);
         assert_eq!(server.finish().len(), 4);
@@ -10594,7 +6364,7 @@ mod tests {
                 .open()
                 .unwrap()
                 .query_row(
-                    "SELECT COUNT(*) FROM sync_outbox WHERE state IN ('pending','sending','failed','conflict')",
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
                     [],
                     |row| row.get(0),
                 )
@@ -10691,7 +6461,7 @@ mod tests {
                 .open()
                 .unwrap()
                 .query_row(
-                    "SELECT (SELECT COUNT(*) FROM sync_outbox),(SELECT COUNT(*) FROM time_entries)",
+                    "SELECT (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'),(SELECT COUNT(*) FROM time_entries)",
                     [],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
@@ -10995,15 +6765,67 @@ mod tests {
                 [],
             )
             .unwrap();
-        let legacy = crate::storage_contract::route(
+        let after_legacy_marker = crate::storage_contract::route(
             &database,
             crate::storage_contract::BusinessDomain::Tasks,
             crate::storage_contract::StorageOperation::Mutation,
-            |_| Ok("sqlite"),
-            |_| -> Result<&str, String> { panic!("legacy sync must use the SQLite adapter") },
+            |_| -> Result<&str, String> {
+                panic!("legacy protocol marker must not route cloud mode to SQLite")
+            },
+            |_| Ok("supabase"),
         )
         .unwrap();
-        assert_eq!(legacy, "sqlite");
+        assert_eq!(after_legacy_marker, "supabase");
+
+        record_direct_cloud_access_success(cloud_workspace_id);
+        let query_server = TestHttpServer::start(vec![TestHttpResponse {
+            path: "/rest/v1/rpc/direct_cloud_task_list",
+            status: 200,
+            body: query_body,
+        }]);
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "supabase_project_url".to_string(),
+                value: json!(query_server.base_url()),
+            },
+        )
+        .unwrap();
+        let reloaded = direct_cloud_task_list_for_command(
+            &database,
+            crate::tasks::TaskListRequest {
+                subject_id: None,
+                include_completed: Some(true),
+                planned_date: Some("2026-10-22".to_string()),
+                today_date: None,
+                today_only: None,
+                daily_estimate_date: None,
+                query: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(reloaded.tasks.len(), 1);
+        assert_eq!(query_server.finish().len(), 1);
+
+        let cached = direct_cloud_task_list_for_command(
+            &database,
+            crate::tasks::TaskListRequest {
+                subject_id: None,
+                include_completed: Some(true),
+                planned_date: Some("2026-10-22".to_string()),
+                today_date: None,
+                today_only: None,
+                daily_estimate_date: None,
+                query: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(cached.tasks.len(), 1);
+        let cache_state = storage_mode(&database).unwrap();
+        assert_eq!(cache_state.cache_source.as_deref(), Some("persistent"));
+        assert!(cache_state.cache_fetched_at.is_some());
+        assert!(!cache_state.cloud_writable);
     }
 
     #[test]
@@ -11508,7 +7330,7 @@ mod tests {
             .open()
             .unwrap()
             .query_row(
-                "SELECT COUNT(*) FROM sync_outbox WHERE state='conflict'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
                 [],
                 |row| row.get(0),
             )
@@ -11762,7 +7584,7 @@ mod tests {
                 .open()
                 .unwrap()
                 .query_row(
-                    "SELECT COUNT(*) FROM sync_outbox WHERE state IN ('pending','sending','failed','conflict')",
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
                     [],
                     |row| row.get(0),
                 )
@@ -12053,20 +7875,21 @@ mod tests {
     }
 
     #[test]
-    fn local_mode_snapshot_has_no_pending_operations() {
+    fn local_mode_snapshot_is_writable_without_cloud_cache() {
         let directory = tempdir().unwrap();
         let database = Database::initialize_at(directory.path().join("test.sqlite3")).unwrap();
         let snapshot = storage_mode(&database).unwrap();
         assert_eq!(snapshot.mode, "local");
-        assert_eq!(snapshot.pending_operations, 0);
-        assert!(!snapshot.online || snapshot.sync_state == "synced");
+        assert!(snapshot.online);
+        assert!(snapshot.cloud_writable);
+        assert!(snapshot.cache_source.is_none());
     }
 
     #[test]
-    fn failed_outbox_rows_are_reported_as_pending_operations() {
+    fn removed_legacy_sync_state_does_not_block_cloud_mode() {
         let directory = tempdir().unwrap();
         let database =
-            Database::initialize_at(directory.path().join("failed-outbox.sqlite3")).unwrap();
+            Database::initialize_at(directory.path().join("legacy-sync-removed.sqlite3")).unwrap();
         let cloud_workspace_id = "cloud-workspace";
         settings::update_setting(
             &database,
@@ -12086,236 +7909,22 @@ mod tests {
             },
         )
         .unwrap();
-        let device_id = storage_mode(&database).unwrap().device_id;
-        database
-            .open()
-            .unwrap()
-            .execute(
-                "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at, error_json)
-                 VALUES (?1, ?2, ?3, 'upsert', 'task', 'task-1', 1, '{}', 'failed', 1, 1, ?4)",
-                rusqlite::params![
-                    uuid::Uuid::now_v7().to_string(),
-                    cloud_workspace_id,
-                    device_id,
-                    json!({ "message": "temporary network failure" }).to_string()
-                ],
-            )
-            .unwrap();
 
-        let snapshot = storage_mode(&database).unwrap();
-        assert_eq!(snapshot.mode, "cloud");
-        assert_eq!(snapshot.pending_operations, 1);
-        assert_eq!(snapshot.sync_state, "pending");
-    }
-
-    #[test]
-    fn pending_outbox_rows_take_priority_over_previous_sync_error() {
-        let directory = tempdir().unwrap();
-        let database =
-            Database::initialize_at(directory.path().join("pending-priority-over-error.sqlite3"))
-                .unwrap();
-        let cloud_workspace_id = "cloud-workspace";
-        settings::update_setting(
-            &database,
-            SettingsUpdate {
-                scope: SettingsScope::Device,
-                key: "cloud_workspace_id".to_string(),
-                value: json!(cloud_workspace_id),
-            },
-        )
-        .unwrap();
-        settings::update_setting(
-            &database,
-            SettingsUpdate {
-                scope: SettingsScope::Device,
-                key: "storage_mode".to_string(),
-                value: json!("cloud"),
-            },
-        )
-        .unwrap();
-        let device_id = storage_mode(&database).unwrap().device_id;
         let connection = database.open().unwrap();
-        connection
-            .execute(
-                "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at, error_json)
-                 VALUES (?1, ?2, ?3, 'upsert', 'task', 'task-1', 1, '{}', 'pending', 0, 1, NULL)",
-                rusqlite::params![uuid::Uuid::now_v7().to_string(), cloud_workspace_id, device_id],
+        let legacy_tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('sync_outbox','local_sync_state','cloud_deferred_entities','legacy_abandoned_outbox','processed_operations','sync_items','sync_runs')",
+                [],
+                |row| row.get(0),
             )
             .unwrap();
-        connection
-            .execute(
-                "INSERT INTO local_sync_state(workspace_id, device_id, last_change_seq, last_full_sync_at, last_error)
-                 VALUES (?1, ?2, 42, 1700000000000, 'network timeout')",
-                rusqlite::params![cloud_workspace_id, device_id],
-            )
-            .unwrap();
+        drop(connection);
+        assert_eq!(legacy_tables, 0);
 
         let snapshot = storage_mode(&database).unwrap();
         assert_eq!(snapshot.mode, "cloud");
-        assert_eq!(snapshot.pending_operations, 1);
-        assert_eq!(snapshot.sync_state, "pending");
-        assert_eq!(snapshot.last_error.as_deref(), Some("network timeout"));
-    }
-
-    #[test]
-    fn conflict_outbox_rows_are_reported_as_conflict_state() {
-        let directory = tempdir().unwrap();
-        let database =
-            Database::initialize_at(directory.path().join("conflict-outbox.sqlite3")).unwrap();
-        let cloud_workspace_id = "cloud-workspace";
-        settings::update_setting(
-            &database,
-            SettingsUpdate {
-                scope: SettingsScope::Device,
-                key: "cloud_workspace_id".to_string(),
-                value: json!(cloud_workspace_id),
-            },
-        )
-        .unwrap();
-        settings::update_setting(
-            &database,
-            SettingsUpdate {
-                scope: SettingsScope::Device,
-                key: "storage_mode".to_string(),
-                value: json!("cloud"),
-            },
-        )
-        .unwrap();
-        let device_id = storage_mode(&database).unwrap().device_id;
-        database
-            .open()
-            .unwrap()
-            .execute(
-                "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at, error_json)
-                 VALUES (?1, ?2, ?3, 'upsert', 'task', 'task-1', 1, '{}', 'conflict', 1, 1, ?4)",
-                rusqlite::params![
-                    uuid::Uuid::now_v7().to_string(),
-                    cloud_workspace_id,
-                    device_id,
-                    json!({ "message": "version conflict" }).to_string()
-                ],
-            )
-            .unwrap();
-        database
-            .open()
-            .unwrap()
-            .execute(
-                "INSERT INTO local_sync_state(workspace_id, device_id, last_change_seq, last_full_sync_at, last_error)
-                 VALUES (?1, ?2, 0, 1, 'previous network timeout')",
-                rusqlite::params![cloud_workspace_id, device_id],
-            )
-            .unwrap();
-
-        let snapshot = storage_mode(&database).unwrap();
-        assert_eq!(snapshot.mode, "cloud");
-        assert_eq!(snapshot.pending_operations, 0);
-        assert_eq!(snapshot.conflict_count, 1);
-        assert_eq!(snapshot.sync_state, "conflict");
-        assert_eq!(
-            snapshot.last_error.as_deref(),
-            Some("previous network timeout")
-        );
-    }
-
-    #[test]
-    fn cloud_sync_state_exposes_last_success_and_error_details() {
-        let directory = tempdir().unwrap();
-        let database =
-            Database::initialize_at(directory.path().join("sync-state-details.sqlite3")).unwrap();
-        let cloud_workspace_id = "cloud-workspace";
-        settings::update_setting(
-            &database,
-            SettingsUpdate {
-                scope: SettingsScope::Device,
-                key: "cloud_workspace_id".to_string(),
-                value: json!(cloud_workspace_id),
-            },
-        )
-        .unwrap();
-        settings::update_setting(
-            &database,
-            SettingsUpdate {
-                scope: SettingsScope::Device,
-                key: "storage_mode".to_string(),
-                value: json!("cloud"),
-            },
-        )
-        .unwrap();
-        database
-            .open()
-            .unwrap()
-            .execute(
-                "INSERT INTO local_sync_state(workspace_id, device_id, last_change_seq, last_full_sync_at, last_error)
-                 VALUES (?1, 'device-1', 42, 1700000000000, 'network timeout')",
-                [cloud_workspace_id],
-            )
-            .unwrap();
-
-        let snapshot = storage_mode(&database).unwrap();
-        assert_eq!(snapshot.sync_state, "error");
-        assert_eq!(snapshot.last_change_seq, 42);
-        assert_eq!(snapshot.last_synced_at, Some(1700000000000));
-        assert_eq!(snapshot.last_error.as_deref(), Some("network timeout"));
-    }
-
-    #[test]
-    fn local_mode_switch_is_blocked_until_cloud_outbox_is_clean() {
-        for dirty_state in ["pending", "failed", "sending", "conflict"] {
-            let (_directory, database, _) = cloud_database_with_outbox_state(
-                &format!("cloud-switch-{dirty_state}.sqlite3"),
-                dirty_state,
-            );
-
-            let error = ensure_no_pending_cloud_work(&database).unwrap_err();
-            assert!(
-                error.starts_with("OFFLINE_RESTRICTED:"),
-                "dirty outbox state {dirty_state} should block local mode switch"
-            );
-            let snapshot = storage_mode(&database).unwrap();
-            assert_eq!(snapshot.mode, "cloud");
-            if dirty_state == "conflict" {
-                assert_eq!(snapshot.conflict_count, 1);
-            } else {
-                assert_eq!(snapshot.pending_operations, 1);
-            }
-        }
-    }
-
-    #[test]
-    fn cloud_configuration_change_is_blocked_until_outbox_is_clean() {
-        for dirty_state in ["pending", "failed", "sending", "conflict"] {
-            let (_directory, database, _) = cloud_database_with_outbox_state(
-                &format!("config-switch-{dirty_state}.sqlite3"),
-                dirty_state,
-            );
-
-            ensure_can_replace_cloud_configuration(
-                &database,
-                "https://old-project.supabase.co",
-                "old-anon-key",
-            )
-            .unwrap();
-            let error = ensure_can_replace_cloud_configuration(
-                &database,
-                "https://new-project.supabase.co",
-                "old-anon-key",
-            )
-            .unwrap_err();
-            assert!(
-                error.starts_with("OFFLINE_RESTRICTED:"),
-                "dirty outbox state {dirty_state} should block project change"
-            );
-            let error = ensure_can_replace_cloud_configuration(
-                &database,
-                "https://old-project.supabase.co",
-                "new-anon-key",
-            )
-            .unwrap_err();
-            assert!(
-                error.starts_with("OFFLINE_RESTRICTED:"),
-                "dirty outbox state {dirty_state} should block key change"
-            );
-        }
+        assert_eq!(snapshot.storage_backend, "direct_supabase");
+        assert!(snapshot.cache_source.is_none());
     }
 
     #[test]
@@ -12360,90 +7969,6 @@ mod tests {
             "new-anon-key"
         )
         .unwrap());
-    }
-
-    #[test]
-    fn cloud_snapshot_migration_is_blocked_until_outbox_is_clean() {
-        for dirty_state in ["pending", "failed", "sending", "conflict"] {
-            let (_directory, database, _) = cloud_database_with_outbox_state(
-                &format!("migration-blocked-{dirty_state}.sqlite3"),
-                dirty_state,
-            );
-
-            let error = migration_execute(
-                &database,
-                MigrationExecuteRequest {
-                    direction: "cloud_to_local_snapshot".to_string(),
-                    confirmed: true,
-                },
-            )
-            .unwrap_err();
-            assert!(
-                error.starts_with("OFFLINE_RESTRICTED:"),
-                "dirty outbox state {dirty_state} should block cloud snapshot migration"
-            );
-        }
-    }
-
-    fn cloud_database_with_outbox_state(
-        file_name: &str,
-        outbox_state: &str,
-    ) -> (tempfile::TempDir, Database, String) {
-        let directory = tempdir().unwrap();
-        let database = Database::initialize_at(directory.path().join(file_name)).unwrap();
-        let cloud_workspace_id = Uuid::now_v7().to_string();
-        settings::update_setting(
-            &database,
-            SettingsUpdate {
-                scope: SettingsScope::Device,
-                key: "cloud_workspace_id".to_string(),
-                value: json!(cloud_workspace_id.clone()),
-            },
-        )
-        .unwrap();
-        settings::update_setting(
-            &database,
-            SettingsUpdate {
-                scope: SettingsScope::Device,
-                key: "storage_mode".to_string(),
-                value: json!("cloud"),
-            },
-        )
-        .unwrap();
-        settings::update_setting(
-            &database,
-            SettingsUpdate {
-                scope: SettingsScope::Device,
-                key: "supabase_project_url".to_string(),
-                value: json!("https://old-project.supabase.co"),
-            },
-        )
-        .unwrap();
-        settings::update_setting(
-            &database,
-            SettingsUpdate {
-                scope: SettingsScope::Device,
-                key: "supabase_anon_key".to_string(),
-                value: json!("old-anon-key"),
-            },
-        )
-        .unwrap();
-        let device_id = storage_mode(&database).unwrap().device_id;
-        database
-            .open()
-            .unwrap()
-            .execute(
-                "INSERT INTO sync_outbox(operation_id, workspace_id, device_id, operation_type, entity_type, entity_id, base_version, payload_json, state, attempt_count, created_at, error_json)
-                 VALUES (?1, ?2, ?3, 'task_update', 'task', 'task-1', 1, '{}', ?4, 1, 1, '{}')",
-                rusqlite::params![
-                    Uuid::now_v7().to_string(),
-                    &cloud_workspace_id,
-                    device_id,
-                    outbox_state
-                ],
-            )
-            .unwrap();
-        (directory, database, cloud_workspace_id)
     }
 
     #[test]
@@ -13374,12 +8899,37 @@ mod tests {
             before_hash,
             local_snapshot_content_hash(&database, &source_workspace_id)
         );
+        let local_subject_id: String = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM subjects WHERE workspace_id=?1 LIMIT 1",
+                [&source_workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        crate::subjects::rename_subject(
+            &database,
+            crate::subjects::SubjectRenameRequest {
+                subject_id: local_subject_id,
+                name: "复制后本地改名".to_string(),
+                expected_version: 1,
+            },
+        )
+        .unwrap();
+        assert_ne!(
+            before_hash,
+            local_snapshot_content_hash(&database, &source_workspace_id)
+        );
         assert_eq!(
             database
                 .open()
                 .unwrap()
-                .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row
-                    .get::<_, i64>(0))
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
                 .unwrap(),
             0
         );
@@ -13410,652 +8960,61 @@ mod tests {
     }
 
     #[test]
-    fn legacy_upgrade_queue_preflight_counts_every_blocking_state() {
+    fn cloud_to_local_copy_is_one_time_and_later_local_edits_stay_local() {
         let directory = tempdir().unwrap();
         let database =
-            Database::initialize_at(directory.path().join("upgrade-preflight.sqlite3")).unwrap();
-        let connection = database.open().unwrap();
-        let workspace_id: String = connection
-            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
-            .unwrap();
-        let device_id: String = connection
-            .query_row("SELECT id FROM devices LIMIT 1", [], |row| row.get(0))
-            .unwrap();
-        for (index, state) in ["pending", "sending", "failed", "conflict"]
-            .iter()
-            .enumerate()
-        {
-            connection.execute(
-                "INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,payload_json,state,created_at) VALUES(?1,?2,?3,'test','task','{}',?4,?5)",
-                params![Uuid::now_v7().to_string(), workspace_id, device_id, state, index as i64],
-            ).unwrap();
-        }
-        let counts = legacy_queue_counts(&connection, &workspace_id).unwrap();
-        assert_eq!(counts.pending, 1);
-        assert_eq!(counts.sending, 1);
-        assert_eq!(counts.failed, 1);
-        assert_eq!(counts.conflict, 1);
-        assert_eq!(counts.total, 4);
-    }
-
-    #[test]
-    fn legacy_upgrade_queue_preflight_allows_an_empty_queue() {
-        let directory = tempdir().unwrap();
-        let database =
-            Database::initialize_at(directory.path().join("upgrade-empty.sqlite3")).unwrap();
-        let connection = database.open().unwrap();
-        let workspace_id: String = connection
-            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(
-            legacy_queue_counts(&connection, &workspace_id).unwrap(),
-            LegacyQueueCounts::default()
-        );
-    }
-
-    #[test]
-    fn legacy_upgrade_preflight_decision_covers_empty_blocked_and_stale_cases() {
-        let server = |workspace_epoch| StorageProtocolUpgradeServerPreflight {
-            workspace_id: "20000000-0000-0000-0000-000000000001".to_string(),
-            device_id: "30000000-0000-0000-0000-000000000001".to_string(),
-            storage_protocol: "sync_v1".to_string(),
-            workspace_epoch,
-            server_upgrade_allowed: true,
-            already_direct: false,
-            requires_local_queue_disposition: true,
-            allowed_queue_dispositions: vec![
-                "queue_drained".to_string(),
-                "abandoned_with_rescue".to_string(),
-            ],
-            server_time: "2026-10-23T20:00:00Z".to_string(),
-        };
-        let clean = build_storage_protocol_upgrade_preflight(
-            server(4),
-            "sync_v1".to_string(),
-            4,
-            Vec::new(),
-            LegacyQueueCounts::default(),
-        );
-        assert!(clean.can_upgrade_with_drained_queue);
-        assert!(clean.blocked_reasons.is_empty());
-
-        let blocked = build_storage_protocol_upgrade_preflight(
-            server(4),
-            "sync_v1".to_string(),
-            4,
-            Vec::new(),
-            LegacyQueueCounts {
-                pending: 1,
-                sending: 1,
-                failed: 1,
-                conflict: 1,
-                total: 4,
-            },
-        );
-        assert!(!blocked.can_upgrade_with_drained_queue);
-        assert!(blocked.blocked_reasons[0].contains("等待 1、发送中 1、失败 1、冲突 1"));
-
-        let stale = build_storage_protocol_upgrade_preflight(
-            server(5),
-            "sync_v1".to_string(),
-            4,
-            Vec::new(),
-            LegacyQueueCounts::default(),
-        );
-        assert!(!stale.can_upgrade_with_drained_queue);
-        assert!(stale.blocked_reasons[0].contains("本机工作空间世代为 4，云端为 5"));
-    }
-
-    fn upgrade_preflight_for_test(queue_total: i64) -> StorageProtocolUpgradePreflight {
-        StorageProtocolUpgradePreflight {
-            workspace_id: "20000000-0000-0000-0000-000000000001".to_string(),
-            device_id: "30000000-0000-0000-0000-000000000001".to_string(),
-            storage_protocol: "sync_v1".to_string(),
-            local_protocol: "sync_v1".to_string(),
-            workspace_epoch: 4,
-            local_workspace_epoch: 4,
-            server_upgrade_allowed: true,
-            already_direct: false,
-            requires_local_queue_disposition: true,
-            allowed_queue_dispositions: vec![
-                "queue_drained".to_string(),
-                "abandoned_with_rescue".to_string(),
-            ],
-            devices: Vec::new(),
-            queue: LegacyQueueCounts {
-                pending: queue_total,
-                sending: 0,
-                failed: 0,
-                conflict: 0,
-                total: queue_total,
-            },
-            can_upgrade_with_drained_queue: queue_total == 0,
-            blocked_reasons: Vec::new(),
-            server_time: "2026-10-23T20:00:00Z".to_string(),
-        }
-    }
-
-    fn drained_queue_for_test() -> crate::cloud_sync::LegacyQueueDrainResult {
-        crate::cloud_sync::LegacyQueueDrainResult {
-            pushed: 3,
-            last_change_seq: 19,
-            domains: vec!["tasks".to_string(), "time".to_string()],
-        }
-    }
-
-    #[test]
-    fn legacy_queue_upgrade_switches_only_after_drain_and_authoritative_refresh() {
-        use std::cell::Cell;
-
-        let initial = upgrade_preflight_for_test(2);
-        let drain_calls = Cell::new(0);
-        let switch_calls = Cell::new(0);
-        let (switched, refreshed, drained) = run_legacy_queue_upgrade_flow(
-            &initial,
-            || {
-                drain_calls.set(drain_calls.get() + 1);
-                Ok(drained_queue_for_test())
-            },
-            || Ok(upgrade_preflight_for_test(0)),
-            |_| {
-                switch_calls.set(switch_calls.get() + 1);
-                Ok(StorageProtocolUpgradeServerResult {
-                    upgraded: true,
-                    already_direct: false,
-                    workspace_epoch: 4,
-                    storage_protocol: Some("direct_v2".to_string()),
-                    change_seq: Some(20),
-                    safety_snapshot_id: None,
-                })
-            },
-        )
-        .unwrap();
-        assert_eq!(drain_calls.get(), 1);
-        assert_eq!(switch_calls.get(), 1);
-        assert!(switched.upgraded);
-        assert_eq!(refreshed.queue.total, 0);
-        assert_eq!(drained.pushed, 3);
-
-        let blocked = run_legacy_queue_upgrade_flow(
-            &upgrade_preflight_for_test(1),
-            || Ok(drained_queue_for_test()),
-            || Ok(upgrade_preflight_for_test(1)),
-            |_| {
-                switch_calls.set(switch_calls.get() + 1);
-                panic!("blocked queue must not switch protocol");
-            },
-        )
-        .unwrap_err();
-        assert!(blocked.starts_with("LEGACY_QUEUE_BLOCKED:"));
-        assert_eq!(switch_calls.get(), 1);
-
-        let drain_failed = run_legacy_queue_upgrade_flow(
-            &upgrade_preflight_for_test(1),
-            || Err("NETWORK_ERROR: simulated push failure".to_string()),
-            || Ok(upgrade_preflight_for_test(0)),
-            |_| panic!("failed drain must not switch protocol"),
-        )
-        .unwrap_err();
-        assert!(drain_failed.starts_with("NETWORK_ERROR:"));
-    }
-
-    #[test]
-    fn drained_upgrade_persists_direct_protocol_without_writing_business_tables() {
-        let directory = tempdir().unwrap();
-        let database =
-            Database::initialize_at(directory.path().join("upgrade-apply.sqlite3")).unwrap();
-        let workspace_id = Uuid::now_v7().to_string();
-        let device_id = storage_mode(&database).unwrap().device_id;
-        settings::update_setting(
-            &database,
-            SettingsUpdate {
-                scope: SettingsScope::Device,
-                key: "cloud_workspace_id".to_string(),
-                value: json!(workspace_id),
-            },
-        )
-        .unwrap();
-        database
-            .open()
-            .unwrap()
-            .execute(
-                "INSERT INTO local_sync_state(workspace_id,device_id,last_change_seq,workspace_epoch) VALUES(?1,?2,12,4)",
-                params![workspace_id, device_id],
-            )
-            .unwrap();
-        let preflight = upgrade_preflight_for_test(0);
-        let server = StorageProtocolUpgradeServerResult {
-            upgraded: true,
-            already_direct: false,
-            workspace_epoch: 4,
-            storage_protocol: Some("direct_v2".to_string()),
-            change_seq: Some(20),
-            safety_snapshot_id: Some(Uuid::now_v7().to_string()),
-        };
-        let before = crate::storage_contract::business_data_fingerprint(&database).unwrap();
-        let applied = apply_legacy_queue_upgrade_result(
-            &database,
-            &server,
-            &drained_queue_for_test(),
-            &preflight,
-        )
-        .unwrap();
-        assert_eq!(applied.storage_protocol, "direct_v2");
-        assert_eq!(applied.pushed_operations, 3);
-        assert_eq!(applied.last_change_seq, 20);
-        assert_eq!(
-            storage_mode(&database).unwrap().configured_cloud_protocol,
-            "direct_v2"
-        );
-        assert_eq!(
-            before,
-            crate::storage_contract::business_data_fingerprint(&database).unwrap()
-        );
-    }
-
-    fn insert_legacy_outbox_for_test(database: &Database, workspace_id: &str, count: i64) {
-        let device_id = storage_mode(database).unwrap().device_id;
-        let connection = database.open().unwrap();
-        for index in 0..count {
-            connection
-                .execute(
-                    "INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,payload_json,state,attempt_count,created_at,workspace_epoch,error_json) VALUES(?1,?2,?3,'task_update','task',?4,?5,1,?6,4,?7)",
-                    params![
-                        Uuid::now_v7().to_string(),
-                        workspace_id,
-                        device_id,
-                        json!({"title": format!("旧修改 {index}")}).to_string(),
-                        if index % 2 == 0 { "pending" } else { "failed" },
-                        index,
-                        json!({"message": "VERSION_CONFLICT: 本地保留"}).to_string()
-                    ],
-                )
+            Database::initialize_at(directory.path().join("cloud-to-local-copy-once.sqlite3"))
                 .unwrap();
-        }
-    }
-
-    fn configure_auth_resume_test_state(
-        database: &Database,
-        project_url: &str,
-        workspace_id: &str,
-        protocol: &str,
-    ) {
-        configure_test_cloud_state(database, project_url, workspace_id);
-        database
-            .open()
-            .unwrap()
-            .execute(
-                "INSERT INTO device_settings(key,value_json,updated_at)
-                 VALUES('cloud_storage_protocol',?1,1)
-                 ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
-                [serde_json::to_string(protocol).unwrap()],
-            )
-            .unwrap();
-        mark_auth_blocked(database, "auth_session_revoked").unwrap();
-    }
-
-    #[test]
-    fn direct_v2_authorization_resume_quarantines_legacy_queue_and_clears_block() {
-        let _guard = lock_test_session_state();
-        reset_test_credentials();
-        let server = TestHttpServer::start(vec![TestHttpResponse {
-            path: "/rest/v1/rpc/device_authorization_get",
-            status: 200,
-            body: r#"{"authorized":true}"#,
-        }]);
-        let directory = tempdir().unwrap();
-        let database =
-            Database::initialize_at(directory.path().join("direct-v2-auth-resume.sqlite3"))
+        let workspace_id = test_workspace_id(&database);
+        let source = local_snapshot(&database, &workspace_id).unwrap();
+        let (manifest, chunks) = test_export_package(&source);
+        let cloud_content_hash = manifest.content_hash.clone();
+        let downloaded =
+            download_data_copy_from_fetch(&manifest, |chunk_index| Ok(chunks[chunk_index].clone()))
                 .unwrap();
-        let workspace_id = Uuid::now_v7().to_string();
-        configure_auth_resume_test_state(
-            &database,
-            &server.base_url(),
-            &workspace_id,
-            crate::storage_contract::DIRECT_CLOUD_PROTOCOL,
-        );
-        save_session(
-            &database,
-            &test_session("direct-v2-auth-resume", Some(now_seconds() + 3600)),
-        )
-        .unwrap();
-        insert_legacy_outbox_for_test(&database, &workspace_id, 2);
-        let business_before: (i64, i64, i64, i64, i64) = database
+
+        replace_local_with_downloaded_data_copy(&database, &manifest, downloaded).unwrap();
+        let copied_hash = test_export_package(&local_snapshot(&database, &workspace_id).unwrap())
+            .0
+            .content_hash;
+        assert_eq!(copied_hash, cloud_content_hash);
+
+        let subject_id: String = database
             .open()
             .unwrap()
             .query_row(
-                "SELECT
-                    (SELECT COUNT(*) FROM subjects),
-                    (SELECT COUNT(*) FROM tasks),
-                    (SELECT COUNT(*) FROM time_entries),
-                    (SELECT COUNT(*) FROM unassigned_sessions),
-                    (SELECT COUNT(*) FROM reports)",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .unwrap();
-
-        ensure_current_device_authorized(&database).unwrap();
-
-        assert_eq!(server.finish().len(), 1);
-        let state = storage_mode(&database).unwrap();
-        assert!(!state.auth_blocked);
-        assert_eq!(state.pending_operations, 0);
-        assert_eq!(state.conflict_count, 0);
-        assert!(state.last_error.is_none());
-        let connection = database.open().unwrap();
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1",
-                    [&workspace_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            0
-        );
-        let (count, reason, checksum): (i64, String, String) = connection
-            .query_row(
-                "SELECT COUNT(*),MIN(quarantine_reason),MIN(rescue_backup_checksum)
-                 FROM legacy_abandoned_outbox WHERE workspace_id=?1",
+                "SELECT id FROM subjects WHERE workspace_id=?1 LIMIT 1",
                 [&workspace_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 2);
-        assert!(reason.contains("direct_v2 登录恢复"));
-        assert_eq!(checksum.len(), 64);
-        drop(connection);
-        let business_after: (i64, i64, i64, i64, i64) = database
+        crate::subjects::rename_subject(
+            &database,
+            crate::subjects::SubjectRenameRequest {
+                subject_id,
+                name: "复制后仅本地修改".to_string(),
+                expected_version: 1,
+            },
+        )
+        .unwrap();
+
+        assert_ne!(
+            copied_hash,
+            test_export_package(&local_snapshot(&database, &workspace_id).unwrap())
+                .0
+                .content_hash
+        );
+        assert_eq!(manifest.content_hash, cloud_content_hash);
+        let legacy_tables: i64 = database
             .open()
             .unwrap()
             .query_row(
-                "SELECT
-                    (SELECT COUNT(*) FROM subjects),
-                    (SELECT COUNT(*) FROM tasks),
-                    (SELECT COUNT(*) FROM time_entries),
-                    (SELECT COUNT(*) FROM unassigned_sessions),
-                    (SELECT COUNT(*) FROM reports)",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
                 [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
+                |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(business_before, business_after);
-    }
-
-    #[test]
-    fn direct_v2_authorization_resume_with_empty_queue_only_clears_block() {
-        let _guard = lock_test_session_state();
-        reset_test_credentials();
-        let server = TestHttpServer::start(vec![TestHttpResponse {
-            path: "/rest/v1/rpc/device_authorization_get",
-            status: 200,
-            body: r#"{"authorized":true}"#,
-        }]);
-        let directory = tempdir().unwrap();
-        let database =
-            Database::initialize_at(directory.path().join("direct-v2-auth-resume-empty.sqlite3"))
-                .unwrap();
-        let workspace_id = Uuid::now_v7().to_string();
-        configure_auth_resume_test_state(
-            &database,
-            &server.base_url(),
-            &workspace_id,
-            crate::storage_contract::DIRECT_CLOUD_PROTOCOL,
-        );
-        save_session(
-            &database,
-            &test_session("direct-v2-auth-resume-empty", Some(now_seconds() + 3600)),
-        )
-        .unwrap();
-
-        ensure_current_device_authorized(&database).unwrap();
-
-        assert_eq!(server.finish().len(), 1);
-        assert!(!storage_mode(&database).unwrap().auth_blocked);
-        assert_eq!(
-            database
-                .open()
-                .unwrap()
-                .query_row("SELECT COUNT(*) FROM legacy_abandoned_outbox", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn legacy_authorization_resume_still_requires_explicit_confirmation() {
-        let _guard = lock_test_session_state();
-        reset_test_credentials();
-        let server = TestHttpServer::start(vec![TestHttpResponse {
-            path: "/rest/v1/rpc/device_authorization_get",
-            status: 200,
-            body: r#"{"authorized":true}"#,
-        }]);
-        let directory = tempdir().unwrap();
-        let database = Database::initialize_at(
-            directory
-                .path()
-                .join("legacy-auth-resume-confirmation.sqlite3"),
-        )
-        .unwrap();
-        let workspace_id = Uuid::now_v7().to_string();
-        configure_auth_resume_test_state(
-            &database,
-            &server.base_url(),
-            &workspace_id,
-            crate::storage_contract::LEGACY_SYNC_PROTOCOL,
-        );
-        save_session(
-            &database,
-            &test_session("legacy-auth-resume", Some(now_seconds() + 3600)),
-        )
-        .unwrap();
-        insert_legacy_outbox_for_test(&database, &workspace_id, 1);
-
-        let error = ensure_current_device_authorized(&database).unwrap_err();
-
-        assert!(error.starts_with("AUTH_RESUME_REQUIRED:"));
-        assert_eq!(server.finish().len(), 1);
-        assert!(storage_mode(&database).unwrap().auth_blocked);
-        assert_eq!(
-            legacy_queue_counts(&database.open().unwrap(), &workspace_id)
-                .unwrap()
-                .total,
-            1
-        );
-    }
-
-    #[test]
-    fn direct_v2_auth_resume_keeps_block_and_queue_when_quarantine_fails() {
-        let directory = tempdir().unwrap();
-        let database = Database::initialize_at(
-            directory
-                .path()
-                .join("direct-v2-auth-resume-rollback.sqlite3"),
-        )
-        .unwrap();
-        let workspace_id = Uuid::now_v7().to_string();
-        configure_auth_resume_test_state(
-            &database,
-            "http://127.0.0.1:9",
-            &workspace_id,
-            crate::storage_contract::DIRECT_CLOUD_PROTOCOL,
-        );
-        insert_legacy_outbox_for_test(&database, &workspace_id, 1);
-        database
-            .open()
-            .unwrap()
-            .execute_batch(
-                "CREATE TRIGGER reject_direct_v2_quarantine
-                 BEFORE INSERT ON legacy_abandoned_outbox
-                 BEGIN SELECT RAISE(ABORT, 'simulated quarantine failure'); END;",
-            )
-            .unwrap();
-
-        let error = quarantine_direct_v2_auth_resume_queue(&database, &workspace_id).unwrap_err();
-
-        assert!(error.starts_with("DIRECT_CLOUD_LEGACY_QUEUE_ISOLATION_FAILED:"));
-        assert!(storage_mode(&database).unwrap().auth_blocked);
-        assert_eq!(
-            legacy_queue_counts(&database.open().unwrap(), &workspace_id)
-                .unwrap()
-                .total,
-            1
-        );
-        assert_eq!(
-            database
-                .open()
-                .unwrap()
-                .query_row("SELECT COUNT(*) FROM legacy_abandoned_outbox", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap(),
-            0
-        );
-    }
-
-    fn test_rescue_backup_for_preflight(
-        preflight: &StorageProtocolUpgradePreflight,
-    ) -> crate::data_protection::ValidatedRescueBackup {
-        crate::data_protection::ValidatedRescueBackup {
-            created_at: "2026-10-23T20:00:00.000Z".to_string(),
-            checksum: "a".repeat(64),
-            source_workspace_marker: crate::data_protection::sha256_hex(
-                preflight.workspace_id.as_bytes(),
-            ),
-            pending_operation_count: preflight.queue.total,
-            legacy_queue_operation_count: preflight.queue.total as usize,
-        }
-    }
-
-    #[test]
-    fn rescue_abandon_requires_explicit_second_confirmation() {
-        let directory = tempdir().unwrap();
-        let database =
-            Database::initialize_at(directory.path().join("abandon-confirmation.sqlite3")).unwrap();
-        let request = |confirmed, text: &str| StorageProtocolAbandonRequest {
-            operation_id: Uuid::now_v7().to_string(),
-            rescue_backup_path: "missing.timegenie-backup".to_string(),
-            confirmed,
-            confirmation_text: text.to_string(),
-            create_safety_snapshot: Some(true),
-        };
-        let unconfirmed =
-            storage_protocol_upgrade_after_rescue(&database, request(false, "放弃旧修改"))
-                .unwrap_err();
-        assert!(unconfirmed.starts_with("ABANDON_NOT_CONFIRMED:"));
-        let wrong_text =
-            storage_protocol_upgrade_after_rescue(&database, request(true, "确认")).unwrap_err();
-        assert!(wrong_text.starts_with("ABANDON_CONFIRMATION_MISMATCH:"));
-    }
-
-    #[test]
-    fn rescue_abandon_isolates_queue_and_restores_it_when_protocol_stays_legacy() {
-        let directory = tempdir().unwrap();
-        let database =
-            Database::initialize_at(directory.path().join("abandon-queue.sqlite3")).unwrap();
-        let preflight = upgrade_preflight_for_test(2);
-        insert_legacy_outbox_for_test(&database, &preflight.workspace_id, 2);
-        let backup = test_rescue_backup_for_preflight(&preflight);
-        let failure = run_abandon_queue_upgrade_flow(
-            &preflight,
-            &backup,
-            || {
-                quarantine_legacy_queue(
-                    &database,
-                    &preflight.workspace_id,
-                    &backup.checksum,
-                    "测试放弃原因",
-                )
-            },
-            |batch_id| restore_quarantined_legacy_queue(&database, batch_id),
-            |_| Err("NETWORK_ERROR: simulated switch failure".to_string()),
-            || Ok(true),
-        )
-        .unwrap_err();
-        assert!(failure.contains("旧队列已恢复到 sync_v1"));
-        let connection = database.open().unwrap();
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            2
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM legacy_abandoned_outbox", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap(),
-            0
-        );
-        drop(connection);
-
-        let (switched, batch_id, quarantined) = run_abandon_queue_upgrade_flow(
-            &preflight,
-            &backup,
-            || {
-                quarantine_legacy_queue(
-                    &database,
-                    &preflight.workspace_id,
-                    &backup.checksum,
-                    "用户确认导出后放弃旧修改",
-                )
-            },
-            |batch_id| restore_quarantined_legacy_queue(&database, batch_id),
-            |_| {
-                Ok(StorageProtocolUpgradeServerResult {
-                    upgraded: true,
-                    already_direct: false,
-                    workspace_epoch: 4,
-                    storage_protocol: Some("direct_v2".to_string()),
-                    change_seq: Some(30),
-                    safety_snapshot_id: Some(Uuid::now_v7().to_string()),
-                })
-            },
-            || Ok(true),
-        )
-        .unwrap();
-        assert!(switched.upgraded);
-        assert_eq!(quarantined, 2);
-        let connection = database.open().unwrap();
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-        let (isolated, checksum, reason): (i64, String, String) = connection
-            .query_row(
-                "SELECT COUNT(*),MIN(rescue_backup_checksum),MIN(quarantine_reason) FROM legacy_abandoned_outbox WHERE quarantine_batch_id=?1",
-                [&batch_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(isolated, 2);
-        assert_eq!(checksum, backup.checksum);
-        assert!(reason.contains("放弃旧修改"));
+        assert_eq!(legacy_tables, 0);
     }
 
     #[test]
@@ -14155,19 +9114,15 @@ mod tests {
             subjects_before
         );
         assert_eq!(
-            database
-                .open()
-                .unwrap()
-                .query_row(
-                    "SELECT device_id,last_change_seq,workspace_epoch FROM local_sync_state WHERE workspace_id=?1",
-                    [&cloud_workspace_id],
-                    |row| Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                    )),
+            {
+                let connection = database.open().unwrap();
+                let checkpoint = read_direct_cloud_checkpoint(&connection, &cloud_workspace_id);
+                (
+                    checkpoint.device_id,
+                    checkpoint.change_seq,
+                    checkpoint.workspace_epoch,
                 )
-                .unwrap(),
+            },
             (device_id, 42, 2)
         );
         let requests = server.finish();

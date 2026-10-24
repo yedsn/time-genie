@@ -6,7 +6,11 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (relativePath) => fs.readFileSync(path.join(root, relativePath), "utf8");
 
 const observability = read("src-tauri/src/direct_cloud_observability.rs");
-const supabase = read("src-tauri/src/supabase.rs");
+const supabase = fs
+  .readdirSync(path.join(root, "src-tauri/src/supabase"))
+  .filter((name) => name.endsWith(".rs"))
+  .map((name) => read(path.join("src-tauri/src/supabase", name)))
+  .join("\n");
 const cloudSync = read("src-tauri/src/cloud_sync.rs");
 const lib = read("src-tauri/src/lib.rs");
 const frontendApi = read("src-ui/src/services/tauri.ts");

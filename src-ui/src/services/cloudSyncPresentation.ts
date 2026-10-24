@@ -5,11 +5,8 @@ export type CloudSyncPresentationState = {
   cloudWritable?: boolean;
   readOnlyReason?: string;
   online: boolean;
-  syncState?: string;
   syncing?: boolean;
   saving?: boolean;
-  pendingOperations?: number;
-  conflictCount?: number;
   lastSyncedAt?: number;
   lastError?: string;
 };

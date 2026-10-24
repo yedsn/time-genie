@@ -50,8 +50,6 @@
         "test:direct-cloud-storage-ui": "node scripts/verify-direct-cloud-storage-ui.mjs",
     "test:direct-cloud-docs": "node scripts/verify-direct-cloud-docs.mjs && node scripts/verify-direct-cloud-release-guard.mjs",
     "test:direct-cloud-release-guard": "node scripts/verify-direct-cloud-release-guard.mjs",
-        "test:supabase:planning-e2e": "cargo test --manifest-path src-tauri/Cargo.toml cloud_e2e::isolated_supabase_planning_two_device_flow -- --nocapture",
-        "test:supabase:restore-e2e": "cargo test --manifest-path src-tauri/Cargo.toml cloud_e2e::isolated_workspace_restore -- --nocapture",
         "test:supabase:e2e": "node scripts/run-supabase-e2e.mjs",
         "test:supabase:e2e:current-session": "cargo run --manifest-path src-tauri/Cargo.toml --bin run_current_account_supabase_e2e",
         "test:supabase:e2e:temporary-account": "cargo run --manifest-path src-tauri/Cargo.toml --bin run_temporary_account_supabase_e2e",
@@ -72,7 +70,6 @@
         "md-editor-v3": "^7.0.0",
         "pinia": "^2.3.0",
         "sortablejs": "^1.15.7",
-        "timegenie": "file:",
         "vue": "^3.5.13"
     },
     "devDependencies": {

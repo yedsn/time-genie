@@ -33,6 +33,7 @@ pub(crate) struct RealtimeListenerHooks {
     pub(crate) on_legacy_change: fn(Option<i64>),
     pub(crate) workspace_epoch: fn(&Database, &str) -> i64,
     pub(crate) covered_change_seq: fn(&Database) -> i64,
+    pub(crate) on_invalidation: fn(&Database, &WorkspaceInvalidation),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -304,6 +305,7 @@ async fn run_realtime_connection(
                                 (hooks.workspace_epoch)(database, &config.workspace_id),
                             ) {
                                 if invalidation.change_seq > (hooks.covered_change_seq)(database) {
+                                    (hooks.on_invalidation)(database, &invalidation);
                                     let _ = app.emit("work-data-changed", &invalidation);
                                 }
                             }

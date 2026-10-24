@@ -656,6 +656,13 @@ mod tests {
             .unwrap_or(0)
     }
 
+    fn migrate_through_legacy_cleanup(path: &std::path::Path) -> Connection {
+        let mut connection = Connection::open(path).unwrap();
+        configure_connection(&connection).unwrap();
+        apply_migrations_before_legacy_cleanup(&mut connection).unwrap();
+        connection
+    }
+
     #[test]
     fn first_start_applies_migration_and_seeds_local_workspace() {
         let directory = tempdir().unwrap();
@@ -1149,8 +1156,7 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        Database::initialize_at(path.clone()).unwrap();
-        let connection = Connection::open(path).unwrap();
+        let connection = migrate_through_legacy_cleanup(&path);
         let state: String = connection
             .query_row(
                 "SELECT state FROM sync_outbox WHERE operation_id='adjustment-op'",
@@ -1482,8 +1488,7 @@ mod tests {
         ).unwrap();
         drop(connection);
 
-        let database = Database::initialize_at(path).unwrap();
-        let connection = database.open().unwrap();
+        let connection = migrate_through_legacy_cleanup(&path);
         let context_plan_count: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM task_day_plans WHERE task_id='source-context'",
@@ -1554,8 +1559,7 @@ mod tests {
         ).unwrap();
         drop(connection);
 
-        let database = Database::initialize_at(path).unwrap();
-        let connection = database.open().unwrap();
+        let connection = migrate_through_legacy_cleanup(&path);
         let sync_state: (i64, bool, Option<String>, Option<i64>) = connection
             .query_row(
                 "SELECT workspace_epoch,epoch_blocked,epoch_blocked_reason,epoch_blocked_at FROM local_sync_state WHERE workspace_id='epoch-ws'",
@@ -1573,8 +1577,14 @@ mod tests {
             .unwrap();
         assert_eq!(outbox_epoch, 1);
         assert_eq!(
-            database.status().unwrap().schema_version,
-            latest_migration_version()
+            connection
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            LEGACY_SYNC_CLEANUP_MIGRATION_VERSION - 1
         );
     }
 
@@ -1644,12 +1654,17 @@ mod tests {
         ).unwrap();
         drop(connection);
 
-        let database = Database::initialize_at(path).unwrap();
+        let connection = migrate_through_legacy_cleanup(&path);
         assert_eq!(
-            database.status().unwrap().schema_version,
-            latest_migration_version()
+            connection
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            LEGACY_SYNC_CLEANUP_MIGRATION_VERSION - 1
         );
-        let connection = database.open().unwrap();
         let queue: (String,String,i64,String,String,i64,Option<String>,String,Option<String>) = connection.query_row(
             "SELECT operation_id,state,attempt_count,payload_json,error_json,coalesced_count,depends_on_operation_id,recovery_kind,recovery_context_json FROM sync_outbox WHERE operation_id='legacy-timer-op'",
             [],
@@ -1848,8 +1863,7 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let database = Database::initialize_at(path).unwrap();
-        let connection = database.open().unwrap();
+        let connection = migrate_through_legacy_cleanup(&path);
         let task_title: String = connection
             .query_row(
                 "SELECT title FROM tasks WHERE id = 'upgrade-task'",
@@ -1876,8 +1890,14 @@ mod tests {
         assert_eq!(queued, 1);
         assert_eq!(deferred_table, 6);
         assert_eq!(
-            database.status().unwrap().schema_version,
-            latest_migration_version()
+            connection
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            LEGACY_SYNC_CLEANUP_MIGRATION_VERSION - 1
         );
     }
 
@@ -1932,8 +1952,7 @@ mod tests {
         }
         drop(connection);
 
-        let database = Database::initialize_at(path).unwrap();
-        let connection = database.open().unwrap();
+        let connection = migrate_through_legacy_cleanup(&path);
         let rows = connection
             .prepare(
                 "SELECT state, payload_version, depends_on_operation_id, coalesced_count
@@ -2008,16 +2027,14 @@ mod tests {
         }
         drop(connection);
 
-        let database = Database::initialize_at(path).unwrap();
+        let connection = migrate_through_legacy_cleanup(&path);
         let rows = collect_strings(
-            &database.open().unwrap(),
+            &connection,
             "SELECT operation_id FROM sync_outbox ORDER BY operation_id",
         )
         .unwrap();
         assert_eq!(rows, vec!["keep-time-entry"]);
-        let payload: String = database
-            .open()
-            .unwrap()
+        let payload: String = connection
             .query_row(
                 "SELECT payload_json FROM sync_outbox WHERE operation_id = 'keep-time-entry'",
                 [],
@@ -2067,8 +2084,12 @@ mod tests {
         connection.execute("INSERT INTO sync_outbox(operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,payload_json,state,attempt_count,created_at) VALUES ('keep-task-op',?1,?2,'task.update','task','task-1','{}','pending',0,1)",params![workspace_id,device_id]).unwrap();
         drop(connection);
 
-        let database = Database::initialize_at(path).unwrap();
-        let connection = database.open().unwrap();
+        let connection = migrate_through_legacy_cleanup(&path);
+        drop(connection);
+        // Startup coordination runs after the final migration; emulate it here so
+        // the assertion reflects the state a real launch observes.
+        recover_local_tracking_state(&Database { path: path.clone() }).unwrap();
+        let connection = Connection::open(&path).unwrap();
         let active: (String, String) = connection.query_row("SELECT shared_source,migration_state FROM unassigned_sessions WHERE id='active-session'",[],|row| Ok((row.get(0)?,row.get(1)?))).unwrap();
         let history: (String, Option<String>) = connection.query_row("SELECT state,generated_entry_id FROM unassigned_sessions WHERE id='resolved-session'",[],|row| Ok((row.get(0)?,row.get(1)?))).unwrap();
         let kept: i64 = connection
@@ -2219,7 +2240,7 @@ mod tests {
 
         let mut upgrade_connection = Connection::open(&path).unwrap();
         configure_connection(&upgrade_connection).unwrap();
-        apply_migrations(&mut upgrade_connection).unwrap();
+        apply_migrations_before_legacy_cleanup(&mut upgrade_connection).unwrap();
         drop(upgrade_connection);
         let database = Database { path };
         let connection = database.open().unwrap();
@@ -2319,8 +2340,14 @@ mod tests {
         .unwrap();
         assert_eq!(outbox_operations, vec!["keep-op", "sending-op"]);
         assert_eq!(
-            database.status().unwrap().schema_version,
-            latest_migration_version()
+            connection
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            LEGACY_SYNC_CLEANUP_MIGRATION_VERSION - 1
         );
 
         // Deployment rollback keeps the migrated database in place. Rehearse

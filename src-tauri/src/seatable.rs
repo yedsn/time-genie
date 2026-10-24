@@ -564,7 +564,7 @@ fn execute_task_sync_with(
     let preview: TaskSyncPreview =
         serde_json::from_str(&preview_json).map_err(|error| error.to_string())?;
     if preview.conflict_count > 0 {
-        return Err("SYNC_CONFLICT: 预览中存在可能重复的事项，请先处理冲突".to_string());
+        return Err("IMPORT_DUPLICATE: 预览中存在可能重复的事项，请先处理重复记录".to_string());
     }
     let now = now_millis();
     connection
@@ -1026,7 +1026,7 @@ fn direct_execute_task_sync_with(
         run.preview.clone()
     };
     if preview.conflict_count > 0 {
-        return Err("SYNC_CONFLICT: 预览中存在可能重复的事项，请先处理冲突".to_string());
+        return Err("IMPORT_DUPLICATE: 预览中存在可能重复的事项，请先处理重复记录".to_string());
     }
     let mut bindings = store.list(database)?;
     let mut success = 0;

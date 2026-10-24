@@ -534,7 +534,6 @@ mod tests {
         let state = crate::supabase::StorageModeSnapshot {
             mode: "cloud".to_string(),
             storage_protocol: crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string(),
-            configured_cloud_protocol: crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string(),
             storage_backend: "legacy_sync_sqlite".to_string(),
             cloud_access_state: "legacy_sync_offline".to_string(),
             cloud_writable: true,
@@ -542,25 +541,25 @@ mod tests {
             workspace_id,
             device_id,
             online: false,
-            sync_state: "waiting".to_string(),
-            pending_operations: 0,
-            conflict_count: 0,
             last_change_seq: 0,
             last_synced_at: None,
+            cache_source: None,
+            cache_fetched_at: None,
             last_error: None,
             auth_blocked: false,
             auth_blocked_reason: None,
             workspace_epoch: 1,
-            epoch_blocked: false,
-            epoch_blocked_reason: None,
         };
         let mut days = get_schedule(&database, &subject_id).unwrap();
         assert_eq!(
             database
                 .open()
                 .unwrap()
-                .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row
-                    .get::<_, i64>(0))
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
                 .unwrap(),
             0
         );
@@ -577,8 +576,11 @@ mod tests {
             database
                 .open()
                 .unwrap()
-                .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row
-                    .get::<_, i64>(0))
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
                 .unwrap(),
             0
         );
@@ -594,7 +596,7 @@ mod tests {
                 .open()
                 .unwrap()
                 .query_row(
-                    "SELECT COUNT(*) FROM sync_outbox WHERE entity_type='subject_work_schedule'",
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
                     [],
                     |row| row.get::<_, i64>(0),
                 )

@@ -7,7 +7,12 @@ const workbench = fs.readFileSync(path.join(root, "src-ui/src/views/MainWorkbenc
 const snapshots = fs.readFileSync(path.join(root, "src-ui/src/components/CloudSnapshotsSettings.vue"), "utf8");
 const presentation = fs.readFileSync(path.join(root, "src-ui/src/services/cloudSyncPresentation.ts"), "utf8");
 const service = fs.readFileSync(path.join(root, "src-ui/src/services/tauri.ts"), "utf8");
-const rust = fs.readFileSync(path.join(root, "src-tauri/src/supabase.rs"), "utf8");
+const supabaseDir = path.join(root, "src-tauri/src/supabase");
+const rust = fs
+  .readdirSync(supabaseDir)
+  .filter((name) => name.endsWith(".rs"))
+  .map((name) => fs.readFileSync(path.join(supabaseDir, name), "utf8"))
+  .join("\n");
 const lib = fs.readFileSync(path.join(root, "src-tauri/src/lib.rs"), "utf8");
 const schemaIntegration = fs.readFileSync(path.join(root, "supabase/schema_integration_test.sql"), "utf8");
 

@@ -840,7 +840,11 @@ mod tests {
             0
         );
         let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(outbox_count, 0);
         assert_eq!(
@@ -1217,7 +1221,11 @@ mod tests {
         assert_eq!(first.adjustments[0].task_id, first.created_tasks[0].task_id);
         let connection = database.open().unwrap();
         let outbox_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sync_outbox'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(outbox_count, 0);
     }

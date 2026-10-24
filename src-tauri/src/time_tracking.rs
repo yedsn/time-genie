@@ -284,20 +284,6 @@ pub(crate) fn get_time_entry_by_id(
     load_entry(&connection, entry_id, now_millis())
 }
 
-pub fn start_timer_with_hooks_for_sync(
-    database: &Database,
-    request: TimerStartRequest,
-) -> Result<TimeEntryDto, String> {
-    let operation_id = request.client_request_id.clone();
-    let state = crate::supabase::storage_mode(database)?;
-    let result = start_timer_with_hooks_and_cloud_operation(
-        database,
-        request,
-        Some((&state, "timer_start", Some(operation_id.as_str()))),
-    )?;
-    Ok(result)
-}
-
 fn start_timer_with_hooks_and_cloud_operation(
     database: &Database,
     request: TimerStartRequest,
@@ -311,16 +297,6 @@ fn start_timer_with_hooks_and_cloud_operation(
         format!("timer.started:{operation_id}"),
         &result,
     );
-    Ok(result)
-}
-
-pub fn stop_timer_with_hooks_for_sync(
-    database: &Database,
-    request: TimerStopRequest,
-) -> Result<TimeEntryDto, String> {
-    let state = crate::supabase::storage_mode(database)?;
-    let result =
-        stop_timer_with_hooks_and_cloud_operation(database, request, Some((&state, "timer_stop")))?;
     Ok(result)
 }
 
@@ -757,16 +733,6 @@ fn start_timer_with_cloud_operation(
     Ok(result)
 }
 
-pub fn pause_timer_for_sync(
-    database: &Database,
-    request: TimerVersionRequest,
-) -> Result<TimeEntryDto, String> {
-    let state = crate::supabase::storage_mode(database)?;
-    let result =
-        pause_timer_with_cloud_operation(database, request, Some((&state, "timer_pause")))?;
-    Ok(result)
-}
-
 fn pause_timer_with_cloud_operation(
     database: &Database,
     request: TimerVersionRequest,
@@ -803,20 +769,6 @@ fn pause_timer_with_cloud_operation(
     bump_revision(&transaction)?;
     let result = load_entry(&transaction, &entry_id, now)?;
     transaction.commit().map_err(|error| error.to_string())?;
-    Ok(result)
-}
-
-pub fn resume_timer_for_sync(
-    database: &Database,
-    request: TimerResumeRequest,
-) -> Result<TimeEntryDto, String> {
-    let operation_id = request.operation_id.clone();
-    let state = crate::supabase::storage_mode(database)?;
-    let result = resume_timer_with_cloud_operation(
-        database,
-        request,
-        Some((&state, "timer_resume", Some(operation_id.as_str()))),
-    )?;
     Ok(result)
 }
 
@@ -3022,7 +2974,6 @@ mod tests {
         crate::supabase::StorageModeSnapshot {
             mode: "cloud".to_string(),
             storage_protocol: crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string(),
-            configured_cloud_protocol: crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string(),
             storage_backend: "legacy_sync_sqlite".to_string(),
             cloud_access_state: "legacy_sync_offline".to_string(),
             cloud_writable: true,
@@ -3030,17 +2981,14 @@ mod tests {
             workspace_id: local_workspace_id,
             device_id,
             online: false,
-            sync_state: "idle".to_string(),
-            pending_operations: 0,
-            conflict_count: 0,
             last_change_seq: 0,
             last_synced_at: None,
+            cache_source: None,
+            cache_fetched_at: None,
             last_error: None,
             auth_blocked: false,
             auth_blocked_reason: None,
             workspace_epoch: 1,
-            epoch_blocked: false,
-            epoch_blocked_reason: None,
         }
     }
 

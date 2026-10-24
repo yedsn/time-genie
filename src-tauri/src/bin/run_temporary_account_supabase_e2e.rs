@@ -82,7 +82,6 @@ curl -fsS -X POST http://127.0.0.1:8000/auth/v1/admin/users \
         .env("TG_SUPABASE_EMAIL", &email)
         .env("TG_SUPABASE_PASSWORD", &password)
         .env("TG_SUPABASE_E2E_ALLOW_RESET", "1")
-        .env("TG_SUPABASE_E2E_DIRECT_ONLY", "1")
         .env("TG_SUPABASE_E2E_PERFORMANCE_ONLY", "1")
         .status();
 

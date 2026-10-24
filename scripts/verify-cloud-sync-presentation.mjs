@@ -99,12 +99,6 @@ assert.deepEqual(directCloudMutationFeedback(new Error("CLOUD_OFFLINE: offline")
   refreshScope: "none",
 });
 
-const staleLegacyFields = cloudSyncPresentation({
-  ...cloud, pendingOperations: 99, conflictCount: 5, syncState: "conflict",
-}, formatSyncTime);
-assert.equal(staleLegacyFields.label, "云端在线");
-assert.equal(cloudSaveStatusLabel({ ...cloud, pendingOperations: 99, conflictCount: 5 }), "已直接保存到 Supabase");
-
 const temporaryOutput = resolve(".tmp-cloud-sync-presentation-test");
 if (temporaryOutput.startsWith(resolve("."))) rmSync(temporaryOutput, { recursive: true, force: true });
 console.log("cloud sync presentation verification passed");
