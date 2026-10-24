@@ -159,6 +159,14 @@ end $$;
 alter table timegenie.workspaces
   alter column storage_protocol set default 'sync_v1';
 
+-- Replaying a historical CREATE FUNCTION after the final schema would restore
+-- PostgreSQL's default PUBLIC execute privilege. Revoke that implicit grant so
+-- the historical portion keeps exercising the original authenticated-only
+-- behavior before the final retirement migration removes these RPCs.
+revoke execute on function timegenie.cloud_apply_patch(uuid,uuid,uuid,text,text,text,bigint,jsonb) from public;
+revoke execute on function timegenie.cloud_apply_patch(uuid,uuid,uuid,text,text,text,bigint,bigint,bigint,jsonb) from public;
+revoke execute on function timegenie.cloud_incremental_pull(uuid,uuid,bigint,integer) from public;
+
 do $$
 begin
   if has_table_privilege('anon', 'timegenie.workspaces', 'select') then
@@ -8287,13 +8295,9 @@ begin
   end if;
 end $$;
 
--- The final cloud migration upgrades every existing workspace, makes new
--- workspaces direct by default, and leaves old sync RPCs as rejection-only
--- tombstones. Applying it twice also proves the deployed patch is idempotent.
+-- The final cloud migration removes the protocol generation entirely. Applying
+-- it twice proves the deployed patch is idempotent.
 reset role;
-update timegenie.workspaces
-set storage_protocol='sync_v1'
-where id='f2000000-0000-0000-0000-000000000001';
 \ir 20261024d_timegenie_retire_legacy_sync.sql
 \ir 20261024d_timegenie_retire_legacy_sync.sql
 
@@ -8306,64 +8310,36 @@ insert into timegenie.workspaces(id,owner_user_id,name) values(
 );
 do $$
 begin
-  if exists(select 1 from timegenie.workspaces where storage_protocol<>'direct_v2') then
-    raise exception 'legacy workspace was not upgraded to direct storage';
+  if exists(
+    select 1 from information_schema.columns
+    where table_schema='timegenie' and table_name='workspaces' and column_name='storage_protocol'
+  ) then
+    raise exception 'legacy storage protocol column still exists';
   end if;
-  if (select storage_protocol from timegenie.workspaces
-      where id='fb000000-0000-0000-0000-000000000001') is distinct from 'direct_v2' then
-    raise exception 'new workspace did not default to direct storage';
+  if to_regprocedure('timegenie.cloud_apply_patch(uuid,uuid,uuid,text,text,text,bigint,jsonb)') is not null
+     or to_regprocedure('timegenie.cloud_apply_patch(uuid,uuid,uuid,text,text,text,bigint,bigint,bigint,jsonb)') is not null
+     or to_regprocedure('timegenie.cloud_incremental_pull(uuid,uuid,bigint,integer)') is not null
+     or to_regprocedure('timegenie.storage_protocol_get(uuid)') is not null
+     or to_regprocedure('timegenie.storage_protocol_upgrade_preflight(uuid,uuid)') is not null
+     or to_regprocedure('timegenie.upgrade_storage_protocol(uuid,uuid,uuid,bigint,text,boolean)') is not null
+     or to_regprocedure('timegenie.provision_direct_v2_workspace(uuid,uuid,uuid)') is not null
+     or to_regprocedure('timegenie.assert_sync_v1_workspace(uuid)') is not null then
+    raise exception 'legacy synchronization or protocol RPC still exists';
   end if;
-end $$;
-
-set role authenticated;
-select set_config('request.jwt.claim.sub','f1000000-0000-0000-0000-000000000001',true);
-do $$
-declare rejected boolean:=false;
-begin
-  begin
-    perform timegenie.cloud_apply_patch(
-      'f2000000-0000-0000-0000-000000000001',
-      'f3000000-0000-0000-0000-000000000001',
-      'fc000000-0000-0000-0000-000000000001',
-      'app_setting.update','app_setting','retired_sync_probe',null,
-      jsonb_build_object('key','retired_sync_probe','value_json','true'::jsonb,'version',1)
-    );
-  exception when others then
-    rejected:=sqlerrm like 'LEGACY_SYNC_UNSUPPORTED:%';
-  end;
-  if not rejected then raise exception 'retired legacy patch RPC was not rejected'; end if;
-  rejected:=false;
-  begin
-    perform timegenie.cloud_incremental_pull(
-      'f2000000-0000-0000-0000-000000000001',
-      'f3000000-0000-0000-0000-000000000001',0,20
-    );
-  exception when others then
-    rejected:=sqlerrm like 'LEGACY_SYNC_UNSUPPORTED:%';
-  end;
-  if not rejected then raise exception 'retired incremental pull RPC was not rejected'; end if;
-
-  rejected:=false;
-  begin
-    perform timegenie.storage_protocol_upgrade_preflight(
-      'f2000000-0000-0000-0000-000000000001',
-      'f3000000-0000-0000-0000-000000000001'
-    );
-  exception when others then
-    rejected:=sqlerrm like 'LEGACY_SYNC_UNSUPPORTED:%';
-  end;
-  if not rejected then raise exception 'retired protocol upgrade RPC was not rejected'; end if;
-end $$;
-reset role;
-do $$
-begin
-  if exists(select 1 from timegenie.app_settings
-       where workspace_id='f2000000-0000-0000-0000-000000000001'
-         and key='retired_sync_probe')
-     or exists(select 1 from timegenie.workspace_changes
-       where workspace_id='f2000000-0000-0000-0000-000000000001'
-         and entity_id='retired_sync_probe') then
-    raise exception 'rejected retired legacy patch modified business data';
+  if to_regprocedure('timegenie.cloud_apply_patch_pre_direct_v2(uuid,uuid,uuid,text,text,text,bigint,jsonb)') is not null
+     or to_regprocedure('timegenie.cloud_incremental_pull_pre_direct_v2(uuid,uuid,bigint,integer)') is not null then
+    raise exception 'legacy private synchronization implementation still exists';
+  end if;
+  if to_regprocedure('timegenie.direct_cloud_task_list(uuid,uuid,bigint,uuid,boolean,text,date)') is null
+     or to_regprocedure('timegenie.direct_cloud_subject_create(uuid,uuid,uuid,bigint,jsonb)') is null
+     or to_regprocedure('timegenie.direct_cloud_workspace_restore_commit(uuid,uuid,uuid,uuid,text,bigint,uuid,boolean)') is null
+     or to_regprocedure('timegenie.data_copy_replace_commit(uuid,uuid,bigint,uuid,text,uuid,boolean)') is null then
+    raise exception 'direct mutation, restore or full-copy capability was removed';
+  end if;
+  if to_regclass('timegenie.processed_operations') is null
+     or to_regclass('timegenie.workspace_changes') is null
+     or to_regclass('timegenie.workspace_snapshots') is null then
+    raise exception 'idempotency, change sequence or snapshot capability was removed';
   end if;
 end $$;
 

@@ -836,16 +836,16 @@ function verifyStaticSchemaInvariants() {
   }
   const retireLegacySyncPatch = fs.readFileSync(retireLegacySyncPatchFile, "utf8");
   for (const expected of [
-    "set storage_protocol='direct_v2'",
-    "alter column storage_protocol set default 'direct_v2'",
-    "check (storage_protocol='direct_v2')",
-    "LEGACY_SYNC_UNSUPPORTED",
-    "create or replace function timegenie.cloud_apply_patch",
-    "create or replace function timegenie.cloud_incremental_pull",
-    "create or replace function timegenie.storage_protocol_upgrade_preflight",
-    "create or replace function timegenie.upgrade_storage_protocol",
-    "revoke execute on function timegenie.cloud_apply_patch_pre_direct_v2",
-    "revoke execute on function timegenie.cloud_incremental_pull_pre_direct_v2",
+    "create or replace function timegenie.assert_direct_v2_workspace",
+    "'storageProtocol','direct_v2'",
+    "drop function if exists timegenie.cloud_apply_patch",
+    "drop function if exists timegenie.cloud_incremental_pull",
+    "drop function if exists timegenie.storage_protocol_get",
+    "drop function if exists timegenie.storage_protocol_upgrade_preflight",
+    "drop function if exists timegenie.upgrade_storage_protocol",
+    "drop function if exists timegenie.provision_direct_v2_workspace",
+    "drop function if exists timegenie.assert_sync_v1_workspace",
+    "drop column if exists storage_protocol",
   ]) {
     if (!retireLegacySyncPatch.includes(expected)) {
       throw new Error("The legacy-sync retirement patch is missing: " + expected);
@@ -858,12 +858,11 @@ function verifyStaticSchemaInvariants() {
     throw new Error("The schema integration test must prove the legacy-sync retirement patch is idempotent.");
   }
   for (const expected of [
-    "legacy workspace was not upgraded to direct storage",
-    "new workspace did not default to direct storage",
-    "retired legacy patch RPC was not rejected",
-    "rejected retired legacy patch modified business data",
-    "retired incremental pull RPC was not rejected",
-    "retired protocol upgrade RPC was not rejected",
+    "legacy storage protocol column still exists",
+    "legacy synchronization or protocol RPC still exists",
+    "legacy private synchronization implementation still exists",
+    "direct mutation, restore or full-copy capability was removed",
+    "idempotency, change sequence or snapshot capability was removed",
   ]) {
     if (!schemaIntegrationTest.includes(expected)) {
       throw new Error("The schema integration test is missing legacy-sync retirement coverage: " + expected);
@@ -1233,42 +1232,16 @@ function verifyStaticSchemaInvariants() {
   }
   const importStart = schema.indexOf("create or replace function timegenie.migration_import_snapshot");
   const applyPatchStart = schema.indexOf("create or replace function timegenie.cloud_apply_patch");
-  if (importStart < 0 || applyPatchStart < 0 || applyPatchStart <= importStart) {
+  if (importStart < 0) {
     throw new Error("Could not locate migration_import_snapshot in supabase/schema.sql.");
   }
-  const migrationImport = schema.slice(importStart, applyPatchStart);
-  const cloudApplyPatch = schema.slice(applyPatchStart);
+  const migrationImport = schema.slice(importStart, applyPatchStart > importStart ? applyPatchStart : undefined);
   if (!migrationImport.includes("nullif(row_data->>'origin_unassigned_session_id','')::uuid")) {
     throw new Error("migration_import_snapshot must preserve time_entries.origin_unassigned_session_id from local snapshots.");
   }
   if (!migrationImport.includes("exists(select 1 from timegenie.work_days where workspace_id = p_workspace_id)")
       || !migrationImport.includes("exists(select 1 from timegenie.unassigned_sessions where workspace_id = p_workspace_id)")) {
     throw new Error("migration_import_snapshot must treat work_days and unassigned_sessions as business data when checking for an empty target.");
-  }
-  if (!cloudApplyPatch.includes("nullif(row_data->>'origin_unassigned_session_id','')::uuid")) {
-    throw new Error("cloud_apply_patch must preserve time_entries.origin_unassigned_session_id from local entity payloads.");
-  }
-  if (!cloudApplyPatch.includes("origin_unassigned_session_id = excluded.origin_unassigned_session_id")) {
-    throw new Error("cloud_apply_patch conflict updates must refresh time_entries.origin_unassigned_session_id.");
-  }
-  if (!cloudApplyPatch.includes("where timegenie.work_days.version <= excluded.version")) {
-    throw new Error("cloud_apply_patch must not let an older time-entry payload overwrite a newer work-day version.");
-  }
-  if (!cloudApplyPatch.includes("p_entity_type = 'unassigned_session'")) {
-    throw new Error("cloud_apply_patch must accept unassigned_session entity payloads.");
-  }
-  for (const expected of [
-    "p_coalesced_count bigint",
-    "final_version <> p_base_version + p_coalesced_count",
-    "pg_advisory_xact_lock",
-    "cloud_apply_patch(uuid, uuid, uuid, text, text, text, bigint, bigint, bigint, jsonb)",
-  ]) {
-    if (!schema.includes(expected) || !timerSyncPatch.includes(expected)) {
-      throw new Error(`The schema and timer sync patch must include: ${expected}`);
-    }
-  }
-  if (timerSyncPatch.includes("while current_step <= final_version")) {
-    throw new Error("The timer sync patch must apply the final image atomically instead of replaying intermediate versions.");
   }
   for (const expected of [
     "task_daily_estimate",
@@ -1564,12 +1537,6 @@ function verifyStaticSchemaInvariants() {
       || !taskPlanningPatch.includes("return timegenie.cloud_apply_patch_legacy")) {
     throw new Error("The cloud task planning patch must preserve all legacy cloud_apply_patch branches.");
   }
-  if (!cloudApplyPatch.includes("delete from timegenie.unassigned_segments where session_id = p_entity_id::uuid")) {
-    throw new Error("cloud_apply_patch must replace unassigned session segments with the complete payload image.");
-  }
-  if (!cloudApplyPatch.includes("expected unassigned session version %, current version %")) {
-    throw new Error("cloud_apply_patch must reject unassigned session updates with stale base versions.");
-  }
   if (!schema.includes("'unassigned_sessions','report_templates'")) {
     throw new Error("unassigned_sessions must keep the workspace change trigger enabled.");
   }
@@ -1579,16 +1546,6 @@ function verifyStaticSchemaInvariants() {
   if (!schema.includes("when 'task_occurrences' then (row_image->>'task_id') || '|' || (row_image->>'occurrence_date')")) {
     throw new Error("touch_workspace_change must preserve task occurrence task/date identity.");
   }
-  if (!cloudApplyPatch.includes("values(p_workspace_id, 'app_settings', row_data->>'key'")) {
-    throw new Error("cloud_apply_patch workspace changes must identify app settings by key.");
-  }
-  if (!cloudApplyPatch.includes("values(p_workspace_id, 'integration_configs', row_data->>'provider'")) {
-    throw new Error("cloud_apply_patch workspace changes must identify integration configs by provider.");
-  }
-  if (!cloudApplyPatch.includes("p_entity_id is distinct from (row_data->>'provider') || '|' || (row_data->>'entity_type') || '|' || (row_data->>'entity_id')")) {
-    throw new Error("cloud_apply_patch must validate the complete external binding identity.");
-  }
-
   const patchImportStart = migrationPatch.indexOf("create or replace function timegenie.migration_import_snapshot");
   if (patchImportStart < 0) {
     throw new Error("Could not locate migration_import_snapshot in the recurring migration patch.");

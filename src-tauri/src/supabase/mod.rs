@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 #[cfg(test)]
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use url::Url;
@@ -42,6 +42,7 @@ static DIRECT_TRACKING_LEASE_TOKENS: OnceLock<Mutex<HashMap<(String, String), St
     OnceLock::new();
 static DIRECT_CLOUD_ACCESS_STATES: OnceLock<Mutex<HashMap<String, DirectCloudAccessRuntime>>> =
     OnceLock::new();
+static DIRECT_CLOUD_REVALIDATIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 #[cfg(test)]
 static TEST_SESSION_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -2498,14 +2499,15 @@ fn direct_cloud_query<T: for<'de> Deserialize<'de> + Serialize>(
     let started_at = Instant::now();
     let account_id = context.session.user_id.as_str();
     let query_key = format!("{function}:{}", stable_json_hash(&body)?);
+    let cache_domain = if function == "direct_cloud_workbench_bootstrap" {
+        "workspace"
+    } else {
+        direct_cloud_cache_domain(function)
+    };
     let cache_key = crate::cloud_read_cache::CloudReadCacheKey {
         account_id,
         workspace_id: &context.workspace_id,
-        domain: if function == "direct_cloud_workbench_bootstrap" {
-            "workspace"
-        } else {
-            direct_cloud_cache_domain(function)
-        },
+        domain: cache_domain,
         query_key: &query_key,
     };
     let body_object = body
@@ -2517,6 +2519,41 @@ fn direct_cloud_query<T: for<'de> Deserialize<'de> + Serialize>(
         "p_expected_epoch".to_string(),
         json!(context.workspace_epoch),
     );
+    let cache_first = direct_cloud_access_runtime(&context.workspace_id).is_none_or(|runtime| {
+        matches!(
+            runtime.state,
+            DirectCloudAccessState::Connecting | DirectCloudAccessState::OfflineReadonly
+        )
+    });
+    if cache_first {
+        if let Ok(cache) = crate::cloud_read_cache::CloudReadCache::for_database(database) {
+            if let Ok(Some(snapshot)) = cache.read(&cache_key, now_seconds() * 1_000) {
+                if snapshot.workspace_epoch == context.workspace_epoch {
+                    if let Ok(response) =
+                        serde_json::from_value::<DirectCloudQueryResponse<T>>(snapshot.payload)
+                    {
+                        set_direct_cloud_access_runtime(
+                            &context.workspace_id,
+                            DirectCloudAccessState::OfflineReadonly,
+                            Some(format!(
+                                "正在显示云端只读缓存，后台刷新中；最后更新于 {}",
+                                snapshot.fetched_at
+                            )),
+                        );
+                        spawn_direct_cloud_revalidation(
+                            database.clone(),
+                            function.to_string(),
+                            context.clone(),
+                            body.clone(),
+                            cache_domain.to_string(),
+                            query_key.clone(),
+                        );
+                        return Ok(response);
+                    }
+                }
+            }
+        }
+    }
     let value = match client(database)?.rpc_for_database_with_epoch(
         database,
         function,
@@ -2589,6 +2626,109 @@ fn direct_cloud_query<T: for<'de> Deserialize<'de> + Serialize>(
         }
     }
     Ok(response)
+}
+
+fn spawn_direct_cloud_revalidation(
+    database: Database,
+    function: String,
+    context: DirectCloudReadContext,
+    body: Value,
+    domain: String,
+    query_key: String,
+) {
+    let revalidation_key = format!(
+        "{}:{}:{}",
+        context.session.user_id, context.workspace_id, query_key
+    );
+    {
+        let mut in_flight = DIRECT_CLOUD_REVALIDATIONS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !in_flight.insert(revalidation_key.clone()) {
+            return;
+        }
+    }
+    std::thread::spawn(move || {
+        let result = revalidate_direct_cloud_query(
+            &database, &function, &context, body, &domain, &query_key,
+        );
+        if let Err(error) = result {
+            record_direct_cloud_access_error(&context.workspace_id, &error);
+            crate::direct_cloud_observability::record_query_error(&context.workspace_id, &error);
+        }
+        if let Some(in_flight) = DIRECT_CLOUD_REVALIDATIONS.get() {
+            in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&revalidation_key);
+        }
+    });
+}
+
+fn revalidate_direct_cloud_query(
+    database: &Database,
+    function: &str,
+    context: &DirectCloudReadContext,
+    body: Value,
+    domain: &str,
+    query_key: &str,
+) -> Result<(), String> {
+    let started_at = Instant::now();
+    let value = client(database)?.rpc_for_database_with_epoch(
+        database,
+        function,
+        body,
+        &context.session,
+        context.workspace_epoch,
+    )?;
+    let response: DirectCloudQueryResponse<Value> = serde_json::from_value(value.clone())
+        .map_err(|error| format!("CLOUD_RESPONSE_INVALID: {function} 响应无效: {error}"))?;
+    record_direct_cloud_checkpoint(database, &response.metadata)?;
+    if response.metadata.writable == Some(false) {
+        set_direct_cloud_access_runtime(
+            &context.workspace_id,
+            DirectCloudAccessState::DegradedReadonly,
+            response
+                .metadata
+                .read_only_reason
+                .clone()
+                .or_else(|| Some("Supabase 已启用紧急只读，业务修改暂时停用".to_string())),
+        );
+    } else {
+        record_direct_cloud_access_success(&context.workspace_id);
+    }
+    crate::direct_cloud_observability::record_query(
+        &context.workspace_id,
+        started_at.elapsed().as_secs_f64() * 1000.0,
+    );
+    if let Ok(cache) = crate::cloud_read_cache::CloudReadCache::for_database(database) {
+        let cache_key = crate::cloud_read_cache::CloudReadCacheKey {
+            account_id: &context.session.user_id,
+            workspace_id: &context.workspace_id,
+            domain,
+            query_key,
+        };
+        let now = now_seconds() * 1_000;
+        let _ = cache.save(
+            &cache_key,
+            &crate::cloud_read_cache::CloudReadCacheSnapshot {
+                payload: value,
+                workspace_epoch: response.metadata.workspace_epoch,
+                change_seq: response.metadata.change_seq,
+                fetched_at: now,
+            },
+            now,
+        );
+    }
+    crate::cloud_sync::emit_revalidated_query(
+        database,
+        &response.metadata.workspace_id,
+        response.metadata.workspace_epoch,
+        response.metadata.change_seq,
+        &response.metadata.domains,
+    );
+    Ok(())
 }
 
 fn stable_json_hash(value: &Value) -> Result<String, String> {
@@ -6826,6 +6966,177 @@ mod tests {
         assert_eq!(cache_state.cache_source.as_deref(), Some("persistent"));
         assert!(cache_state.cache_fetched_at.is_some());
         assert!(!cache_state.cloud_writable);
+    }
+
+    #[test]
+    fn direct_cloud_query_returns_persistent_cache_then_revalidates_in_background() {
+        let _guard = lock_test_session_state();
+        reset_test_credentials();
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(directory.path().join("swr.sqlite3")).unwrap();
+        let workspace_id = "20000000-0000-0000-0000-0000000000c7";
+        let old_task = json!({
+            "id":"60000000-0000-0000-0000-0000000000c7",
+            "subjectId":"50000000-0000-0000-0000-0000000000c7",
+            "parentId":null,"dayInstanceDate":null,"dayInstanceKind":null,
+            "dayInstanceSourceTaskId":null,"title":"缓存事项","status":"open",
+            "plannedDate":null,"estimateMinutes":null,"note":null,
+            "projectName":null,"solutionName":null,"sortOrder":1,
+            "completedAt":null,"depth":0,"pathLabel":"缓存事项",
+            "selectable":true,"directMinutes":0,"totalMinutes":0,
+            "executionState":"ready","version":1
+        });
+        let mut new_task = old_task.clone();
+        new_task["title"] = json!("云端新事项");
+        new_task["version"] = json!(2);
+        let response = |task: Value, change_seq: i64| {
+            json!({
+                "metadata":{
+                    "workspaceId":workspace_id,"deviceId":"device-placeholder",
+                    "storageProtocol":"direct_v2","workspaceEpoch":1,
+                    "changeSeq":change_seq,"serverTime":"2026-10-24T21:00:00+08:00",
+                    "domains":["tasks"],"writable":true
+                },
+                "data":{"tasks":[task]}
+            })
+        };
+        let network_body = Box::leak(
+            serde_json::to_string(&response(new_task, 9))
+                .unwrap()
+                .into_boxed_str(),
+        );
+        let server = TestHttpServer::start(vec![TestHttpResponse {
+            path: "/rest/v1/rpc/direct_cloud_task_list",
+            status: 200,
+            body: network_body,
+        }]);
+        configure_test_cloud_state(&database, &server.base_url(), workspace_id);
+        let session = test_session("swr", Some(now_seconds() + 3600));
+        cache_session(workspace_id, &session).unwrap();
+        let request_body = json!({
+            "p_subject_id":null,"p_include_completed":true,
+            "p_planned_date":null,"p_query":null
+        });
+        let query_key = format!(
+            "direct_cloud_task_list:{}",
+            stable_json_hash(&request_body).unwrap()
+        );
+        let cache = crate::cloud_read_cache::CloudReadCache::for_database(&database).unwrap();
+        cache
+            .save(
+                &crate::cloud_read_cache::CloudReadCacheKey {
+                    account_id: &session.user_id,
+                    workspace_id,
+                    domain: "tasks",
+                    query_key: &query_key,
+                },
+                &crate::cloud_read_cache::CloudReadCacheSnapshot {
+                    payload: response(old_task, 3),
+                    workspace_epoch: 1,
+                    change_seq: 3,
+                    fetched_at: now_seconds() * 1_000 - 5_000,
+                },
+                now_seconds() * 1_000,
+            )
+            .unwrap();
+        set_direct_cloud_access_runtime(
+            workspace_id,
+            DirectCloudAccessState::Connecting,
+            Some("启动中".to_string()),
+        );
+
+        let cached = direct_cloud_task_list_for_command(
+            &database,
+            crate::tasks::TaskListRequest {
+                subject_id: None,
+                include_completed: Some(true),
+                planned_date: None,
+                today_date: None,
+                today_only: None,
+                daily_estimate_date: None,
+                query: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(cached.tasks[0].title, "缓存事项");
+        assert!(!storage_mode(&database).unwrap().cloud_writable);
+        assert_eq!(server.finish().len(), 1);
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let snapshot = cache
+                .read(
+                    &crate::cloud_read_cache::CloudReadCacheKey {
+                        account_id: &session.user_id,
+                        workspace_id,
+                        domain: "tasks",
+                        query_key: &query_key,
+                    },
+                    now_seconds() * 1_000,
+                )
+                .unwrap()
+                .unwrap();
+            if snapshot.change_seq == 9 {
+                assert_eq!(
+                    snapshot.payload.pointer("/data/tasks/0/title"),
+                    Some(&json!("云端新事项"))
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "后台权威查询没有替换持久缓存");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            direct_cloud_access_runtime(workspace_id).map(|runtime| runtime.state),
+            Some(DirectCloudAccessState::OnlineWritable)
+        );
+    }
+
+    #[test]
+    fn authoritative_query_succeeds_when_persistent_cache_cannot_open() {
+        let _guard = lock_test_session_state();
+        reset_test_credentials();
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("cache-failure.sqlite3")).unwrap();
+        let workspace_id = "20000000-0000-0000-0000-0000000000c8";
+        std::fs::create_dir(directory.path().join("cloud-read-cache.sqlite3")).unwrap();
+        let body = Box::leak(
+            serde_json::to_string(&json!({
+                "metadata":{"workspaceId":workspace_id,"deviceId":"device-placeholder",
+                    "storageProtocol":"direct_v2","workspaceEpoch":1,"changeSeq":1,
+                    "serverTime":"2026-10-24T21:00:00+08:00","domains":["tasks"],"writable":true},
+                "data":{"tasks":[]}
+            }))
+            .unwrap()
+            .into_boxed_str(),
+        );
+        let server = TestHttpServer::start(vec![TestHttpResponse {
+            path: "/rest/v1/rpc/direct_cloud_task_list",
+            status: 200,
+            body,
+        }]);
+        configure_test_cloud_state(&database, &server.base_url(), workspace_id);
+        cache_session(
+            workspace_id,
+            &test_session("cache-failure", Some(now_seconds() + 3600)),
+        )
+        .unwrap();
+        let result = direct_cloud_task_list_for_command(
+            &database,
+            crate::tasks::TaskListRequest {
+                subject_id: None,
+                include_completed: Some(true),
+                planned_date: None,
+                today_date: None,
+                today_only: None,
+                daily_estimate_date: None,
+                query: None,
+            },
+        )
+        .unwrap();
+        assert!(result.tasks.is_empty());
+        assert_eq!(server.finish().len(), 1);
     }
 
     #[test]

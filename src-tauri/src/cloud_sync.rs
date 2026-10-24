@@ -13,8 +13,10 @@ use crate::supabase::{client, current_session, direct_cloud_workbench_bootstrap,
 static REALTIME_ENABLED: AtomicBool = AtomicBool::new(false);
 static REALTIME_WAKEUP: OnceLock<Arc<Notify>> = OnceLock::new();
 static CLOUD_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 
 pub fn spawn_background_services(database: Database, app: AppHandle) {
+    let _ = APP_HANDLE.set(app.clone());
     crate::direct_cloud_realtime::spawn_realtime_listener(
         database.clone(),
         app,
@@ -53,6 +55,32 @@ pub(crate) fn enter_direct_cloud_mode() {
 pub(crate) fn disable_cloud_sync() {
     REALTIME_ENABLED.store(false, Ordering::Release);
     realtime_wakeup().notify_waiters();
+}
+
+pub(crate) fn emit_revalidated_query(
+    database: &Database,
+    workspace_id: &str,
+    workspace_epoch: i64,
+    change_seq: i64,
+    domains: &[String],
+) {
+    let Some(app) = APP_HANDLE.get() else {
+        return;
+    };
+    let _ = app.emit(
+        "work-data-changed",
+        WorkspaceInvalidation {
+            workspace_id: workspace_id.to_string(),
+            change_seq,
+            workspace_epoch,
+            domains: domains.to_vec(),
+            source: "cloud-cache-revalidated".to_string(),
+            changed_by_device_id: None,
+        },
+    );
+    if let Ok(state) = storage_mode(database) {
+        let _ = app.emit("cloud-sync-state-changed", state);
+    }
 }
 
 pub(crate) fn with_cloud_sync_operation_lock<T>(

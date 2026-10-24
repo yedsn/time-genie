@@ -31,10 +31,10 @@ fn main() {
         "supabase:session",
     )
     .expect("无法访问 TimeGenie Windows 凭据项");
-    let session_json = entry
+    let mut session_json = entry
         .get_password()
         .expect("当前账号没有可用的 TimeGenie Supabase 保存会话");
-    let session: Value =
+    let mut session: Value =
         serde_json::from_str(&session_json).expect("当前 TimeGenie Supabase 保存会话不是有效 JSON");
     for field in ["userId", "accessToken", "refreshToken"] {
         assert!(
@@ -45,7 +45,7 @@ fn main() {
             "当前 TimeGenie Supabase 保存会话缺少 {field}"
         );
     }
-    let expires_at = session
+    let mut expires_at = session
         .get("expiresAt")
         .and_then(Value::as_i64)
         .expect("当前 TimeGenie Supabase 保存会话缺少 expiresAt");
@@ -53,14 +53,78 @@ fn main() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("系统时间早于 Unix epoch")
         .as_secs() as i64;
-    assert!(
-        expires_at > now + 15 * 60,
-        "当前 TimeGenie Supabase 登录有效期不足 15 分钟，请先在应用中重新登录"
-    );
+    if expires_at <= now + 15 * 60 {
+        let response = reqwest::blocking::Client::new()
+            .post(format!(
+                "{}/auth/v1/token?grant_type=refresh_token",
+                project_url.trim_end_matches('/')
+            ))
+            .header("apikey", &anon_key)
+            .json(&serde_json::json!({
+                "refresh_token": session
+                    .get("refreshToken")
+                    .and_then(Value::as_str)
+                    .expect("当前 TimeGenie Supabase 保存会话缺少 refreshToken")
+            }))
+            .send()
+            .expect("无法刷新当前 TimeGenie Supabase 会话");
+        assert!(
+            response.status().is_success(),
+            "当前 TimeGenie Supabase 会话刷新失败，请先在应用中重新登录"
+        );
+        let refreshed: Value = response
+            .json()
+            .expect("当前 TimeGenie Supabase 会话刷新响应不是有效 JSON");
+        let refreshed_user_id = refreshed
+            .pointer("/user/id")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                session
+                    .get("userId")
+                    .and_then(Value::as_str)
+                    .expect("当前 TimeGenie Supabase 保存会话缺少 userId")
+            });
+        expires_at = now
+            + refreshed
+                .get("expires_in")
+                .and_then(Value::as_i64)
+                .unwrap_or(3600);
+        session = serde_json::json!({
+            "userId": refreshed_user_id,
+            "email": refreshed.pointer("/user/email").cloned().unwrap_or(Value::Null),
+            "accessToken": refreshed.get("access_token").and_then(Value::as_str)
+                .expect("当前 TimeGenie Supabase 会话刷新响应缺少 access_token"),
+            "refreshToken": refreshed.get("refresh_token").and_then(Value::as_str)
+                .or_else(|| session.get("refreshToken").and_then(Value::as_str))
+                .expect("当前 TimeGenie Supabase 会话刷新响应缺少 refresh_token"),
+            "expiresAt": expires_at,
+        });
+        session_json = serde_json::to_string(&session).expect("无法序列化刷新后的 Supabase 会话");
+        entry
+            .set_password(&session_json)
+            .expect("无法保存刷新后的 TimeGenie Supabase 会话");
+        let local_workspace_id: String = connection
+            .query_row(
+                "SELECT id FROM workspaces WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("找不到本地工作空间标识");
+        let legacy_entry =
+            keyring::Entry::new("timegenie", &format!("supabase:{local_workspace_id}"))
+                .expect("无法访问兼容的 TimeGenie Supabase 凭据项");
+        let _ = legacy_entry.set_password(&session_json);
+    }
+    let workspace_id = setting("cloud_workspace_id");
     if std::env::args().any(|argument| argument == "--check-only") {
         println!(
-            "CURRENT_SESSION_READY expires_in_seconds={}",
-            expires_at - now
+            "CURRENT_SESSION_READY user_id={} workspace_id={} expires_in_seconds={}",
+            session
+                .get("userId")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            workspace_id,
+            expires_at - now,
         );
         return;
     }

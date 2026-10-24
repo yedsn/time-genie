@@ -36,14 +36,14 @@
 
 - [x] 6.1 新增 Supabase 退役 SQL，撤销或删除旧 patch、增量拉取和协议升级 RPC 的客户端权限，并确保旧调用返回 `LEGACY_SYNC_UNSUPPORTED` 或函数不存在且不会修改业务数据；运行 schema 集成测试验证。
 - [x] 6.2 将现有和新建 workspace 收敛为直连语义，移除客户端对 `sync_v1/direct_v2` 升级状态的依赖；运行 fresh schema 和既有 schema 升级测试验证。
-- [ ] 6.3 从 `schema.sql`、schema 验证脚本和最终兼容阶段中删除旧函数、grant、仅旧同步使用的触发器与协议字段，同时保留 direct mutation、幂等、workspace epoch、change sequence、快照和恢复能力；运行 `npm run test:supabase:schema`。
+- [x] 6.3 从 `schema.sql`、schema 验证脚本和最终兼容阶段中删除旧函数、grant、仅旧同步使用的触发器与协议字段，同时保留 direct mutation、幂等、workspace epoch、change sequence、快照和恢复能力；运行 `npm run test:supabase:schema`。
 - [x] 6.4 更新 Supabase 部署说明，记录 SQL 先行/同步发布顺序、旧客户端不再受支持以及禁止恢复旧写权限的回滚约束，并核对文档中的执行命令。
 
 ## 7. 上线隔离的持久只读缓存
 
 - [x] 7.1 新建独立 `cloud-read-cache.sqlite3` 管理模块，实现按账号、workspace、domain 和 query key 读取/保存查询快照及 schema version 校验；用单元测试验证它不访问主业务数据库且无实体 mutation/outbox API。
 - [x] 7.2 实现缓存 payload 脱敏、64 MiB/30 天保留限制、最近使用清理和损坏自动重建，测试确认 token、认证头、集成密钥不会落盘，损坏文件不会阻止应用启动。
-- [ ] 7.3 将直连查询接入 stale-while-revalidate：启动先读匹配快照、在线立即查询权威数据、成功后异步更新快照，补充冷启动、在线替换、缓存写失败不影响查询成功的测试。
+- [x] 7.3 将直连查询接入 stale-while-revalidate：启动先读匹配快照、在线立即查询权威数据、成功后异步更新快照，补充冷启动、在线替换、缓存写失败不影响查询成功的测试。
 - [x] 7.4 将 mutation 成功、Realtime domain 通知、workspace epoch 变化和云端恢复接入缓存失效，测试确认只刷新受影响域且 epoch 变化会清空整个 workspace 缓存。
 - [x] 7.5 在退出登录、设备撤销、切换账号、切换 workspace 和切换本地模式时清理内存数据并隔离或删除对应持久缓存，测试确认任何身份都不能读取另一身份的快照。
 - [x] 7.6 增加“清除云端缓存”操作，测试确认它只删除云端内存/磁盘缓存，不修改本地模式业务数据或 Supabase 数据。

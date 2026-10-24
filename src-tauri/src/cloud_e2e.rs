@@ -156,19 +156,24 @@ fn enter_direct_cloud_mode(database: &Database, workspace_id: &str, workspace_ep
             |row| row.get(0),
         )
         .unwrap();
-    set_device_setting(
-        database,
-        "direct_cloud_checkpoint",
-        json!({
-            "workspaceId": workspace_id,
-            "deviceId": device_id,
-            "changeSeq": 0,
-            "workspaceEpoch": workspace_epoch,
-            "fetchedAt": null,
-            "lastError": null,
-            "authBlockedReason": null
-        }),
-    );
+    let checkpoint = json!({
+        "workspaceId": workspace_id,
+        "deviceId": device_id,
+        "changeSeq": 0,
+        "workspaceEpoch": workspace_epoch,
+        "fetchedAt": null,
+        "lastError": null,
+        "authBlockedReason": null
+    });
+    database
+        .open()
+        .unwrap()
+        .execute(
+            "INSERT INTO device_settings(key,value_json,updated_at) VALUES('direct_cloud_checkpoint',?1,0)
+             ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+            [checkpoint.to_string()],
+        )
+        .unwrap();
     crate::cloud_sync::enter_direct_cloud_mode();
     supabase::direct_cloud_workbench_bootstrap(database).unwrap();
 }
