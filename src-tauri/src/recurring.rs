@@ -733,7 +733,6 @@ pub fn task_recurrence_save(
             crate::supabase::ensure_repository_write_mode(database)?;
             let state = crate::supabase::storage_mode(database)?;
             let result = save_rule_with_cloud_operation(database, request, Some(&state))?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| {
@@ -756,7 +755,7 @@ pub fn task_recurrence_close(
             crate::supabase::ensure_repository_write_mode(database)?;
             let state = crate::supabase::storage_mode(database)?;
             close_rule_with_cloud_operation(database, request, Some(&state))?;
-            crate::cloud_sync::flush_if_online(database)
+            Ok(())
         },
         |database| {
             crate::supabase::direct_cloud_recurrence_close_for_command(database, direct_request)

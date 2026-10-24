@@ -3599,7 +3599,6 @@ pub fn task_daily_estimate_set(
             let state = crate::supabase::storage_mode(database)?;
             let result =
                 set_task_daily_estimate_with_cloud_operation(database, request, Some(&state))?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| {
@@ -3630,7 +3629,6 @@ pub fn task_daily_estimate_batch_set(
                 request,
                 Some(&state),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| {
@@ -3660,7 +3658,6 @@ pub fn task_plan_batch_apply(
                 request,
                 Some((&state, "task_plan_batch_apply")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| {
@@ -3687,7 +3684,6 @@ pub fn task_recurring_estimate_set(
             let state = crate::supabase::storage_mode(database)?;
             let result =
                 set_recurring_task_estimate_with_cloud_operation(database, request, Some(&state))?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| {
@@ -3718,7 +3714,6 @@ pub fn task_create(
                 "manual",
                 Some((&state, "task_create")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| {
@@ -3749,7 +3744,6 @@ pub fn task_create_positioned(
                 request,
                 Some((&state, "task_create_positioned")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| {
@@ -3780,7 +3774,6 @@ pub fn task_create_quick(
                 "timer_quick_create",
                 Some((&state, "task_create_quick")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| {
@@ -3808,7 +3801,6 @@ pub fn task_update(
             let state = crate::supabase::storage_mode(database)?;
             let result =
                 update_task_with_cloud_operation(database, request, Some((&state, "task_update")))?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| crate::supabase::direct_cloud_task_update_for_command(database, direct_request),
@@ -3833,7 +3825,6 @@ pub fn task_today_recurring_update(
                 request,
                 Some(&state),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| {
@@ -3867,7 +3858,6 @@ pub fn task_set_completed(
                 request,
                 Some((&state, "task_set_completed")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             if should_publish {
                 publish_task_completed_hook(database, &task_id, occurrence_date.as_deref(), None);
             }
@@ -3891,7 +3881,7 @@ pub fn task_delete_subtree(
             crate::supabase::ensure_repository_write_mode(database)?;
             let state = crate::supabase::storage_mode(database)?;
             delete_task_with_cloud_operation(database, request, Some((&state, "task_delete")))?;
-            crate::cloud_sync::flush_if_online(database)
+            Ok(())
         },
         |database| crate::supabase::direct_cloud_task_delete_for_command(database, direct_request),
     )
@@ -3915,7 +3905,6 @@ pub fn task_reorder_subtree(
                 request,
                 Some((&state, "task_reorder")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| crate::supabase::direct_cloud_task_reorder_for_command(database, direct_request),
@@ -3937,7 +3926,6 @@ pub fn task_move(
             let state = crate::supabase::storage_mode(database)?;
             let result =
                 move_task_with_cloud_operation(database, request, Some((&state, "task_move")))?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| crate::supabase::direct_cloud_task_move_for_command(database, direct_request),
@@ -3962,7 +3950,6 @@ pub fn task_change_parent(
                 request,
                 Some((&state, "task_change_parent")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| {
@@ -3989,7 +3976,6 @@ pub fn task_duplicate_subtree(
                 request,
                 Some((&state, "task_duplicate")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| {

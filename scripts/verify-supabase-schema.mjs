@@ -69,6 +69,8 @@ const removeClientGenerationGatePatchFile = path.join(repoRoot, "supabase", "202
 const directInteractionPerformancePatchFile = path.join(repoRoot, "supabase", "20261023n_timegenie_direct_cloud_interaction_performance.sql");
 const unassignedNextSessionIdempotencyPatchFile = path.join(repoRoot, "supabase", "20261024_timegenie_unassigned_next_session_idempotency.sql");
 const legacyUnassignedSuccessorIdempotencyPatchFile = path.join(repoRoot, "supabase", "20261024b_timegenie_legacy_unassigned_successor_idempotency.sql");
+const unassignedSuccessorBoundaryPatchFile = path.join(repoRoot, "supabase", "20261024c_timegenie_unassigned_successor_boundary.sql");
+const retireLegacySyncPatchFile = path.join(repoRoot, "supabase", "20261024d_timegenie_retire_legacy_sync.sql");
 
 const binaryNames = process.platform === "win32"
   ? {
@@ -810,6 +812,62 @@ function verifyStaticSchemaInvariants() {
   }
   if ((schemaIntegrationTest.match(/\\ir 20261024b_timegenie_legacy_unassigned_successor_idempotency\.sql/g) ?? []).length < 2) {
     throw new Error("The schema integration test must prove the legacy unassigned successor patch is idempotent.");
+  }
+  const unassignedSuccessorBoundaryPatch = fs.readFileSync(unassignedSuccessorBoundaryPatchFile, "utf8");
+  for (const expected of [
+    "create or replace function timegenie.direct_cloud_unassigned_anchor_ensure_locked",
+    "session.id=previous_session_id and session.work_date=target_date",
+    "when rolled_over_previous_date then timegenie.workspace_day_start",
+    "then p_observed_at",
+    "workspace_day_start(p_workspace_id,target_date)",
+  ]) {
+    if (!unassignedSuccessorBoundaryPatch.includes(expected)) {
+      throw new Error("The unassigned successor boundary patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261024c_timegenie_unassigned_successor_boundary.sql")) {
+    throw new Error("The source schema must include the unassigned successor boundary patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261024c_timegenie_unassigned_successor_boundary\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the unassigned successor boundary patch is idempotent.");
+  }
+  if (!schemaIntegrationTest.includes("same-day unassigned successor did not restart at discard boundary")) {
+    throw new Error("The schema integration test must verify the same-day discard boundary.");
+  }
+  const retireLegacySyncPatch = fs.readFileSync(retireLegacySyncPatchFile, "utf8");
+  for (const expected of [
+    "set storage_protocol='direct_v2'",
+    "alter column storage_protocol set default 'direct_v2'",
+    "check (storage_protocol='direct_v2')",
+    "LEGACY_SYNC_UNSUPPORTED",
+    "create or replace function timegenie.cloud_apply_patch",
+    "create or replace function timegenie.cloud_incremental_pull",
+    "create or replace function timegenie.storage_protocol_upgrade_preflight",
+    "create or replace function timegenie.upgrade_storage_protocol",
+    "revoke execute on function timegenie.cloud_apply_patch_pre_direct_v2",
+    "revoke execute on function timegenie.cloud_incremental_pull_pre_direct_v2",
+  ]) {
+    if (!retireLegacySyncPatch.includes(expected)) {
+      throw new Error("The legacy-sync retirement patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261024d_timegenie_retire_legacy_sync.sql")) {
+    throw new Error("The source schema must retire the legacy cloud synchronization protocol.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261024d_timegenie_retire_legacy_sync\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the legacy-sync retirement patch is idempotent.");
+  }
+  for (const expected of [
+    "legacy workspace was not upgraded to direct storage",
+    "new workspace did not default to direct storage",
+    "retired legacy patch RPC was not rejected",
+    "rejected retired legacy patch modified business data",
+    "retired incremental pull RPC was not rejected",
+    "retired protocol upgrade RPC was not rejected",
+  ]) {
+    if (!schemaIntegrationTest.includes(expected)) {
+      throw new Error("The schema integration test is missing legacy-sync retirement coverage: " + expected);
+    }
   }
   for (const expected of [
     "direct report create was not authoritative/idempotent",

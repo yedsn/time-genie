@@ -1550,7 +1550,6 @@ pub fn seatable_task_sync_execute(
                 &client,
                 Some((&state, "external_binding_upsert")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| {
@@ -1599,7 +1598,6 @@ pub fn seatable_sync_retry_failed(
                 &client,
                 Some((&state, "external_binding_upsert")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| {

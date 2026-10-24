@@ -5,6 +5,7 @@ use serde_json::Value;
 use crate::database::Database;
 
 pub const STORAGE_BOUNDARIES_JSON: &str = include_str!("../storage-boundaries.json");
+// Kept temporarily while the server-side retirement migration removes legacy protocol fields.
 pub const LEGACY_SYNC_PROTOCOL: &str = "sync_v1";
 pub const DIRECT_CLOUD_PROTOCOL: &str = "direct_v2";
 
@@ -12,7 +13,6 @@ pub const DIRECT_CLOUD_PROTOCOL: &str = "direct_v2";
 #[serde(rename_all = "snake_case")]
 pub enum StorageBackend {
     LocalSqlite,
-    LegacySyncSqlite,
     DirectSupabase,
 }
 
@@ -76,15 +76,9 @@ pub fn storage_backend_from_connection(connection: &Connection) -> Result<Storag
     if mode != "cloud" {
         return Ok(StorageBackend::LocalSqlite);
     }
-    let protocol = read_device_string(connection, "cloud_storage_protocol")?
-        .unwrap_or_else(|| LEGACY_SYNC_PROTOCOL.to_string());
-    match protocol.as_str() {
-        LEGACY_SYNC_PROTOCOL => Ok(StorageBackend::LegacySyncSqlite),
-        DIRECT_CLOUD_PROTOCOL => Ok(StorageBackend::DirectSupabase),
-        _ => Err(format!(
-            "CLOUD_PROTOCOL_UNSUPPORTED: 不支持的云端存储协议 {protocol}"
-        )),
-    }
+    // Cloud mode is direct Supabase. Legacy and unknown persisted protocol markers are
+    // ignored so an old local setting can never route business work back to SQLite.
+    Ok(StorageBackend::DirectSupabase)
 }
 
 pub fn route<T>(
@@ -95,7 +89,7 @@ pub fn route<T>(
     direct: impl FnOnce(&Database) -> Result<T, String>,
 ) -> Result<T, String> {
     match storage_backend(database)? {
-        StorageBackend::LocalSqlite | StorageBackend::LegacySyncSqlite => sqlite(database),
+        StorageBackend::LocalSqlite => sqlite(database),
         StorageBackend::DirectSupabase => direct(database).map_err(|error| {
             if error.trim().is_empty() {
                 DomainStorageError::direct_adapter_pending(domain, operation).to_string()
@@ -183,7 +177,7 @@ mod tests {
     }
 
     #[test]
-    fn routes_local_and_legacy_cloud_to_sqlite_adapter() {
+    fn routes_local_to_sqlite_and_any_cloud_marker_to_direct_adapter() {
         let database = test_database();
         let local = route(
             &database,
@@ -195,7 +189,7 @@ mod tests {
         .unwrap();
         assert_eq!(local, "sqlite");
         set_device_value(&database, "storage_mode", "cloud");
-        let legacy = route(
+        let legacy_marker = route(
             &database,
             BusinessDomain::Tasks,
             StorageOperation::Mutation,
@@ -203,7 +197,17 @@ mod tests {
             |_| Ok("cloud"),
         )
         .unwrap();
-        assert_eq!(legacy, "sqlite");
+        assert_eq!(legacy_marker, "cloud");
+        set_device_value(&database, "cloud_storage_protocol", "future_v9");
+        let unknown_marker = route(
+            &database,
+            BusinessDomain::Tasks,
+            StorageOperation::Mutation,
+            |_| Ok("sqlite"),
+            |_| Ok("cloud"),
+        )
+        .unwrap();
+        assert_eq!(unknown_marker, "cloud");
     }
 
     #[test]
@@ -238,52 +242,37 @@ mod tests {
     }
 
     #[test]
-    fn direct_cloud_route_does_not_execute_sqlite_adapter_or_change_local_tables() {
+    fn direct_cloud_never_executes_sqlite_adapter_for_any_business_domain_or_operation() {
         let database = test_database();
         set_device_value(&database, "storage_mode", "cloud");
         set_device_value(&database, "cloud_storage_protocol", DIRECT_CLOUD_PROTOCOL);
         let before = business_data_fingerprint(&database).unwrap();
-        let result = route(
-            &database,
+        for domain in [
             BusinessDomain::Tasks,
-            StorageOperation::Mutation,
-            |database| {
-                database
-                    .open()?
-                    .execute("DELETE FROM tasks", [])
-                    .map_err(|error| error.to_string())?;
-                Ok(())
-            },
-            |_| direct_adapter_pending(BusinessDomain::Tasks, StorageOperation::Mutation),
-        );
-        assert!(result
-            .unwrap_err()
-            .starts_with("DIRECT_CLOUD_ADAPTER_PENDING:"));
-        assert_eq!(before, business_data_fingerprint(&database).unwrap());
-    }
-
-    #[test]
-    fn direct_cloud_query_does_not_execute_sqlite_adapter() {
-        let database = test_database();
-        set_device_value(&database, "storage_mode", "cloud");
-        set_device_value(&database, "cloud_storage_protocol", DIRECT_CLOUD_PROTOCOL);
-        let before = business_data_fingerprint(&database).unwrap();
-        let result = route(
-            &database,
+            BusinessDomain::Planning,
+            BusinessDomain::Time,
             BusinessDomain::Reports,
-            StorageOperation::Query,
-            |database| {
-                database
-                    .open()?
-                    .execute("DELETE FROM reports", [])
-                    .map_err(|error| error.to_string())?;
-                Ok(())
-            },
-            |_| direct_adapter_pending(BusinessDomain::Reports, StorageOperation::Query),
-        );
-        assert!(result
-            .unwrap_err()
-            .starts_with("DIRECT_CLOUD_ADAPTER_PENDING:"));
+            BusinessDomain::SharedSettingsIntegrations,
+            BusinessDomain::DataProtection,
+        ] {
+            for operation in [StorageOperation::Query, StorageOperation::Mutation] {
+                let result = route(
+                    &database,
+                    domain,
+                    operation,
+                    |database| {
+                        database
+                            .open()?
+                            .execute("DELETE FROM tasks", [])
+                            .map_err(|error| error.to_string())?;
+                        Ok("sqlite")
+                    },
+                    |_| Ok("supabase"),
+                )
+                .unwrap();
+                assert_eq!(result, "supabase");
+            }
+        }
         assert_eq!(before, business_data_fingerprint(&database).unwrap());
     }
 
@@ -327,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_snapshot_maps_reauthentication_and_protocol_incompatibility() {
+    fn storage_snapshot_maps_reauthentication_without_legacy_protocol_routing() {
         let database = test_database();
         let (workspace_id, device_id) = configure_cloud_context(&database, DIRECT_CLOUD_PROTOCOL);
         database
@@ -344,10 +333,10 @@ mod tests {
         assert!(!reauth.cloud_writable);
 
         set_device_value(&database, "cloud_storage_protocol", "future_v9");
-        let incompatible =
-            crate::supabase::storage_mode_from_connection(&database.open().unwrap(), true).unwrap();
-        assert_eq!(incompatible.cloud_access_state, "protocol_incompatible");
-        assert!(!incompatible.cloud_writable);
+        assert_eq!(
+            storage_backend(&database).unwrap(),
+            StorageBackend::DirectSupabase
+        );
     }
 
     #[test]

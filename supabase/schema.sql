@@ -3917,3 +3917,10 @@ notify pgrst, 'reload schema';
 -- Keep legacy-client successor creation idempotent when direct-v2 has already
 -- materialized or resolved the requested predecessor's successor.
 \ir 20261024b_timegenie_legacy_unassigned_successor_idempotency.sql
+
+-- Restart same-day unassigned successors at the resolution/discard boundary.
+\ir 20261024c_timegenie_unassigned_successor_boundary.sql
+
+-- Retire the legacy SQLite synchronization protocol and make direct-v2 the
+-- only cloud storage behavior.
+\ir 20261024d_timegenie_retire_legacy_sync.sql

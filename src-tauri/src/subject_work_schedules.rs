@@ -438,7 +438,6 @@ pub fn subject_work_schedule_save(
             crate::supabase::ensure_repository_write_mode(database)?;
             let state = crate::supabase::storage_mode(database)?;
             let result = save_schedule_with_cloud_operations(database, request, Some(&state))?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| direct_schedule_save_for_command(database, direct_request),

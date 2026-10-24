@@ -22,7 +22,7 @@ function openAllocation() {
 
 <template>
   <button
-    v-if="!store.unassignedDialogOpen"
+    v-if="store.unassignedSessionId && !store.unassignedDialogOpen"
     class="unassigned-time-indicator"
     type="button"
     title="处理未归属时间"

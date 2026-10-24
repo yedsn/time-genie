@@ -7,6 +7,7 @@ const modulePath = resolve(".tmp-work-data-refresh-test/workDataRefresh.js");
 const {
   partitionWorkDataRefreshDomains,
   shouldClearDirectCloudMemory,
+  shouldRefreshDirectCloudData,
   workDataChangeDomainsForMutation,
   workDataRefreshPlan,
 } = await import(pathToFileURL(modulePath));
@@ -44,10 +45,17 @@ assert.deepEqual(partitionWorkDataRefreshDomains(staleDomains, "reports", true).
 assert.deepEqual(partitionWorkDataRefreshDomains(staleDomains, "today", true).visible, []);
 assert.deepEqual(workDataChangeDomainsForMutation("subject"), ["subjects"]);
 assert.deepEqual(workDataChangeDomainsForMutation("task"), ["tasks"]);
-assert.equal(shouldClearDirectCloudMemory("offline_readonly", false), true);
-assert.equal(shouldClearDirectCloudMemory("connecting", false), true);
-assert.equal(shouldClearDirectCloudMemory("online_writable", false), false);
-assert.equal(shouldClearDirectCloudMemory("offline_readonly", true), false);
+assert.equal(shouldClearDirectCloudMemory("offline_readonly"), false);
+assert.equal(shouldClearDirectCloudMemory("degraded_readonly"), false);
+assert.equal(shouldClearDirectCloudMemory("connecting"), false);
+assert.equal(shouldClearDirectCloudMemory("online_writable"), false);
+assert.equal(shouldClearDirectCloudMemory("reauth_required"), true);
+assert.equal(shouldClearDirectCloudMemory("protocol_incompatible"), true);
+assert.equal(shouldRefreshDirectCloudData("", "online_writable"), true);
+assert.equal(shouldRefreshDirectCloudData("connecting", "online_writable"), true);
+assert.equal(shouldRefreshDirectCloudData("offline_readonly", "online_writable"), true);
+assert.equal(shouldRefreshDirectCloudData("online_writable", "online_writable"), false);
+assert.equal(shouldRefreshDirectCloudData("online_writable", "offline_readonly"), false);
 
 rmSync(resolve(".tmp-work-data-refresh-test"), { recursive: true, force: true });
 console.log("work data refresh verification passed");

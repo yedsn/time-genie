@@ -913,7 +913,6 @@ pub fn settings_update(
     database: tauri::State<'_, Database>,
     request: SettingsUpdate,
 ) -> Result<SettingsSnapshot, String> {
-    let is_shared = matches!(&request.scope, SettingsScope::Shared);
     let refresh_tray =
         matches!(&request.scope, SettingsScope::Device) && request.key == "tray_icon_style";
     let direct_request = request.clone();
@@ -925,9 +924,6 @@ pub fn settings_update(
             crate::supabase::ensure_repository_write_mode(database)?;
             let state = crate::supabase::storage_mode(database)?;
             let result = update_setting_with_cloud_operation(database, request, Some(&state))?;
-            if is_shared {
-                crate::cloud_sync::flush_if_online(database)?;
-            }
             Ok(result)
         },
         |database| direct_update_setting_for_command(database, direct_request),
@@ -953,7 +949,6 @@ pub fn integration_secret_set(
             let state = crate::supabase::storage_mode(database)?;
             let result =
                 set_integration_secret_with_cloud_operation(database, request, Some(&state))?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| direct_set_integration_secret_for_command(database, direct_request),
@@ -975,7 +970,6 @@ pub fn integration_config_update(
             let state = crate::supabase::storage_mode(database)?;
             let result =
                 update_integration_config_with_cloud_operation(database, request, Some(&state))?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| direct_update_integration_config_for_command(database, direct_request),
@@ -997,7 +991,6 @@ pub fn integration_secret_clear(
             let state = crate::supabase::storage_mode(database)?;
             let result =
                 clear_integration_secret_with_cloud_operation(database, provider, Some(&state))?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| direct_clear_integration_secret_for_command(database, direct_provider),

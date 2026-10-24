@@ -3,11 +3,11 @@ import { computed, onMounted, onUnmounted, watch } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import MainWorkbench from "./views/MainWorkbench.vue";
 import HoverPanel from "./views/HoverPanel.vue";
-import { catchUpCloudSync, hideHoverAfterKeyboardClose, closeMainWindow, getSettings, getStorageMode, isCurrentWindowFocused, onCloudSyncStateChanged, onCurrentWindowFocusChanged, onOpenUnassignedResolution, onWorkDataChanged, type StorageModeSnapshot } from "./services/tauri";
+import { hideHoverAfterKeyboardClose, closeMainWindow, getSettings, getStorageMode, isCurrentWindowFocused, onCloudSyncStateChanged, onCurrentWindowFocusChanged, onOpenUnassignedResolution, onWorkDataChanged, type StorageModeSnapshot } from "./services/tauri";
 import { useWorkdayStore } from "./store";
 import { stopCompletionFeedback } from "./services/completionFeedback";
 import { applyAppTheme, getCachedAppTheme, isAppTheme } from "./services/theme";
-import { partitionWorkDataRefreshDomains, shouldClearDirectCloudMemory, workDataRefreshPlan } from "./services/workDataRefresh";
+import { partitionWorkDataRefreshDomains, shouldClearDirectCloudMemory, shouldRefreshDirectCloudData, workDataRefreshPlan } from "./services/workDataRefresh";
 import { shouldRefreshTimeHistory } from "./services/timeEntryHistoryCore";
 import { decideWorkDataInvalidation } from "./services/workDataInvalidationCore";
 import { shouldCalibrateTimer, TimerCalibrationSingleFlight } from "./services/timerCalibrationCore";
@@ -33,12 +33,12 @@ let catchUpTimer: number | undefined;
 const catchUpSingleFlight = new TimerCalibrationSingleFlight();
 let lastCatchUpAt = Date.now();
 let lastWakeHeartbeatAt = Date.now();
-let directCloudLoadedThisProcess = false;
 const currentWindowLabel = getCurrentWindow().label;
 let currentWorkspaceEpoch = 0;
 let appliedChangeSeq = 0;
 let currentWorkspaceId = "";
 let wasDirectCloud = false;
+let directCloudAccessState = "";
 
 function clearPendingDomainRefresh() {
   pendingRefreshDomains.clear();
@@ -65,14 +65,16 @@ function applyCloudAccessState(state: StorageModeSnapshot) {
   currentWorkspaceEpoch = state.workspaceEpoch || currentWorkspaceEpoch;
   if (!state.storageProtocol) return;
   if (state.mode !== "cloud" || state.storageProtocol !== "direct_v2") {
-    directCloudLoadedThisProcess = false;
+    directCloudAccessState = "";
     return;
   }
+  const previousAccessState = directCloudAccessState;
+  directCloudAccessState = state.cloudAccessState;
   if (state.cloudAccessState === "online_writable") {
-    directCloudLoadedThisProcess = true;
+    if (shouldRefreshDirectCloudData(previousAccessState, state.cloudAccessState)) void catchUpCloudData();
     return;
   }
-  if (shouldClearDirectCloudMemory(state.cloudAccessState, directCloudLoadedThisProcess)) {
+  if (shouldClearDirectCloudMemory(state.cloudAccessState)) {
     store.clearCloudBusinessMemory();
   }
 }
@@ -81,8 +83,10 @@ async function catchUpCloudData() {
   lastCatchUpAt = Date.now();
   try {
     await catchUpSingleFlight.run(async () => {
-      await catchUpCloudSync();
-      await store.loadTimeData();
+      await Promise.all([
+        store.loadTimeData(true),
+        store.loadUnassignedState(false, true),
+      ]);
     });
   } catch {
     // The backend reports the connection state; keep the loaded page visible.

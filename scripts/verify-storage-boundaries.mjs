@@ -5,6 +5,18 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const manifest = JSON.parse(fs.readFileSync(path.join(repoRoot, "src-tauri", "storage-boundaries.json"), "utf8"));
 const libSource = fs.readFileSync(path.join(repoRoot, "src-tauri", "src", "lib.rs"), "utf8");
+const storageContractSource = fs.readFileSync(path.join(repoRoot, "src-tauri", "src", "storage_contract.rs"), "utf8");
+const backendBlock = storageContractSource.match(/pub enum StorageBackend\s*\{([\s\S]*?)\}/)?.[1] ?? "";
+const storageBackends = backendBlock
+  .split(/[\s,]+/)
+  .map((item) => item.trim())
+  .filter(Boolean);
+if (storageBackends.join(",") !== "LocalSqlite,DirectSupabase") {
+  throw new Error(`业务存储后端必须且只能是 LocalSqlite 与 DirectSupabase，当前为：${storageBackends.join(", ")}`);
+}
+if (storageContractSource.includes("LegacySyncSqlite")) {
+  throw new Error("存储路由不得保留 LegacySyncSqlite");
+}
 const handlerStart = libSource.indexOf("tauri::generate_handler![");
 const handlerEnd = libSource.indexOf("]),", handlerStart) >= 0
   ? libSource.indexOf("]),", handlerStart)

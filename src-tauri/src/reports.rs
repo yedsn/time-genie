@@ -4092,7 +4092,6 @@ pub fn report_create(
                 request,
                 Some((&state, "report_create", Some(operation_id.as_str()))),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| direct_report_create_for_command(database, direct_request),
@@ -4124,7 +4123,6 @@ pub fn report_update_scope(
                 request,
                 Some((&state, "report_update_scope")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| direct_report_scope_update_for_command(database, direct_request),
@@ -4152,7 +4150,6 @@ pub fn report_save_content(
                 request,
                 Some((&state, "report_save_content")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| direct_report_content_save_for_command(database, direct_request),
@@ -4179,7 +4176,6 @@ pub fn report_regenerate(
                 request,
                 Some((&state, "report_regenerate")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| direct_report_regenerate_for_command(database, direct_request),
@@ -4202,7 +4198,7 @@ pub fn report_delete(
             crate::supabase::ensure_repository_write_mode(database)?;
             let state = crate::supabase::storage_mode(database)?;
             delete_report_with_cloud_operation(database, request, Some((&state, "report_delete")))?;
-            crate::cloud_sync::flush_if_online(database)
+            Ok(())
         },
         |database| direct_report_delete_for_command(database, direct_request),
     )
@@ -4264,7 +4260,6 @@ pub fn report_template_save(
                 request,
                 Some((&state, "report_template_save")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| direct_template_save_for_command(database, direct_request),
@@ -4323,7 +4318,6 @@ pub fn report_template_create(
                 request,
                 Some((&state, "report_template_create")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| direct_template_create_for_command(database, direct_request),
@@ -4354,7 +4348,6 @@ pub fn report_template_update(
                 request,
                 Some((&state, "report_template_update")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| direct_template_update_for_command(database, direct_request),
@@ -4382,7 +4375,6 @@ pub fn report_template_duplicate(
                 request,
                 Some((&state, "report_template_duplicate")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| direct_template_duplicate_for_command(database, direct_request),
@@ -4409,7 +4401,6 @@ pub fn report_template_set_default(
                 request,
                 Some((&state, "report_template_set_default")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| direct_template_set_default_for_command(database, direct_request),
@@ -4437,7 +4428,7 @@ pub fn report_template_delete(
                 request,
                 Some((&state, "report_template_delete")),
             )?;
-            crate::cloud_sync::flush_if_online(database)
+            Ok(())
         },
         |database| direct_template_delete_for_command(database, direct_request),
     )
@@ -4463,7 +4454,6 @@ pub fn report_template_reorder(
                 request,
                 Some((&state, "report_template_reorder")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| direct_template_reorder_for_command(database, direct_request),

@@ -1204,7 +1204,6 @@ pub fn obsidian_plan_import_confirm(
                 request,
                 Some((&state, "obsidian_plan_import")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| direct_confirm_plan_import(database, direct_request),

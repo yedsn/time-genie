@@ -55,6 +55,10 @@ export function workDataChangeDomainsForMutation(mutation: "subject" | "task" | 
   return mutation === "subject" ? ["subjects"] : mutation === "time" ? ["time", "tasks"] : ["tasks"];
 }
 
-export function shouldClearDirectCloudMemory(accessState: string, previouslyWritable: boolean) {
-  return !previouslyWritable && accessState !== "online_writable";
+export function shouldClearDirectCloudMemory(accessState: string) {
+  return accessState === "reauth_required" || accessState === "protocol_incompatible";
+}
+
+export function shouldRefreshDirectCloudData(previousAccessState: string, accessState: string) {
+  return accessState === "online_writable" && previousAccessState !== "online_writable";
 }

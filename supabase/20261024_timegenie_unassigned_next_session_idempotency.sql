@@ -24,6 +24,7 @@ declare
   anchor_started timestamptz;
   new_session_id uuid;
   active_timer boolean;
+  rolled_over_previous_date boolean:=false;
 begin
   target_date:=timegenie.workspace_work_date(p_workspace_id,p_observed_at);
 
@@ -37,6 +38,7 @@ begin
     order by session.work_date,session.created_at
     for update
   loop
+    rolled_over_previous_date:=true;
     close_at:=least(timegenie.workspace_day_end(p_workspace_id,open_session.work_date),p_observed_at);
     update timegenie.unassigned_segments segment set
       ended_at=greatest(segment.started_at,close_at),
@@ -107,8 +109,14 @@ begin
     end if;
   end if;
 
-  anchor_started:=case when previous_session_id is null
-    then p_observed_at else timegenie.workspace_day_start(p_workspace_id,target_date) end;
+  anchor_started:=case
+    when previous_session_id is null then p_observed_at
+    when rolled_over_previous_date then timegenie.workspace_day_start(p_workspace_id,target_date)
+    when exists(select 1 from timegenie.unassigned_sessions session
+      where session.id=previous_session_id and session.work_date=target_date)
+      then p_observed_at
+    else timegenie.workspace_day_start(p_workspace_id,target_date)
+  end;
 
   select (setting.value_json#>>'{}')::integer into threshold
   from timegenie.app_settings setting

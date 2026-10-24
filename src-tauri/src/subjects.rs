@@ -298,9 +298,6 @@ pub fn subject_create(
                 request,
                 Some((&state, "subject_create")),
             )?;
-            if !result.already_exists {
-                crate::cloud_sync::flush_if_online(database)?;
-            }
             Ok(result)
         },
         |database| crate::supabase::direct_cloud_subject_create(database, direct_request),
@@ -326,7 +323,6 @@ pub fn subject_rename(
                 request,
                 Some((&state, "subject_rename", base_version)),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| crate::supabase::direct_cloud_subject_rename(database, direct_request),

@@ -296,7 +296,6 @@ pub fn start_timer_with_hooks_for_sync(
         request,
         Some((&state, "timer_start", Some(operation_id.as_str()))),
     )?;
-    crate::cloud_sync::flush_if_online(database)?;
     Ok(result)
 }
 
@@ -323,7 +322,6 @@ pub fn stop_timer_with_hooks_for_sync(
     let state = crate::supabase::storage_mode(database)?;
     let result =
         stop_timer_with_hooks_and_cloud_operation(database, request, Some((&state, "timer_stop")))?;
-    crate::cloud_sync::flush_if_online(database)?;
     Ok(result)
 }
 
@@ -875,7 +873,6 @@ pub fn pause_timer_for_sync(
     let state = crate::supabase::storage_mode(database)?;
     let result =
         pause_timer_with_cloud_operation(database, request, Some((&state, "timer_pause")))?;
-    crate::cloud_sync::flush_if_online(database)?;
     Ok(result)
 }
 
@@ -940,7 +937,6 @@ pub fn resume_timer_for_sync(
         request,
         Some((&state, "timer_resume", Some(operation_id.as_str()))),
     )?;
-    crate::cloud_sync::flush_if_online(database)?;
     Ok(result)
 }
 
@@ -2994,7 +2990,6 @@ pub(crate) fn timer_start_for_storage(
                 request,
                 Some((&state, "timer_start", Some(operation_id.as_str()))),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| crate::supabase::direct_cloud_timer_start(database, direct_request),
@@ -3015,7 +3010,6 @@ pub(crate) fn timer_pause_for_storage(
             let state = crate::supabase::storage_mode(database)?;
             let result =
                 pause_timer_with_cloud_operation(database, request, Some((&state, "timer_pause")))?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| crate::supabase::direct_cloud_timer_pause(database, direct_request),
@@ -3040,7 +3034,6 @@ pub(crate) fn timer_resume_for_storage(
                 request,
                 Some((&state, "timer_resume", Some(operation_id.as_str()))),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| crate::supabase::direct_cloud_timer_resume(database, direct_request),
@@ -3064,7 +3057,6 @@ pub(crate) fn timer_stop_for_storage(
                 request,
                 Some((&state, "timer_stop")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             timer_chain_result(database, result)
         },
         |database| crate::supabase::direct_cloud_timer_stop(database, direct_request),
@@ -3097,7 +3089,6 @@ pub fn timer_transition(
             crate::supabase::ensure_repository_write_mode(database)?;
             let state = crate::supabase::storage_mode(database)?;
             let result = transition_timer_with_cloud_operation(database, request, Some(&state))?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| crate::supabase::direct_cloud_timer_transition(database, direct_request),
@@ -3247,7 +3238,6 @@ pub fn time_entry_create_manual(
                     Some(operation_id.as_str()),
                 )),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| crate::supabase::direct_cloud_manual_time_create(database, direct_request),
@@ -3272,7 +3262,6 @@ pub fn time_entry_update(
                 request,
                 Some((&state, "time_entry_update")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| crate::supabase::direct_cloud_time_entry_update(database, direct_request),
@@ -3297,7 +3286,6 @@ pub fn time_entry_update_disposition(
                 request,
                 Some((&state, "time_entry_update_disposition")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| crate::supabase::direct_cloud_time_entry_disposition(database, direct_request),
@@ -3322,7 +3310,6 @@ pub fn time_allocation_replace(
                 request,
                 Some((&state, "time_allocation_replace")),
             )?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| crate::supabase::direct_cloud_time_allocation_replace(database, direct_request),
@@ -4951,7 +4938,6 @@ mod tests {
         )
         .unwrap();
 
-        crate::cloud_sync::flush_if_online(&database).unwrap();
         let active = get_timer_state(&database).unwrap().unwrap();
         assert_eq!(active.id, entry.id);
         assert_eq!(active.state, "running");

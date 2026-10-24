@@ -39,6 +39,8 @@ assert.match(movePlanBody, /catch \(error\)[\s\S]*await loadWorkspaceData\(\)/, 
 assert.doesNotMatch(movePlanBody.slice(0, movePlanBody.indexOf("catch (error)")), /await loadWorkspaceData\(\)/, "移动成功不得等待工作台重载");
 const resolveUnassignedBody = store.slice(store.indexOf("async function resolveUnassignedTime"), store.lastIndexOf("  return {"));
 assert.doesNotMatch(resolveUnassignedBody, /await (?:Promise\.all\(\[)?(?:loadWorkspaceData|loadTimeData|loadTodayOverview|loadTimeHistory)/, "未归属处理成功不得等待全量查询");
+assert.match(resolveUnassignedBody, /if \(resolution\.nextSession\)[\s\S]*applyUnassignedState\(resolution\.nextSession\)/, "未归属处理成功后必须立即切换到服务端返回的新起点");
+assert.match(resolveUnassignedBody, /loadUnassignedState\(false, true\)/, "旧返回格式必须轻量刷新未归属起点");
 const saveTaskBody = functionBody("saveTask", "duplicateTask");
 assert.doesNotMatch(saveTaskBody, /loadReports|loadTimeData/, "普通事项保存不得查询报告或计时");
 console.log("direct cloud request budget verification passed");

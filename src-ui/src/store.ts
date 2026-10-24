@@ -60,7 +60,6 @@ import {
   applyTaskPlanBatch,
   getActualAdjustmentSnapshot,
   applyActualAdjustmentBatch,
-  catchUpCloudSync,
   setRecurringTaskEstimate,
   startTimerRecord,
   transitionTimerRecord,
@@ -78,6 +77,7 @@ import {
   type TaskRecord,
   type TodayWorkOverviewRecord,
   type ReportRecordDto,
+  type UnassignedResolveResult,
   type UnassignedStateRecord,
   type RecurrenceRuleRecord,
   type ActualAdjustmentBatchRequest,
@@ -2278,7 +2278,6 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function loadActualAdjustmentSnapshot(subjectId = selectedSubjectId.value) {
-    await catchUpCloudSync();
     const workDate = await ensureWorkspaceCalendar();
     return await getActualAdjustmentSnapshot(subjectId, workDate, false);
   }
@@ -2700,6 +2699,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     const targetVersion = unassignedVersion.value;
 
     const completionCandidates = new Set<string>();
+    let resolution: UnassignedResolveResult;
     if (action === "work") {
       const mergedAllocations = new Map<string, { minutes: number; completeTask: boolean; taskExpectedVersion?: number }>();
       for (const allocation of allocations) {
@@ -2727,26 +2727,36 @@ export const useWorkdayStore = defineStore("workday", () => {
         unassignedDialogOpen.value = false;
         return false;
       }
-      await resolveUnassignedWork(targetSessionId, targetVersion, normalizedAllocations);
+      resolution = await resolveUnassignedWork(targetSessionId, targetVersion, normalizedAllocations);
     } else if (action === "break") {
       if (!canSubmitUnassignedResolution(targetSessionId, targetVersion, unassignedSessionId.value, unassignedVersion.value)) {
         unassignedDialogOpen.value = false;
         return false;
       }
-      await resolveUnassignedBreak(targetSessionId, targetVersion);
+      resolution = await resolveUnassignedBreak(targetSessionId, targetVersion);
     } else {
       if (!canSubmitUnassignedResolution(targetSessionId, targetVersion, unassignedSessionId.value, unassignedVersion.value)) {
         unassignedDialogOpen.value = false;
         return false;
       }
-      await discardUnassignedTime(targetSessionId, targetVersion);
+      resolution = await discardUnassignedTime(targetSessionId, targetVersion);
     }
 
     unassignedDialogOpen.value = false;
-    resetUnassignedTracking();
+    markUnassignedStateChanged();
+    queryCoordinator.markMatchingStale("unassigned");
+    if (resolution.nextSession) {
+      unassignedCurrentSession.value = resolution.nextSession;
+      applyUnassignedState(resolution.nextSession);
+    } else {
+      const reloaded = await loadUnassignedState(false, true);
+      if (!reloaded) {
+        unassignedCurrentSession.value = undefined;
+        resetUnassignedTracking();
+      }
+    }
     queryCoordinator.markMatchingStale("time");
     queryCoordinator.markMatchingStale("workspace");
-    queryCoordinator.markMatchingStale("unassigned");
     queryCoordinator.markMatchingStale("todayOverview");
     queryCoordinator.markMatchingStale("timeHistory");
     const completedTaskIds = [...completionCandidates].filter((taskId) => tasks.find((task) => task.id === taskId)?.status === "done");

@@ -19,10 +19,6 @@ for (const expected of [
   "cloudBusinessReadOnly", "cloudReadOnlyReason", "data-cloud-readonly-banner",
   "rejectCloudReadonlyMutation", "if (rejectCloudReadonlyMutation()) return;",
   `:disabled="cloudBusinessReadOnly && store.activePage !== 'settings'"`,
-  "directCloudEnabled &&",
-  "直接使用 Supabase 云端数据", "独立的本地存储数据不会被删除",
-  "放弃本机旧数据，直接使用云端", "resetLegacyCloudAndUseAuthority",
-  "resetLegacyCloudToAuthority",
 ]) {
   if (!workbench.includes(expected)) throw new Error(`直连云端设置界面缺少：${expected}`);
 }
@@ -52,6 +48,8 @@ for (const expected of [
 for (const forbidden of [
   "cloudQueueDialogOpen", "cloudConflictDialogOpen", "resetLocalCacheDialogOpen",
   "listCloudSyncQueue", "listCloudSyncConflicts", "resetLocalCacheFromCloud",
+  "resetLegacyCloudAndUseAuthority", "resetLegacyCloudToAuthority",
+  "storage-protocol-upgrade-section", "storageState?.conflictCount",
   `title="同步队列"`, `title="处理云端同步冲突"`, `title="重置本地数据"`,
 ]) {
   if (workbench.includes(forbidden)) throw new Error(`前端仍包含旧同步入口或对话框：${forbidden}`);
@@ -65,7 +63,7 @@ for (const expected of [
 }
 for (const expected of [
   "cloudStatePillTitle", "点击查看云端状态", "cloudDockWorkingLabel",
-  "directCloudEnabled.value ? \"刷新中\" : \"保存中\"",
+  "刷新中",
   "云端离线，只能查看已加载数据；不会保存到本机等待同步",
   "登录已失效，请重新登录 Supabase",
   "主体设置已直接保存到 Supabase",
@@ -80,14 +78,6 @@ for (const expected of [
   "登录已失效，请重新登录 Supabase",
 ]) {
   if (!presentation.includes(expected)) throw new Error(`direct_v2 状态或提交提示缺少：${expected}`);
-}
-for (const expected of [
-  "直接使用 Supabase 云端数据？",
-  "放弃本机旧云端副本和未上传修改",
-  "store.clearCloudBusinessMemory();",
-  "救援备份已自动保存",
-]) {
-  if (!workbench.includes(expected)) throw new Error(`协议升级路径自动化缺少：${expected}`);
 }
 for (const expected of [
   "仍运行旧同步版本的设备", "legacy sync write was accepted after direct protocol upgrade",

@@ -1360,6 +1360,7 @@ struct DirectCloudUnassignedEnsureData {
 struct DirectCloudUnassignedResolveData {
     session: crate::unassigned::UnassignedStateDto,
     generated_entry: Option<crate::time_tracking::TimeEntryDto>,
+    next_session: Option<crate::unassigned::UnassignedStateDto>,
     server_time: i64,
 }
 
@@ -3202,6 +3203,7 @@ fn direct_cloud_unassigned_resolve(
         resolution_type: resolution_type.to_string(),
         elapsed_seconds: response.data.session.elapsed_seconds,
         required_minutes: response.data.session.required_minutes,
+        next_session: response.data.next_session,
     })
 }
 
@@ -3971,13 +3973,7 @@ pub(crate) fn storage_mode_from_connection(
             |row| row.get(0),
         )
         .unwrap_or_else(|_| "local".to_string());
-    let configured_cloud_protocol = connection
-        .query_row(
-            "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'cloud_storage_protocol'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .unwrap_or_else(|_| crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string());
+    let configured_cloud_protocol = crate::storage_contract::DIRECT_CLOUD_PROTOCOL.to_string();
     let storage_protocol = if mode == "cloud" {
         configured_cloud_protocol.clone()
     } else {
@@ -3994,23 +3990,13 @@ pub(crate) fn storage_mode_from_connection(
     } else {
         local_workspace_id.clone()
     };
-    let sync_workspace_id = workspace_id.clone();
-    let (pending, conflicts): (i64, i64) = connection
+    let (last_change_seq, last_synced_at, last_error, workspace_epoch): (i64, Option<i64>, Option<String>, i64) = connection
         .query_row(
-            "SELECT
-                (SELECT COUNT(*) FROM sync_outbox WHERE workspace_id = ?1 AND state IN ('pending', 'sending', 'failed')),
-                (SELECT COUNT(*) FROM sync_outbox WHERE workspace_id = ?1 AND state = 'conflict')",
-            [&sync_workspace_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            "SELECT last_change_seq, last_full_sync_at, last_error, workspace_epoch FROM local_sync_state WHERE workspace_id = ?1",
+            [&workspace_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
-        .map_err(|error| error.to_string())?;
-    let (last_change_seq, last_synced_at, last_error, workspace_epoch, epoch_blocked, epoch_blocked_reason): (i64, Option<i64>, Option<String>, i64, bool, Option<String>) = connection
-        .query_row(
-            "SELECT last_change_seq, last_full_sync_at, last_error, workspace_epoch, epoch_blocked, epoch_blocked_reason FROM local_sync_state WHERE workspace_id = ?1",
-            [&sync_workspace_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
-        )
-        .unwrap_or((0, None, None, 1, false, None));
+        .unwrap_or((0, None, None, 1));
     let cloud_workspace_id: Option<String> = connection
         .query_row(
             "SELECT json_extract(value_json, '$') FROM device_settings WHERE key = 'cloud_workspace_id'",
@@ -4033,25 +4019,12 @@ pub(crate) fn storage_mode_from_connection(
                 .flatten()
         })
         .unwrap_or((false, None));
-    let protocol_supported = matches!(
-        storage_protocol.as_str(),
-        "local"
-            | crate::storage_contract::LEGACY_SYNC_PROTOCOL
-            | crate::storage_contract::DIRECT_CLOUD_PROTOCOL
-    );
-    let direct_cloud =
-        mode == "cloud" && storage_protocol == crate::storage_contract::DIRECT_CLOUD_PROTOCOL;
+    let direct_cloud = mode == "cloud";
     let runtime_access = direct_cloud
         .then(|| direct_cloud_access_runtime(&workspace_id))
         .flatten();
     let (cloud_access_state, cloud_writable, read_only_reason) = if mode == "local" {
         ("local_writable".to_string(), true, None)
-    } else if !protocol_supported {
-        (
-            "protocol_incompatible".to_string(),
-            false,
-            Some("当前云端存储协议不受支持，请升级应用".to_string()),
-        )
     } else if auth_blocked {
         (
             "reauth_required".to_string(),
@@ -4062,17 +4035,7 @@ pub(crate) fn storage_mode_from_connection(
                     .unwrap_or_else(|| "云端授权已失效，请重新登录".to_string()),
             ),
         )
-    } else if epoch_blocked {
-        (
-            "degraded_readonly".to_string(),
-            false,
-            Some(
-                epoch_blocked_reason
-                    .clone()
-                    .unwrap_or_else(|| "云端工作空间世代已变化".to_string()),
-            ),
-        )
-    } else if direct_cloud && !online {
+    } else if !online {
         let state = runtime_access
             .as_ref()
             .map(|runtime| runtime.state)
@@ -4083,7 +4046,7 @@ pub(crate) fn storage_mode_from_connection(
             .and_then(|runtime| runtime.reason.clone())
             .or_else(|| Some("当前无法连接 Supabase，云端数据暂时只读".to_string()));
         (state.as_str().to_string(), state.writable(), reason)
-    } else if direct_cloud {
+    } else {
         let runtime = runtime_access.unwrap_or(DirectCloudAccessRuntime {
             state: DirectCloudAccessState::Connecting,
             reason: Some("正在连接 Supabase 并加载云端数据".to_string()),
@@ -4093,34 +4056,18 @@ pub(crate) fn storage_mode_from_connection(
             runtime.state.writable(),
             runtime.reason,
         )
-    } else if online {
-        ("legacy_sync".to_string(), true, None)
-    } else {
-        (
-            "legacy_sync_offline".to_string(),
-            true,
-            Some("当前使用兼容同步协议，修改会保存在本机等待同步".to_string()),
-        )
     };
     Ok(StorageModeSnapshot {
         online: mode == "local" || online,
-        sync_state: if epoch_blocked {
-            "epoch_blocked".to_string()
-        } else if conflicts > 0 {
-            "conflict".to_string()
-        } else if pending > 0 {
-            "pending".to_string()
-        } else if last_error.is_some() {
+        sync_state: if last_error.is_some() {
             "error".to_string()
         } else {
             "synced".to_string()
         },
         storage_backend: if mode == "local" {
             "local_sqlite".to_string()
-        } else if direct_cloud {
-            "direct_supabase".to_string()
         } else {
-            "legacy_sync_sqlite".to_string()
+            "direct_supabase".to_string()
         },
         mode,
         storage_protocol,
@@ -4130,16 +4077,16 @@ pub(crate) fn storage_mode_from_connection(
         read_only_reason,
         workspace_id,
         device_id,
-        pending_operations: pending,
-        conflict_count: conflicts,
+        pending_operations: 0,
+        conflict_count: 0,
         last_change_seq,
         last_synced_at,
         last_error,
         auth_blocked,
         auth_blocked_reason,
         workspace_epoch,
-        epoch_blocked,
-        epoch_blocked_reason,
+        epoch_blocked: false,
+        epoch_blocked_reason: None,
     })
 }
 
@@ -11272,6 +11219,19 @@ mod tests {
             "mustResolve": true,
             "version": 2,
         });
+        let next_anchor = json!({
+            "sessionId": "94000000-0000-0000-0000-0000000000d9",
+            "workDate": "2026-10-22",
+            "state": "collecting",
+            "firstStartedAt": server_started_at + 8_000_000,
+            "lastEndedAt": null,
+            "currentSegmentStartedAt": server_started_at + 8_000_000,
+            "elapsedSeconds": 0,
+            "requiredMinutes": 0,
+            "thresholdSeconds": 300,
+            "mustResolve": false,
+            "version": 1,
+        });
         let list_body = Box::leak(
             serde_json::to_string(&json!({
                 "metadata": metadata(json!(["time", "unassigned"])),
@@ -11426,7 +11386,7 @@ mod tests {
                 status: 200,
                 body: mutation_body(
                     "70000000-0000-0000-0000-0000000000dc",
-                    json!({"session":anchor,"generatedEntry":null,"serverTime":server_started_at + 8_000_000}),
+                    json!({"session":anchor,"generatedEntry":null,"nextSession":next_anchor,"serverTime":server_started_at + 8_000_000}),
                 ),
             },
             TestHttpResponse {
@@ -11551,6 +11511,20 @@ mod tests {
         .unwrap();
         assert_eq!(resolved.resolution_type, "discard");
         assert_eq!(resolved.elapsed_seconds, 600);
+        assert_eq!(
+            resolved
+                .next_session
+                .as_ref()
+                .map(|session| session.session_id.as_str()),
+            Some("94000000-0000-0000-0000-0000000000d9")
+        );
+        assert_eq!(
+            resolved
+                .next_session
+                .as_ref()
+                .map(|session| session.first_started_at),
+            Some(server_started_at + 8_000_000)
+        );
 
         let snapshot = direct_cloud_actual_adjustment_snapshot(
             &database,

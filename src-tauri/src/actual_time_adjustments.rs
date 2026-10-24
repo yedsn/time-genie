@@ -677,7 +677,6 @@ pub fn apply_batch(
     let result_json = serde_json::to_string(&result).map_err(|error| error.to_string())?;
     transaction.execute("INSERT INTO actual_adjustment_batches(workspace_id,client_request_id,batch_id,request_hash,result_json,created_at) VALUES(?1,?2,?3,?4,?5,?6)",params![workspace_id,request.client_request_id,request.batch_id,request_hash,result_json,now_millis()]).map_err(|error|error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())?;
-    crate::cloud_sync::flush_if_online(database)?;
     Ok(result)
 }
 
@@ -714,7 +713,6 @@ pub fn delete_adjustment(
     bump_revision(&transaction)?;
     let result = load_adjustment(&transaction, &request.adjustment_id)?;
     transaction.commit().map_err(|error| error.to_string())?;
-    crate::cloud_sync::flush_if_online(database)?;
     Ok(result)
 }
 

@@ -45,53 +45,31 @@ insert into timegenie.tasks(id, workspace_id, subject_id, title, status, source_
 set local role authenticated;
 select set_config('request.jwt.claim.sub', '11000000-0000-0000-0000-000000000001', true);
 
-select timegenie.cloud_apply_patch(
+select timegenie.direct_cloud_task_daily_estimate_set(
   '21000000-0000-0000-0000-000000000001',
   '31000000-0000-0000-0000-000000000001',
   '41000000-0000-0000-0000-000000000001',
-  'task_daily_estimate.set',
-  'task_daily_estimate',
-  '61000000-0000-0000-0000-000000000001|2026-10-05',
-  null,
+  1,
   jsonb_build_object(
-    'task_id', '61000000-0000-0000-0000-000000000001',
-    'work_date', '2026-10-05',
-    'estimate_minutes', 45,
-    'created_at', 1791158400000,
-    'updated_at', 1791158400000,
-    'version', 1
+    'taskId', '61000000-0000-0000-0000-000000000001',
+    'workDate', '2026-10-25',
+    'estimateMinutes', 45,
+    'expectedVersion', null
   )
 );
 
-select timegenie.cloud_apply_patch(
+select timegenie.direct_cloud_recurrence_save(
   '21000000-0000-0000-0000-000000000001',
   '31000000-0000-0000-0000-000000000001',
   '41000000-0000-0000-0000-000000000002',
-  'task_recurrence.save',
-  'task_recurrence_rule',
-  '61000000-0000-0000-0000-000000000001',
-  null,
+  1,
   jsonb_build_object(
-    'action', 'save',
-    'task_id', '61000000-0000-0000-0000-000000000001',
-    'task_expected_version', 1,
-    'task_version', 2,
-    'rule_id', '91000000-0000-0000-0000-000000000001',
+    'taskId', '61000000-0000-0000-0000-000000000001',
+    'taskExpectedVersion', 1,
     'frequency', 'weekly',
-    'weekdays_mask', 21,
-    'effective_start', '2026-10-05',
-    'version', 1,
-    'rules', jsonb_build_array(jsonb_build_object(
-      'id', '91000000-0000-0000-0000-000000000001',
-      'task_id', '61000000-0000-0000-0000-000000000001',
-      'frequency', 'weekly',
-      'weekdays_mask', 21,
-      'effective_start', '2026-10-05',
-      'effective_end', null,
-      'created_at', 1791158400000,
-      'updated_at', 1791158400000,
-      'version', 1
-    ))
+    'weekdaysMask', 21,
+    'effectiveStart', '2026-10-25',
+    'ruleExpectedVersion', null
   )
 );
 
@@ -101,13 +79,14 @@ do $$
 begin
   if (select estimate_minutes from timegenie.task_daily_estimates
       where task_id = '61000000-0000-0000-0000-000000000001'
-        and work_date = '2026-10-05') <> 45 then
+        and work_date = '2026-10-25') <> 45 then
     raise exception 'fresh schema did not apply daily estimate';
   end if;
   if not exists(
     select 1 from timegenie.task_recurrence_rules
-    where id = '91000000-0000-0000-0000-000000000001'
-      and frequency = 'weekly' and weekdays_mask = 21 and effective_end is null
+    where task_id = '61000000-0000-0000-0000-000000000001'
+      and frequency = 'weekly' and weekdays_mask = 21
+      and effective_start='2026-10-25' and effective_end is null
   ) then
     raise exception 'fresh schema did not apply recurrence rule';
   end if;
@@ -115,7 +94,7 @@ begin
     select 1 from timegenie.workspace_changes
     where workspace_id = '21000000-0000-0000-0000-000000000001'
       and entity_type = 'task_daily_estimates'
-      and entity_id = '61000000-0000-0000-0000-000000000001|2026-10-05'
+      and entity_id = '61000000-0000-0000-0000-000000000001|2026-10-25'
   ) then
     raise exception 'fresh schema did not preserve daily estimate composite change identity';
   end if;

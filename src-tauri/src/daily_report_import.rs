@@ -627,7 +627,6 @@ pub fn confirm(
         return Err("VERSION_CONFLICT: 日报导入预览已变化".to_string());
     }
     transaction.commit().map_err(|error| error.to_string())?;
-    crate::cloud_sync::flush_if_online(database)?;
     result.already_confirmed = false;
     Ok(result)
 }

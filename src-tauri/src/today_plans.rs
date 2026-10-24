@@ -1230,7 +1230,6 @@ pub fn task_day_plan_set(
             crate::supabase::ensure_repository_write_mode(database)?;
             let state = crate::supabase::storage_mode(database)?;
             let result = set_day_plan(database, request, Some(&state))?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| crate::supabase::direct_cloud_day_plan_set_for_command(database, direct_request),
@@ -1251,7 +1250,6 @@ pub fn task_day_plan_batch_set(
             crate::supabase::ensure_repository_write_mode(database)?;
             let state = crate::supabase::storage_mode(database)?;
             let result = set_day_plan_batch(database, request, Some(&state))?;
-            crate::cloud_sync::flush_if_online(database)?;
             Ok(result)
         },
         |database| {

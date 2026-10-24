@@ -150,6 +150,8 @@ end $$;
 \ir 20261024_timegenie_unassigned_next_session_idempotency.sql
 \ir 20261024b_timegenie_legacy_unassigned_successor_idempotency.sql
 \ir 20261024b_timegenie_legacy_unassigned_successor_idempotency.sql
+\ir 20261024c_timegenie_unassigned_successor_boundary.sql
+\ir 20261024c_timegenie_unassigned_successor_boundary.sql
 
 do $$
 begin
@@ -8250,6 +8252,114 @@ begin
       legacy_result,legacy_retry,direct_result;
   end if;
 end $$;
+
+-- Same-day successors restart at the handling boundary; the day-start rule is
+-- reserved for the first anchor carried over from an earlier work date.
+do $$
+declare boundary timestamptz:='2026-10-24 10:30:00+08'; result_value jsonb;
+begin
+  update timegenie.unassigned_sessions set state='discarded',resolution_type='discard',
+    resolved_at=boundary,last_ended_at=boundary,updated_at=boundary
+  where id='f7100000-0000-0000-0000-000000000002';
+  delete from timegenie.unassigned_segments
+  where session_id in (select id from timegenie.unassigned_sessions
+    where workspace_id='f2000000-0000-0000-0000-000000000001'
+      and state in ('collecting','awaiting_resolution'));
+  delete from timegenie.unassigned_sessions
+  where workspace_id='f2000000-0000-0000-0000-000000000001'
+    and state in ('collecting','awaiting_resolution');
+  result_value:=timegenie.direct_cloud_unassigned_anchor_ensure_locked(
+    'f2000000-0000-0000-0000-000000000001',
+    'f3000000-0000-0000-0000-000000000001',boundary
+  );
+  if (select first_started_at from timegenie.unassigned_sessions
+      where id=(result_value->>'sessionId')::uuid) is distinct from boundary
+     or (select started_at from timegenie.unassigned_segments
+      where session_id=(result_value->>'sessionId')::uuid and ended_at is null)
+       is distinct from boundary then
+    raise exception 'same-day unassigned successor did not restart at discard boundary: %',result_value;
+  end if;
+end $$;
+
+-- The final cloud migration upgrades every existing workspace, makes new
+-- workspaces direct by default, and leaves old sync RPCs as rejection-only
+-- tombstones. Applying it twice also proves the deployed patch is idempotent.
+reset role;
+update timegenie.workspaces
+set storage_protocol='sync_v1'
+where id='f2000000-0000-0000-0000-000000000001';
+\ir 20261024d_timegenie_retire_legacy_sync.sql
+\ir 20261024d_timegenie_retire_legacy_sync.sql
+
+insert into auth.users(id) values('fa000000-0000-0000-0000-000000000001')
+on conflict(id) do nothing;
+insert into timegenie.workspaces(id,owner_user_id,name) values(
+  'fb000000-0000-0000-0000-000000000001',
+  'fa000000-0000-0000-0000-000000000001',
+  '直连默认工作空间'
+);
+do $$
+begin
+  if exists(select 1 from timegenie.workspaces where storage_protocol<>'direct_v2') then
+    raise exception 'legacy workspace was not upgraded to direct storage';
+  end if;
+  if (select storage_protocol from timegenie.workspaces
+      where id='fb000000-0000-0000-0000-000000000001') is distinct from 'direct_v2' then
+    raise exception 'new workspace did not default to direct storage';
+  end if;
+end $$;
+
+set role authenticated;
+select set_config('request.jwt.claim.sub','f1000000-0000-0000-0000-000000000001',true);
+do $$
+declare before_setting_count bigint; before_change_count bigint; rejected boolean:=false;
+begin
+  before_setting_count:=(select count(*) from timegenie.app_settings
+    where workspace_id='f2000000-0000-0000-0000-000000000001');
+  before_change_count:=(select count(*) from timegenie.workspace_changes
+    where workspace_id='f2000000-0000-0000-0000-000000000001');
+  begin
+    perform timegenie.cloud_apply_patch(
+      'f2000000-0000-0000-0000-000000000001',
+      'f3000000-0000-0000-0000-000000000001',
+      'fc000000-0000-0000-0000-000000000001',
+      'app_setting.update','app_setting','retired_sync_probe',null,
+      jsonb_build_object('key','retired_sync_probe','value_json','true'::jsonb,'version',1)
+    );
+  exception when others then
+    rejected:=sqlerrm like 'LEGACY_SYNC_UNSUPPORTED:%';
+  end;
+  if not rejected then raise exception 'retired legacy patch RPC was not rejected'; end if;
+  if before_setting_count<>(select count(*) from timegenie.app_settings
+       where workspace_id='f2000000-0000-0000-0000-000000000001')
+     or before_change_count<>(select count(*) from timegenie.workspace_changes
+       where workspace_id='f2000000-0000-0000-0000-000000000001') then
+    raise exception 'rejected retired legacy patch modified business data';
+  end if;
+
+  rejected:=false;
+  begin
+    perform timegenie.cloud_incremental_pull(
+      'f2000000-0000-0000-0000-000000000001',
+      'f3000000-0000-0000-0000-000000000001',0,20
+    );
+  exception when others then
+    rejected:=sqlerrm like 'LEGACY_SYNC_UNSUPPORTED:%';
+  end;
+  if not rejected then raise exception 'retired incremental pull RPC was not rejected'; end if;
+
+  rejected:=false;
+  begin
+    perform timegenie.storage_protocol_upgrade_preflight(
+      'f2000000-0000-0000-0000-000000000001',
+      'f3000000-0000-0000-0000-000000000001'
+    );
+  exception when others then
+    rejected:=sqlerrm like 'LEGACY_SYNC_UNSUPPORTED:%';
+  end;
+  if not rejected then raise exception 'retired protocol upgrade RPC was not rejected'; end if;
+end $$;
+reset role;
 
 select 'Supabase schema integration tests passed' as result;
 

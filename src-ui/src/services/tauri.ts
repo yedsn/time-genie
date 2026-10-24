@@ -205,10 +205,10 @@ export type CloudSessionSnapshot = {
 
 export type StorageModeSnapshot = {
   mode: "local" | "cloud";
-  storageProtocol: "local" | "sync_v1" | "direct_v2" | string;
-  configuredCloudProtocol: "sync_v1" | "direct_v2" | string;
-  storageBackend: "local_sqlite" | "legacy_sync_sqlite" | "direct_supabase" | string;
-  cloudAccessState: "local_writable" | "legacy_sync" | "legacy_sync_offline" | "online_writable" | "offline_readonly" | "degraded_readonly" | "reauth_required" | "protocol_incompatible" | string;
+  storageProtocol: "local" | "direct_v2" | string;
+  configuredCloudProtocol: "direct_v2" | string;
+  storageBackend: "local_sqlite" | "direct_supabase" | string;
+  cloudAccessState: "local_writable" | "online_writable" | "offline_readonly" | "degraded_readonly" | "reauth_required" | string;
   cloudWritable: boolean;
   readOnlyReason?: string;
   workspaceId: string;
@@ -860,6 +860,7 @@ export type UnassignedResolveResult = {
   resolutionType: "work" | "break" | "discard";
   elapsedSeconds: number;
   requiredMinutes: number;
+  nextSession?: UnassignedStateRecord;
 };
 
 export type ReportRecordDto = {
@@ -1805,71 +1806,12 @@ export async function executeStorageMigration(direction: StorageMigrationPreview
   });
 }
 
-export async function getCloudSyncStatus(): Promise<StorageModeSnapshot> {
-  return await invoke("cloud_sync_status");
-}
-
-export async function getStorageProtocolUpgradePreflight(): Promise<StorageProtocolUpgradePreflight> {
-  return await invoke("storage_protocol_upgrade_preflight_get");
-}
-
-export async function upgradeStorageProtocolWithDrainedQueue(
-  operationId = crypto.randomUUID(),
-  createSafetySnapshot = true,
-): Promise<StorageProtocolUpgradeResult> {
-  return await invoke("storage_protocol_upgrade_with_drained_queue_command", {
-    request: { operationId, createSafetySnapshot },
-  });
-}
-
-export async function upgradeStorageProtocolAfterRescue(
-  rescueBackupPath: string,
-  confirmationText: string,
-  operationId = crypto.randomUUID(),
-  createSafetySnapshot = true,
-): Promise<StorageProtocolAbandonResult> {
-  return await invoke("storage_protocol_upgrade_after_rescue_command", {
-    request: {
-      operationId,
-      rescueBackupPath,
-      confirmed: true,
-      confirmationText,
-      createSafetySnapshot,
-    },
-  });
-}
-
-export async function resetLegacyCloudToAuthority(
-  operationId = crypto.randomUUID(),
-  createSafetySnapshot = true,
-): Promise<StorageProtocolAbandonResult> {
-  return await invoke("storage_protocol_reset_to_cloud_authority_command", {
-    request: { operationId, confirmed: true, createSafetySnapshot },
-  });
-}
-
 export async function listCloudDevices(): Promise<CloudDevice[]> {
   return await invoke("cloud_device_list");
 }
 
 export async function revokeCloudDevice(deviceId: string): Promise<CloudDevice[]> {
   return await invoke("cloud_device_revoke", { request: { deviceId } });
-}
-
-export async function resumeCloudSyncAfterReauth(): Promise<StorageModeSnapshot> {
-  return await invoke("cloud_sync_resume_after_reauth");
-}
-
-export async function refreshCloudSync(): Promise<void> {
-  await invoke("cloud_sync_refresh");
-}
-
-export async function catchUpCloudSync(): Promise<void> {
-  await invoke("cloud_sync_catch_up");
-}
-
-export async function discardOldEpochChangesAndRedownload(): Promise<StorageModeSnapshot> {
-  return await invoke("cloud_sync_discard_old_epoch_changes");
 }
 
 export async function testSeaTableConnection(): Promise<SeaTableConnectionResult> {

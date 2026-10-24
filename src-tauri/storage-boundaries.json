@@ -66,6 +66,9 @@
       "dataProtection": "本地备份、显式双向复制和升级救援按用户确认跨越存储空间，不属于日常 direct_v2 业务读写。"
     },
     "forbiddenDirectV2References": [
+      "enqueue_entity",
+      "enqueue_entity_deferred",
+      "flush_if_online",
       "push_outbox",
       "pull_incremental",
       "cloud_snapshot_get",

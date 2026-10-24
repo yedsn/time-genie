@@ -57,6 +57,8 @@ pub struct UnassignedResolveResult {
     pub resolution_type: String,
     pub elapsed_seconds: i64,
     pub required_minutes: i64,
+    #[serde(default)]
+    pub next_session: Option<UnassignedStateDto>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -399,6 +401,7 @@ fn resolve_work_with_cloud_operation(
         resolution_type: "work".to_string(),
         elapsed_seconds: state.elapsed_seconds,
         required_minutes: state.required_minutes,
+        next_session: None,
     };
     save_processed_result(
         &transaction,
@@ -508,7 +511,6 @@ pub fn resolve_work_for_sync(
             Some(operation_id.as_str()),
         )),
     )?;
-    crate::cloud_sync::flush_if_online(database)?;
     Ok(result)
 }
 
@@ -610,6 +612,7 @@ fn resolve_without_allocations(
         resolution_type: resolution_type.to_string(),
         elapsed_seconds: state.elapsed_seconds,
         required_minutes: state.required_minutes,
+        next_session: None,
     };
     save_processed_result(
         &transaction,
@@ -659,7 +662,6 @@ pub fn resolve_break_for_sync(
             Some(operation_id.as_str()),
         )),
     )?;
-    crate::cloud_sync::flush_if_online(database)?;
     Ok(result)
 }
 
@@ -675,7 +677,6 @@ pub fn discard_for_sync(
         "discard",
         Some((&state, "unassigned_discard", Some(operation_id.as_str()))),
     )?;
-    crate::cloud_sync::flush_if_online(database)?;
     Ok(result)
 }
 
@@ -1017,6 +1018,7 @@ fn adopt_existing_generated_resolution(
         resolution_type: resolution_type.to_string(),
         elapsed_seconds,
         required_minutes: settlement_minutes(elapsed_seconds),
+        next_session: None,
     };
     save_processed_result(
         transaction,
@@ -2393,8 +2395,6 @@ mod tests {
             )),
         )
         .unwrap();
-        crate::cloud_sync::flush_if_online(&database).unwrap();
-
         let entry_id = result.generated_entry_id.unwrap();
         let connection = database.open().unwrap();
         let outbox = connection
