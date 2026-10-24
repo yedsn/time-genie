@@ -1,5 +1,6 @@
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
+#[cfg(debug_assertions)]
 use rusqlite::params;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -576,6 +577,7 @@ pub fn revoke_device(database: &Database, device_id: &str) -> Result<Vec<CloudDe
     list_devices(database)
 }
 
+#[cfg(debug_assertions)]
 pub(crate) fn dev_cloud_session_from_env() -> Option<CloudSession> {
     if std::env::var_os("TG_DEV_CLOUD_SESSION").is_none() {
         return None;

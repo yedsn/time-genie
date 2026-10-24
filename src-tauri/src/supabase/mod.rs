@@ -3338,8 +3338,6 @@ pub(crate) fn current_session(database: &Database) -> Result<CloudSession, Strin
     current_session_with_refresh(database, false, true)
 }
 
-#[cfg(debug_assertions)]
-
 fn validate_project_url(value: &str) -> Result<String, String> {
     let value = value.trim().trim_end_matches('/');
     let url =
