@@ -361,7 +361,7 @@ defineExpose({ commit: commitText, closeSuggestions: closeTaskSuggestions, focus
     <el-autocomplete ref="autocompleteRef" v-model="inputText" class="task-autocomplete-input" :fetch-suggestions="fetchSuggestions" :placeholder="placeholder" :aria-label="ariaLabel" popper-class="task-autocomplete-popper" placement="bottom-start" fit-input-width highlight-first-item :select-when-unmatched="false" clearable :clear-icon="X" @input="handleInput" @click="openTaskSuggestions" @clear="clearSelectedTask" @select="selectSuggestion" @keydown.enter.stop @keydown.esc.stop="handleEscape">
       <template #header>
         <div class="task-subject-tabs" role="tablist" aria-label="筛选事项主体">
-          <button v-for="subject in store.subjects" :key="subject.id" type="button" role="tab" :aria-selected="activeSubjectId === subject.id" :class="{ active: activeSubjectId === subject.id }" @pointerdown.stop="switchSubject(subject.id)">{{ subject.name }}</button>
+          <button v-for="subject in store.subjects" :key="subject.id" v-hover-switch="() => switchSubject(subject.id)" type="button" role="tab" :aria-selected="activeSubjectId === subject.id" :class="{ active: activeSubjectId === subject.id }" @pointerdown.stop="switchSubject(subject.id)">{{ subject.name }}</button>
         </div>
       </template>
       <template #default="{ item }">

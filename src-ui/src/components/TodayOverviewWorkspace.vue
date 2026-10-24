@@ -162,6 +162,7 @@ function taskTitle(task: TodayWorkOverviewTaskRecord) {
         <button
           v-for="subject in subjectOptions"
           :key="subject.id || 'all'"
+          v-hover-switch
           type="button"
           role="tab"
           :aria-selected="store.todayOverviewSubjectId === subject.id"

@@ -479,6 +479,7 @@ fn validate_setting_key(scope: &SettingsScope, key: &str) -> Result<(), String> 
             "start_minimized",
             "completion_feedback_enabled",
             "completion_feedback_sound_enabled",
+            "hover_navigation_enabled",
             "app_theme",
             "obsidian_root_path",
             "obsidian_daily_path_pattern",
@@ -517,10 +518,12 @@ fn validate_setting_value(key: &str, value: &Value) -> Result<(), String> {
     }
     if matches!(
         key,
-        "completion_feedback_enabled" | "completion_feedback_sound_enabled"
+        "completion_feedback_enabled"
+            | "completion_feedback_sound_enabled"
+            | "hover_navigation_enabled"
     ) && !value.is_boolean()
     {
-        return Err("激励反馈设置必须是布尔值".to_string());
+        return Err("交互设置必须是布尔值".to_string());
     }
     if key == "report_duration_format" && !matches!(value.as_str(), Some("minutes" | "hours")) {
         return Err("报告时长格式只能是 minutes 或 hours".to_string());
@@ -1027,6 +1030,15 @@ mod tests {
             &database,
             SettingsUpdate {
                 scope: SettingsScope::Device,
+                key: "hover_navigation_enabled".to_string(),
+                value: serde_json::json!(true),
+            },
+        )
+        .unwrap();
+        update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
                 key: "app_theme".to_string(),
                 value: serde_json::json!("ocean"),
             },
@@ -1057,6 +1069,10 @@ mod tests {
         assert_eq!(
             snapshot.device["completion_feedback_sound_enabled"],
             serde_json::json!(false)
+        );
+        assert_eq!(
+            snapshot.device["hover_navigation_enabled"],
+            serde_json::json!(true)
         );
         assert_eq!(snapshot.device["app_theme"], serde_json::json!("ocean"));
         assert_eq!(
@@ -1090,6 +1106,15 @@ mod tests {
             SettingsUpdate {
                 scope: SettingsScope::Device,
                 key: "completion_feedback_sound_enabled".to_string(),
+                value: serde_json::json!("yes"),
+            },
+        )
+        .is_err());
+        assert!(update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "hover_navigation_enabled".to_string(),
                 value: serde_json::json!("yes"),
             },
         )

@@ -27,6 +27,7 @@ import { remainingOpenTaskCount } from "../services/completionFeedbackCore";
 import { APP_THEMES, applyAppTheme, isAppTheme, type AppTheme } from "../services/theme";
 import type { ExecutionPanelMode } from "../services/executionTaskPanelCore";
 import { cloneWorkSchedule, createDefaultWorkSchedule, loadSubjectWorkSchedule, saveSubjectWorkSchedule, type WorkScheduleDay } from "../services/subjectWorkScheduleMock";
+import { setHoverNavigationEnabled } from "../services/hoverNavigation";
 
 const store = useWorkdayStore();
 const appVersion = __APP_VERSION__;
@@ -117,6 +118,7 @@ const settingsDraft = reactive({
   appTheme: "forest" as AppTheme,
   completionFeedbackEnabled: true,
   completionFeedbackSoundEnabled: true,
+  hoverNavigationEnabled: false,
   trayHoverEnabled: true,
   trayMenuSuppressHover: true,
   trayIconStyle: "status-orb" as "status-orb" | "minimal" | "app-icon",
@@ -323,6 +325,8 @@ async function loadSettings() {
     setCompletionFeedbackEnabled(settingsDraft.completionFeedbackEnabled);
     settingsDraft.completionFeedbackSoundEnabled = settingBoolean("device", "completion_feedback_sound_enabled", true);
     setCompletionFeedbackSoundEnabled(settingsDraft.completionFeedbackSoundEnabled);
+    settingsDraft.hoverNavigationEnabled = settingBoolean("device", "hover_navigation_enabled");
+    setHoverNavigationEnabled(settingsDraft.hoverNavigationEnabled);
     settingsDraft.trayHoverEnabled = settingBoolean("device", "tray_hover_enabled", true);
     settingsDraft.trayMenuSuppressHover = settingBoolean("device", "tray_menu_suppress_hover", true);
     const trayIconStyle = settingString("device", "tray_icon_style", "status-orb");
@@ -355,6 +359,8 @@ async function saveSettings() {
     setCompletionFeedbackEnabled(settingsDraft.completionFeedbackEnabled);
     await updateSetting("device", "completion_feedback_sound_enabled", settingsDraft.completionFeedbackSoundEnabled);
     setCompletionFeedbackSoundEnabled(settingsDraft.completionFeedbackSoundEnabled);
+    await updateSetting("device", "hover_navigation_enabled", settingsDraft.hoverNavigationEnabled);
+    setHoverNavigationEnabled(settingsDraft.hoverNavigationEnabled);
     await updateSetting("device", "app_theme", settingsDraft.appTheme);
     applyAppTheme(settingsDraft.appTheme, true);
     if (settingsDraft.storageMode === "local") storageState.value = await setLocalStorageMode();
@@ -1542,7 +1548,7 @@ async function handleCompletedTaskDelete(task: Task) {
       </div>
       <nav class="nav-list">
         <template v-for="page in pages" :key="page.id">
-          <button :class="{ active: store.activePage === page.id }" @click="store.selectPage(page.id)">
+          <button v-hover-switch :class="{ active: store.activePage === page.id }" @click="store.selectPage(page.id)">
             <component :is="page.icon" :size="17" />
             <span>{{ page.label }}</span>
             <i v-if="page.id === 'settings' && storageState?.mode === 'cloud' && cloudSaveNeedsAttention" :class="['nav-sync-indicator', { conflict: cloudSyncAttentionLevel === 'critical' }]" :title="cloudSyncLabel"></i>
@@ -1554,7 +1560,7 @@ async function handleCompletedTaskDelete(task: Task) {
               class="subject-nav-row"
               :class="{ active: store.activePage === 'plan' && store.selectedSubjectId === subject.id }"
             >
-              <button class="subject-select-button" type="button" :title="subject.name" @click="store.selectSubject(subject.id)">
+              <button v-hover-switch class="subject-select-button" type="button" :title="subject.name" :aria-current="store.activePage === 'plan' && store.selectedSubjectId === subject.id ? 'page' : undefined" @click="store.selectSubject(subject.id)">
                 <Folder :size="13" />
                 <span>{{ subject.name }}</span>
                 <small>{{ subjectTaskCount(subject.id) }}</small>
@@ -1597,13 +1603,13 @@ async function handleCompletedTaskDelete(task: Task) {
 
       <section v-else-if="store.activePage === 'plan'" class="plan-edit-layout">
         <div class="plan-task-tabs" role="tablist" aria-label="事项状态">
-          <button type="button" role="tab" :aria-selected="store.planTaskTab === 'today'" :class="{ active: store.planTaskTab === 'today' }" @click="store.selectPlanTaskTab('today')">
+          <button v-hover-switch type="button" role="tab" :aria-selected="store.planTaskTab === 'today'" :class="{ active: store.planTaskTab === 'today' }" @click="store.selectPlanTaskTab('today')">
             <span>今日</span><strong>{{ store.todayPlanTasks.filter((task) => task.subjectId === store.selectedSubjectId && task.todayMember).length }}</strong>
           </button>
-          <button type="button" role="tab" :aria-selected="store.planTaskTab === 'active'" :class="{ active: store.planTaskTab === 'active' }" @click="store.selectPlanTaskTab('active')">
+          <button v-hover-switch type="button" role="tab" :aria-selected="store.planTaskTab === 'active'" :class="{ active: store.planTaskTab === 'active' }" @click="store.selectPlanTaskTab('active')">
             <span>进行中</span><strong>{{ store.selectedSubjectTasks.length }}</strong>
           </button>
-          <button type="button" role="tab" :aria-selected="store.planTaskTab === 'completed'" :class="{ active: store.planTaskTab === 'completed' }" @click="store.selectPlanTaskTab('completed')">
+          <button v-hover-switch type="button" role="tab" :aria-selected="store.planTaskTab === 'completed'" :class="{ active: store.planTaskTab === 'completed' }" @click="store.selectPlanTaskTab('completed')">
             <span>已完成</span><strong v-if="!store.completedTasksStale" data-completed-count>{{ store.completedTasksTotal }}</strong>
           </button>
         </div>
@@ -1723,7 +1729,7 @@ async function handleCompletedTaskDelete(task: Task) {
           <nav class="settings-page-nav-list">
             <section v-for="group in settingsNavGroups" :key="group.label" class="settings-page-nav-group">
               <div class="settings-page-nav-group-title">{{ group.label }}</div>
-              <button v-for="item in group.items" :key="item.id" class="settings-page-nav-item" :class="{ active: activeSettingsSection === item.id }" type="button" @click="scrollToSettingsSection(item.id)"><component :is="item.icon" :size="14" /><span>{{ item.label }}</span></button>
+              <button v-for="item in group.items" :key="item.id" v-hover-switch class="settings-page-nav-item" :class="{ active: activeSettingsSection === item.id }" type="button" @click="scrollToSettingsSection(item.id)"><component :is="item.icon" :size="14" /><span>{{ item.label }}</span></button>
             </section>
           </nav>
         </aside>
@@ -1887,6 +1893,8 @@ async function handleCompletedTaskDelete(task: Task) {
           <p class="settings-help">开启后显示彩带、完成提示和列表反馈；此选项不受 Windows 动画设置影响。</p>
           <label class="switch-line"><input v-model="settingsDraft.completionFeedbackSoundEnabled" :disabled="!settingsLoaded || !settingsDraft.completionFeedbackEnabled" type="checkbox" @change="setCompletionFeedbackSoundEnabled(settingsDraft.completionFeedbackSoundEnabled)" />播放完成事项时的激励音效</label>
           <p class="settings-help">使用本地成功提示音与视觉特效同步播放；关闭后仅保留视觉反馈。</p>
+          <label class="switch-line"><input v-model="settingsDraft.hoverNavigationEnabled" :disabled="!settingsLoaded" type="checkbox" @change="setHoverNavigationEnabled(settingsDraft.hoverNavigationEnabled)" />鼠标移到菜单和标签页时自动切换</label>
+          <p class="settings-help">默认关闭；开启后无需点击即可切换导航菜单、设置目录和页面标签，原有点击操作仍然可用。</p>
         </div>
 
         <div id="settings-tray" data-settings-section="tray" class="work-panel settings-panel">

@@ -1087,7 +1087,7 @@ function formatTime(timestamp: number) {
 
     <div class="timer-task-dialog-toolbar">
       <div class="timer-task-subject-tabs" role="tablist" aria-label="执行事项主体">
-        <button v-for="subject in store.subjects" :key="subject.id" type="button" role="tab" :aria-selected="subjectId === subject.id" :class="{ active: subjectId === subject.id }" @click="selectSubject(subject.id)">{{ subject.name }}</button>
+        <button v-for="subject in store.subjects" :key="subject.id" v-hover-switch type="button" role="tab" :aria-selected="subjectId === subject.id" :class="{ active: subjectId === subject.id }" @click="selectSubject(subject.id)">{{ subject.name }}</button>
       </div>
       <label class="timer-task-search"><Search :size="15" /><input ref="searchRef" v-model="query" placeholder="搜索当前主体事项" aria-label="搜索执行事项" /></label>
       <button v-if="usesTodayPlan" class="secondary-button compact" type="button" @click="openTodayPicker"><ListTodo :size="14" />从进行中导入</button>

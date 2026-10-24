@@ -288,8 +288,8 @@ async function copyMarkdown() {
 
     <div class="daily-editor-modebar">
       <div class="report-mode-tabs" role="tablist" aria-label="日报编辑模式">
-        <button :class="{ active: editorMode === 'edit' }" type="button" @click="editorMode = 'edit'"><FilePenLine :size="14" />编辑</button>
-        <button :class="{ active: editorMode === 'preview' }" type="button" @click="editorMode = 'preview'">预览</button>
+        <button v-hover-switch :class="{ active: editorMode === 'edit' }" type="button" @click="editorMode = 'edit'"><FilePenLine :size="14" />编辑</button>
+        <button v-hover-switch :class="{ active: editorMode === 'preview' }" type="button" @click="editorMode = 'preview'">预览</button>
       </div>
       <span>{{ markdown.length }} 字符 · Markdown</span>
     </div>
