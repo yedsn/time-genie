@@ -1229,6 +1229,7 @@ struct DirectCloudRecurrenceData {
 #[serde(rename_all = "camelCase")]
 struct DirectCloudOccurrenceStatusData {
     task: DirectCloudTaskData,
+    occurrence: crate::recurring::TaskOccurrenceDto,
     instance: Option<DirectCloudTaskData>,
 }
 
@@ -1507,7 +1508,13 @@ pub fn direct_cloud_task_status_for_command(
         )?;
         // Match the local command: recurring completion returns the source task
         // with occurrence context rather than replacing it with the member instance.
-        return Ok(response.data.task.into());
+        let mut task: crate::tasks::TaskDto = response.data.task.into();
+        task.status = response.data.occurrence.status;
+        task.completed_at = response.data.occurrence.completed_at;
+        task.occurrence_date = Some(response.data.occurrence.occurrence_date);
+        task.occurrence_origin = Some(response.data.occurrence.origin);
+        task.occurrence_version = Some(response.data.occurrence.version);
+        return Ok(task);
     }
     let response = direct_cloud_mutation::<DirectCloudTaskMutationData>(
         database,
@@ -7161,29 +7168,45 @@ mod tests {
         .unwrap();
         assert_eq!(listed.tasks.len(), 1);
 
-        let status = crate::storage_contract::route(
+        crate::automation_hooks::create_hook(
             &database,
-            crate::storage_contract::BusinessDomain::Planning,
-            crate::storage_contract::StorageOperation::Mutation,
-            |_| -> Result<crate::tasks::TaskDto, String> {
-                sqlite_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Err("sqlite adapter must not run".to_string())
+            crate::automation_hooks::HookDraftRequest {
+                name: "云端事项完成".to_string(),
+                event_type: "task.completed".to_string(),
+                action_type: "process".to_string(),
+                action_config: json!({
+                    "program": "time-genie-test-missing-hook-program",
+                    "args": [],
+                    "workingDirectory": null,
+                }),
+                timeout_seconds: 1,
+                enabled: true,
             },
-            |database| {
-                direct_cloud_task_status_for_command(
-                    database,
-                    crate::tasks::TaskStatusRequest {
-                        id: task_id.to_string(),
-                        expected_version: 1,
-                        done: true,
-                        occurrence_date: None,
-                        occurrence_expected_version: None,
-                    },
-                )
+        )
+        .unwrap();
+        let status = crate::tasks::set_task_completed_for_command(
+            &database,
+            crate::tasks::TaskStatusRequest {
+                id: task_id.to_string(),
+                expected_version: 1,
+                done: true,
+                occurrence_date: None,
+                occurrence_expected_version: None,
             },
         )
         .unwrap();
         assert_eq!(status.status, "done");
+        let hook_event: (i64, String) = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*), MIN(event_id) FROM device_hook_runs WHERE event_type='task.completed'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(hook_event.0, 1);
+        assert_eq!(hook_event.1, format!("task.completed:{task_id}:global:2"));
 
         let rule = crate::storage_contract::route(
             &database,
@@ -7329,6 +7352,103 @@ mod tests {
         assert_eq!(cache_state.cache_source.as_deref(), Some("persistent"));
         assert!(cache_state.cache_fetched_at.is_some());
         assert!(!cache_state.cloud_writable);
+    }
+
+    #[test]
+    fn direct_cloud_recurring_completion_returns_occurrence_context() {
+        let _guard = lock_test_session_state();
+        reset_test_credentials();
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("direct-recurring-completion.sqlite3"))
+                .unwrap();
+        let cloud_workspace_id = "20000000-0000-0000-0000-0000000000e9";
+        let task_id = "60000000-0000-0000-0000-0000000000e9";
+        let occurrence_date = "2026-10-25";
+        let body = Box::leak(
+            serde_json::to_string(&json!({
+                "operationId": "70000000-0000-0000-0000-0000000000e9",
+                "metadata": {
+                    "workspaceId": cloud_workspace_id,
+                    "deviceId": "device-placeholder",
+                    "storageProtocol": "direct_v2",
+                    "workspaceEpoch": 1,
+                    "changeSeq": 8,
+                    "serverTime": "2026-10-25T18:00:00+08:00",
+                    "domains": ["recurrence", "planning", "tasks"],
+                    "diagnostics": {"responseBytes": 512, "rpcCount": 1, "durationMs": 1.0}
+                },
+                "data": {
+                    "task": {
+                        "id": task_id,
+                        "subjectId": "50000000-0000-0000-0000-0000000000e9",
+                        "parentId": null,
+                        "dayInstanceDate": null,
+                        "dayInstanceKind": null,
+                        "dayInstanceSourceTaskId": null,
+                        "title": "云端重复事项",
+                        "status": "open",
+                        "plannedDate": null,
+                        "estimateMinutes": 30,
+                        "note": null,
+                        "projectName": null,
+                        "solutionName": null,
+                        "sortOrder": 10,
+                        "completedAt": null,
+                        "depth": 0,
+                        "pathLabel": "云端重复事项",
+                        "selectable": true,
+                        "directMinutes": 0,
+                        "totalMinutes": 0,
+                        "executionState": "not_started",
+                        "version": 4
+                    },
+                    "occurrence": {
+                        "taskId": task_id,
+                        "occurrenceDate": occurrence_date,
+                        "origin": "scheduled",
+                        "status": "done",
+                        "completedAt": 1792912800000_i64,
+                        "version": 2
+                    },
+                    "instance": null
+                }
+            }))
+            .unwrap()
+            .into_boxed_str(),
+        );
+        let server = TestHttpServer::start(vec![TestHttpResponse {
+            path: "/rest/v1/rpc/direct_cloud_recurrence_occurrence_set_status",
+            status: 200,
+            body,
+        }]);
+        configure_test_cloud_state(&database, &server.base_url(), cloud_workspace_id);
+        cache_session(
+            cloud_workspace_id,
+            &test_session("direct-recurring-completion", Some(now_seconds() + 3600)),
+        )
+        .unwrap();
+
+        let task = direct_cloud_task_status_for_command(
+            &database,
+            crate::tasks::TaskStatusRequest {
+                id: task_id.to_string(),
+                expected_version: 4,
+                done: true,
+                occurrence_date: Some(occurrence_date.to_string()),
+                occurrence_expected_version: Some(1),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(task.status, "done");
+        assert_eq!(task.occurrence_date.as_deref(), Some(occurrence_date));
+        assert_eq!(task.occurrence_origin.as_deref(), Some("scheduled"));
+        assert_eq!(task.occurrence_version, Some(2));
+        assert_eq!(task.completed_at, Some(1792912800000_i64));
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("\"occurrenceExpectedVersion\":1"));
     }
 
     #[test]

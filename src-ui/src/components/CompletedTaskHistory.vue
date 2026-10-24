@@ -76,7 +76,7 @@ async function confirmDelete(task: Task) {
     <header class="completed-history-head">
       <div>
         <h2>{{ subjectName }}</h2>
-        <span>共 {{ total }} 项普通已完成事项 · 按事项原顺序排列</span>
+        <span>共 {{ total }} 项普通已完成事项 · 按完成时间倒序排列</span>
       </div>
       <button class="icon-button subtle" type="button" title="刷新已完成事项" :disabled="loading" @click="emit('refresh')">
         <RefreshCw :size="15" :class="{ spinning: loading }" />

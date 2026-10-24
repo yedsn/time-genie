@@ -330,22 +330,30 @@ pub(crate) fn publish_task_completed_hook(
     occurrence_date: Option<&str>,
     operation_id: Option<&str>,
 ) {
-    let result = load_task_for_hook(database, task_id, occurrence_date).and_then(|task| {
-        let version = task.occurrence_version.unwrap_or(task.version);
-        let event_id = operation_id
-            .map(|value| format!("task.completed:{value}:{task_id}"))
-            .unwrap_or_else(|| {
-                format!(
-                    "task.completed:{task_id}:{}:{version}",
-                    occurrence_date.unwrap_or("global")
-                )
-            });
-        crate::automation_hooks::task_completed_event(database, event_id, &task)
-            .and_then(|event| crate::automation_hooks::publish(database.clone(), event).map(|_| ()))
-    });
+    let result = load_task_for_hook(database, task_id, occurrence_date)
+        .and_then(|task| publish_task_completed_snapshot_hook(database, &task, operation_id));
     if let Err(error) = result {
         eprintln!("事项完成 Hook 调度失败，不影响事项结果: {error}");
     }
+}
+
+fn publish_task_completed_snapshot_hook(
+    database: &Database,
+    task: &TaskDto,
+    operation_id: Option<&str>,
+) -> Result<(), String> {
+    let version = task.occurrence_version.unwrap_or(task.version);
+    let event_id = operation_id
+        .map(|value| format!("task.completed:{value}:{}", task.id))
+        .unwrap_or_else(|| {
+            format!(
+                "task.completed:{}:{}:{version}",
+                task.id,
+                task.occurrence_date.as_deref().unwrap_or("global")
+            )
+        });
+    crate::automation_hooks::task_completed_event(database, event_id, task)
+        .and_then(|event| crate::automation_hooks::publish(database.clone(), event).map(|_| ()))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -599,34 +607,14 @@ pub fn list_completed_task_page(
     };
     let mut statement = connection
         .prepare(
-            "WITH RECURSIVE completed_tree(id, path) AS (
-               SELECT t.id,
-                      printf('%+011d', t.sort_order + 1000000000) || '|' ||
-                      printf('%020d', t.created_at) || '|' || t.id
-               FROM tasks t
-               WHERE t.workspace_id = ?1 AND t.subject_id = ?2 AND t.deleted_at IS NULL
-                 AND t.day_instance_date IS NULL
-                 AND (t.parent_id IS NULL OR NOT EXISTS (
-                   SELECT 1 FROM tasks p
-                   WHERE p.id = t.parent_id AND p.workspace_id = t.workspace_id AND p.deleted_at IS NULL
-                 ))
-               UNION ALL
-               SELECT child.id,
-                      parent.path || '/' || printf('%+011d', child.sort_order + 1000000000) || '|' ||
-                      printf('%020d', child.created_at) || '|' || child.id
-               FROM tasks child
-               JOIN completed_tree parent ON child.parent_id = parent.id
-               WHERE child.workspace_id = ?1 AND child.subject_id = ?2 AND child.deleted_at IS NULL
-                 AND child.day_instance_date IS NULL
-             )
-             SELECT t.id, t.subject_id, t.parent_id, t.title, t.status, t.planned_date,
+            "SELECT t.id, t.subject_id, t.parent_id, t.title, t.status, t.planned_date,
                     t.estimate_minutes, t.note, t.project_name, t.solution_name, t.sort_order,
                     t.completed_at, t.version, t.day_instance_date, t.day_instance_kind,
                     t.day_instance_source_task_id
-             FROM completed_tree tree
-             JOIN tasks t ON t.id = tree.id
-             WHERE t.status = 'done'
-             ORDER BY tree.path
+             FROM tasks t
+             WHERE t.workspace_id = ?1 AND t.subject_id = ?2
+               AND t.status = 'done' AND t.deleted_at IS NULL AND t.day_instance_date IS NULL
+             ORDER BY t.completed_at DESC, t.id DESC
              LIMIT ?3 OFFSET ?4",
         )
         .map_err(|error| error.to_string())?;
@@ -3536,30 +3524,43 @@ pub fn task_set_completed(
     database: tauri::State<'_, Database>,
     request: TaskStatusRequest,
 ) -> Result<TaskDto, String> {
+    set_task_completed_for_command(&database, request)
+}
+
+pub(crate) fn set_task_completed_for_command(
+    database: &Database,
+    request: TaskStatusRequest,
+) -> Result<TaskDto, String> {
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    let (task, should_publish) = crate::storage_contract::route(
+        database,
         crate::storage_contract::BusinessDomain::Planning,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
             crate::supabase::ensure_repository_write_mode(database)?;
             let should_publish = request.done
                 && !task_is_completed(database, &request.id, request.occurrence_date.as_deref())?;
-            let task_id = request.id.clone();
-            let occurrence_date = request.occurrence_date.clone();
             let state = crate::supabase::storage_mode(database)?;
             let result = set_task_status_with_cloud_operation(
                 database,
                 request,
                 Some((&state, "task_set_completed")),
             )?;
-            if should_publish {
-                publish_task_completed_hook(database, &task_id, occurrence_date.as_deref(), None);
-            }
-            Ok(result)
+            Ok((result, should_publish))
         },
-        |database| crate::supabase::direct_cloud_task_status_for_command(database, direct_request),
-    )
+        |database| {
+            let should_publish = direct_request.done;
+            let result =
+                crate::supabase::direct_cloud_task_status_for_command(database, direct_request)?;
+            Ok((result, should_publish))
+        },
+    )?;
+    if should_publish && task.status == "done" {
+        if let Err(error) = publish_task_completed_snapshot_hook(database, &task, None) {
+            eprintln!("事项完成 Hook 调度失败，不影响事项结果: {error}");
+        }
+    }
+    Ok(task)
 }
 
 #[tauri::command]
@@ -5114,7 +5115,7 @@ mod tests {
                     params![completed_at, task.id],
                 )
                 .unwrap();
-            expected.push((task.id, task.sort_order));
+            expected.push((task.id, completed_at));
         }
         let other_task = create_test_task(&database, &other_subject_id, None, "其他主体已完成");
         database
@@ -5125,7 +5126,7 @@ mod tests {
                 [&other_task.id],
             )
             .unwrap();
-        expected.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+        expected.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| right.0.cmp(&left.0)));
 
         let first = list_completed_task_page(
             &database,
@@ -5262,7 +5263,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_task_page_preserves_original_tree_order() {
+    fn completed_task_page_sorts_by_completed_at_descending() {
         let database = database();
         let connection = database.open().unwrap();
         let subject_id: String = connection
@@ -5274,16 +5275,18 @@ mod tests {
         let child_a = create_test_task(&database, &subject_id, Some(parent_a.id.clone()), "子项 A");
         let parent_b = create_test_task(&database, &subject_id, None, "父项 B");
         let child_b = create_test_task(&database, &subject_id, Some(parent_b.id.clone()), "子项 B");
-        for (index, task) in [&child_b, &parent_b, &child_a, &parent_a]
-            .into_iter()
-            .enumerate()
-        {
+        for (completed_at, task) in [
+            (4000, &child_b),
+            (3000, &parent_b),
+            (2000, &child_a),
+            (1000, &parent_a),
+        ] {
             database
                 .open()
                 .unwrap()
                 .execute(
                     "UPDATE tasks SET status = 'done', completed_at = ?1 WHERE id = ?2",
-                    params![1000 + index as i64, task.id],
+                    params![completed_at, task.id],
                 )
                 .unwrap();
         }
@@ -5304,7 +5307,7 @@ mod tests {
                 .iter()
                 .map(|task| task.title.as_str())
                 .collect::<Vec<_>>(),
-            vec!["父项 A", "子项 A", "父项 B", "子项 B"]
+            vec!["子项 B", "父项 B", "子项 A", "父项 A"]
         );
     }
 
