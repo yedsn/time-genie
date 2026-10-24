@@ -3913,3 +3913,7 @@ notify pgrst, 'reload schema';
 -- Keep direct-cloud unassigned successor creation idempotent when a resolved
 -- current-day anchor already follows an older awaiting-resolution session.
 \ir 20261024_timegenie_unassigned_next_session_idempotency.sql
+
+-- Keep legacy-client successor creation idempotent when direct-v2 has already
+-- materialized or resolved the requested predecessor's successor.
+\ir 20261024b_timegenie_legacy_unassigned_successor_idempotency.sql

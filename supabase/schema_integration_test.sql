@@ -148,6 +148,8 @@ end $$;
 \ir 20261023n_timegenie_direct_cloud_interaction_performance.sql
 \ir 20261024_timegenie_unassigned_next_session_idempotency.sql
 \ir 20261024_timegenie_unassigned_next_session_idempotency.sql
+\ir 20261024b_timegenie_legacy_unassigned_successor_idempotency.sql
+\ir 20261024b_timegenie_legacy_unassigned_successor_idempotency.sql
 
 do $$
 begin
@@ -8170,6 +8172,11 @@ where id='20000000-0000-0000-0000-00000000000a';
 reset role;
 insert into auth.users(id) values('f1000000-0000-0000-0000-000000000001')
 on conflict(id) do nothing;
+select set_config(
+  'request.jwt.claim.sub',
+  'f1000000-0000-0000-0000-000000000001',
+  true
+);
 insert into timegenie.workspaces(id,owner_user_id,name,timezone) values(
   'f2000000-0000-0000-0000-000000000001',
   'f1000000-0000-0000-0000-000000000001',
@@ -8210,29 +8217,37 @@ insert into timegenie.unassigned_sessions(
     '2026-10-24 00:10:00+08'
   );
 do $$
-declare first_result jsonb; retry_result jsonb;
+declare legacy_result jsonb; legacy_retry jsonb; direct_result jsonb;
 begin
-  first_result:=timegenie.direct_cloud_unassigned_anchor_ensure_locked(
+  legacy_result:=timegenie.timegenie_unassigned_create_anchor(
     'f2000000-0000-0000-0000-000000000001',
     'f3000000-0000-0000-0000-000000000001',
-    '2026-10-24 10:00:00+08'
+    '2026-10-24 10:00:00+08',null,
+    'f7100000-0000-0000-0000-000000000001'
   );
-  retry_result:=timegenie.direct_cloud_unassigned_anchor_ensure_locked(
+  legacy_retry:=timegenie.timegenie_unassigned_create_anchor(
     'f2000000-0000-0000-0000-000000000001',
     'f3000000-0000-0000-0000-000000000001',
-    '2026-10-24 10:00:01+08'
+    '2026-10-24 10:00:01+08',null,
+    'f7100000-0000-0000-0000-000000000001'
   );
-  if first_result->>'created' is distinct from 'true'
-     or retry_result->>'created' is distinct from 'false'
-     or first_result->>'sessionId' is distinct from retry_result->>'sessionId'
+  direct_result:=timegenie.direct_cloud_unassigned_anchor_ensure_locked(
+    'f2000000-0000-0000-0000-000000000001',
+    'f3000000-0000-0000-0000-000000000001',
+    '2026-10-24 10:00:02+08'
+  );
+  if legacy_result->>'id' is null
+     or legacy_retry->>'id' is distinct from legacy_result->>'id'
+     or direct_result->>'sessionId' is distinct from legacy_result->>'id'
+     or direct_result->>'created' is distinct from 'false'
      or (select count(*) from timegenie.unassigned_sessions
          where workspace_id='f2000000-0000-0000-0000-000000000001'
            and predecessor_session_id='f7100000-0000-0000-0000-000000000001')<>1
      or (select count(*) from timegenie.unassigned_sessions
          where workspace_id='f2000000-0000-0000-0000-000000000001'
            and predecessor_session_id='f7100000-0000-0000-0000-000000000002')<>1 then
-    raise exception 'unassigned successor ensure was not idempotent: % / %',
-      first_result,retry_result;
+    raise exception 'legacy/direct unassigned successor mixing was not idempotent: % / % / %',
+      legacy_result,legacy_retry,direct_result;
   end if;
 end $$;
 

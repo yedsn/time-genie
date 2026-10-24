@@ -68,6 +68,7 @@ const directWorkspaceRestorePatchFile = path.join(repoRoot, "supabase", "2026102
 const removeClientGenerationGatePatchFile = path.join(repoRoot, "supabase", "20261023m_timegenie_remove_client_generation_gate.sql");
 const directInteractionPerformancePatchFile = path.join(repoRoot, "supabase", "20261023n_timegenie_direct_cloud_interaction_performance.sql");
 const unassignedNextSessionIdempotencyPatchFile = path.join(repoRoot, "supabase", "20261024_timegenie_unassigned_next_session_idempotency.sql");
+const legacyUnassignedSuccessorIdempotencyPatchFile = path.join(repoRoot, "supabase", "20261024b_timegenie_legacy_unassigned_successor_idempotency.sql");
 
 const binaryNames = process.platform === "win32"
   ? {
@@ -789,8 +790,26 @@ function verifyStaticSchemaInvariants() {
   if ((schemaIntegrationTest.match(/\\ir 20261024_timegenie_unassigned_next_session_idempotency\.sql/g) ?? []).length < 2) {
     throw new Error("The schema integration test must prove the unassigned successor idempotency patch is idempotent.");
   }
-  if (!schemaIntegrationTest.includes("unassigned successor ensure was not idempotent")) {
+  if (!schemaIntegrationTest.includes("unassigned successor ensure was not idempotent")
+      && !schemaIntegrationTest.includes("legacy/direct unassigned successor mixing was not idempotent")) {
     throw new Error("The schema integration test must reproduce the resolved-successor unique-index regression.");
+  }
+  const legacyUnassignedSuccessorIdempotencyPatch = fs.readFileSync(legacyUnassignedSuccessorIdempotencyPatchFile, "utf8");
+  for (const expected of [
+    "create or replace function timegenie.timegenie_unassigned_create_anchor",
+    "session.predecessor_session_id=predecessor_id",
+    "predecessor_id:=successor_row.id",
+    "uq_unassigned_next_session",
+  ]) {
+    if (!legacyUnassignedSuccessorIdempotencyPatch.includes(expected)) {
+      throw new Error("The legacy unassigned successor idempotency patch is missing: " + expected);
+    }
+  }
+  if (!schema.includes("\\ir 20261024b_timegenie_legacy_unassigned_successor_idempotency.sql")) {
+    throw new Error("The source schema must include the legacy unassigned successor idempotency patch.");
+  }
+  if ((schemaIntegrationTest.match(/\\ir 20261024b_timegenie_legacy_unassigned_successor_idempotency\.sql/g) ?? []).length < 2) {
+    throw new Error("The schema integration test must prove the legacy unassigned successor patch is idempotent.");
   }
   for (const expected of [
     "direct report create was not authoritative/idempotent",

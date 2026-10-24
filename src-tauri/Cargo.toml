@@ -1,6 +1,7 @@
 [package]
 name = "timegenie"
 version = "0.4.6"
+default-run = "timegenie"
 description = "TimeGenie — local-first desktop app for work hours and daily reports"
 authors = ["TimeGenie"]
 license = "MIT"

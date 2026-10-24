@@ -4760,6 +4760,10 @@ pub(crate) fn ensure_current_device_authorized(database: &Database) -> Result<()
     )?;
     if value.get("authorized").and_then(Value::as_bool) == Some(true) {
         if auth_blocked_reason(database)?.is_some() {
+            if state.storage_protocol == crate::storage_contract::DIRECT_CLOUD_PROTOCOL {
+                quarantine_direct_v2_auth_resume_queue(database, &state.workspace_id)?;
+                return Ok(());
+            }
             return Err(
                 "AUTH_RESUME_REQUIRED: 登录已恢复，请确认如何处理此前保留的待同步修改".to_string(),
             );
@@ -5145,6 +5149,101 @@ fn quarantine_legacy_queue(
         .commit()
         .map_err(|error| format!("LEGACY_QUEUE_ISOLATION_FAILED: {error}"))?;
     Ok((batch_id, count))
+}
+
+fn quarantine_direct_v2_auth_resume_queue(
+    database: &Database,
+    workspace_id: &str,
+) -> Result<i64, String> {
+    let mut connection = database.open()?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let mode = read_device_setting_string(&transaction, "storage_mode")?
+        .unwrap_or_else(|| "local".to_string());
+    let protocol = read_device_setting_string(&transaction, "cloud_storage_protocol")?
+        .unwrap_or_else(|| crate::storage_contract::LEGACY_SYNC_PROTOCOL.to_string());
+    let configured_workspace_id =
+        read_device_setting_string(&transaction, "cloud_workspace_id")?.unwrap_or_default();
+    if mode != "cloud"
+        || protocol != crate::storage_contract::DIRECT_CLOUD_PROTOCOL
+        || configured_workspace_id != workspace_id
+    {
+        return Err(
+            "AUTH_RESUME_REQUIRED: 存储模式已变化，请重新确认旧同步修改的处理方式".to_string(),
+        );
+    }
+
+    let count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1 AND state IN ('pending','sending','failed','conflict')",
+            [workspace_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if count > 0 {
+        let batch_id = Uuid::now_v7().to_string();
+        let quarantined_at = now_millis();
+        let quarantine_checksum = crate::data_protection::sha256_hex(
+            format!("direct_v2_auth_resume:{workspace_id}:{batch_id}:{count}:{quarantined_at}")
+                .as_bytes(),
+        );
+        let reason = "direct_v2 登录恢复：旧同步队列不再适用，已隔离并以云端权威数据为准";
+        let inserted = transaction
+            .execute(
+                "INSERT INTO legacy_abandoned_outbox(
+                    operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,
+                    base_version,payload_json,state,attempt_count,created_at,last_attempt_at,
+                    error_json,payload_version,depends_on_operation_id,coalesced_count,
+                    recovery_kind,recovery_context_json,recovery_updated_at,workspace_epoch,
+                    quarantine_batch_id,quarantine_reason,rescue_backup_checksum,quarantined_at
+                 )
+                 SELECT operation_id,workspace_id,device_id,operation_type,entity_type,entity_id,
+                        base_version,payload_json,state,attempt_count,created_at,last_attempt_at,
+                        error_json,payload_version,depends_on_operation_id,coalesced_count,
+                        recovery_kind,recovery_context_json,recovery_updated_at,workspace_epoch,
+                        ?2,?3,?4,?5
+                 FROM sync_outbox
+                 WHERE workspace_id=?1 AND state IN ('pending','sending','failed','conflict')",
+                params![
+                    workspace_id,
+                    batch_id,
+                    reason,
+                    quarantine_checksum,
+                    quarantined_at
+                ],
+            )
+            .map_err(|error| format!("DIRECT_CLOUD_LEGACY_QUEUE_ISOLATION_FAILED: {error}"))?;
+        if inserted as i64 != count {
+            return Err(format!(
+                "DIRECT_CLOUD_LEGACY_QUEUE_ISOLATION_FAILED: 预期隔离 {count} 条，实际 {inserted} 条"
+            ));
+        }
+        let deleted = transaction
+            .execute(
+                "DELETE FROM sync_outbox WHERE workspace_id=?1 AND state IN ('pending','sending','failed','conflict')",
+                [workspace_id],
+            )
+            .map_err(|error| format!("DIRECT_CLOUD_LEGACY_QUEUE_ISOLATION_FAILED: {error}"))?;
+        if deleted as i64 != count {
+            return Err(format!(
+                "DIRECT_CLOUD_LEGACY_QUEUE_ISOLATION_FAILED: 预期移除 {count} 条，实际 {deleted} 条"
+            ));
+        }
+    }
+
+    transaction
+        .execute(
+            "UPDATE local_sync_state
+             SET auth_blocked=0,auth_blocked_reason=NULL,auth_blocked_at=NULL,last_error=NULL
+             WHERE workspace_id=?1",
+            [workspace_id],
+        )
+        .map_err(|error| format!("DIRECT_CLOUD_AUTH_RESUME_FAILED: {error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("DIRECT_CLOUD_AUTH_RESUME_FAILED: {error}"))?;
+    Ok(count)
 }
 
 fn restore_quarantined_legacy_queue(database: &Database, batch_id: &str) -> Result<(), String> {
@@ -5548,6 +5647,13 @@ pub fn resume_pending_sync(database: &Database) -> Result<StorageModeSnapshot, S
     )?;
     if value.get("authorized").and_then(Value::as_bool) != Some(true) {
         return Err("DEVICE_REVOKED: 当前设备尚未重新授权".to_string());
+    }
+    let state = storage_mode(database)?;
+    if state.mode == "cloud"
+        && state.storage_protocol == crate::storage_contract::DIRECT_CLOUD_PROTOCOL
+    {
+        quarantine_direct_v2_auth_resume_queue(database, &workspace_id)?;
+        return storage_mode(database);
     }
     clear_auth_blocked(database)?;
     settings::update_setting(
@@ -13748,6 +13854,265 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    fn configure_auth_resume_test_state(
+        database: &Database,
+        project_url: &str,
+        workspace_id: &str,
+        protocol: &str,
+    ) {
+        configure_test_cloud_state(database, project_url, workspace_id);
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "INSERT INTO device_settings(key,value_json,updated_at)
+                 VALUES('cloud_storage_protocol',?1,1)
+                 ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+                [serde_json::to_string(protocol).unwrap()],
+            )
+            .unwrap();
+        mark_auth_blocked(database, "auth_session_revoked").unwrap();
+    }
+
+    #[test]
+    fn direct_v2_authorization_resume_quarantines_legacy_queue_and_clears_block() {
+        let _guard = lock_test_session_state();
+        reset_test_credentials();
+        let server = TestHttpServer::start(vec![TestHttpResponse {
+            path: "/rest/v1/rpc/device_authorization_get",
+            status: 200,
+            body: r#"{"authorized":true}"#,
+        }]);
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("direct-v2-auth-resume.sqlite3"))
+                .unwrap();
+        let workspace_id = Uuid::now_v7().to_string();
+        configure_auth_resume_test_state(
+            &database,
+            &server.base_url(),
+            &workspace_id,
+            crate::storage_contract::DIRECT_CLOUD_PROTOCOL,
+        );
+        save_session(
+            &database,
+            &test_session("direct-v2-auth-resume", Some(now_seconds() + 3600)),
+        )
+        .unwrap();
+        insert_legacy_outbox_for_test(&database, &workspace_id, 2);
+        let business_before: (i64, i64, i64, i64, i64) = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM subjects),
+                    (SELECT COUNT(*) FROM tasks),
+                    (SELECT COUNT(*) FROM time_entries),
+                    (SELECT COUNT(*) FROM unassigned_sessions),
+                    (SELECT COUNT(*) FROM reports)",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        ensure_current_device_authorized(&database).unwrap();
+
+        assert_eq!(server.finish().len(), 1);
+        let state = storage_mode(&database).unwrap();
+        assert!(!state.auth_blocked);
+        assert_eq!(state.pending_operations, 0);
+        assert_eq!(state.conflict_count, 0);
+        assert!(state.last_error.is_none());
+        let connection = database.open().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1",
+                    [&workspace_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        let (count, reason, checksum): (i64, String, String) = connection
+            .query_row(
+                "SELECT COUNT(*),MIN(quarantine_reason),MIN(rescue_backup_checksum)
+                 FROM legacy_abandoned_outbox WHERE workspace_id=?1",
+                [&workspace_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert!(reason.contains("direct_v2 登录恢复"));
+        assert_eq!(checksum.len(), 64);
+        drop(connection);
+        let business_after: (i64, i64, i64, i64, i64) = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM subjects),
+                    (SELECT COUNT(*) FROM tasks),
+                    (SELECT COUNT(*) FROM time_entries),
+                    (SELECT COUNT(*) FROM unassigned_sessions),
+                    (SELECT COUNT(*) FROM reports)",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(business_before, business_after);
+    }
+
+    #[test]
+    fn direct_v2_authorization_resume_with_empty_queue_only_clears_block() {
+        let _guard = lock_test_session_state();
+        reset_test_credentials();
+        let server = TestHttpServer::start(vec![TestHttpResponse {
+            path: "/rest/v1/rpc/device_authorization_get",
+            status: 200,
+            body: r#"{"authorized":true}"#,
+        }]);
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("direct-v2-auth-resume-empty.sqlite3"))
+                .unwrap();
+        let workspace_id = Uuid::now_v7().to_string();
+        configure_auth_resume_test_state(
+            &database,
+            &server.base_url(),
+            &workspace_id,
+            crate::storage_contract::DIRECT_CLOUD_PROTOCOL,
+        );
+        save_session(
+            &database,
+            &test_session("direct-v2-auth-resume-empty", Some(now_seconds() + 3600)),
+        )
+        .unwrap();
+
+        ensure_current_device_authorized(&database).unwrap();
+
+        assert_eq!(server.finish().len(), 1);
+        assert!(!storage_mode(&database).unwrap().auth_blocked);
+        assert_eq!(
+            database
+                .open()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM legacy_abandoned_outbox", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn legacy_authorization_resume_still_requires_explicit_confirmation() {
+        let _guard = lock_test_session_state();
+        reset_test_credentials();
+        let server = TestHttpServer::start(vec![TestHttpResponse {
+            path: "/rest/v1/rpc/device_authorization_get",
+            status: 200,
+            body: r#"{"authorized":true}"#,
+        }]);
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("legacy-auth-resume-confirmation.sqlite3"),
+        )
+        .unwrap();
+        let workspace_id = Uuid::now_v7().to_string();
+        configure_auth_resume_test_state(
+            &database,
+            &server.base_url(),
+            &workspace_id,
+            crate::storage_contract::LEGACY_SYNC_PROTOCOL,
+        );
+        save_session(
+            &database,
+            &test_session("legacy-auth-resume", Some(now_seconds() + 3600)),
+        )
+        .unwrap();
+        insert_legacy_outbox_for_test(&database, &workspace_id, 1);
+
+        let error = ensure_current_device_authorized(&database).unwrap_err();
+
+        assert!(error.starts_with("AUTH_RESUME_REQUIRED:"));
+        assert_eq!(server.finish().len(), 1);
+        assert!(storage_mode(&database).unwrap().auth_blocked);
+        assert_eq!(
+            legacy_queue_counts(&database.open().unwrap(), &workspace_id)
+                .unwrap()
+                .total,
+            1
+        );
+    }
+
+    #[test]
+    fn direct_v2_auth_resume_keeps_block_and_queue_when_quarantine_fails() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(
+            directory
+                .path()
+                .join("direct-v2-auth-resume-rollback.sqlite3"),
+        )
+        .unwrap();
+        let workspace_id = Uuid::now_v7().to_string();
+        configure_auth_resume_test_state(
+            &database,
+            "http://127.0.0.1:9",
+            &workspace_id,
+            crate::storage_contract::DIRECT_CLOUD_PROTOCOL,
+        );
+        insert_legacy_outbox_for_test(&database, &workspace_id, 1);
+        database
+            .open()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_direct_v2_quarantine
+                 BEFORE INSERT ON legacy_abandoned_outbox
+                 BEGIN SELECT RAISE(ABORT, 'simulated quarantine failure'); END;",
+            )
+            .unwrap();
+
+        let error = quarantine_direct_v2_auth_resume_queue(&database, &workspace_id).unwrap_err();
+
+        assert!(error.starts_with("DIRECT_CLOUD_LEGACY_QUEUE_ISOLATION_FAILED:"));
+        assert!(storage_mode(&database).unwrap().auth_blocked);
+        assert_eq!(
+            legacy_queue_counts(&database.open().unwrap(), &workspace_id)
+                .unwrap()
+                .total,
+            1
+        );
+        assert_eq!(
+            database
+                .open()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM legacy_abandoned_outbox", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
     }
 
     fn test_rescue_backup_for_preflight(
