@@ -142,85 +142,27 @@ pub(crate) fn get_state_with_cloud_context_and_sync_change(
     )?;
     let active_timer = has_active_timer(&transaction, &workspace_id)?;
     let session_id = active_session_id(&transaction, &workspace_id, &current_date)?;
-    let existing_version = version_before_coordinate;
-    let mut created = session_before_coordinate.is_none() && session_id.is_some();
+    let _existing_version = version_before_coordinate;
     let session_id = match (session_id, active_timer) {
         (Some(id), _) => Some(id),
-        (None, false) => {
-            created = true;
-            Some(create_session(
-                &transaction,
-                &workspace_id,
-                now,
-                if cloud_state.is_some() {
-                    "cloud"
-                } else {
-                    "local"
-                },
-                None,
-            )?)
-        }
+        (None, false) => Some(create_session(
+            &transaction,
+            &workspace_id,
+            now,
+            if cloud_state.is_some() {
+                "cloud"
+            } else {
+                "local"
+            },
+            None,
+        )?),
         (None, true) => None,
     };
     let result = session_id
         .map(|id| load_state(&transaction, &id, now, true))
         .transpose()?;
-    let mut sync_changed = false;
-    if let (Some(state), Some(result)) = (cloud_state, result.as_ref()) {
-        let migrated_candidate: bool = transaction
-            .query_row(
-                "SELECT shared_source <> 'cloud' OR migration_state = 'candidate'
-                 FROM unassigned_sessions WHERE id=?1",
-                [&result.session_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        if migrated_candidate {
-            transaction
-                .execute(
-                    "UPDATE unassigned_sessions
-                     SET shared_source='cloud', migration_state='candidate'
-                     WHERE id=?1",
-                    [&result.session_id],
-                )
-                .map_err(|error| error.to_string())?;
-        }
-        let candidate_already_queued: bool = migrated_candidate
-            && transaction
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sync_outbox
-                     WHERE workspace_id=?1 AND entity_type='unassigned_session'
-                       AND entity_id=?2 AND state IN ('pending','sending','failed'))",
-                    params![state.workspace_id, result.session_id],
-                    |row| row.get(0),
-                )
-                .map_err(|error| error.to_string())?;
-        if created
-            || (migrated_candidate && !candidate_already_queued)
-            || (!migrated_candidate && existing_version != Some(result.version))
-        {
-            sync_changed = crate::cloud_sync::enqueue_entity_in_transaction(
-                &transaction,
-                state,
-                if created || migrated_candidate {
-                    "unassigned_session_create"
-                } else {
-                    "unassigned_anchor_reset"
-                },
-                "unassigned_session",
-                Some(&result.session_id),
-                if created || migrated_candidate {
-                    None
-                } else {
-                    existing_version
-                },
-                None,
-            )?
-            .is_some();
-        }
-    }
     transaction.commit().map_err(|error| error.to_string())?;
-    Ok((result, sync_changed))
+    Ok((result, false))
 }
 
 pub(crate) fn coordinate_sessions(database: &Database, now: i64) -> Result<(), String> {
@@ -244,7 +186,7 @@ pub fn resolve_work(
 fn resolve_work_with_cloud_operation(
     database: &Database,
     request: ResolveWorkRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
 ) -> Result<UnassignedResolveResult, String> {
     validate_operation_id(&request.operation_id)?;
     let mut connection = database.open()?;
@@ -308,15 +250,6 @@ fn resolve_work_with_cloud_operation(
         return Err("VALIDATION_ERROR: 请至少分配 1 分钟到事项".to_string());
     }
     let entry_id = Uuid::now_v7().to_string();
-    let completed_task_outbox = merged
-        .iter()
-        .filter_map(|(task_id, (_, complete_task, expected_version))| {
-            complete_task
-                .then_some(*expected_version)
-                .flatten()
-                .map(|version| (task_id.clone(), version))
-        })
-        .collect::<Vec<_>>();
     let allocated_task_ids = merged
         .iter()
         .filter_map(|(task_id, (minutes, _, _))| (*minutes > 0).then_some(task_id))
@@ -348,7 +281,6 @@ fn resolve_work_with_cloud_operation(
             )?;
         }
     }
-    let mut completed_occurrence_outbox = Vec::<(String, Option<i64>)>::new();
     for (task_id, (minutes, complete_task, expected_version)) in merged {
         let work_date = state.work_date.clone();
         crate::recurring::ensure_occurrence_if_recurring(
@@ -368,16 +300,14 @@ fn resolve_work_with_cloud_operation(
                 .map_err(|error| error.to_string())?;
         }
         if complete_task {
-            if let Some(occurrence_outbox) = crate::time_tracking::complete_task_if_open(
+            crate::time_tracking::complete_task_if_open(
                 &transaction,
                 &workspace_id,
                 &task_id,
                 expected_version,
                 &work_date,
                 now,
-            )? {
-                completed_occurrence_outbox.push(occurrence_outbox);
-            }
+            )?;
         }
     }
     finish_session(
@@ -415,45 +345,10 @@ fn resolve_work_with_cloud_operation(
         &transaction,
         &workspace_id,
         now,
-        cloud_operation.is_some(),
+        false,
         Some(&request.session_id),
     )?;
     bump_revision(&transaction)?;
-    if let Some((state, operation_type, operation_id)) = cloud_operation {
-        let session_operation_id = crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "unassigned_session",
-            Some(&result.session_id),
-            Some(request.expected_version),
-            operation_id,
-        )?;
-        for (task_id, base_version) in completed_task_outbox {
-            crate::cloud_sync::enqueue_entity_in_transaction_with_dependency(
-                &transaction,
-                state,
-                "task_set_completed_from_unassigned",
-                "task",
-                Some(&task_id),
-                Some(base_version),
-                None,
-                session_operation_id.as_deref(),
-            )?;
-        }
-        for (entity_id, base_version) in completed_occurrence_outbox {
-            crate::cloud_sync::enqueue_entity_in_transaction_with_dependency(
-                &transaction,
-                state,
-                "task_occurrence_set_completed_from_unassigned",
-                "task_occurrence",
-                Some(&entity_id),
-                base_version,
-                None,
-                session_operation_id.as_deref(),
-            )?;
-        }
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -526,7 +421,7 @@ fn resolve_without_allocations(
     database: &Database,
     request: ResolveSessionRequest,
     resolution_type: &str,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
 ) -> Result<UnassignedResolveResult, String> {
     validate_operation_id(&request.operation_id)?;
     let mut connection = database.open()?;
@@ -626,22 +521,10 @@ fn resolve_without_allocations(
         &transaction,
         &workspace_id,
         now,
-        cloud_operation.is_some(),
+        false,
         Some(&request.session_id),
     )?;
     bump_revision(&transaction)?;
-    if let Some((state, operation_type, operation_id)) = cloud_operation {
-        let session_operation_id = crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "unassigned_session",
-            Some(&result.session_id),
-            Some(request.expected_version),
-            operation_id,
-        )?;
-        let _ = session_operation_id;
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -1682,7 +1565,7 @@ mod tests {
         let result = resolve_work(
             &database,
             ResolveWorkRequest {
-                session_id: due.session_id,
+                session_id: due.session_id.clone(),
                 allocations: vec![UnassignedAllocationInput {
                     task_id: task_id.clone(),
                     minutes: due.required_minutes,
@@ -1745,7 +1628,7 @@ mod tests {
         let result = resolve_work(
             &database,
             ResolveWorkRequest {
-                session_id: due.session_id,
+                session_id: due.session_id.clone(),
                 allocations: vec![
                     UnassignedAllocationInput {
                         task_id: allocated_task_id.clone(),
@@ -2035,7 +1918,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(initial_outbox, 1);
+        assert_eq!(initial_outbox, 0);
         for _ in 0..10 {
             let refreshed = get_state_with_cloud_context(&database, Some(&state))
                 .unwrap()
@@ -2314,7 +2197,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_mode_unassigned_work_can_write_local_cache_when_cloud_is_unavailable() {
+    fn cloud_compatible_unassigned_work_is_idempotent_without_outbox() {
         let (database, task_id) = setup();
         let subject_id: String = database
             .open()
@@ -2370,6 +2253,35 @@ mod tests {
         let result = resolve_work_with_hooks_and_cloud_operation(
             &database,
             ResolveWorkRequest {
+                session_id: due.session_id.clone(),
+                allocations: vec![
+                    UnassignedAllocationInput {
+                        task_id: task_id.clone(),
+                        minutes: due.required_minutes,
+                        complete_task: false,
+                        task_expected_version: None,
+                    },
+                    UnassignedAllocationInput {
+                        task_id: completion_only_task.id.clone(),
+                        minutes: 0,
+                        complete_task: true,
+                        task_expected_version: Some(completion_only_task.version),
+                    },
+                ],
+                expected_version: due.version,
+                operation_id: operation_id.clone(),
+            },
+            Some((
+                &state,
+                "unassigned_resolve_work",
+                Some(operation_id.as_str()),
+            )),
+        )
+        .unwrap();
+        let entry_id = result.generated_entry_id.unwrap();
+        let repeated = resolve_work_with_hooks_and_cloud_operation(
+            &database,
+            ResolveWorkRequest {
                 session_id: due.session_id,
                 allocations: vec![
                     UnassignedAllocationInput {
@@ -2395,59 +2307,40 @@ mod tests {
             )),
         )
         .unwrap();
-        let entry_id = result.generated_entry_id.unwrap();
-        let connection = database.open().unwrap();
-        let outbox = connection
-            .prepare(
-                "SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json FROM sync_outbox WHERE workspace_id = ?1 ORDER BY created_at, rowid",
-            )
-            .unwrap()
-            .query_map([cloud_workspace_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(outbox.len(), 2);
-        assert_eq!(outbox[0].0, operation_id);
-        assert_eq!(outbox[0].1, "unassigned_resolve_work");
-        assert_eq!(outbox[0].2, "unassigned_session");
-        assert_eq!(outbox[0].3, result.session_id);
-        assert_eq!(outbox[0].4, Some(due.version));
-        let payload: serde_json::Value = serde_json::from_str(&outbox[0].5).unwrap();
-        let entry_payload = payload
-            .get("generated_entry")
-            .expect("resolve payload embeds the generated entry");
         assert_eq!(
-            entry_payload.get("id").and_then(serde_json::Value::as_str),
+            repeated.generated_entry_id.as_deref(),
             Some(entry_id.as_str())
         );
-        assert_eq!(
-            entry_payload.get("origin_unassigned_session_id"),
-            Some(&serde_json::Value::String(result.session_id))
-        );
-        assert!(entry_payload
-            .get("allocations")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|allocations| allocations.len() == 1));
-        let task_completion = outbox
-            .iter()
-            .find(|row| row.1 == "task_set_completed_from_unassigned")
+        let connection = database.open().unwrap();
+        let (origin, allocation_count): (String, i64) = connection
+            .query_row(
+                "SELECT origin_unassigned_session_id,(SELECT COUNT(*) FROM time_allocations WHERE entry_id=time_entries.id) FROM time_entries WHERE id=?1",
+                [&entry_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .unwrap();
-        assert_eq!(task_completion.2, "task");
-        assert_eq!(task_completion.3, completion_only_task.id);
-        assert_eq!(task_completion.4, Some(completion_only_task.version));
+        assert_eq!(origin, result.session_id);
+        assert_eq!(allocation_count, 1);
+        let completed_status: String = connection
+            .query_row(
+                "SELECT status FROM tasks WHERE id=?1",
+                [&completion_only_task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(completed_status, "done");
+        let outbox_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1",
+                [&cloud_workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]
-    fn cloud_mode_unassigned_break_and_discard_queue_generated_entries_transactionally() {
+    fn cloud_compatible_break_and_discard_restart_timing_without_outbox() {
         let (database, _) = setup();
         let cloud_workspace_id = Uuid::now_v7().to_string();
         settings::update_setting(
@@ -2511,7 +2404,7 @@ mod tests {
         let discard_result = resolve_without_allocations(
             &database,
             ResolveSessionRequest {
-                session_id: second.session_id,
+                session_id: second.session_id.clone(),
                 expected_version: second.version,
                 operation_id: discard_operation_id.clone(),
             },
@@ -2524,49 +2417,34 @@ mod tests {
         )
         .unwrap();
 
-        let connection = database.open().unwrap();
-        let outbox = connection
-            .prepare(
-                "SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json FROM sync_outbox ORDER BY created_at, rowid",
+        assert!(break_result.generated_entry_id.is_some());
+        assert!(discard_result.generated_entry_id.is_some());
+        let next = get_state(&database).unwrap().unwrap();
+        assert_ne!(next.session_id, second.session_id);
+        assert_eq!(next.current_segment_started_at, Some(next.first_started_at));
+        let discarded_at: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT updated_at FROM unassigned_sessions WHERE id=?1",
+                [&second.session_id],
+                |row| row.get(0),
             )
-            .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
             .unwrap();
-
-        assert_eq!(outbox.len(), 2);
-        assert_eq!(outbox[0].0, break_operation_id);
-        assert_eq!(outbox[0].1, "unassigned_resolve_break");
-        assert_eq!(outbox[0].2, "unassigned_session");
-        let break_payload: serde_json::Value = serde_json::from_str(&outbox[0].5).unwrap();
-        assert_eq!(
-            break_payload["generated_entry"]["id"].as_str(),
-            break_result.generated_entry_id.as_deref()
-        );
-        assert!(break_payload["generated_entry"]["allocations"]
-            .as_array()
-            .is_some_and(Vec::is_empty));
-        assert_eq!(outbox[1].0, discard_operation_id);
-        assert_eq!(outbox[1].1, "unassigned_discard");
-        assert_eq!(outbox[1].2, "unassigned_session");
-        let discard_payload: serde_json::Value = serde_json::from_str(&outbox[1].5).unwrap();
-        assert_eq!(
-            discard_payload["generated_entry"]["id"].as_str(),
-            discard_result.generated_entry_id.as_deref()
-        );
-        assert!(discard_payload["generated_entry"]["allocations"]
-            .as_array()
-            .is_some_and(Vec::is_empty));
+        assert_eq!(next.first_started_at, discarded_at);
+        let connection = database.open().unwrap();
+        let predecessor: Option<String> = connection
+            .query_row(
+                "SELECT predecessor_session_id FROM unassigned_sessions WHERE id=?1",
+                [&next.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(predecessor.as_deref(), Some(second.session_id.as_str()));
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(outbox_count, 0);
     }
 
     fn shanghai_millis(value: &str) -> i64 {

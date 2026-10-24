@@ -134,7 +134,7 @@ pub fn update_setting(
 fn update_setting_with_cloud_operation(
     database: &Database,
     request: SettingsUpdate,
-    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+    _cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
 ) -> Result<SettingsSnapshot, String> {
     validate_setting_key(&request.scope, &request.key)?;
     validate_setting_value(&request.key, &request.value)?;
@@ -153,14 +153,6 @@ fn update_setting_with_cloud_operation(
         .map_err(|error| error.to_string())?;
     match request.scope {
         SettingsScope::Shared => {
-            let base_version: Option<i64> = transaction
-                .query_row(
-                    "SELECT version FROM app_settings WHERE workspace_id = ?1 AND key = ?2",
-                    params![workspace_id, request.key],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|error| error.to_string())?;
             transaction
                 .execute(
                     "INSERT INTO app_settings(workspace_id, key, value_json, updated_at, version)
@@ -181,17 +173,6 @@ fn update_setting_with_cloud_operation(
                     )
                     .map_err(|error| error.to_string())?;
             }
-            if let Some(state) = cloud_state {
-                crate::cloud_sync::enqueue_entity_in_transaction(
-                    &transaction,
-                    state,
-                    "app_setting_update",
-                    "app_setting",
-                    Some(&request.key),
-                    base_version,
-                    None,
-                )?;
-            }
         }
         SettingsScope::Device => {
             transaction
@@ -211,7 +192,7 @@ fn update_setting_with_cloud_operation(
 fn set_integration_secret_with_cloud_operation(
     database: &Database,
     request: IntegrationSecretRequest,
-    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+    _cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
 ) -> Result<SettingsSnapshot, String> {
     if request.value.trim().is_empty() {
         return Err("凭据不能为空".to_string());
@@ -233,14 +214,6 @@ fn set_integration_secret_with_cloud_operation(
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
-    let base_version: Option<i64> = transaction
-        .query_row(
-            "SELECT version FROM integration_configs WHERE workspace_id = ?1 AND provider = ?2",
-            params![workspace_id, provider],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?;
     transaction
         .execute(
             "INSERT INTO integration_configs(workspace_id, provider, enabled, config_json, secret_ref, updated_at, version)
@@ -249,17 +222,6 @@ fn set_integration_secret_with_cloud_operation(
             params![workspace_id, provider, format!("keyring://{provider}"), now],
         )
         .map_err(|error| error.to_string())?;
-    if let Some(state) = cloud_state {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            "integration_secret_set",
-            "integration_config",
-            Some(provider),
-            base_version,
-            None,
-        )?;
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     get_settings(database)
 }
@@ -275,7 +237,7 @@ pub fn update_integration_config(
 fn update_integration_config_with_cloud_operation(
     database: &Database,
     request: IntegrationConfigRequest,
-    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+    _cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
 ) -> Result<SettingsSnapshot, String> {
     if !matches!(request.provider.as_str(), "seatable") {
         return Err(format!("不支持的共享集成: {}", request.provider));
@@ -292,14 +254,6 @@ fn update_integration_config_with_cloud_operation(
         .map_err(|error| error.to_string())?;
     let transaction = connection
         .transaction()
-        .map_err(|error| error.to_string())?;
-    let base_version: Option<i64> = transaction
-        .query_row(
-            "SELECT version FROM integration_configs WHERE workspace_id = ?1 AND provider = ?2",
-            params![workspace_id, request.provider],
-            |row| row.get(0),
-        )
-        .optional()
         .map_err(|error| error.to_string())?;
     if let Some(expected_version) = request.expected_version {
         let changed = transaction
@@ -330,17 +284,6 @@ fn update_integration_config_with_cloud_operation(
             )
             .map_err(|error| error.to_string())?;
     }
-    if let Some(state) = cloud_state {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            "integration_config_update",
-            "integration_config",
-            Some(&request.provider),
-            request.expected_version.or(base_version),
-            None,
-        )?;
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     get_settings(database)
 }
@@ -348,7 +291,7 @@ fn update_integration_config_with_cloud_operation(
 fn clear_integration_secret_with_cloud_operation(
     database: &Database,
     provider: SecretProvider,
-    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+    _cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
 ) -> Result<SettingsSnapshot, String> {
     let mut connection = database.open()?;
     let workspace_id: String = connection
@@ -367,34 +310,13 @@ fn clear_integration_secret_with_cloud_operation(
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
-    let base_version: Option<i64> = transaction
-        .query_row(
-            "SELECT version FROM integration_configs WHERE workspace_id = ?1 AND provider = ?2",
-            params![workspace_id, provider_name],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?;
-    let changed = transaction
+    transaction
         .execute(
             "UPDATE integration_configs SET secret_ref = NULL, enabled = 0, updated_at = ?1, version = version + 1
              WHERE workspace_id = ?2 AND provider = ?3",
             params![now_millis(), workspace_id, provider_name],
         )
         .map_err(|error| error.to_string())?;
-    if changed > 0 {
-        if let Some(state) = cloud_state {
-            crate::cloud_sync::enqueue_entity_in_transaction(
-                &transaction,
-                state,
-                "integration_secret_clear",
-                "integration_config",
-                Some(provider_name),
-                base_version,
-                None,
-            )?;
-        }
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     get_settings(database)
 }
@@ -1242,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_shared_settings_and_integration_config_are_queued_transactionally() {
+    fn legacy_cloud_settings_helpers_do_not_create_outbox_rows() {
         let directory = tempdir().unwrap();
         let database =
             Database::initialize_at(directory.path().join("settings-cloud.sqlite3")).unwrap();
@@ -1329,60 +1251,25 @@ mod tests {
         .unwrap();
 
         let connection = database.open().unwrap();
-        let mut statement = connection
-            .prepare(
-                "SELECT operation_type, entity_type, entity_id, payload_json FROM sync_outbox ORDER BY created_at, operation_type",
-            )
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
             .unwrap();
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-
-        assert_eq!(rows.len(), 2);
-        assert!(rows
-            .iter()
-            .any(|(operation_type, entity_type, entity_id, payload_json)| {
-                let payload: Value = serde_json::from_str(payload_json).unwrap();
-                operation_type == "app_setting_update"
-                    && entity_type == "app_setting"
-                    && entity_id.as_deref() == Some("salary_hourly_rate")
-                    && payload["value_json"] == serde_json::json!(120)
-            }));
-        assert!(rows
-            .iter()
-            .any(|(operation_type, entity_type, entity_id, payload_json)| {
-                let payload: Value = serde_json::from_str(payload_json).unwrap();
-                operation_type == "integration_config_update"
-                    && entity_type == "integration_config"
-                    && entity_id.as_deref() == Some("seatable")
-                    && payload["config_json"]
-                        == serde_json::json!({ "serverUrl": "https://example.invalid" })
-            }));
-        assert!(!rows
-            .iter()
-            .any(|(_, _, entity_id, _)| entity_id.as_deref() == Some("obsidian_root_path")));
-        assert!(!rows
-            .iter()
-            .any(|(_, _, entity_id, _)| entity_id.as_deref() == Some(&subject_daily_report_key)));
-        for local_key in [
-            "tray_hover_enabled",
-            "tray_menu_suppress_hover",
-            "start_minimized",
-            "device_name",
-        ] {
-            assert!(!rows
-                .iter()
-                .any(|(_, _, entity_id, _)| entity_id.as_deref() == Some(local_key)));
-        }
+        drop(connection);
+        let snapshot = get_settings(&database).unwrap();
+        assert_eq!(
+            snapshot.shared["salary_hourly_rate"],
+            serde_json::json!(120)
+        );
+        assert_eq!(
+            snapshot.device["obsidian_root_path"],
+            serde_json::json!("D:/private-vault")
+        );
+        assert_eq!(
+            snapshot.device[&subject_daily_report_key],
+            serde_json::json!("D:/private-vault/daily")
+        );
+        assert!(snapshot.integrations["seatable"].enabled);
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]
@@ -1425,7 +1312,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_integration_secret_state_is_queued_without_secret_material() {
+    fn legacy_cloud_secret_helpers_do_not_create_outbox_rows() {
         let directory = tempdir().unwrap();
         let database =
             Database::initialize_at(directory.path().join("settings-cloud-secret.sqlite3"))
@@ -1468,40 +1355,11 @@ mod tests {
         .unwrap();
 
         let connection = database.open().unwrap();
-        let rows = connection
-            .prepare(
-                "SELECT operation_type, entity_type, entity_id, base_version, payload_json FROM sync_outbox ORDER BY created_at, rowid",
-            )
-            .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
             .unwrap();
-
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0, "integration_secret_set");
-        assert_eq!(rows[0].1, "integration_config");
-        assert_eq!(rows[0].2.as_deref(), Some("seatable"));
-        assert_eq!(rows[0].3, None);
-        assert_eq!(rows[1].0, "integration_secret_clear");
-        assert_eq!(rows[1].1, "integration_config");
-        assert_eq!(rows[1].2.as_deref(), Some("seatable"));
-        assert_eq!(rows[1].3, Some(1));
-
-        for (_, _, _, _, payload_json) in rows {
-            let payload: Value = serde_json::from_str(&payload_json).unwrap();
-            assert_eq!(payload["provider"], "seatable");
-            assert!(payload.get("secret_ref").is_none());
-            assert!(!payload_json.contains("secret-token-that-must-not-sync"));
-            assert!(!payload_json.contains("keyring://"));
-        }
+        assert_eq!(outbox_count, 0);
+        drop(connection);
+        assert!(!get_settings(&database).unwrap().secrets.seatable_token_set);
     }
 }

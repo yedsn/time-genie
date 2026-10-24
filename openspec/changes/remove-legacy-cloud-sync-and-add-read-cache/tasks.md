@@ -8,8 +8,8 @@
 
 ## 2. 停止产生旧同步数据
 
-- [ ] 2.1 从 subjects、tasks、today plans、recurring、reports、settings、integrations 等领域模块移除 `enqueue_entity`、deferred enqueue 和 `flush_if_online` 调用，逐域运行 Rust 测试并用 `rg` 验证生产代码不再引用这些 hook。
-- [ ] 2.2 将计时、未归属时间和实际时间调整的本地路径限定为 SQLite 事务、云端路径限定为 direct mutation，补充成功、失败、幂等重试均不创建 outbox 的测试并运行相关 Rust 测试。
+- [x] 2.1 从 subjects、tasks、today plans、recurring、reports、settings、integrations 等领域模块移除 `enqueue_entity`、deferred enqueue 和 `flush_if_online` 调用，逐域运行 Rust 测试并用 `rg` 验证生产代码不再引用这些 hook。
+- [x] 2.2 将计时、未归属时间和实际时间调整的本地路径限定为 SQLite 事务、云端路径限定为 direct mutation，补充成功、失败、幂等重试均不创建 outbox 的测试并运行相关 Rust 测试。
 - [x] 2.3 删除前端对旧 `cloud_sync_save`、catch-up、conflict resolve、cache reset 和 protocol upgrade 命令的调用，更新 TypeScript 类型与验证脚本并运行 `npm run typecheck`。
 
 ## 3. 安全退役本地旧同步数据
@@ -34,7 +34,7 @@
 
 ## 6. 退役 Supabase 旧同步协议
 
-- [ ] 6.1 新增 Supabase 退役 SQL，撤销或删除旧 patch、增量拉取和协议升级 RPC 的客户端权限，并确保旧调用返回 `LEGACY_SYNC_UNSUPPORTED` 或函数不存在且不会修改业务数据；运行 schema 集成测试验证。
+- [x] 6.1 新增 Supabase 退役 SQL，撤销或删除旧 patch、增量拉取和协议升级 RPC 的客户端权限，并确保旧调用返回 `LEGACY_SYNC_UNSUPPORTED` 或函数不存在且不会修改业务数据；运行 schema 集成测试验证。
 - [ ] 6.2 将现有和新建 workspace 收敛为直连语义，移除客户端对 `sync_v1/direct_v2` 升级状态的依赖；运行 fresh schema 和既有 schema 升级测试验证。
 - [ ] 6.3 从 `schema.sql`、schema 验证脚本和最终兼容阶段中删除旧函数、grant、仅旧同步使用的触发器与协议字段，同时保留 direct mutation、幂等、workspace epoch、change sequence、快照和恢复能力；运行 `npm run test:supabase:schema`。
 - [ ] 6.4 更新 Supabase 部署说明，记录 SQL 先行/同步发布顺序、旧客户端不再受支持以及禁止恢复旧写权限的回滚约束，并核对文档中的执行命令。

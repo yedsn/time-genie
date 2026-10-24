@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use uuid::Uuid;
 
 use crate::database::Database;
@@ -391,7 +390,7 @@ fn timer_chain_result_from_connection(
 fn transition_timer_with_cloud_operation(
     database: &Database,
     request: TimerTransitionRequest,
-    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+    _cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
 ) -> Result<TimerTransitionResultDto, String> {
     validate_operation_id(&request.client_request_id)?;
     if request.task_id.is_some() == request.new_task.is_some() {
@@ -521,21 +520,19 @@ fn transition_timer_with_cloud_operation(
         created_task = Some(task);
         id
     };
-    let created_day_plan = if created_task
+    if created_task
         .as_ref()
         .is_some_and(|task| task.day_instance_date.is_none())
     {
-        Some(crate::today_plans::ensure_included_in_transaction(
+        crate::today_plans::ensure_included_in_transaction(
             &transaction,
             &workspace_id,
             &target_task_id,
             &work_date,
             now,
             None,
-        )?)
-    } else {
-        None
-    };
+        )?;
+    }
 
     if let Some((active_id, _)) = active.as_ref() {
         let current_task_id: Option<String> = transaction
@@ -566,8 +563,6 @@ fn transition_timer_with_cloud_operation(
         }
     }
 
-    let mut previous_base_version = None;
-    let mut previous_entry_id = None;
     let previous_stop_result = if let Some((active_id, active_version)) = active {
         let state = entry_state(&transaction, &workspace_id, &active_id, active_version)?;
         if state == "running" {
@@ -586,32 +581,19 @@ fn transition_timer_with_cloud_operation(
             now,
         )?;
         let stopped = load_entry(&transaction, &active_id, now)?;
-        previous_base_version = Some(active_version);
-        previous_entry_id = Some(active_id);
         Some(timer_chain_result_from_connection(&transaction, stopped)?)
     } else {
         None
     };
 
-    let previous_occurrence = crate::recurring::occurrence_for_date(
-        &transaction,
-        &workspace_id,
-        &target_task_id,
-        &work_date,
-    )?;
-    let occurrence = crate::recurring::ensure_occurrence_if_recurring(
+    crate::recurring::ensure_occurrence_if_recurring(
         &transaction,
         &workspace_id,
         &target_task_id,
         &work_date,
         now,
     )?;
-    let created_occurrence = if previous_occurrence.is_none() {
-        occurrence
-    } else {
-        None
-    };
-    crate::unassigned::clear_for_timer(&transaction, &workspace_id, now, cloud_state.is_some())?;
+    crate::unassigned::clear_for_timer(&transaction, &workspace_id, now, false)?;
     let label = selectable_task_title(&transaction, &workspace_id, &target_task_id)?;
     let entry_id = Uuid::now_v7().to_string();
     transaction
@@ -645,81 +627,6 @@ fn transition_timer_with_cloud_operation(
     record_runtime_heartbeat(&transaction, &workspace_id, now)?;
     bump_revision(&transaction)?;
     let active_entry = load_entry(&transaction, &entry_id, now)?;
-    if let Some(state) = cloud_state {
-        let previous_entry = previous_entry_id
-            .as_deref()
-            .map(|id| {
-                crate::cloud_sync::entity_payload_from_connection(
-                    &transaction,
-                    "time_entry",
-                    Some(id),
-                )
-            })
-            .transpose()?;
-        let task = if let Some(task) = created_task.as_ref() {
-            Some(crate::cloud_sync::entity_payload_from_connection(
-                &transaction,
-                "task",
-                Some(&task.id),
-            )?)
-        } else if request.reopen_completed_task_version.is_some() {
-            Some(crate::cloud_sync::entity_payload_from_connection(
-                &transaction,
-                "task",
-                Some(&target_task_id),
-            )?)
-        } else {
-            None
-        };
-        let next_entry = crate::cloud_sync::entity_payload_from_connection(
-            &transaction,
-            "time_entry",
-            Some(&entry_id),
-        )?;
-        let occurrence = created_occurrence
-            .as_ref()
-            .map(|item| {
-                crate::cloud_sync::entity_payload_from_connection(
-                    &transaction,
-                    "task_occurrence",
-                    Some(&crate::recurring::occurrence_entity_id(
-                        &item.task_id,
-                        &item.occurrence_date,
-                    )),
-                )
-            })
-            .transpose()?;
-        let day_plan = created_day_plan
-            .as_ref()
-            .map(|_| {
-                crate::cloud_sync::entity_payload_from_connection(
-                    &transaction,
-                    "task_day_plan",
-                    Some(&format!("{target_task_id}|{work_date}")),
-                )
-            })
-            .transpose()?;
-        crate::cloud_sync::enqueue_payload_in_transaction(
-            &transaction,
-            state,
-            "timer_transition_apply",
-            "timer_transition",
-            &request.client_request_id,
-            None,
-            &json!({
-                "previous_entry": previous_entry,
-                "previous_base_version": previous_base_version,
-                "task": task,
-                "reopen_task_base_version": request.reopen_completed_task_version,
-                "expected_parent_version": request.new_task.as_ref().and_then(|draft| draft.expected_parent_version),
-                "occurrence": occurrence,
-                "day_plan": day_plan,
-                "active_entry": next_entry,
-            }),
-            Some(&request.client_request_id),
-            None,
-        )?;
-    }
     let result = TimerTransitionResultDto {
         created_task,
         previous_stop_result,
@@ -774,7 +681,7 @@ pub fn start_timer(
 fn start_timer_with_cloud_operation(
     database: &Database,
     request: TimerStartRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
 ) -> Result<TimeEntryDto, String> {
     validate_operation_id(&request.client_request_id)?;
     let mut connection = database.open()?;
@@ -817,12 +724,7 @@ fn start_timer_with_cloud_operation(
             now,
         )?;
     }
-    crate::unassigned::clear_for_timer(
-        &transaction,
-        &workspace_id,
-        now,
-        cloud_operation.is_some(),
-    )?;
+    crate::unassigned::clear_for_timer(&transaction, &workspace_id, now, false)?;
     transaction
         .execute(
             "INSERT INTO time_entries(
@@ -851,17 +753,6 @@ fn start_timer_with_cloud_operation(
         "timer_start",
         &result,
     )?;
-    if let Some((state, operation_type, operation_id)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "time_entry",
-            Some(&entry_id),
-            None,
-            operation_id,
-        )?;
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -879,7 +770,7 @@ pub fn pause_timer_for_sync(
 fn pause_timer_with_cloud_operation(
     database: &Database,
     request: TimerVersionRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<TimeEntryDto, String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
@@ -911,17 +802,6 @@ fn pause_timer_with_cloud_operation(
     )?;
     bump_revision(&transaction)?;
     let result = load_entry(&transaction, &entry_id, now)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "time_entry",
-            Some(&entry_id),
-            Some(active_version),
-            None,
-        )?;
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -943,7 +823,7 @@ pub fn resume_timer_for_sync(
 fn resume_timer_with_cloud_operation(
     database: &Database,
     request: TimerResumeRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
 ) -> Result<TimeEntryDto, String> {
     validate_operation_id(&request.operation_id)?;
     let mut connection = database.open()?;
@@ -1004,17 +884,6 @@ fn resume_timer_with_cloud_operation(
         "timer_resume",
         &result,
     )?;
-    if let Some((state, operation_type, operation_id)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "time_entry",
-            Some(&entry_id),
-            Some(active_version),
-            operation_id,
-        )?;
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -1027,7 +896,7 @@ pub fn stop_timer(database: &Database, request: TimerStopRequest) -> Result<Time
 fn stop_timer_with_cloud_operation(
     database: &Database,
     request: TimerStopRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<TimeEntryDto, String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
@@ -1135,26 +1004,10 @@ fn stop_timer_with_cloud_operation(
             }
         }
     }
-    crate::unassigned::start_after_timer(
-        &transaction,
-        &workspace_id,
-        now,
-        cloud_operation.is_some(),
-    )?;
+    crate::unassigned::start_after_timer(&transaction, &workspace_id, now, false)?;
     bump_revision(&transaction)?;
     record_runtime_heartbeat(&transaction, &workspace_id, now)?;
     let result = load_entry(&transaction, &entry_id, now)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "time_entry",
-            Some(&entry_id),
-            Some(active_version),
-            None,
-        )?;
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -1360,7 +1213,7 @@ pub fn create_manual_entry(
 fn create_manual_entry_with_cloud_operation(
     database: &Database,
     request: ManualEntryRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
 ) -> Result<TimeEntryDto, String> {
     validate_date(&request.work_date)?;
     validate_operation_id(&request.client_request_id)?;
@@ -1380,17 +1233,6 @@ fn create_manual_entry_with_cloud_operation(
     };
     let id = Uuid::now_v7().to_string();
     let now = now_millis();
-    let completed_task_outbox = request
-        .complete_task
-        .then(|| {
-            request
-                .task_id
-                .as_ref()
-                .zip(request.task_expected_version)
-                .map(|(task_id, version)| (task_id.clone(), version))
-        })
-        .flatten();
-    let mut completed_occurrence_outbox = Vec::<(String, Option<i64>)>::new();
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
@@ -1438,16 +1280,14 @@ fn create_manual_entry_with_cloud_operation(
                 )
                 .map_err(|error| error.to_string())?;
             if request.complete_task {
-                if let Some(occurrence_outbox) = complete_task_if_open(
+                complete_task_if_open(
                     &transaction,
                     &workspace_id,
                     &task_id,
                     request.task_expected_version,
                     &request.work_date,
                     now,
-                )? {
-                    completed_occurrence_outbox.push(occurrence_outbox);
-                }
+                )?;
             }
         }
     }
@@ -1461,39 +1301,6 @@ fn create_manual_entry_with_cloud_operation(
         "time_entry_create_manual",
         &result,
     )?;
-    if let Some((state, operation_type, operation_id)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "time_entry",
-            Some(&id),
-            None,
-            operation_id,
-        )?;
-        if let Some((task_id, base_version)) = completed_task_outbox {
-            crate::cloud_sync::enqueue_entity_in_transaction(
-                &transaction,
-                state,
-                "task_set_completed_from_time_entry",
-                "task",
-                Some(&task_id),
-                Some(base_version),
-                None,
-            )?;
-        }
-        for (entity_id, base_version) in completed_occurrence_outbox {
-            crate::cloud_sync::enqueue_entity_in_transaction(
-                &transaction,
-                state,
-                "task_occurrence_set_completed_from_time_entry",
-                "task_occurrence",
-                Some(&entity_id),
-                base_version,
-                None,
-            )?;
-        }
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -1509,7 +1316,7 @@ pub fn update_time_entry(
 fn update_time_entry_with_cloud_operation(
     database: &Database,
     request: TimeEntryUpdateRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<TimeEntryDto, String> {
     if request.ended_at <= request.started_at {
         return Err("VALIDATION_ERROR: 结束时间必须晚于开始时间".to_string());
@@ -1561,17 +1368,6 @@ fn update_time_entry_with_cloud_operation(
     clear_workday_settlement(&transaction, &workspace_id, &request.entry_id)?;
     bump_revision(&transaction)?;
     let result = load_entry(&transaction, &request.entry_id, now)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "time_entry",
-            Some(&request.entry_id),
-            Some(request.expected_version),
-            None,
-        )?;
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -1587,7 +1383,7 @@ pub fn update_time_entry_disposition(
 fn update_time_entry_disposition_with_cloud_operation(
     database: &Database,
     request: TimeEntryDispositionRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<TimeEntryDto, String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
@@ -1646,17 +1442,6 @@ fn update_time_entry_disposition_with_cloud_operation(
         result.note = Some("已标记为无效时间".to_string());
         result
     };
-    if let Some((state, operation_type)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "time_entry",
-            Some(&request.entry_id),
-            Some(request.expected_version),
-            None,
-        )?;
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -1672,7 +1457,7 @@ pub fn replace_allocations(
 fn replace_allocations_with_cloud_operation(
     database: &Database,
     request: AllocationReplaceRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<TimeEntryDto, String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
@@ -1720,16 +1505,6 @@ fn replace_allocations_with_cloud_operation(
         }
     }
     let total: i64 = merged.values().map(|(minutes, _, _, _)| *minutes).sum();
-    let completed_task_outbox = merged
-        .iter()
-        .filter_map(|(task_id, (_, _, complete_task, expected_version))| {
-            complete_task
-                .then_some(*expected_version)
-                .flatten()
-                .map(|version| (task_id.clone(), version))
-        })
-        .collect::<Vec<_>>();
-    let mut completed_occurrence_outbox = Vec::<(String, Option<i64>)>::new();
     for (task_id, (_, _, complete_task, expected_version)) in &merged {
         if *complete_task {
             validate_task_completion(
@@ -1765,16 +1540,14 @@ fn replace_allocations_with_cloud_operation(
                 .map_err(|error| error.to_string())?;
         }
         if complete_task {
-            if let Some(occurrence_outbox) = complete_task_if_open(
+            complete_task_if_open(
                 &transaction,
                 &workspace_id,
                 &task_id,
                 expected_version,
                 &current.work_date,
                 now,
-            )? {
-                completed_occurrence_outbox.push(occurrence_outbox);
-            }
+            )?;
         }
     }
     let should_convert_to_work = current.kind == "break" && total > 0;
@@ -1798,41 +1571,6 @@ fn replace_allocations_with_cloud_operation(
     clear_workday_settlement(&transaction, &workspace_id, &request.entry_id)?;
     bump_revision(&transaction)?;
     let result = load_entry(&transaction, &request.entry_id, now)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        let time_entry_operation_id = crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "time_entry",
-            Some(&request.entry_id),
-            Some(request.expected_version),
-            None,
-        )?;
-        for (task_id, base_version) in completed_task_outbox {
-            crate::cloud_sync::enqueue_entity_in_transaction_with_dependency(
-                &transaction,
-                state,
-                "task_set_completed_from_allocation",
-                "task",
-                Some(&task_id),
-                Some(base_version),
-                None,
-                time_entry_operation_id.as_deref(),
-            )?;
-        }
-        for (entity_id, base_version) in completed_occurrence_outbox {
-            crate::cloud_sync::enqueue_entity_in_transaction_with_dependency(
-                &transaction,
-                state,
-                "task_occurrence_set_completed_from_allocation",
-                "task_occurrence",
-                Some(&entity_id),
-                base_version,
-                None,
-                time_entry_operation_id.as_deref(),
-            )?;
-        }
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -2167,7 +1905,6 @@ fn coordinate_active_timer_in_transaction(
     workspace_id: &str,
     now: i64,
 ) -> Result<Option<String>, String> {
-    let cloud_state = crate::supabase::storage_mode_from_connection(transaction, false).ok();
     type ActiveTimer = (
         String,
         String,
@@ -2263,12 +2000,6 @@ fn coordinate_active_timer_in_transaction(
                 )
                 .map_err(|error| error.to_string())?;
             bump_revision(transaction)?;
-            enqueue_timer_coordination_rows(
-                transaction,
-                cloud_state.as_ref(),
-                workspace_id,
-                &[(&entry_id, version, "timer_continuity_close", None)],
-            )?;
         } else {
             transaction
                 .execute(
@@ -2310,20 +2041,6 @@ fn coordinate_active_timer_in_transaction(
             None,
             now,
             now,
-        )?;
-        enqueue_timer_coordination_rows(
-            transaction,
-            cloud_state.as_ref(),
-            workspace_id,
-            &[
-                (&entry_id, version, "timer_rollover_close", None),
-                (
-                    &next_id,
-                    0,
-                    "timer_rollover_create",
-                    Some(entry_id.as_str()),
-                ),
-            ],
         )?;
         record_runtime_heartbeat(transaction, workspace_id, now)?;
         bump_revision(transaction)?;
@@ -2368,20 +2085,6 @@ fn coordinate_active_timer_in_transaction(
             now,
             now,
         )?;
-        enqueue_timer_coordination_rows(
-            transaction,
-            cloud_state.as_ref(),
-            workspace_id,
-            &[
-                (&entry_id, version, "timer_interruption_close", None),
-                (
-                    &next_id,
-                    0,
-                    "timer_rollover_create",
-                    Some(entry_id.as_str()),
-                ),
-            ],
-        )?;
         record_runtime_heartbeat(transaction, workspace_id, now)?;
         bump_revision(transaction)?;
         return Ok(Some(next_id));
@@ -2403,14 +2106,7 @@ fn coordinate_active_timer_in_transaction(
         )
         .map_err(|error| error.to_string())?;
 
-    let closed_entry_id = entry_id.clone();
     let mut previous_id = entry_id;
-    let mut coordinated_rows = vec![(
-        closed_entry_id.clone(),
-        version,
-        "timer_rollover_close",
-        None,
-    )];
     for (index, slice) in slices.iter().enumerate().skip(1) {
         let is_last = index + 1 == slices.len();
         let next_id = insert_timer_slice(
@@ -2430,90 +2126,11 @@ fn coordinate_active_timer_in_transaction(
             slice.started_at,
             if is_last { now } else { slice.ended_at },
         )?;
-        coordinated_rows.push((
-            next_id.clone(),
-            0,
-            "timer_rollover_create",
-            Some(previous_id.clone()),
-        ));
         previous_id = next_id;
     }
-    let row_refs = coordinated_rows
-        .iter()
-        .map(|(id, base_version, operation_type, predecessor)| {
-            (
-                id.as_str(),
-                *base_version,
-                *operation_type,
-                predecessor.as_deref(),
-            )
-        })
-        .collect::<Vec<_>>();
-    enqueue_timer_coordination_rows(transaction, cloud_state.as_ref(), workspace_id, &row_refs)?;
     record_runtime_heartbeat(transaction, workspace_id, now)?;
     bump_revision(transaction)?;
     Ok(Some(previous_id))
-}
-
-fn stable_calendar_operation_id(
-    chain_id: &str,
-    work_date: &str,
-    entry_id: &str,
-    base_version: i64,
-    action: &str,
-) -> String {
-    Uuid::new_v5(
-        &Uuid::NAMESPACE_OID,
-        format!(
-            "timegenie:calendar-timer:{chain_id}:{work_date}:{entry_id}:{base_version}:{action}"
-        )
-        .as_bytes(),
-    )
-    .to_string()
-}
-
-fn enqueue_timer_coordination_rows(
-    transaction: &Transaction<'_>,
-    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
-    workspace_id: &str,
-    rows: &[(&str, i64, &str, Option<&str>)],
-) -> Result<(), String> {
-    let Some(cloud_state) = cloud_state.filter(|state| state.mode == "cloud") else {
-        return Ok(());
-    };
-    let mut operation_by_entry = std::collections::HashMap::<String, String>::new();
-    for (entry_id, base_version, operation_type, predecessor_id) in rows {
-        let (chain_id, work_date): (String, String) = transaction
-            .query_row(
-                "SELECT COALESCE(timer_chain_id,id),work_date FROM time_entries WHERE workspace_id=?1 AND id=?2",
-                params![workspace_id, entry_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|error| error.to_string())?;
-        let operation_id = stable_calendar_operation_id(
-            &chain_id,
-            &work_date,
-            entry_id,
-            *base_version,
-            operation_type,
-        );
-        let dependency = predecessor_id
-            .and_then(|id| operation_by_entry.get(id))
-            .map(String::as_str);
-        let actual_operation_id = crate::cloud_sync::enqueue_entity_in_transaction_with_dependency(
-            transaction,
-            cloud_state,
-            operation_type,
-            "time_entry",
-            Some(entry_id),
-            (*base_version > 0).then_some(*base_version),
-            Some(&operation_id),
-            dependency,
-        )?
-        .ok_or_else(|| "SYNC_ERROR: 云端计时操作未成功入队".to_string())?;
-        operation_by_entry.insert((*entry_id).to_string(), actual_operation_id);
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3322,7 +2939,7 @@ mod tests {
     use crate::recurring::{save_rule, RecurrenceSaveRequest};
     use crate::settings::{self, SettingsScope, SettingsUpdate};
     use crate::tasks::{create_task, TaskCreateRequest};
-    use serde_json::{json, Value};
+    use serde_json::json;
     use tempfile::tempdir;
 
     fn test_work_date() -> String {
@@ -3821,6 +3438,10 @@ mod tests {
             (status.as_str(), active_state.as_str()),
             ("done", "running")
         );
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]
@@ -4170,7 +3791,7 @@ mod tests {
     }
 
     #[test]
-    fn transition_queues_one_atomic_cloud_operation_and_reuses_it_on_retry() {
+    fn transition_is_idempotent_without_creating_outbox() {
         let (database, _, task_id) = setup();
         let state = cloud_state(&database);
         let operation_id = Uuid::now_v7().to_string();
@@ -4189,27 +3810,14 @@ mod tests {
             transition_timer_with_cloud_operation(&database, request, Some(&state)).unwrap();
         assert_eq!(repeated.active_entry.id, first.active_entry.id);
         let connection = database.open().unwrap();
-        let rows: Vec<(String, String, String)> = connection
-            .prepare(
-                "SELECT operation_id,operation_type,entity_type FROM sync_outbox ORDER BY rowid",
-            )
-            .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(
-            rows,
-            vec![(
-                operation_id,
-                "timer_transition_apply".to_string(),
-                "timer_transition".to_string()
-            )]
-        );
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]
-    fn cloud_new_task_transition_carries_day_plan_in_atomic_payload() {
+    fn cloud_compatible_new_task_transition_persists_business_rows_without_outbox() {
         let (database, _, _) = setup();
         let state = cloud_state(&database);
         let operation_id = Uuid::now_v7().to_string();
@@ -4234,27 +3842,27 @@ mod tests {
         )
         .unwrap();
         let created = result.created_task.unwrap();
-        let payload: Value = serde_json::from_str(
-            &database
-                .open()
-                .unwrap()
-                .query_row(
-                    "SELECT payload_json FROM sync_outbox WHERE operation_id=?1",
-                    [&operation_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(payload["task"]["id"], created.id);
-        assert_eq!(payload["day_plan"]["task_id"], created.id);
-        assert_eq!(payload["day_plan"]["work_date"], test_work_date());
-        assert_eq!(payload["day_plan"]["state"], "included");
-        assert_eq!(payload["active_entry"]["default_task_id"], created.id);
+        assert_eq!(
+            result.active_entry.default_task_id.as_deref(),
+            Some(created.id.as_str())
+        );
+        let connection = database.open().unwrap();
+        let day_plan_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_day_plans WHERE task_id=?1 AND work_date=?2 AND state='included'",
+                params![created.id, test_work_date()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(day_plan_count, 1);
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]
-    fn cloud_transition_only_carries_a_new_recurring_occurrence() {
+    fn cloud_compatible_transition_creates_one_recurring_occurrence_without_outbox() {
         let (database, _, ordinary_task_id) = setup();
         let state = cloud_state(&database);
         let ordinary_operation_id = Uuid::now_v7().to_string();
@@ -4272,19 +3880,14 @@ mod tests {
             Some(&state),
         )
         .unwrap();
-        let ordinary_payload: Value = serde_json::from_str(
-            &database
-                .open()
-                .unwrap()
-                .query_row(
-                    "SELECT payload_json FROM sync_outbox WHERE operation_id=?1",
-                    [&ordinary_operation_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(ordinary_payload["occurrence"].is_null());
+        let ordinary_occurrences: i64 = database
+            .open()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM task_occurrences", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(ordinary_occurrences, 0);
 
         database
             .open()
@@ -4337,20 +3940,16 @@ mod tests {
             Some(&state),
         )
         .unwrap();
-        let first_payload: Value = serde_json::from_str(
-            &database
-                .open()
-                .unwrap()
-                .query_row(
-                    "SELECT payload_json FROM sync_outbox WHERE operation_id=?1",
-                    [&first_operation_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(first_payload["occurrence"]["task_id"], recurring.id);
-        assert_eq!(first_payload["occurrence"]["version"], 1);
+        let occurrence_count: i64 = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM task_occurrences WHERE task_id=?1",
+                [&recurring.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(occurrence_count, 1);
 
         database
             .open()
@@ -4367,7 +3966,7 @@ mod tests {
                 client_request_id: second_operation_id.clone(),
                 current_entry_id: None,
                 current_entry_expected_version: None,
-                task_id: Some(recurring.id),
+                task_id: Some(recurring.id.clone()),
                 reopen_completed_task_version: None,
                 new_task: None,
                 note: None,
@@ -4375,19 +3974,19 @@ mod tests {
             Some(&state),
         )
         .unwrap();
-        let second_payload: Value = serde_json::from_str(
-            &database
-                .open()
-                .unwrap()
-                .query_row(
-                    "SELECT payload_json FROM sync_outbox WHERE operation_id=?1",
-                    [&second_operation_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(second_payload["occurrence"].is_null());
+        let connection = database.open().unwrap();
+        let occurrence_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_occurrences WHERE task_id=?1",
+                [&recurring.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(occurrence_count, 1);
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(outbox_count, 0);
     }
 
     fn seed_history_entry(
@@ -4752,7 +4351,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_time_entry_writes_persist_outbox_in_the_same_transaction() {
+    fn cloud_compatible_time_entry_writes_commit_without_outbox() {
         let (database, _workspace_id, task_id) = setup();
         let completion_only_task = create_task(
             &database,
@@ -4852,59 +4451,38 @@ mod tests {
         .unwrap();
 
         let connection = database.open().unwrap();
-        let outbox = connection
-            .prepare(
-                "SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json, depends_on_operation_id, payload_version, coalesced_count FROM sync_outbox ORDER BY created_at, rowid",
+        let entry: (String, i64, i64) = connection
+            .query_row(
+                "SELECT note,duration_seconds,version FROM time_entries WHERE id=?1",
+                [&created.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<i64>>(7)?,
-                    row.get::<_, i64>(8)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
             .unwrap();
-
-        assert_eq!(outbox.len(), 2);
-        let time_entry = outbox.iter().find(|row| row.2 == "time_entry").unwrap();
-        let value: Value = serde_json::from_str(&time_entry.5).unwrap();
-        assert_eq!(time_entry.0, operation_id);
-        assert_eq!(time_entry.1, "time_allocation_replace");
-        assert_eq!(time_entry.3.as_deref(), Some(created.id.as_str()));
-        assert_eq!(time_entry.4, None);
-        assert_eq!(time_entry.7, Some(3));
-        assert_eq!(time_entry.8, 3);
-        assert_eq!(value["note"], "修正后的云端手动记录");
-        assert_eq!(value["duration_seconds"], 2_400);
-        assert!(value["allocations"].as_array().is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item["task_id"] == task_id && item["minutes"] == 40)
-        }));
-        let task_completion = outbox
-            .iter()
-            .find(|row| row.1 == "task_set_completed_from_allocation")
+        assert_eq!(entry, ("修正后的云端手动记录".to_string(), 2_400, 3));
+        let allocation_minutes: i64 = connection
+            .query_row(
+                "SELECT minutes FROM time_allocations WHERE entry_id=?1 AND task_id=?2",
+                params![created.id, task_id],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert_eq!(task_completion.2, "task");
-        assert_eq!(
-            task_completion.3.as_deref(),
-            Some(completion_only_task.id.as_str())
-        );
-        assert_eq!(task_completion.4, Some(completion_only_task.version));
-        assert_eq!(task_completion.6.as_deref(), Some(operation_id.as_str()));
+        assert_eq!(allocation_minutes, 40);
+        let completed_status: String = connection
+            .query_row(
+                "SELECT status FROM tasks WHERE id=?1",
+                [&completion_only_task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(completed_status, "done");
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]
-    fn cloud_mode_timer_can_write_local_cache_when_cloud_is_unavailable() {
+    fn cloud_compatible_timer_start_does_not_create_outbox() {
         let (database, _workspace_id, task_id) = setup();
         let cloud_workspace_id = Uuid::now_v7().to_string();
         settings::update_setting(
@@ -4943,22 +4521,14 @@ mod tests {
         assert_eq!(active.state, "running");
 
         let connection = database.open().unwrap();
-        let outbox: (String, String, String) = connection
+        let outbox_count: i64 = connection
             .query_row(
-                "SELECT operation_type, entity_type, entity_id FROM sync_outbox
-                 WHERE workspace_id = ?1 AND entity_type = 'time_entry'",
+                "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1",
                 [cloud_workspace_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(
-            outbox,
-            (
-                "timer_start".to_string(),
-                "time_entry".to_string(),
-                entry.id
-            )
-        );
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]
@@ -5014,7 +4584,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_timer_lifecycle_persists_outbox_in_the_same_transaction() {
+    fn cloud_compatible_timer_lifecycle_commits_without_outbox() {
         let (database, _workspace_id, task_id) = setup();
         let cloud_workspace_id = Uuid::now_v7().to_string();
         settings::update_setting(
@@ -5080,53 +4650,31 @@ mod tests {
         .unwrap();
 
         let connection = database.open().unwrap();
-        let outbox = connection
-            .prepare(
-                "SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json, payload_version, coalesced_count FROM sync_outbox ORDER BY created_at, rowid",
+        let (state_value, version): (String, i64) = connection
+            .query_row(
+                "SELECT state,version FROM time_entries WHERE id=?1",
+                [&started.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, i64>(7)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
             .unwrap();
-
-        assert_eq!(outbox.len(), 1);
-        let timer = outbox.iter().find(|row| row.2 == "time_entry").unwrap();
-        assert_eq!(
-            timer.0,
-            crate::cloud_sync::stable_timer_operation_id(
-                &started.id,
-                None,
-                resumed.version + 1,
-                "timer_stop"
+        assert_eq!(state_value, "ended");
+        assert_eq!(version, resumed.version + 1);
+        let segment_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM time_segments WHERE entry_id=?1",
+                [&started.id],
+                |row| row.get(0),
             )
-        );
-        assert_eq!(timer.1, "timer_stop");
-        assert_eq!(timer.4, None);
-        assert_eq!(timer.6, Some(4));
-        assert_eq!(timer.7, 4);
-        let value: Value = serde_json::from_str(&timer.5).unwrap();
-        assert_eq!(timer.3.as_deref(), Some(started.id.as_str()));
-        assert_eq!(value["id"], started.id);
-        assert_eq!(value["state"], "ended");
-        assert_eq!(value["version"], resumed.version + 1);
-        assert_eq!(value["segments"].as_array().map(Vec::len), Some(2));
-        assert!(outbox.iter().all(|row| row.2 != "unassigned_session"));
+            .unwrap();
+        assert_eq!(segment_count, 2);
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]
-    fn offline_timer_lifecycle_keeps_one_contiguous_chain_through_allocation() {
+    fn timer_lifecycle_keeps_one_contiguous_chain_without_outbox() {
         let (database, _workspace_id, task_id) = setup();
         let cloud_workspace_id = Uuid::now_v7().to_string();
         settings::update_setting(
@@ -5233,22 +4781,22 @@ mod tests {
         assert_eq!(allocated.version, 6);
         assert_eq!(allocated.allocations.len(), 1);
         let connection = database.open().unwrap();
-        let queued: (String, Option<i64>, i64, i64, String) = connection
+        let segment_count: i64 = connection
             .query_row(
-                "SELECT operation_type,base_version,payload_version,coalesced_count,payload_json FROM sync_outbox WHERE workspace_id=?1 AND entity_id=?2",
-                params![cloud_workspace_id,started.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                "SELECT COUNT(*) FROM time_segments WHERE entry_id=?1",
+                [&started.id],
+                |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(queued.0, "time_allocation_replace");
-        assert_eq!(queued.1, None);
-        assert_eq!(queued.2, 6);
-        assert_eq!(queued.3, 6);
-        let payload: Value = serde_json::from_str(&queued.4).unwrap();
-        assert_eq!(payload["version"], 6);
-        assert_eq!(payload["state"], "ended");
-        assert_eq!(payload["segments"].as_array().map(Vec::len), Some(3));
-        assert_eq!(payload["allocations"].as_array().map(Vec::len), Some(1));
+        assert_eq!(segment_count, 3);
+        let outbox_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1",
+                [cloud_workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]
@@ -6081,7 +5629,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_recurring_completion_depends_on_the_final_time_entry_operation() {
+    fn cloud_compatible_recurring_completion_updates_occurrence_without_outbox() {
         let (database, _workspace_id, task_id) = setup();
         let task_version: i64 = database
             .open()
@@ -6172,15 +5720,18 @@ mod tests {
         .unwrap();
 
         let connection = database.open().unwrap();
-        let occurrence: (String, Option<String>) = connection
+        let occurrence_status: String = connection
             .query_row(
-                "SELECT entity_id, depends_on_operation_id FROM sync_outbox WHERE operation_type = 'task_occurrence_set_completed_from_allocation'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT status FROM task_occurrences WHERE task_id=?1 AND occurrence_date=?2",
+                params![task_id, today],
+                |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(occurrence.0, format!("{task_id}|{today}"));
-        assert_eq!(occurrence.1.as_deref(), Some(operation_id.as_str()));
+        assert_eq!(occurrence_status, "done");
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]
@@ -6586,7 +6137,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_continuity_closes_use_distinct_operation_ids() {
+    fn repeated_continuity_closes_update_business_state_without_outbox() {
         let (database, workspace_id, task_id) = setup();
         let cloud_workspace_id = Uuid::now_v7().to_string();
         settings::update_setting(
@@ -6620,42 +6171,9 @@ mod tests {
         );
 
         coordinate_active_timer(&database, first_recovery).unwrap();
-        let first_operation_id: String = database
-            .open()
-            .unwrap()
-            .query_row(
-                "SELECT operation_id FROM sync_outbox
-                 WHERE workspace_id=?1 AND operation_type='timer_continuity_close'",
-                [&cloud_workspace_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        database
-            .open()
-            .unwrap()
-            .execute(
-                "DELETE FROM sync_outbox WHERE operation_id=?1",
-                [&first_operation_id],
-            )
-            .unwrap();
-
         coordinate_active_timer(&database, second_recovery).unwrap();
-        let (second_operation_id, base_version): (String, i64) = database
-            .open()
-            .unwrap()
-            .query_row(
-                "SELECT operation_id,base_version FROM sync_outbox
-                 WHERE workspace_id=?1 AND operation_type='timer_continuity_close'",
-                [&cloud_workspace_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-
-        assert_ne!(first_operation_id, second_operation_id);
-        assert_eq!(base_version, 2);
-        let version: i64 = database
-            .open()
-            .unwrap()
+        let connection = database.open().unwrap();
+        let version: i64 = connection
             .query_row(
                 "SELECT version FROM time_entries WHERE id=?1",
                 [&entry_id],
@@ -6663,6 +6181,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, 3);
+        let segment_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM time_segments WHERE entry_id=?1",
+                [&entry_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(segment_count, 3);
+        let outbox_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE workspace_id=?1",
+                [&cloud_workspace_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]
@@ -6721,7 +6255,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_rollover_queues_deterministic_close_then_create_operations() {
+    fn cloud_compatible_rollover_splits_entries_without_outbox() {
         let directory = tempdir().unwrap();
         let database =
             Database::initialize_at(directory.path().join("cloud-rollover-outbox.sqlite3"))
@@ -6772,23 +6306,24 @@ mod tests {
         drop(connection);
         coordinate_active_timer(&database, boundary + 30_000).unwrap();
         let connection = database.open().unwrap();
-        let rows=connection.prepare("SELECT operation_type,depends_on_operation_id,operation_id FROM sync_outbox WHERE workspace_id=?1 AND operation_type LIKE 'timer_rollover_%' ORDER BY created_at,rowid").unwrap().query_map([cloud_workspace_id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,Option<String>>(1)?,row.get::<_,String>(2)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0, "timer_rollover_close");
-        assert_eq!(rows[1].0, "timer_rollover_create");
-        assert_eq!(rows[1].1.as_deref(), Some(rows[0].2.as_str()));
+        let entries: Vec<(String, String)> = connection.prepare(
+            "SELECT work_date,state FROM time_entries WHERE timer_chain_id=?1 ORDER BY work_date"
+        ).unwrap().query_map([&entry_id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                (yesterday, "ended".to_string()),
+                (today, "running".to_string())
+            ]
+        );
         drop(connection);
         coordinate_active_timer(&database, boundary + 30_000).unwrap();
         let count: i64 = database
             .open()
             .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM sync_outbox WHERE operation_type LIKE 'timer_rollover_%'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 0);
     }
 
     #[test]

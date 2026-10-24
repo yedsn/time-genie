@@ -535,8 +535,6 @@ pub fn apply_batch(
         .as_ref()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let mut cloud_batch_payload =
-        serde_json::to_value(&request).map_err(|error| error.to_string())?;
     let mut adjustments = Vec::new();
     for item in &request.items {
         if !(0..=1440).contains(&item.target_minutes)
@@ -632,40 +630,6 @@ pub fn apply_batch(
             adjustments.push(load_adjustment(&transaction, &adjustment_id)?);
         }
     }
-    if state.mode == "cloud" {
-        let created_task_payloads = created_tasks
-            .iter()
-            .map(|created| {
-                let task = crate::cloud_sync::entity_payload_from_connection(
-                    &transaction,
-                    "task",
-                    Some(&created.task_id),
-                )?;
-                Ok::<serde_json::Value, String>(serde_json::json!({
-                    "clientTaskId": created.client_task_id,
-                    "task": task,
-                }))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let adjustment_payloads = adjustments
-            .iter()
-            .map(|adjustment| {
-                crate::cloud_sync::entity_payload_from_connection(
-                    &transaction,
-                    "actual_time_adjustment",
-                    Some(&adjustment.id),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        cloud_batch_payload["createdTasks"] = serde_json::Value::Array(created_task_payloads);
-        cloud_batch_payload["adjustments"] = serde_json::Value::Array(adjustment_payloads);
-        crate::cloud_sync::enqueue_actual_adjustment_batch_in_transaction(
-            &transaction,
-            &state,
-            &request.client_request_id,
-            &cloud_batch_payload,
-        )?;
-    }
     bump_revision(&transaction)?;
     let result = ActualAdjustmentBatchResult {
         batch_id: request.batch_id.clone(),
@@ -701,15 +665,6 @@ pub fn delete_adjustment(
         return Err("VERSION_CONFLICT: 实际调整记录已变化".to_string());
     }
     transaction.execute("UPDATE actual_time_adjustments SET deleted_at=?1,updated_at=?1,version=version+1,updated_by_device_id=?2 WHERE id=?3 AND workspace_id=?4",params![now,state.device_id,request.adjustment_id,workspace_id]).map_err(|error|error.to_string())?;
-    crate::cloud_sync::enqueue_entity_in_transaction(
-        &transaction,
-        &state,
-        "actual_adjustment_delete",
-        "actual_time_adjustment",
-        Some(&request.adjustment_id),
-        Some(request.expected_version),
-        Some(&request.client_request_id),
-    )?;
     bump_revision(&transaction)?;
     let result = load_adjustment(&transaction, &request.adjustment_id)?;
     transaction.commit().map_err(|error| error.to_string())?;
@@ -884,6 +839,10 @@ mod tests {
             direct_actual_minutes(&connection, &workspace, &source, Some(&work_date)).unwrap(),
             0
         );
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(outbox_count, 0);
         assert_eq!(
             direct_actual_minutes(&connection, &workspace, &instance, Some(&work_date)).unwrap(),
             35
@@ -1211,7 +1170,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_outbox_contains_one_atomic_batch_with_task_mapping_before_adjustments() {
+    fn cloud_compatible_batch_is_idempotent_without_creating_outbox() {
         use crate::settings::{self, SettingsScope, SettingsUpdate};
         let (database, _workspace, subject) = fixture();
         settings::update_setting(
@@ -1233,44 +1192,34 @@ mod tests {
         )
         .unwrap();
         let work_date = current_work_date(&database);
-        apply_batch(
-            &database,
-            ActualAdjustmentBatchRequest {
-                subject_id: subject,
-                work_date,
-                client_request_id: "40000000-0000-0000-0000-000000000001".into(),
-                batch_id: "41000000-0000-0000-0000-000000000001".into(),
-                note: None,
-                day_instance_date: None,
-                items: vec![],
-                new_tasks: vec![ActualAdjustmentNewTaskInput {
-                    client_task_id: "draft".into(),
-                    title: "离线事项".into(),
-                    parent_id: None,
-                    expected_parent_version: None,
-                    target_minutes: 30,
-                }],
-            },
-        )
-        .unwrap();
+        let request = ActualAdjustmentBatchRequest {
+            subject_id: subject,
+            work_date,
+            client_request_id: "40000000-0000-0000-0000-000000000001".into(),
+            batch_id: "41000000-0000-0000-0000-000000000001".into(),
+            note: None,
+            day_instance_date: None,
+            items: vec![],
+            new_tasks: vec![ActualAdjustmentNewTaskInput {
+                client_task_id: "draft".into(),
+                title: "云端兼容事项".into(),
+                parent_id: None,
+                expected_parent_version: None,
+                target_minutes: 30,
+            }],
+        };
+        let first = apply_batch(&database, request.clone()).unwrap();
+        let repeated = apply_batch(&database, request).unwrap();
+        assert_eq!(repeated, first);
+        assert_eq!(first.created_task_count, 1);
+        assert_eq!(first.created_adjustment_count, 1);
+        assert_eq!(first.created_tasks[0].client_task_id, "draft");
+        assert_eq!(first.adjustments[0].task_id, first.created_tasks[0].task_id);
         let connection = database.open().unwrap();
-        let (operation_id, entity_type, payload_json): (String, String, String) = connection
-            .query_row(
-                "SELECT operation_id,entity_type,payload_json FROM sync_outbox",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(operation_id, "40000000-0000-0000-0000-000000000001");
-        assert_eq!(entity_type, "actual_adjustment_batch");
-        let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
-        let created = payload["createdTasks"].as_array().unwrap();
-        let adjustments = payload["adjustments"].as_array().unwrap();
-        assert_eq!(created.len(), 1);
-        assert_eq!(adjustments.len(), 1);
-        assert_eq!(created[0]["clientTaskId"], "draft");
-        assert_eq!(created[0]["task"]["title"], "离线事项");
-        assert_eq!(adjustments[0]["task_id"], created[0]["task"]["id"]);
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]

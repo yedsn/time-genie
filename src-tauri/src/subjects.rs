@@ -67,7 +67,7 @@ pub fn create_subject(
 fn create_subject_with_cloud_operation(
     database: &Database,
     request: SubjectCreateRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<SubjectCreateResult, String> {
     let name = request.name.trim();
     if name.is_empty() {
@@ -100,36 +100,8 @@ fn create_subject_with_cloud_operation(
             params![id, workspace_id, name, sort_order, now],
         )
         .map_err(|error| error.to_string())?;
-    let schedule_ids = crate::subject_work_schedules::insert_default_schedule(
-        &transaction,
-        &workspace_id,
-        &id,
-        now,
-    )?;
+    crate::subject_work_schedules::insert_default_schedule(&transaction, &workspace_id, &id, now)?;
     bump_revision(&transaction)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        let subject_operation_id = crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "subject",
-            Some(&id),
-            None,
-            None,
-        )?;
-        for schedule_id in schedule_ids {
-            crate::cloud_sync::enqueue_entity_in_transaction_with_dependency(
-                &transaction,
-                state,
-                "subject_work_schedule_create",
-                "subject_work_schedule",
-                Some(&schedule_id),
-                None,
-                None,
-                subject_operation_id.as_deref(),
-            )?;
-        }
-    }
     let subject = load_subject(&transaction, &id)?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(SubjectCreateResult {
@@ -149,7 +121,7 @@ pub fn rename_subject(
 fn rename_subject_with_cloud_operation(
     database: &Database,
     request: SubjectRenameRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, i64)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, i64)>,
 ) -> Result<SubjectDto, String> {
     let name = request.name.trim();
     if name.is_empty() {
@@ -182,17 +154,6 @@ fn rename_subject_with_cloud_operation(
         return Err("VERSION_CONFLICT: 主体已被其他窗口或设备更新".to_string());
     }
     bump_revision(&transaction)?;
-    if let Some((state, operation_type, base_version)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "subject",
-            Some(&request.subject_id),
-            Some(base_version),
-            None,
-        )?;
-    }
     let result = load_subject(&transaction, &request.subject_id)?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
@@ -333,7 +294,7 @@ pub fn subject_rename(
 mod tests {
     use super::*;
     use crate::settings::{self, SettingsScope, SettingsUpdate};
-    use serde_json::{json, Value};
+    use serde_json::json;
     use tempfile::tempdir;
 
     #[test]
@@ -369,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_subject_writes_persist_outbox_in_the_same_transaction() {
+    fn legacy_cloud_subject_helpers_do_not_create_outbox_rows() {
         let directory = tempdir().unwrap();
         let database =
             Database::initialize_at(directory.path().join("subjects-cloud.sqlite3")).unwrap();
@@ -414,40 +375,11 @@ mod tests {
         .unwrap();
 
         let connection = database.open().unwrap();
-        let mut statement = connection
-            .prepare(
-                "SELECT operation_type, base_version, payload_json FROM sync_outbox WHERE entity_id = ?1 ORDER BY created_at, operation_type",
-            )
-            .unwrap();
-        let rows = statement
-            .query_map([created.subject.id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
             .unwrap();
 
         assert_eq!(renamed.name, "云端主体改名");
-        assert_eq!(rows.len(), 2);
-        assert!(rows
-            .iter()
-            .any(|(operation_type, base_version, payload_json)| {
-                let payload: Value = serde_json::from_str(payload_json).unwrap();
-                operation_type == "subject_create"
-                    && base_version.is_none()
-                    && payload["name"] == "云端主体"
-            }));
-        assert!(rows
-            .iter()
-            .any(|(operation_type, base_version, payload_json)| {
-                let payload: Value = serde_json::from_str(payload_json).unwrap();
-                operation_type == "subject_rename"
-                    && *base_version == Some(created.subject.version)
-                    && payload["name"] == "云端主体改名"
-            }));
+        assert_eq!(outbox_count, 0);
     }
 }

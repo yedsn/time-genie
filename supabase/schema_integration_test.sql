@@ -153,6 +153,12 @@ end $$;
 \ir 20261024c_timegenie_unassigned_successor_boundary.sql
 \ir 20261024c_timegenie_unassigned_successor_boundary.sql
 
+-- The cases below exercise the historical upgrade path before the final
+-- retirement migration. New workspaces in this part intentionally model the
+-- old sync_v1 default; 20261024d later converges all of them to direct_v2.
+alter table timegenie.workspaces
+  alter column storage_protocol set default 'sync_v1';
+
 do $$
 begin
   if has_table_privilege('anon', 'timegenie.workspaces', 'select') then
@@ -8312,12 +8318,8 @@ end $$;
 set role authenticated;
 select set_config('request.jwt.claim.sub','f1000000-0000-0000-0000-000000000001',true);
 do $$
-declare before_setting_count bigint; before_change_count bigint; rejected boolean:=false;
+declare rejected boolean:=false;
 begin
-  before_setting_count:=(select count(*) from timegenie.app_settings
-    where workspace_id='f2000000-0000-0000-0000-000000000001');
-  before_change_count:=(select count(*) from timegenie.workspace_changes
-    where workspace_id='f2000000-0000-0000-0000-000000000001');
   begin
     perform timegenie.cloud_apply_patch(
       'f2000000-0000-0000-0000-000000000001',
@@ -8330,13 +8332,6 @@ begin
     rejected:=sqlerrm like 'LEGACY_SYNC_UNSUPPORTED:%';
   end;
   if not rejected then raise exception 'retired legacy patch RPC was not rejected'; end if;
-  if before_setting_count<>(select count(*) from timegenie.app_settings
-       where workspace_id='f2000000-0000-0000-0000-000000000001')
-     or before_change_count<>(select count(*) from timegenie.workspace_changes
-       where workspace_id='f2000000-0000-0000-0000-000000000001') then
-    raise exception 'rejected retired legacy patch modified business data';
-  end if;
-
   rejected:=false;
   begin
     perform timegenie.cloud_incremental_pull(
@@ -8360,6 +8355,17 @@ begin
   if not rejected then raise exception 'retired protocol upgrade RPC was not rejected'; end if;
 end $$;
 reset role;
+do $$
+begin
+  if exists(select 1 from timegenie.app_settings
+       where workspace_id='f2000000-0000-0000-0000-000000000001'
+         and key='retired_sync_probe')
+     or exists(select 1 from timegenie.workspace_changes
+       where workspace_id='f2000000-0000-0000-0000-000000000001'
+         and entity_id='retired_sync_probe') then
+    raise exception 'rejected retired legacy patch modified business data';
+  end if;
+end $$;
 
 select 'Supabase schema integration tests passed' as result;
 

@@ -457,7 +457,7 @@ pub fn confirm(
         .map_err(|error| error.to_string())?;
     let mut item_to_task = HashMap::new();
     let mut created_ids = Vec::new();
-    let mut pending_adjustments = Vec::<(String, Option<String>, i64)>::new();
+    let mut pending_adjustments = Vec::<(String, i64)>::new();
     let mut adjustment_count = 0usize;
     let mut skipped_count = 0usize;
     for item in all_items.iter().filter(|item| required.contains(&item.id)) {
@@ -527,15 +527,6 @@ pub fn confirm(
                 params![Uuid::now_v7().to_string(),workspace_id,task.id,completed_at],
             ).map_err(|error| error.to_string())?;
         }
-        let task_operation_id = crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            &state,
-            "daily_report_task_import",
-            "task",
-            Some(&task.id),
-            None,
-            None,
-        )?;
         if target_kind == DAY_INSTANCE && estimate.is_some() && !is_context {
             crate::tasks::write_daily_estimate_in_transaction(
                 &transaction,
@@ -544,18 +535,14 @@ pub fn confirm(
                 &source_date,
                 estimate,
                 now,
-                Some(&state),
-                task_operation_id.as_deref(),
+                None,
+                None,
                 false,
             )?;
         }
         if explicitly_selected && item.status == "done" {
             if let Some(target_minutes) = item.import_actual_minutes {
-                pending_adjustments.push((
-                    task.id.clone(),
-                    task_operation_id.clone(),
-                    target_minutes,
-                ));
+                pending_adjustments.push((task.id.clone(), target_minutes));
             }
         }
         transaction.execute(
@@ -573,7 +560,7 @@ pub fn confirm(
         item_to_task.insert(item.id.clone(), task.id.clone());
         created_ids.push(task.id);
     }
-    for (task_id, task_operation_id, target_minutes) in pending_adjustments {
+    for (task_id, target_minutes) in pending_adjustments {
         let baseline = crate::actual_time_adjustments::direct_actual_minutes(
             &transaction,
             &workspace_id,
@@ -591,15 +578,6 @@ pub fn confirm(
              ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'从 Obsidian 日报导入','daily_report_import',?9,?10,?10,1,?11,?11)",
             params![adjustment_id,workspace_id,subject_id,task_id,source_date,delta,baseline,target_minutes,request.batch_id,now,state.device_id],
         ).map_err(|error| error.to_string())?;
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            &state,
-            "daily_report_actual_import",
-            "actual_time_adjustment",
-            Some(&adjustment_id),
-            None,
-            task_operation_id.as_deref(),
-        )?;
         adjustment_count += 1;
     }
     crate::tasks::bump_revision_for_import(&transaction)?;

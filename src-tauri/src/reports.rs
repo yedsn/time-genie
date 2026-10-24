@@ -813,7 +813,7 @@ pub fn create_report(
 fn create_report_with_cloud_operation(
     database: &Database,
     request: ReportCreateRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str, Option<&str>)>,
 ) -> Result<ReportDto, String> {
     validate_operation_id(&request.client_request_id)?;
     let (period_start, period_end) =
@@ -903,17 +903,6 @@ fn create_report_with_cloud_operation(
         "report_create",
         &result,
     )?;
-    if let Some((state, operation_type, operation_id)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "report",
-            Some(&id),
-            None,
-            operation_id,
-        )?;
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -921,7 +910,7 @@ fn create_report_with_cloud_operation(
 fn update_report_scope_with_cloud_operation(
     database: &Database,
     request: ReportScopeUpdateRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<ReportDto, String> {
     let (period_start, period_end) =
         normalize_period(&request.report_type, &request.reference_date)?;
@@ -995,17 +984,6 @@ fn update_report_scope_with_cloud_operation(
     )?;
     bump_revision(&transaction)?;
     let result = load_report(&transaction, &request.report_id)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "report",
-            Some(&request.report_id),
-            Some(request.expected_version),
-            None,
-        )?;
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -1021,7 +999,7 @@ pub fn save_report_content(
 fn save_report_content_with_cloud_operation(
     database: &Database,
     request: ReportContentSaveRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<ReportDto, String> {
     if request.markdown.trim().is_empty() {
         return Err("VALIDATION_ERROR: 报告内容不能为空".to_string());
@@ -1044,17 +1022,6 @@ fn save_report_content_with_cloud_operation(
     }
     bump_revision(&transaction)?;
     let result = load_report(&transaction, &request.report_id)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "report",
-            Some(&request.report_id),
-            Some(request.expected_version),
-            None,
-        )?;
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -1070,7 +1037,7 @@ pub fn regenerate_report(
 fn regenerate_report_with_cloud_operation(
     database: &Database,
     request: ReportVersionRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<ReportDto, String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
@@ -1105,17 +1072,6 @@ fn regenerate_report_with_cloud_operation(
     }
     bump_revision(&transaction)?;
     let result = load_report(&transaction, &request.report_id)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "report",
-            Some(&request.report_id),
-            Some(request.expected_version),
-            None,
-        )?;
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -1123,7 +1079,7 @@ fn regenerate_report_with_cloud_operation(
 fn delete_report_with_cloud_operation(
     database: &Database,
     request: ReportVersionRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<(), String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
@@ -1147,17 +1103,6 @@ fn delete_report_with_cloud_operation(
         return Err("VERSION_CONFLICT: 报告已变化或已删除".to_string());
     }
     bump_revision(&transaction)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "report",
-            Some(&request.report_id),
-            Some(request.expected_version),
-            None,
-        )?;
-    }
     transaction.commit().map_err(|error| error.to_string())
 }
 
@@ -1239,7 +1184,7 @@ pub fn get_template_by_id(
 fn create_template_with_cloud_operation(
     database: &Database,
     request: ReportTemplateCreateRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<ReportTemplateDto, String> {
     validate_report_type(&request.report_type)?;
     let name = validate_template_name(&request.name)?;
@@ -1274,7 +1219,7 @@ fn create_template_with_cloud_operation(
     ).map_err(map_template_write_error)?;
     bump_revision(&transaction)?;
     let result = load_template_by_id(&transaction, &id, false)?;
-    enqueue_template_change(&transaction, cloud_operation, "report_template", &id, None)?;
+    enqueue_template_change(&transaction, _cloud_operation, "report_template", &id, None)?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -1468,33 +1413,6 @@ fn delete_template_with_cloud_operation(
         ).map_err(|error| error.to_string())?;
     }
     bump_revision(&transaction)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        let mut payload = crate::cloud_sync::entity_payload_from_connection(
-            &transaction,
-            "report_template",
-            Some(&target.id),
-        )?;
-        if let Some(replacement) = replacement.as_ref() {
-            payload
-                .as_object_mut()
-                .ok_or_else(|| "CACHE_ERROR: 报告模板同步快照不是对象".to_string())?
-                .insert(
-                    "replacement_template_id".to_string(),
-                    serde_json::Value::String(replacement.id.clone()),
-                );
-        }
-        crate::cloud_sync::enqueue_payload_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "report_template",
-            &target.id,
-            Some(request.expected_version),
-            &payload,
-            None,
-            None,
-        )?;
-    }
     transaction.commit().map_err(|error| error.to_string())
 }
 
@@ -1514,7 +1432,7 @@ pub fn delete_template_for_cloud_test(
 fn reorder_templates_with_cloud_operation(
     database: &Database,
     request: ReportTemplateReorderRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<Vec<ReportTemplateDto>, String> {
     validate_report_type(&request.report_type)?;
     let mut connection = database.open()?;
@@ -1545,7 +1463,7 @@ fn reorder_templates_with_cloud_operation(
         ).map_err(|error| error.to_string())?;
         enqueue_template_change(
             &transaction,
-            cloud_operation,
+            _cloud_operation,
             "report_template_reorder",
             id,
             base_version,
@@ -1611,17 +1529,6 @@ fn save_template_with_cloud_operation(
     };
     bump_revision(&transaction)?;
     let result = load_template_by_id(&transaction, &id, false)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "report_template",
-            Some(&id),
-            request.expected_version.or(base_version),
-            None,
-        )?;
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -3035,27 +2942,13 @@ fn map_template_write_error(error: rusqlite::Error) -> String {
 }
 
 fn enqueue_template_change(
-    transaction: &Transaction<'_>,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
-    fallback_operation: &str,
-    id: &str,
-    base_version: Option<i64>,
+    _transaction: &Transaction<'_>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _fallback_operation: &str,
+    _id: &str,
+    _base_version: Option<i64>,
 ) -> Result<(), String> {
-    if let Some((state, operation_type)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            transaction,
-            state,
-            operation_type,
-            "report_template",
-            Some(id),
-            base_version,
-            None,
-        )
-        .map(|_| ())
-    } else {
-        let _ = fallback_operation;
-        Ok(())
-    }
+    Ok(())
 }
 
 fn report_type_label(report_type: &str) -> &'static str {
@@ -4480,7 +4373,7 @@ mod tests {
     use crate::today_plans::TaskDayPlanSetRequest;
     use crate::today_plans::{snapshot as day_plan_snapshot, TaskDayPlanSnapshotRequest};
     use chrono::NaiveDateTime;
-    use serde_json::{json, Value};
+    use serde_json::json;
     use tempfile::tempdir;
 
     fn setup() -> (Database, String, String) {
@@ -4797,7 +4690,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_report_writes_persist_outbox_in_the_same_transaction() {
+    fn legacy_cloud_report_helpers_do_not_create_outbox_rows() {
         let (database, subject_id, task_id) = setup();
         let cloud_workspace_id = Uuid::now_v7().to_string();
         settings::update_setting(
@@ -4867,70 +4760,20 @@ mod tests {
         .unwrap();
 
         let connection = database.open().unwrap();
-        let outbox = connection
-            .prepare(
-                "SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json FROM sync_outbox ORDER BY created_at, operation_type",
-            )
-            .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
             .unwrap();
-
-        assert!(outbox.iter().any(
-            |(operation_id, operation, entity_type, entity_id, base_version, payload)| {
-                let value: Value = serde_json::from_str(payload).unwrap();
-                operation_id == &create_operation_id
-                    && operation == "report_create"
-                    && entity_type == "report"
-                    && entity_id.as_deref() == Some(&created.id)
-                    && base_version.is_none()
-                    && value["report_tasks"]
-                        .as_array()
-                        .is_some_and(|tasks| tasks.len() == 1)
-            }
-        ));
-        assert!(outbox.iter().any(
-            |(_, operation, entity_type, entity_id, base_version, payload)| {
-                let value: Value = serde_json::from_str(payload).unwrap();
-                operation == "report_save_content"
-                    && entity_type == "report"
-                    && entity_id.as_deref() == Some(&created.id)
-                    && *base_version == Some(created.version)
-                    && value["markdown_content"] == "# 云端事务报告\n\n本地已保存。"
-            }
-        ));
-        assert!(outbox.iter().any(
-            |(_, operation, entity_type, entity_id, base_version, payload)| {
-                let value: Value = serde_json::from_str(payload).unwrap();
-                operation == "report_template_save"
-                    && entity_type == "report_template"
-                    && entity_id.as_deref() == Some(&template.id)
-                    && *base_version == Some(template.version - 1)
-                    && value["content"] == "# {{日期}}\n{{今日事项}}"
-                    && value["subject_id"].is_null()
-                    && value["name"] == "标准日报"
-            }
-        ));
-        assert!(outbox.iter().any(
-            |(_, operation, entity_type, entity_id, base_version, payload)| {
-                let value: Value = serde_json::from_str(payload).unwrap();
-                operation == "report_delete"
-                    && entity_type == "report"
-                    && entity_id.as_deref() == Some(&created.id)
-                    && *base_version == Some(saved.version)
-                    && !value["deleted_at"].is_null()
-            }
-        ));
+        let deleted_at: Option<i64> = connection
+            .query_row(
+                "SELECT deleted_at FROM reports WHERE id=?1",
+                [&created.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved.markdown, "# 云端事务报告\n\n本地已保存。");
+        assert_eq!(template.content, "# {{日期}}\n{{今日事项}}");
+        assert!(deleted_at.is_some());
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]

@@ -3,7 +3,6 @@ use std::collections::{HashMap, HashSet};
 use chrono::NaiveDate;
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use uuid::Uuid;
 
 use crate::database::Database;
@@ -778,56 +777,13 @@ pub(crate) fn write_daily_estimate_in_transaction(
             )
             .map_err(|error| error.to_string())?;
     }
-    let Some(state) = cloud_state else {
-        return Ok(());
-    };
-    let occurrence_operation_id = if previous_occurrence.is_none() && occurrence.is_some() {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            transaction,
-            state,
-            "task_occurrence_create_from_daily_estimate",
-            "task_occurrence",
-            Some(&crate::recurring::occurrence_entity_id(task_id, work_date)),
-            None,
-            dependency_operation_id,
-        )?
-    } else {
-        dependency_operation_id.map(str::to_string)
-    };
-    let entity_id = format!("{estimate_task_id}|{work_date}");
-    if let Some(minutes) = estimate_minutes {
-        let row: (i64, i64, i64) = transaction
-            .query_row(
-                "SELECT estimate_minutes,created_at,version FROM task_daily_estimates
-                 WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3",
-                params![workspace_id, estimate_task_id, work_date],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .map_err(|error| error.to_string())?;
-        crate::cloud_sync::enqueue_payload_in_transaction(
-            transaction,
-            state,
-            "task_daily_estimate_set",
-            "task_daily_estimate",
-            &entity_id,
-            previous_estimate.map(|value| value.0),
-            &json!({"task_id":estimate_task_id,"work_date":work_date,"estimate_minutes":minutes,"created_at":row.1,"updated_at":now,"version":row.2}),
-            None,
-            occurrence_operation_id.as_deref(),
-        )?;
-    } else if let Some((previous_version, created_at)) = previous_estimate {
-        crate::cloud_sync::enqueue_payload_in_transaction(
-            transaction,
-            state,
-            "task_daily_estimate_clear",
-            "task_daily_estimate",
-            &entity_id,
-            Some(previous_version),
-            &json!({"task_id":estimate_task_id,"work_date":work_date,"deleted":true,"created_at":created_at,"updated_at":now,"version":previous_version + 1}),
-            None,
-            occurrence_operation_id.as_deref(),
-        )?;
-    }
+    let _ = (
+        cloud_state,
+        dependency_operation_id,
+        previous_occurrence,
+        occurrence,
+        previous_estimate,
+    );
     Ok(())
 }
 
@@ -837,36 +793,15 @@ pub(crate) fn clear_daily_estimate_for_day_plan_in_transaction(
     task_id: &str,
     work_date: &str,
     now: i64,
-    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
-    dependency_operation_id: Option<&str>,
+    _cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+    _dependency_operation_id: Option<&str>,
 ) -> Result<(), String> {
-    let previous: Option<(i64, i64)> = transaction
-        .query_row(
-            "SELECT version,created_at FROM task_daily_estimates WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3",
-            params![workspace_id, task_id, work_date],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?;
     transaction
         .execute(
             "DELETE FROM task_daily_estimates WHERE workspace_id=?1 AND task_id=?2 AND work_date=?3",
             params![workspace_id, task_id, work_date],
         )
         .map_err(|error| error.to_string())?;
-    if let (Some(state), Some((version, created_at))) = (cloud_state, previous) {
-        crate::cloud_sync::enqueue_payload_in_transaction(
-            transaction,
-            state,
-            "task_daily_estimate_clear",
-            "task_daily_estimate",
-            &format!("{task_id}|{work_date}"),
-            Some(version),
-            &json!({"task_id":task_id,"work_date":work_date,"deleted":true,"created_at":created_at,"updated_at":now,"version":version + 1}),
-            None,
-            dependency_operation_id,
-        )?;
-    }
     Ok(())
 }
 
@@ -897,19 +832,6 @@ fn write_recurring_estimate_in_transaction(
     if changed == 0 {
         return Err("VERSION_CONFLICT: 事项已被其他窗口或设备更新".to_string());
     }
-    let task_operation = if let Some(state) = cloud_state {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            transaction,
-            state,
-            "task_recurring_estimate_set",
-            "task",
-            Some(task_id),
-            Some(expected_version),
-            None,
-        )?
-    } else {
-        None
-    };
     write_daily_estimate_in_transaction(
         transaction,
         workspace_id,
@@ -918,7 +840,7 @@ fn write_recurring_estimate_in_transaction(
         Some(estimate_minutes),
         now,
         cloud_state,
-        task_operation.as_deref(),
+        None,
         false,
     )
 }
@@ -1095,7 +1017,7 @@ fn create_task_with_source(
     database: &Database,
     request: TaskCreateRequest,
     source_type: &str,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<TaskDto, String> {
     validate_title(&request.title)?;
     validate_estimate(request.estimate_minutes)?;
@@ -1112,8 +1034,8 @@ fn create_task_with_source(
         source_type,
         None,
         now,
-        cloud_operation.map(|value| value.0),
-        cloud_operation.map(|value| value.1),
+        _cloud_operation.map(|value| value.0),
+        _cloud_operation.map(|value| value.1),
         None,
     )?;
     bump_revision(&transaction)?;
@@ -1220,20 +1142,8 @@ pub(crate) fn create_task_in_transaction(
             ],
         )
         .map_err(|error| error.to_string())?;
-    let operation_id = if let (Some(state), Some(operation_type)) = (cloud_state, operation_type) {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            transaction,
-            state,
-            operation_type,
-            "task",
-            Some(&id),
-            None,
-            dependency_operation_id,
-        )?
-    } else {
-        None
-    };
-    Ok((load_task(transaction, &id)?, operation_id))
+    let _ = (cloud_state, operation_type, dependency_operation_id);
+    Ok((load_task(transaction, &id)?, None))
 }
 
 fn create_positioned_task_with_cloud_operation(
@@ -1317,28 +1227,6 @@ fn create_positioned_task_with_cloud_operation(
         params![id,workspace_id,request.subject_id,request.parent_id,request.title.trim(),request.planned_date,request.estimate_minutes,request.note,request.project_name,request.solution_name,sort_result.sort_order,now,day_instance_date,day_instance_kind],
     ).map_err(|error| error.to_string())?;
     bump_revision(&transaction)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        for (sibling_id, base_version) in &sort_result.normalized_siblings {
-            crate::cloud_sync::enqueue_entity_in_transaction(
-                &transaction,
-                state,
-                "task_order_normalize",
-                "task",
-                Some(sibling_id),
-                Some(*base_version),
-                None,
-            )?;
-        }
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "task",
-            Some(&id),
-            None,
-            None,
-        )?;
-    }
     let result = load_task(&transaction, &id)?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
@@ -1361,7 +1249,7 @@ pub(crate) fn update_task_for_cloud_test(
 fn update_task_with_cloud_operation(
     database: &Database,
     mut request: TaskUpdateRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<TaskDto, String> {
     if let Some(note) = request.note.as_mut() {
         *note = note.take().and_then(|value| {
@@ -1435,17 +1323,6 @@ fn update_task_with_cloud_operation(
         return Err("VERSION_CONFLICT: 事项已被其他窗口或设备更新".to_string());
     }
     bump_revision(&transaction)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "task",
-            Some(&request.id),
-            Some(request.expected_version),
-            None,
-        )?;
-    }
     let result = load_task(&transaction, &request.id)?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
@@ -1562,27 +1439,6 @@ fn update_today_recurring_instance_with_cloud_operation(
         return Err("VERSION_CONFLICT: 重复事项模板已被其他窗口或设备更新".to_string());
     }
     bump_revision(&transaction)?;
-    if let Some(state) = cloud_state {
-        let instance_operation_id = crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            "today_recurring_instance_update",
-            "task",
-            Some(&request.instance_id),
-            Some(request.instance_expected_version),
-            None,
-        )?;
-        crate::cloud_sync::enqueue_entity_in_transaction_with_dependency(
-            &transaction,
-            state,
-            "today_recurring_template_update",
-            "task",
-            Some(&source_id),
-            Some(request.source_expected_version),
-            None,
-            instance_operation_id.as_deref(),
-        )?;
-    }
     let instance = load_task(&transaction, &request.instance_id)?;
     let source = load_task(&transaction, &source_id)?;
     transaction.commit().map_err(|error| error.to_string())?;
@@ -1655,15 +1511,7 @@ fn set_task_status_with_cloud_operation(
                             .as_ref()
                             .is_none_or(|previous| item.version > previous.version)
                     }) {
-                        crate::cloud_sync::enqueue_entity_in_transaction(
-                            &transaction,
-                            state,
-                            operation_type,
-                            "task_occurrence",
-                            Some(&entity_id),
-                            base_version,
-                            None,
-                        )?;
+                        let _ = (state, operation_type, entity_id, base_version);
                     }
                 }
                 transaction.commit().map_err(|error| error.to_string())?;
@@ -1700,17 +1548,6 @@ fn set_task_status_with_cloud_operation(
         )
         .map_err(|error| error.to_string())?;
     bump_revision(&transaction)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "task",
-            Some(&request.id),
-            Some(request.expected_version),
-            None,
-        )?;
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     let connection = database.open()?;
     load_task(&connection, &current.id)
@@ -1727,7 +1564,7 @@ pub fn delete_task(
 fn delete_task_with_cloud_operation(
     database: &Database,
     request: TaskDeleteRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<Vec<(String, i64)>, String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
@@ -1746,7 +1583,7 @@ fn delete_task_with_cloud_operation(
             &request.id,
             current.day_instance_date.as_deref().unwrap_or_default(),
             now,
-            cloud_operation.map(|value| value.0),
+            _cloud_operation.map(|value| value.0),
         )?;
         bump_revision(&transaction)?;
         transaction.commit().map_err(|error| error.to_string())?;
@@ -1798,19 +1635,6 @@ fn delete_task_with_cloud_operation(
         )
         .map_err(|error| error.to_string())?;
     bump_revision(&transaction)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        for (id, base_version) in &subtree_versions {
-            crate::cloud_sync::enqueue_entity_in_transaction(
-                &transaction,
-                state,
-                operation_type,
-                "task",
-                Some(id),
-                Some(*base_version),
-                None,
-            )?;
-        }
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(subtree_versions)
 }
@@ -1823,7 +1647,7 @@ pub fn reorder_task(database: &Database, request: TaskReorderRequest) -> Result<
 fn reorder_task_with_cloud_operation(
     database: &Database,
     request: TaskReorderRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<TaskDto, String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
@@ -1849,17 +1673,6 @@ fn reorder_task_with_cloud_operation(
         return Err("VERSION_CONFLICT: 事项已被其他窗口或设备更新".to_string());
     }
     bump_revision(&transaction)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "task",
-            Some(&request.id),
-            Some(request.expected_version),
-            None,
-        )?;
-    }
     let result = load_task(&transaction, &request.id)?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
@@ -1965,7 +1778,7 @@ fn sibling_sort_order(
 fn move_task_with_cloud_operation(
     database: &Database,
     request: TaskMoveRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<TaskDto, String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
@@ -2041,28 +1854,6 @@ fn move_task_with_cloud_operation(
         return Err("VERSION_CONFLICT: 事项已被其他窗口或设备更新".to_string());
     }
     bump_revision(&transaction)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        for (sibling_id, base_version) in &sort_result.normalized_siblings {
-            crate::cloud_sync::enqueue_entity_in_transaction(
-                &transaction,
-                state,
-                "task_order_normalize",
-                "task",
-                Some(sibling_id),
-                Some(*base_version),
-                None,
-            )?;
-        }
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "task",
-            Some(&request.id),
-            Some(request.expected_version),
-            None,
-        )?;
-    }
     let result = load_task(&transaction, &request.id)?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
@@ -2071,7 +1862,7 @@ fn move_task_with_cloud_operation(
 fn change_task_parent_with_cloud_operation(
     database: &Database,
     request: TaskChangeParentRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<TaskDto, String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
@@ -2113,17 +1904,6 @@ fn change_task_parent_with_cloud_operation(
         return Err("VERSION_CONFLICT: 事项已被其他窗口或设备更新".to_string());
     }
     bump_revision(&transaction)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            &transaction,
-            state,
-            operation_type,
-            "task",
-            Some(&request.id),
-            Some(request.expected_version),
-            None,
-        )?;
-    }
     let result = load_task(&transaction, &current.id)?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
@@ -2140,7 +1920,7 @@ pub fn duplicate_task_subtree(
 fn duplicate_task_subtree_with_cloud_operation(
     database: &Database,
     request: TaskDuplicateRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<TaskDuplicateResult, String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
@@ -2210,19 +1990,6 @@ fn duplicate_task_subtree_with_cloud_operation(
         created_ids.push(id);
     }
     bump_revision(&transaction)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        for id in &created_ids {
-            crate::cloud_sync::enqueue_entity_in_transaction(
-                &transaction,
-                state,
-                operation_type,
-                "task",
-                Some(id),
-                None,
-                None,
-            )?;
-        }
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     let connection = database.open()?;
     let tasks = created_ids
@@ -2280,7 +2047,6 @@ fn apply_task_plan_batch_with_cloud_operation(
         return Err("VALIDATION_ERROR: 删除确认事项不能重复".to_string());
     }
     let mut today_plan_changed_count = 0;
-    let mut created_task_operation_ids = HashMap::<String, String>::new();
     if let Some(change) = request.today_plan_change.as_ref() {
         validate_date(&change.work_date)?;
         let include_seen: HashSet<&str> = change
@@ -2471,29 +2237,6 @@ fn apply_task_plan_batch_with_cloud_operation(
             let Some(task_id) = line_to_task.get(*line_key) else {
                 return Err("VALIDATION_ERROR: 今日计划新增行不存在".to_string());
             };
-            let dependency_operation_id = if created_ids.contains(task_id) {
-                if let Some((state, operation_type)) = cloud_state {
-                    let operation_id = crate::cloud_sync::enqueue_entity_in_transaction(
-                        &transaction,
-                        state,
-                        operation_type,
-                        "task",
-                        Some(task_id),
-                        None,
-                        None,
-                    )?;
-                    if let Some(operation_id) = operation_id {
-                        created_task_operation_ids.insert(task_id.clone(), operation_id.clone());
-                        Some(operation_id)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
             crate::today_plans::write_day_plan_in_transaction(
                 &transaction,
                 &workspace_id,
@@ -2503,7 +2246,7 @@ fn apply_task_plan_batch_with_cloud_operation(
                 None,
                 now,
                 cloud_state.map(|value| value.0),
-                dependency_operation_id.as_deref(),
+                None,
             )?;
             today_plan_changed_count += 1;
         }
@@ -2574,54 +2317,6 @@ fn apply_task_plan_batch_with_cloud_operation(
         });
     }
     bump_revision(&transaction)?;
-    if let Some((state, operation_type)) = cloud_state {
-        for id in &created_ids {
-            if created_task_operation_ids.contains_key(id) {
-                continue;
-            }
-            crate::cloud_sync::enqueue_entity_in_transaction(
-                &transaction,
-                state,
-                operation_type,
-                "task",
-                Some(id),
-                None,
-                None,
-            )?;
-        }
-        for task_id in &updated_ids {
-            let base_version = request
-                .baseline_tasks
-                .iter()
-                .find(|base| base.task_id == *task_id)
-                .map(|base| base.expected_version);
-            crate::cloud_sync::enqueue_entity_in_transaction(
-                &transaction,
-                state,
-                operation_type,
-                "task",
-                Some(task_id),
-                base_version,
-                None,
-            )?;
-        }
-        for task_id in &actual_deleted {
-            let base_version = request
-                .baseline_tasks
-                .iter()
-                .find(|base| base.task_id == *task_id)
-                .map(|base| base.expected_version);
-            crate::cloud_sync::enqueue_entity_in_transaction(
-                &transaction,
-                state,
-                operation_type,
-                "task",
-                Some(task_id),
-                base_version,
-                None,
-            )?;
-        }
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(TaskPlanBatchApplyResult {
         created_count,
@@ -3995,7 +3690,7 @@ mod tests {
     use crate::database::Database;
     use crate::settings::{self, SettingsScope, SettingsUpdate};
     use chrono::{Datelike, Local};
-    use serde_json::{json, Value};
+    use serde_json::json;
     use tempfile::tempdir;
 
     fn database() -> Database {
@@ -4114,43 +3809,18 @@ mod tests {
         .unwrap();
 
         let connection = database.open().unwrap();
-        let transition_payload: Value = serde_json::from_str(
-            &connection
-                .query_row(
-                    "SELECT payload_json FROM sync_outbox WHERE operation_id=?1",
-                    [&first_transition_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(transition_payload["occurrence"]["version"], 1);
-        let occurrence_rows = connection
-            .prepare(
-                "SELECT base_version,payload_version,payload_json FROM sync_outbox
-                 WHERE entity_type='task_occurrence' AND entity_id=?1 ORDER BY created_at,rowid",
+        let occurrence: (String, i64) = connection
+            .query_row(
+                "SELECT status,version FROM task_occurrences WHERE task_id=?1 AND occurrence_date=?2",
+                params![recurring_task.id, work_date],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .unwrap()
-            .query_map([format!("{}|{}", recurring_task.id, work_date)], |row| {
-                Ok((
-                    row.get::<_, Option<i64>>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(occurrence_rows.len(), 2);
-        assert_eq!(occurrence_rows[0].0, Some(1));
-        assert_eq!(occurrence_rows[0].1, Some(2));
-        assert_eq!(occurrence_rows[1].0, Some(2));
-        assert_eq!(occurrence_rows[1].1, Some(3));
-        assert_eq!(
-            serde_json::from_str::<Value>(&occurrence_rows[1].2).unwrap()["status"],
-            "open"
-        );
-        assert_eq!(connection.query_row("SELECT COUNT(*) FROM sync_outbox WHERE operation_id=?1 AND entity_type='timer_transition'",[second_transition_id],|row|row.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(occurrence, ("open".to_string(), 3));
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(outbox_count, 0);
     }
 
     fn create_leaf_task(database: &Database, title: &str) -> TaskDto {
@@ -4189,7 +3859,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_task_create_persists_task_and_outbox_together() {
+    fn legacy_cloud_task_create_helper_does_not_create_outbox() {
         let database = database();
         let cloud_workspace_id = Uuid::now_v7().to_string();
         settings::update_setting(
@@ -4236,23 +3906,15 @@ mod tests {
         .unwrap();
 
         let connection = database.open().unwrap();
-        let (outbox_count, outbox_workspace, payload_json): (i64, String, String) = connection
-            .query_row(
-                "SELECT COUNT(*), workspace_id, payload_json FROM sync_outbox WHERE entity_id = ?1",
-                [&task.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
             .unwrap();
-        let payload: Value = serde_json::from_str(&payload_json).unwrap();
-
-        assert_eq!(outbox_count, 1);
-        assert_eq!(outbox_workspace, state.workspace_id);
-        assert_eq!(payload["id"], task.id);
-        assert_eq!(payload["title"], "云端模式事务入队事项");
+        assert_eq!(task.title, "云端模式事务入队事项");
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]
-    fn cloud_mode_queues_daily_estimate_updates_and_clears() {
+    fn legacy_cloud_daily_estimate_helper_does_not_create_outbox() {
         let database = database();
         let cloud_workspace_id = Uuid::now_v7().to_string();
         settings::update_setting(
@@ -4301,25 +3963,14 @@ mod tests {
         )
         .unwrap();
         let connection = database.open().unwrap();
-        let rows = connection
-            .prepare("SELECT operation_id, operation_type, entity_type, entity_id, base_version, payload_json, depends_on_operation_id FROM sync_outbox ORDER BY rowid")
-            .unwrap()
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<i64>>(4)?, row.get::<_, String>(5)?, row.get::<_, Option<String>>(6)?)))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].1, "task_daily_estimate_set");
-        assert_eq!(rows[0].2, "task_daily_estimate");
-        assert_eq!(rows[0].3, format!("{task_id}|2026-10-05"));
-        assert_eq!(rows[0].4, None);
-        assert_eq!(rows[0].6, None);
-        let cleared: Value = serde_json::from_str(&rows[1].5).unwrap();
-        assert_eq!(rows[1].1, "task_daily_estimate_clear");
-        assert_eq!(rows[1].4, Some(1));
-        assert_eq!(rows[1].6, None);
-        assert_eq!(cleared["deleted"], true);
-        assert_eq!(cleared["version"], 2);
+        let estimate_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM task_daily_estimates WHERE task_id=?1 AND work_date='2026-10-05'", [&task_id], |row| row.get(0))
+            .unwrap();
+        assert_eq!(estimate_count, 0);
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]
@@ -4345,7 +3996,7 @@ mod tests {
     }
 
     #[test]
-    fn recurring_daily_estimate_queues_new_occurrence_before_estimate() {
+    fn recurring_daily_estimate_materializes_without_outbox() {
         let database = database();
         let task = create_leaf_task(&database, "计划日预估");
         let today = Local::now().format("%Y-%m-%d").to_string();
@@ -4383,26 +4034,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(occurrence, ("scheduled".to_string(), "open".to_string()));
-        let operations = connection
-            .prepare(
-                "SELECT operation_id, entity_type, depends_on_operation_id FROM sync_outbox ORDER BY rowid",
-            )
-            .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(operations.len(), 2);
-        assert_eq!(operations[0].1, "task_occurrence");
-        assert_eq!(operations[0].2, None);
-        assert_eq!(operations[1].1, "task_daily_estimate");
-        assert_eq!(operations[1].2.as_deref(), Some(operations[0].0.as_str()));
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]
@@ -4543,11 +4178,11 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(estimate_outbox_count, 1);
+        assert_eq!(estimate_outbox_count, 0);
     }
 
     #[test]
-    fn cloud_task_mutations_queue_outbox_in_the_same_transaction() {
+    fn legacy_cloud_task_mutation_helpers_do_not_create_outbox() {
         let database = database();
         let occurrence_date = Local::now().format("%Y-%m-%d").to_string();
         let cloud_workspace_id = Uuid::now_v7().to_string();
@@ -4678,79 +4313,29 @@ mod tests {
         .unwrap();
 
         let connection = database.open().unwrap();
-        let outbox = connection
-            .prepare(
-                "SELECT operation_type, entity_id, base_version, payload_json FROM sync_outbox ORDER BY created_at, operation_type",
-            )
-            .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
             .unwrap();
-
-        assert!(outbox
-            .iter()
-            .any(|(operation, entity_id, base_version, payload)| {
-                let value: Value = serde_json::from_str(payload).unwrap();
-                operation == "task_update"
-                    && entity_id.as_deref() == Some(&task.id)
-                    && *base_version == Some(task.version)
-                    && value["title"] == "云端事务修改事项 - 已更新"
-                    && value["estimate_minutes"] == 45
-            }));
-        assert!(outbox
-            .iter()
-            .any(|(operation, entity_id, base_version, payload)| {
-                let value: Value = serde_json::from_str(payload).unwrap();
-                operation == "task_set_completed"
-                    && entity_id.as_deref() == Some(&task.id)
-                    && *base_version == Some(updated.version)
-                    && value["status"] == "done"
-                    && value["status_events"]
-                        .as_array()
-                        .is_some_and(|events| events.len() == 1)
-            }));
-        assert!(outbox
-            .iter()
-            .any(|(operation, entity_id, base_version, payload)| {
-                let value: Value = serde_json::from_str(payload).unwrap();
-                operation == "task_duplicate"
-                    && entity_id.as_deref() == Some(&duplicate.root_id)
-                    && base_version.is_none()
-                    && value["title"] == "云端事务修改事项 - 已更新 - 副本"
-            }));
-        assert!(outbox
-            .iter()
-            .any(|(operation, entity_id, base_version, payload)| {
-                let value: Value = serde_json::from_str(payload).unwrap();
-                operation == "task_delete"
-                    && entity_id.as_deref() == Some(&task.id)
-                    && *base_version == Some(done.version)
-                    && !value["deleted_at"].is_null()
-            }));
-        assert!(outbox
-            .iter()
-            .any(|(operation, entity_id, base_version, payload)| {
-                let value: Value = serde_json::from_str(payload).unwrap();
-                operation == "task_set_completed"
-                    && entity_id.as_deref()
-                        == Some(&crate::recurring::occurrence_entity_id(
-                            &recurring_task.id,
-                            &occurrence_date,
-                        ))
-                    && value["task_id"] == recurring_task.id
-                    && value["occurrence_date"] == occurrence_date
-                    && value["status"] == "done"
-                    && value["version"] == 2
-                    && base_version.is_none()
-            }));
+        let deleted_at: Option<i64> = connection
+            .query_row(
+                "SELECT deleted_at FROM tasks WHERE id=?1",
+                [&task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let occurrence_status: String = connection
+            .query_row(
+                "SELECT status FROM task_occurrences WHERE task_id=?1 AND occurrence_date=?2",
+                params![recurring_task.id, occurrence_date],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated.title, "云端事务修改事项 - 已更新");
+        assert_eq!(done.status, "done");
+        assert_eq!(duplicate.tasks[0].title, "云端事务修改事项 - 已更新 - 副本");
+        assert!(deleted_at.is_some());
+        assert_eq!(occurrence_status, "done");
+        assert_eq!(outbox_count, 0);
         assert_eq!(rule.version, 1);
     }
 
@@ -6042,7 +5627,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_sibling_order_is_normalized_and_queued_with_move() {
+    fn dense_sibling_order_is_normalized_without_outbox() {
         let database = database();
         let subject_id: String = database
             .open()
@@ -6100,7 +5685,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(queued >= 3);
+        assert_eq!(queued, 0);
     }
 
     #[test]
@@ -6173,7 +5758,7 @@ mod tests {
     }
 
     #[test]
-    fn task_note_update_normalizes_clear_and_preserves_cloud_payload() {
+    fn task_note_update_normalizes_clear_without_outbox() {
         let database = database();
         let task = create_leaf_task(&database, "备注事项");
         let state = configure_cloud_mode(&database);
@@ -6228,20 +5813,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cleared.note, None);
-        let payloads = database
+        let outbox_count: i64 = database
             .open()
             .unwrap()
-            .prepare("SELECT payload_json FROM sync_outbox WHERE entity_id=?1 ORDER BY rowid")
-            .unwrap()
-            .query_map([task.id], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&payloads[0]).unwrap()["note"],
-            "完整备注"
-        );
-        assert!(serde_json::from_str::<Value>(&payloads[1]).unwrap()["note"].is_null());
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]
@@ -6539,7 +6116,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_batch_cloud_mode_queues_create_update_and_delete() {
+    fn legacy_cloud_plan_batch_helper_does_not_create_outbox() {
         let database = database();
         let subject_id: String = database
             .open()
@@ -6604,7 +6181,7 @@ mod tests {
         .unwrap();
         let connection = database.open().unwrap();
         let queued: i64 = connection.query_row("SELECT COUNT(*) FROM sync_outbox WHERE operation_type='task_plan_batch_apply' AND entity_type='task'", [], |row| row.get(0)).unwrap();
-        assert!(queued >= 3);
+        assert_eq!(queued, 0);
         let deleted_at: Option<i64> = connection
             .query_row(
                 "SELECT deleted_at FROM tasks WHERE id=?1",
@@ -6726,19 +6303,12 @@ mod tests {
                 .today_estimate_minutes,
             Some(20)
         );
-        let operations = database.open().unwrap()
-            .prepare("SELECT operation_id,entity_type,depends_on_operation_id FROM sync_outbox ORDER BY rowid")
+        let outbox_count: i64 = database
+            .open()
             .unwrap()
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)))
-            .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
-        // 重复预计只更新模板和按日覆盖；显式加入今日由独立的计划操作负责。
-        assert_eq!(operations.len(), 4);
-        assert_eq!(operations[0].1, "task");
-        assert_eq!(operations[1].1, "task_daily_estimate");
-        assert_eq!(operations[1].2.as_deref(), Some(operations[0].0.as_str()));
-        assert_eq!(operations[2].1, "task");
-        assert_eq!(operations[3].1, "task_daily_estimate");
-        assert_eq!(operations[3].2.as_deref(), Some(operations[2].0.as_str()));
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]

@@ -528,7 +528,7 @@ fn execute_task_sync_with(
     request: SyncExecuteRequest,
     config: &SeaTableConfig,
     client: &impl SeaTableApi,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<SyncExecutionResult, String> {
     let mut connection = database.open()?;
     let workspace_id: String = connection
@@ -617,18 +617,6 @@ fn execute_task_sync_with(
                      ON CONFLICT(workspace_id, provider, entity_type, entity_id) DO UPDATE SET external_id = excluded.external_id, last_synced_at = excluded.last_synced_at",
                     params![Uuid::now_v7().to_string(), workspace_id, item.task_id, external_id, now],
                 ).map_err(|error| error.to_string())?;
-                if let Some((state, operation_type)) = cloud_operation {
-                    let binding_entity_id = format!("seatable|task|{}", item.task_id);
-                    crate::cloud_sync::enqueue_entity_in_transaction(
-                        &transaction,
-                        state,
-                        operation_type,
-                        "external_binding",
-                        Some(&binding_entity_id),
-                        None,
-                        None,
-                    )?;
-                }
                 transaction.commit().map_err(|error| error.to_string())?;
             }
             Err(error) => {
@@ -1908,7 +1896,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_task_sync_persists_external_binding_outbox_transactionally() {
+    fn legacy_cloud_task_sync_persists_binding_without_outbox() {
         let (database, subject_id, task_ids) = database_and_tasks();
         settings::update_setting(
             &database,
@@ -1961,22 +1949,13 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let (operation_type, entity_type, payload_json): (String, String, String) = connection
-            .query_row(
-                "SELECT operation_type, entity_type, payload_json FROM sync_outbox WHERE entity_id = ?1",
-                [format!("seatable|task|{}", task_ids[0])],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
             .unwrap();
-        let payload: Value = serde_json::from_str(&payload_json).unwrap();
 
         assert_eq!(result.success_count, 1);
         assert!(!external_id.is_empty());
-        assert_eq!(operation_type, "external_binding_upsert");
-        assert_eq!(entity_type, "external_binding");
-        assert_eq!(payload["provider"], "seatable");
-        assert_eq!(payload["entity_id"], task_ids[0]);
-        assert_eq!(payload["external_id"], external_id);
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]

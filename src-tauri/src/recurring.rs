@@ -264,7 +264,7 @@ pub fn save_rule(
 fn save_rule_with_cloud_operation(
     database: &Database,
     request: RecurrenceSaveRequest,
-    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+    _cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
 ) -> Result<RecurrenceRuleDto, String> {
     validate_frequency(&request.frequency, request.weekdays_mask)?;
     let start = parse_date(&request.effective_start)?;
@@ -342,39 +342,6 @@ fn save_rule_with_cloud_operation(
     )?;
     bump_revision(&transaction)?;
     let result = load_rule(&transaction, &rule_id)?;
-    if let Some(state) = cloud_state {
-        let task_version: i64 = transaction
-            .query_row(
-                "SELECT version FROM tasks WHERE workspace_id = ?1 AND id = ?2",
-                params![workspace_id, request.task_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        let payload = json!({
-            "action": "save",
-            "task_id": request.task_id,
-            "task_expected_version": request.task_expected_version,
-            "task_version": task_version,
-            "rule_expected_version": request.rule_expected_version,
-            "rule_id": result.id,
-            "frequency": request.frequency,
-            "weekdays_mask": request.weekdays_mask,
-            "effective_start": request.effective_start,
-            "rules": recurrence_rules_payload(&transaction, &workspace_id, &request.task_id)?,
-            "version": result.version
-        });
-        crate::cloud_sync::enqueue_payload_in_transaction(
-            &transaction,
-            state,
-            "task_recurrence_save",
-            "task_recurrence_rule",
-            &request.task_id,
-            request.rule_expected_version,
-            &payload,
-            None,
-            None,
-        )?;
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
 }
@@ -396,7 +363,7 @@ pub fn close_rule(database: &Database, request: RecurrenceCloseRequest) -> Resul
 fn close_rule_with_cloud_operation(
     database: &Database,
     request: RecurrenceCloseRequest,
-    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+    _cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
 ) -> Result<(), String> {
     validate_date(&request.effective_end)?;
     let mut connection = database.open()?;
@@ -448,38 +415,6 @@ fn close_rule_with_cloud_operation(
             now,
         )?;
         bump_revision(&transaction)?;
-    }
-    if let Some(state) = cloud_state {
-        let task_version: i64 = transaction
-            .query_row(
-                "SELECT version FROM tasks WHERE workspace_id = ?1 AND id = ?2",
-                params![workspace_id, request.task_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        let rules = recurrence_rules_payload(&transaction, &workspace_id, &request.task_id)?;
-        let payload = json!({
-            "action": "close",
-            "task_id": request.task_id,
-            "task_expected_version": request.task_expected_version,
-            "task_version": task_version,
-            "rule_expected_version": request.rule_expected_version,
-            "rule_id": current.id,
-            "effective_end": request.effective_end,
-            "rules": rules,
-            "version": request.rule_expected_version + 1
-        });
-        crate::cloud_sync::enqueue_payload_in_transaction(
-            &transaction,
-            state,
-            "task_recurrence_close",
-            "task_recurrence_rule",
-            &request.task_id,
-            Some(request.rule_expected_version),
-            &payload,
-            None,
-            None,
-        )?;
     }
     transaction.commit().map_err(|error| error.to_string())
 }
@@ -946,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_mode_queues_recurrence_rule_changes() {
+    fn legacy_cloud_recurrence_helper_does_not_create_outbox() {
         let (database, _, task_id, task_version) = setup_task();
         let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
         let rule = save_rule(
@@ -1007,24 +942,12 @@ mod tests {
         )
         .unwrap();
         let connection = database.open().unwrap();
-        let (operation_type, entity_type, entity_id, base_version, payload_json): (String, String, String, Option<i64>, String) = connection
-            .query_row(
-                "SELECT operation_type, entity_type, entity_id, base_version, payload_json FROM sync_outbox",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-            )
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
             .unwrap();
-        let payload: Value = serde_json::from_str(&payload_json).unwrap();
-        assert_eq!(operation_type, "task_recurrence_save");
-        assert_eq!(entity_type, "task_recurrence_rule");
-        assert_eq!(entity_id, task_id);
-        assert_eq!(base_version, Some(rule.version));
-        assert_eq!(payload["action"], "save");
-        assert_eq!(payload["frequency"], "weekdays");
-        assert_eq!(payload["version"], changed.version);
-        assert!(payload["rules"]
-            .as_array()
-            .is_some_and(|rules| !rules.is_empty()));
+        assert_eq!(changed.task_id, task_id);
+        assert_eq!(changed.frequency, "weekdays");
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]
@@ -1092,20 +1015,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(historical, ("weekdays".to_string(), Some(today_text), 3));
-        let payload_json: String = connection
-            .query_row(
-                "SELECT payload_json FROM sync_outbox ORDER BY rowid DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
             .unwrap();
-        let payload: Value = serde_json::from_str(&payload_json).unwrap();
-        assert_eq!(payload["action"], "save");
-        assert_eq!(payload["rule_id"], next.id);
-        assert_eq!(payload["rule_expected_version"], same_day.version);
-        assert_eq!(payload["frequency"], "weekly");
-        assert_eq!(payload["weekdays_mask"], 1_i64 << tomorrow_weekday);
-        assert_eq!(payload["rules"].as_array().unwrap().len(), 2);
+        assert_eq!(next.frequency, "weekly");
+        assert_eq!(next.weekdays_mask, Some(1_i64 << tomorrow_weekday));
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]
@@ -1150,17 +1065,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rule_count, 0);
-        let payload_json: String = connection
-            .query_row(
-                "SELECT payload_json FROM sync_outbox ORDER BY rowid DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
             .unwrap();
-        let payload: Value = serde_json::from_str(&payload_json).unwrap();
-        assert_eq!(payload["action"], "close");
-        assert_eq!(payload["rule_id"], rule.id);
-        assert!(payload["rules"].as_array().unwrap().is_empty());
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]
@@ -1202,21 +1110,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, (Some(today_text.clone()), 2));
-        let payload_json: String = connection
-            .query_row(
-                "SELECT payload_json FROM sync_outbox ORDER BY rowid DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
             .unwrap();
-        let payload: Value = serde_json::from_str(&payload_json).unwrap();
-        assert_eq!(payload["action"], "close");
-        assert_eq!(payload["effective_end"], today_text);
-        assert_eq!(payload["rules"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            payload["rules"][0]["effective_end"],
-            payload["effective_end"]
-        );
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]

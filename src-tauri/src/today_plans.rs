@@ -2,7 +2,6 @@ use std::collections::HashSet;
 
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 use crate::database::Database;
 use crate::tasks::{self, TaskDto};
@@ -200,8 +199,8 @@ fn upsert_plan_mapping(
     state: &str,
     instance_task_id: Option<&str>,
     now: i64,
-    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
-    dependency_operation_id: Option<&str>,
+    _cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+    _dependency_operation_id: Option<&str>,
 ) -> Result<TaskDayPlanDto, String> {
     let current: Option<(String, Option<String>, i64, i64)> = transaction
         .query_row(
@@ -227,8 +226,6 @@ fn upsert_plan_mapping(
             instance_task_id: instance_task_id.map(str::to_string),
         });
     }
-    let previous_version = current.as_ref().map(|item| item.2);
-    let created_at = current.as_ref().map(|item| item.3).unwrap_or(now);
     transaction
         .execute(
             "INSERT INTO task_day_plans(workspace_id,task_id,work_date,state,instance_task_id,created_at,updated_at,version)
@@ -246,27 +243,6 @@ fn upsert_plan_mapping(
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
-    if let Some(storage) = cloud_state {
-        crate::cloud_sync::enqueue_payload_in_transaction(
-            transaction,
-            storage,
-            "task_day_plan_materialize",
-            "task_day_plan",
-            &format!("{source_task_id}|{work_date}"),
-            previous_version,
-            &json!({
-                "task_id":source_task_id,
-                "work_date":work_date,
-                "state":state,
-                "instance_task_id":instance_task_id,
-                "created_at":created_at,
-                "updated_at":now,
-                "version":version
-            }),
-            None,
-            dependency_operation_id,
-        )?;
-    }
     Ok(TaskDayPlanDto {
         task_id: source_task_id.to_string(),
         work_date: work_date.to_string(),
@@ -283,8 +259,8 @@ fn move_source_estimate_to_instance(
     instance_task_id: &str,
     work_date: &str,
     now: i64,
-    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
-    dependency_operation_id: Option<&str>,
+    _cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+    _dependency_operation_id: Option<&str>,
 ) -> Result<(), String> {
     let previous: Option<(i64, i64, i64)> = transaction
         .query_row(
@@ -295,7 +271,7 @@ fn move_source_estimate_to_instance(
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    let Some((minutes, created_at, version)) = previous else {
+    let Some((minutes, _, _)) = previous else {
         return Ok(());
     };
     transaction
@@ -313,30 +289,6 @@ fn move_source_estimate_to_instance(
             params![workspace_id, instance_task_id, work_date, minutes, now],
         )
         .map_err(|error| error.to_string())?;
-    if let Some(storage) = cloud_state {
-        crate::cloud_sync::enqueue_payload_in_transaction(
-            transaction,
-            storage,
-            "task_daily_estimate_clear_for_today_instance",
-            "task_daily_estimate",
-            &format!("{source_task_id}|{work_date}"),
-            Some(version),
-            &json!({"task_id":source_task_id,"work_date":work_date,"deleted":true,"created_at":created_at,"updated_at":now,"version":version+1}),
-            None,
-            dependency_operation_id,
-        )?;
-        crate::cloud_sync::enqueue_payload_in_transaction(
-            transaction,
-            storage,
-            "task_daily_estimate_set_for_today_instance",
-            "task_daily_estimate",
-            &format!("{instance_task_id}|{work_date}"),
-            None,
-            &json!({"task_id":instance_task_id,"work_date":work_date,"estimate_minutes":minutes,"created_at":now,"updated_at":now,"version":1}),
-            None,
-            dependency_operation_id,
-        )?;
-    }
     Ok(())
 }
 
@@ -348,8 +300,8 @@ fn initialize_recurring_instance_estimate(
     work_date: &str,
     source_estimate_minutes: Option<i64>,
     now: i64,
-    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
-    dependency_operation_id: Option<&str>,
+    _cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
+    _dependency_operation_id: Option<&str>,
 ) -> Result<(), String> {
     let Some(minutes) = source_estimate_minutes.filter(|minutes| *minutes > 0) else {
         return Ok(());
@@ -378,26 +330,6 @@ fn initialize_recurring_instance_estimate(
             params![workspace_id, instance_task_id, work_date, minutes, now],
         )
         .map_err(|error| error.to_string())?;
-    if let Some(storage) = cloud_state {
-        crate::cloud_sync::enqueue_payload_in_transaction(
-            transaction,
-            storage,
-            "task_daily_estimate_initialize_from_recurring_source",
-            "task_daily_estimate",
-            &format!("{instance_task_id}|{work_date}"),
-            None,
-            &json!({
-                "task_id":instance_task_id,
-                "work_date":work_date,
-                "estimate_minutes":minutes,
-                "created_at":now,
-                "updated_at":now,
-                "version":1
-            }),
-            None,
-            dependency_operation_id,
-        )?;
-    }
     Ok(())
 }
 
@@ -433,17 +365,6 @@ fn ensure_instance_recursive(
                     params![source.title,source.note,source.project_name,source.solution_name,source.estimate_minutes,source.planned_date,now,source_task_id,workspace_id],
                 )
                 .map_err(|error| error.to_string())?;
-            if let Some(storage) = cloud_state {
-                crate::cloud_sync::enqueue_entity_in_transaction(
-                    transaction,
-                    storage,
-                    "task_today_context_promote",
-                    "task",
-                    Some(source_task_id),
-                    Some(version),
-                    dependency_operation_id,
-                )?;
-            }
         }
         return Ok(source_task_id.to_string());
     }
@@ -467,17 +388,6 @@ fn ensure_instance_recursive(
                     params![source.title,source.note,source.project_name,source.solution_name,source.estimate_minutes,source.planned_date,now,instance_id,workspace_id],
                 )
                 .map_err(|error| error.to_string())?;
-            if let Some(storage) = cloud_state {
-                crate::cloud_sync::enqueue_entity_in_transaction(
-                    transaction,
-                    storage,
-                    "task_today_context_promote",
-                    "task",
-                    Some(&instance_id),
-                    Some(version),
-                    dependency_operation_id,
-                )?;
-            }
         }
         if expected_kind == "member" {
             move_source_estimate_to_instance(
@@ -564,19 +474,6 @@ fn ensure_instance_recursive(
                 source.sort_order,completed_at,now,work_date,expected_kind,source_task_id],
         )
         .map_err(|error| error.to_string())?;
-    let task_operation_id = if let Some(storage) = cloud_state {
-        crate::cloud_sync::enqueue_entity_in_transaction(
-            transaction,
-            storage,
-            "task_today_instance_create",
-            "task",
-            Some(&id),
-            None,
-            dependency_operation_id,
-        )?
-    } else {
-        None
-    };
     if expected_kind == "member" {
         move_source_estimate_to_instance(
             transaction,
@@ -586,7 +483,7 @@ fn ensure_instance_recursive(
             work_date,
             now,
             cloud_state,
-            task_operation_id.as_deref().or(dependency_operation_id),
+            dependency_operation_id,
         )?;
         initialize_recurring_instance_estimate(
             transaction,
@@ -597,7 +494,7 @@ fn ensure_instance_recursive(
             source.estimate_minutes,
             now,
             cloud_state,
-            task_operation_id.as_deref().or(dependency_operation_id),
+            dependency_operation_id,
         )?;
     }
     if expected_kind == "member" {
@@ -610,7 +507,7 @@ fn ensure_instance_recursive(
             Some(&id),
             now,
             cloud_state,
-            task_operation_id.as_deref().or(dependency_operation_id),
+            dependency_operation_id,
         )?;
     }
     Ok(id)
@@ -775,17 +672,6 @@ pub(crate) fn archive_day_instance_subtree_in_transaction(
             cloud_state,
             None,
         )?;
-        if let Some(storage) = cloud_state {
-            crate::cloud_sync::enqueue_entity_in_transaction(
-                transaction,
-                storage,
-                "task_today_instance_archive",
-                "task",
-                Some(id),
-                Some(*version),
-                None,
-            )?;
-        }
         if let Some(source_id) = source_id {
             upsert_plan_mapping(
                 transaction,
@@ -835,17 +721,6 @@ pub(crate) fn archive_day_instance_subtree_in_transaction(
                 params![now, context_id, version],
             )
             .map_err(|error| error.to_string())?;
-        if let Some(storage) = cloud_state {
-            crate::cloud_sync::enqueue_entity_in_transaction(
-                transaction,
-                storage,
-                "task_today_context_archive",
-                "task",
-                Some(&context_id),
-                Some(version),
-                None,
-            )?;
-        }
         if let Some(source_id) = source_id {
             upsert_plan_mapping(
                 transaction,
@@ -1361,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_materialization_does_not_enqueue_day_plan_for_context_parent() {
+    fn legacy_cloud_materialization_does_not_create_outbox_rows() {
         let database = database();
         let date = "2026-10-22";
         let parent = create_task(&database, "云端上下文父事项", None);
@@ -1436,7 +1311,7 @@ mod tests {
         assert_eq!(parent_plan_count, 0);
         assert_eq!(parent_outbox_count, 0);
         assert_eq!(child_plan_count, 1);
-        assert_eq!(child_outbox_count, 1);
+        assert_eq!(child_outbox_count, 0);
     }
 
     #[test]

@@ -79,7 +79,7 @@ pub fn get_schedule(
 fn save_schedule_with_cloud_operations(
     database: &Database,
     request: WorkScheduleSaveRequest,
-    state: Option<&crate::supabase::StorageModeSnapshot>,
+    _state: Option<&crate::supabase::StorageModeSnapshot>,
 ) -> Result<Vec<WorkScheduleDayDto>, String> {
     validate_days(&request.days)?;
     let mut connection = database.open()?;
@@ -132,17 +132,6 @@ fn save_schedule_with_cloud_operations(
                     params![Uuid::now_v7().to_string(), workspace_id, day.id, index as i64 + 1, parse_time(&segment.start)?, parse_time(&segment.end)?,],
                 )
                 .map_err(|error| error.to_string())?;
-        }
-        if let Some(state) = state {
-            crate::cloud_sync::enqueue_entity_in_transaction(
-                &transaction,
-                state,
-                "subject_work_schedule_save",
-                "subject_work_schedule",
-                Some(&day.id),
-                Some(day.version),
-                None,
-            )?;
         }
         changed = true;
     }
@@ -529,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_mode_queues_only_real_schedule_changes() {
+    fn legacy_cloud_schedule_helper_never_creates_outbox_rows() {
         let database = database();
         let connection = database.open().unwrap();
         let workspace_id: String = connection
@@ -610,7 +599,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            1
+            0
         );
     }
 }

@@ -477,7 +477,7 @@ pub fn confirm_plan_import(
 fn confirm_plan_import_with_cloud_operation(
     database: &Database,
     request: PlanImportConfirmRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
+    _cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<PlanImportConfirmResult, String> {
     let mut connection = database.open()?;
     let batch: Option<(String, String, String, i64)> = connection
@@ -570,19 +570,6 @@ fn confirm_plan_import_with_cloud_operation(
         )
         .map_err(|error| error.to_string())?;
     bump_revision(&transaction)?;
-    if let Some((state, operation_type)) = cloud_operation {
-        for task_id in &created_ids {
-            crate::cloud_sync::enqueue_entity_in_transaction(
-                &transaction,
-                state,
-                operation_type,
-                "task",
-                Some(task_id),
-                None,
-                None,
-            )?;
-        }
-    }
     transaction.commit().map_err(|error| error.to_string())?;
     let connection = database.open()?;
     let tasks = created_ids
@@ -1329,7 +1316,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_obsidian_import_queues_created_tasks_in_the_same_transaction() {
+    fn legacy_cloud_obsidian_import_does_not_create_outbox_rows() {
         let directory = tempdir().unwrap();
         let vault = directory.path().join("vault");
         fs::create_dir_all(vault.join("工作日报")).unwrap();
@@ -1405,36 +1392,16 @@ mod tests {
         .unwrap();
 
         let connection = database.open().unwrap();
-        let outbox = connection
-            .prepare(
-                "SELECT operation_type, entity_type, entity_id, payload_json FROM sync_outbox ORDER BY created_at, operation_type",
-            )
-            .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
+        let outbox_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
             .unwrap();
 
         assert_eq!(confirmed.tasks.len(), 2);
-        assert!(confirmed.tasks.iter().all(|task| {
-            outbox
-                .iter()
-                .any(|(operation, entity_type, entity_id, payload)| {
-                    let value: serde_json::Value = serde_json::from_str(payload).unwrap();
-                    operation == "obsidian_plan_import"
-                        && entity_type == "task"
-                        && entity_id.as_deref() == Some(&task.id)
-                        && value["source_type"] == "obsidian_import"
-                        && value["planned_date"] == "2026-10-03"
-                })
-        }));
+        assert!(confirmed
+            .tasks
+            .iter()
+            .all(|task| task.planned_date.as_deref() == Some("2026-10-03")));
+        assert_eq!(outbox_count, 0);
     }
 
     #[test]
