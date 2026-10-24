@@ -71,6 +71,7 @@ const unassignedNextSessionIdempotencyPatchFile = path.join(repoRoot, "supabase"
 const legacyUnassignedSuccessorIdempotencyPatchFile = path.join(repoRoot, "supabase", "20261024b_timegenie_legacy_unassigned_successor_idempotency.sql");
 const unassignedSuccessorBoundaryPatchFile = path.join(repoRoot, "supabase", "20261024c_timegenie_unassigned_successor_boundary.sql");
 const retireLegacySyncPatchFile = path.join(repoRoot, "supabase", "20261024d_timegenie_retire_legacy_sync.sql");
+const directReadonlyQueriesPatchFile = path.join(repoRoot, "supabase", "20261024e_timegenie_direct_cloud_readonly_queries.sql");
 
 const binaryNames = process.platform === "win32"
   ? {
@@ -856,6 +857,19 @@ function verifyStaticSchemaInvariants() {
   }
   if ((schemaIntegrationTest.match(/\\ir 20261024d_timegenie_retire_legacy_sync\.sql/g) ?? []).length < 2) {
     throw new Error("The schema integration test must prove the legacy-sync retirement patch is idempotent.");
+  }
+  const directReadonlyQueriesPatch = fs.readFileSync(directReadonlyQueriesPatchFile, "utf8");
+  if (!directReadonlyQueriesPatch.includes("returns void language plpgsql stable security definer")
+      || /for\s+share/i.test(directReadonlyQueriesPatch)) {
+    throw new Error("The direct-cloud authorization patch must be read-only and must not acquire row locks.");
+  }
+  if (!schema.includes("\\ir 20261024e_timegenie_direct_cloud_readonly_queries.sql")) {
+    throw new Error("The source schema must include the direct-cloud read-only query fix.");
+  }
+  if ((schemaIntegrationTest.match(/\ir 20261024e_timegenie_direct_cloud_readonly_queries\.sql/g) ?? []).length < 2
+      || !schemaIntegrationTest.includes("begin read only;")
+      || !schemaIntegrationTest.includes("select timegenie.direct_cloud_context(")) {
+    throw new Error("The schema integration test must exercise direct-cloud authorization in a read-only transaction.");
   }
   for (const expected of [
     "legacy storage protocol column still exists",

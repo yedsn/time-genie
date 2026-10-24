@@ -448,6 +448,7 @@ pub fn run() {
             supabase::storage_mode_set_local,
             supabase::storage_mode_set_cloud,
             supabase::cloud_read_cache_clear,
+            supabase::direct_cloud_force_refresh_prepare,
             supabase::cloud_configure,
             supabase::cloud_project_probe,
             supabase::cloud_sign_in_password,

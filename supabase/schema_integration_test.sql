@@ -8300,6 +8300,8 @@ end $$;
 reset role;
 \ir 20261024d_timegenie_retire_legacy_sync.sql
 \ir 20261024d_timegenie_retire_legacy_sync.sql
+\ir 20261024e_timegenie_direct_cloud_readonly_queries.sql
+\ir 20261024e_timegenie_direct_cloud_readonly_queries.sql
 
 insert into auth.users(id) values('fa000000-0000-0000-0000-000000000001')
 on conflict(id) do nothing;
@@ -8345,4 +8347,30 @@ end $$;
 
 select 'Supabase schema integration tests passed' as result;
 
+rollback;
+
+-- PostgREST can execute query RPCs in a read-only transaction. Authorization
+-- must not request a row lock in that context.
+begin;
+insert into auth.users(id) values('fc000000-0000-0000-0000-000000000001');
+insert into timegenie.workspaces(id,owner_user_id,name) values(
+  'fd000000-0000-0000-0000-000000000001',
+  'fc000000-0000-0000-0000-000000000001',
+  '只读查询工作空间'
+);
+insert into timegenie.devices(id,workspace_id,device_name,platform,app_version) values(
+  'fe000000-0000-0000-0000-000000000001',
+  'fd000000-0000-0000-0000-000000000001',
+  '只读查询设备','windows','0.4.6'
+);
+commit;
+
+begin read only;
+select set_config('request.jwt.claim.sub','fc000000-0000-0000-0000-000000000001',true);
+set local role authenticated;
+select timegenie.direct_cloud_context(
+  'fd000000-0000-0000-0000-000000000001',
+  'fe000000-0000-0000-0000-000000000001',
+  1
+);
 rollback;

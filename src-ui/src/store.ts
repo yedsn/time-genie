@@ -701,8 +701,10 @@ export const useWorkdayStore = defineStore("workday", () => {
         trendDays: 14,
       });
       if (requestSeq === todayOverviewRequestSeq && isCurrent()) replaceRefIfChanged(todayOverview, result);
+      return true;
     } catch (error) {
       console.error("加载今日概览失败", error);
+      return false;
     } finally {
       if (requestSeq === todayOverviewRequestSeq) todayOverviewLoading.value = false;
     }

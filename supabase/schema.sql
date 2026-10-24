@@ -3924,3 +3924,7 @@ notify pgrst, 'reload schema';
 -- Retire the legacy SQLite synchronization protocol and make direct-v2 the
 -- only cloud storage behavior.
 \ir 20261024d_timegenie_retire_legacy_sync.sql
+
+-- Keep direct-cloud authorization compatible with PostgREST read-only query
+-- transactions by avoiding unnecessary row locks.
+\ir 20261024e_timegenie_direct_cloud_readonly_queries.sql

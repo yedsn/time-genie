@@ -4,9 +4,10 @@ TimeGenie 云端模式现在只使用 Supabase 直连。Supabase 是唯一业务
 
 ## 发布顺序
 
-1. 先部署 `supabase/20261024d_timegenie_retire_legacy_sync.sql`。该 SQL 将既有 workspace 收敛到直连语义，并让旧 patch、增量拉取和协议升级 RPC 只返回 `LEGACY_SYNC_UNSUPPORTED`，不得修改业务数据。
-2. 再发布本次桌面客户端。新客户端不读取 `sync_v1/direct_v2` 升级状态，云端模式始终直接查询和修改 Supabase。
-3. 发布后运行 `npm run test:supabase:schema`，再使用专用可丢弃账号运行 `npm run test:supabase:e2e`。
+1. 先部署 `supabase/20261024d_timegenie_retire_legacy_sync.sql`。该 SQL 将既有 workspace 收敛到直连语义，并删除旧 patch、增量拉取和协议升级 RPC，旧客户端不得再修改业务数据。
+2. 紧接着部署 `supabase/20261024e_timegenie_direct_cloud_readonly_queries.sql`。该 SQL 移除直连查询授权中的无必要行锁，使 PostgREST 在只读事务中执行查询 RPC 时不会报 `cannot execute SELECT FOR SHARE in a read-only transaction`。
+3. 再发布本次桌面客户端。新客户端不读取 `sync_v1/direct_v2` 升级状态，云端模式始终直接查询和修改 Supabase。
+4. 发布后运行 `npm run test:supabase:schema`，再使用专用可丢弃账号运行 `npm run test:supabase:e2e`。
 
 ## 旧客户端策略
 

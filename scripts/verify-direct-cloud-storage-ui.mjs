@@ -45,6 +45,7 @@ for (const expected of [
 for (const expected of [
   "stageLocalDataCopyToCloud", "replaceCloudWithStagedLocalData",
   "replaceLocalWithCloudDataCopy", "setCloudStorageMode", "storage_mode_set_cloud",
+  "prepareDirectCloudForceRefresh", "direct_cloud_force_refresh_prepare",
 ]) {
   if (!service.includes(expected) && !rust.includes(expected) && !lib.includes(expected)) {
     throw new Error(`直连云端复制/切换服务缺少：${expected}`);
@@ -62,7 +63,12 @@ for (const forbidden of [
 for (const expected of [
   `v-if="directCloudEnabled" class="secondary-button compact"`,
   "data-direct-cloud-refresh",
-  "刷新云端数据",
+  "强制刷新云端数据",
+  `return "强制刷新";`,
+  "storageState.value = await prepareDirectCloudForceRefresh();",
+  "store.clearCloudBusinessMemory();",
+  "store.loadTimeHistory(store.timeHistoryPage, true)",
+  "已丢弃本机云端缓存，并强制读取 Supabase 最新数据",
 ]) {
   if (!workbench.includes(expected)) throw new Error(`direct_v2 设置页能力边界缺少：${expected}`);
 }

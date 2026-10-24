@@ -2490,6 +2490,84 @@ fn direct_cloud_access_state_for_error(error: &str) -> (DirectCloudAccessState, 
     )
 }
 
+fn is_workspace_epoch_stale(error: &str) -> bool {
+    error.starts_with("WORKSPACE_EPOCH_STALE:")
+}
+
+fn refresh_direct_cloud_epoch(
+    database: &Database,
+    context: &DirectCloudReadContext,
+) -> Result<DirectCloudReadContext, String> {
+    let value = client(database)?.rpc_for_database_with_epoch(
+        database,
+        "direct_cloud_context",
+        json!({
+            "p_workspace_id": context.workspace_id,
+            "p_device_id": context.device_id,
+            "p_expected_epoch": Value::Null,
+        }),
+        &context.session,
+        context.workspace_epoch,
+    )?;
+    let workspace_id = value
+        .get("workspaceId")
+        .and_then(Value::as_str)
+        .filter(|value| *value == context.workspace_id)
+        .ok_or_else(|| "CLOUD_RESPONSE_INVALID: 云端工作空间上下文无效".to_string())?;
+    let device_id = value
+        .get("deviceId")
+        .and_then(Value::as_str)
+        .filter(|value| *value == context.device_id)
+        .ok_or_else(|| "CLOUD_RESPONSE_INVALID: 云端设备上下文无效".to_string())?;
+    let workspace_epoch = value
+        .get("workspaceEpoch")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "CLOUD_RESPONSE_INVALID: 云端工作空间 epoch 无效".to_string())?;
+    let change_seq = value
+        .get("changeSeq")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    if let Ok(cache) = crate::cloud_read_cache::CloudReadCache::for_database(database) {
+        let _ = cache.clear_workspace(workspace_id);
+    }
+    write_direct_cloud_checkpoint(
+        database,
+        &DirectCloudCheckpoint {
+            workspace_id: workspace_id.to_string(),
+            device_id: device_id.to_string(),
+            change_seq,
+            workspace_epoch,
+            fetched_at: Some(now_seconds() * 1_000),
+            last_error: None,
+            auth_blocked_reason: None,
+        },
+    )?;
+    if value
+        .get("writable")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+    {
+        record_direct_cloud_access_success(workspace_id);
+    } else {
+        set_direct_cloud_access_runtime(
+            workspace_id,
+            DirectCloudAccessState::DegradedReadonly,
+            value
+                .get("readOnlyReason")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| Some("Supabase 当前只读，已重新读取最新云端数据".to_string())),
+        );
+    }
+    Ok(DirectCloudReadContext {
+        workspace_id: workspace_id.to_string(),
+        device_id: device_id.to_string(),
+        workspace_epoch,
+        session: context.session.clone(),
+    })
+}
+
 fn direct_cloud_query<T: for<'de> Deserialize<'de> + Serialize>(
     database: &Database,
     function: &str,
@@ -2554,14 +2632,27 @@ fn direct_cloud_query<T: for<'de> Deserialize<'de> + Serialize>(
             }
         }
     }
-    let value = match client(database)?.rpc_for_database_with_epoch(
+    let api = client(database)?;
+    let mut effective_context = context.clone();
+    let value = match api.rpc_for_database_with_epoch(
         database,
         function,
-        body,
-        &context.session,
-        context.workspace_epoch,
+        body.clone(),
+        &effective_context.session,
+        effective_context.workspace_epoch,
     ) {
         Ok(value) => value,
+        Err(error) if is_workspace_epoch_stale(&error) => {
+            effective_context = refresh_direct_cloud_epoch(database, &effective_context)?;
+            body["p_expected_epoch"] = json!(effective_context.workspace_epoch);
+            api.rpc_for_database_with_epoch(
+                database,
+                function,
+                body,
+                &effective_context.session,
+                effective_context.workspace_epoch,
+            )?
+        }
         Err(error) => {
             record_direct_cloud_access_error(&context.workspace_id, &error);
             crate::direct_cloud_observability::record_query_error(&context.workspace_id, &error);
@@ -2675,13 +2766,30 @@ fn revalidate_direct_cloud_query(
     query_key: &str,
 ) -> Result<(), String> {
     let started_at = Instant::now();
-    let value = client(database)?.rpc_for_database_with_epoch(
+    let api = client(database)?;
+    let mut effective_context = context.clone();
+    let mut body = body;
+    let value = match api.rpc_for_database_with_epoch(
         database,
         function,
-        body,
-        &context.session,
-        context.workspace_epoch,
-    )?;
+        body.clone(),
+        &effective_context.session,
+        effective_context.workspace_epoch,
+    ) {
+        Ok(value) => value,
+        Err(error) if is_workspace_epoch_stale(&error) => {
+            effective_context = refresh_direct_cloud_epoch(database, &effective_context)?;
+            body["p_expected_epoch"] = json!(effective_context.workspace_epoch);
+            api.rpc_for_database_with_epoch(
+                database,
+                function,
+                body,
+                &effective_context.session,
+                effective_context.workspace_epoch,
+            )?
+        }
+        Err(error) => return Err(error),
+    };
     let response: DirectCloudQueryResponse<Value> = serde_json::from_value(value.clone())
         .map_err(|error| format!("CLOUD_RESPONSE_INVALID: {function} 响应无效: {error}"))?;
     record_direct_cloud_checkpoint(database, &response.metadata)?;
@@ -2822,7 +2930,7 @@ fn direct_cloud_mutation_with_context<T: for<'de> Deserialize<'de>>(
         .unwrap_or_else(|| Uuid::now_v7().to_string());
     Uuid::parse_str(&operation_id)
         .map_err(|_| "VALIDATION_ERROR: operationId 必须是 UUID".to_string())?;
-    let body = json!({
+    let mut body = json!({
         "p_workspace_id": context.workspace_id,
         "p_device_id": context.device_id,
         "p_operation_id": operation_id,
@@ -2830,14 +2938,26 @@ fn direct_cloud_mutation_with_context<T: for<'de> Deserialize<'de>>(
         "p_payload": payload,
     });
     let api = client(database)?;
+    let mut effective_context = context.clone();
     let value = match api.rpc_for_database_with_epoch(
         database,
         function,
         body.clone(),
-        &context.session,
-        context.workspace_epoch,
+        &effective_context.session,
+        effective_context.workspace_epoch,
     ) {
         Ok(value) => value,
+        Err(error) if is_workspace_epoch_stale(&error) => {
+            effective_context = refresh_direct_cloud_epoch(database, &effective_context)?;
+            body["p_expected_epoch"] = json!(effective_context.workspace_epoch);
+            api.rpc_for_database_with_epoch(
+                database,
+                function,
+                body,
+                &effective_context.session,
+                effective_context.workspace_epoch,
+            )?
+        }
         Err(error)
             if error.starts_with("NETWORK_ERROR:")
                 || error.starts_with("CLOUD_TIMEOUT:")
@@ -2847,8 +2967,8 @@ fn direct_cloud_mutation_with_context<T: for<'de> Deserialize<'de>>(
                 database,
                 function,
                 body,
-                &context.session,
-                context.workspace_epoch,
+                &effective_context.session,
+                effective_context.workspace_epoch,
             ) {
                 Ok(value) => value,
                 Err(retry_error) => {
@@ -3567,6 +3687,21 @@ pub fn cloud_read_cache_clear(
 ) -> Result<StorageModeSnapshot, String> {
     crate::cloud_read_cache::CloudReadCache::for_database(&database)?.clear_all()?;
     storage_mode(&database)
+}
+
+fn direct_cloud_force_refresh_prepare_for_database(
+    database: &Database,
+) -> Result<StorageModeSnapshot, String> {
+    let context = direct_cloud_read_context(database)?;
+    refresh_direct_cloud_epoch(database, &context)?;
+    storage_mode(database)
+}
+
+#[tauri::command]
+pub fn direct_cloud_force_refresh_prepare(
+    database: tauri::State<'_, Database>,
+) -> Result<StorageModeSnapshot, String> {
+    direct_cloud_force_refresh_prepare_for_database(&database)
 }
 
 #[tauri::command]
@@ -7090,6 +7225,243 @@ mod tests {
             direct_cloud_access_runtime(workspace_id).map(|runtime| runtime.state),
             Some(DirectCloudAccessState::OnlineWritable)
         );
+    }
+
+    #[test]
+    fn stale_workspace_epoch_refreshes_checkpoint_and_retries_query() {
+        let _guard = lock_test_session_state();
+        reset_test_credentials();
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("epoch-query.sqlite3")).unwrap();
+        let workspace_id = "20000000-0000-0000-0000-0000000000c9";
+        let device_id: String = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM devices WHERE revoked_at IS NULL ORDER BY created_at LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let context_body = Box::leak(
+            serde_json::to_string(&json!({
+                "workspaceId":workspace_id,"deviceId":device_id,
+                "storageProtocol":"direct_v2","workspaceEpoch":7,"changeSeq":11,
+                "serverTime":"2026-10-24T23:00:00+08:00","writable":true,
+                "readOnlyReason":null
+            }))
+            .unwrap()
+            .into_boxed_str(),
+        );
+        let query_body = Box::leak(
+            serde_json::to_string(&json!({
+                "metadata":{"workspaceId":workspace_id,"deviceId":device_id,
+                    "storageProtocol":"direct_v2","workspaceEpoch":7,"changeSeq":11,
+                    "serverTime":"2026-10-24T23:00:00+08:00","domains":["tasks"],
+                    "writable":true},
+                "data":{"tasks":[]}
+            }))
+            .unwrap()
+            .into_boxed_str(),
+        );
+        let server = TestHttpServer::start(vec![
+            TestHttpResponse {
+                path: "/rest/v1/rpc/direct_cloud_task_list",
+                status: 400,
+                body: r#"{"code":"P0001","message":"WORKSPACE_EPOCH_STALE: expected 1, current 7"}"#,
+            },
+            TestHttpResponse {
+                path: "/rest/v1/rpc/direct_cloud_context",
+                status: 200,
+                body: context_body,
+            },
+            TestHttpResponse {
+                path: "/rest/v1/rpc/direct_cloud_task_list",
+                status: 200,
+                body: query_body,
+            },
+        ]);
+        configure_test_cloud_state(&database, &server.base_url(), workspace_id);
+        cache_session(
+            workspace_id,
+            &test_session("epoch-query", Some(now_seconds() + 3600)),
+        )
+        .unwrap();
+
+        let result = direct_cloud_task_list_for_command(
+            &database,
+            crate::tasks::TaskListRequest {
+                subject_id: None,
+                include_completed: Some(true),
+                planned_date: None,
+                today_date: None,
+                today_only: None,
+                daily_estimate_date: None,
+                query: None,
+            },
+        )
+        .unwrap();
+        assert!(result.tasks.is_empty());
+        let checkpoint = read_direct_cloud_checkpoint(&database.open().unwrap(), workspace_id);
+        assert_eq!((checkpoint.workspace_epoch, checkpoint.change_seq), (7, 11));
+        let requests = server.finish();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].contains("\"p_expected_epoch\":null"));
+        assert!(requests[2].contains("\"p_expected_epoch\":7"));
+    }
+
+    #[test]
+    fn force_refresh_uses_authoritative_epoch_and_clears_workspace_cache() {
+        let _guard = lock_test_session_state();
+        reset_test_credentials();
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("force-refresh.sqlite3")).unwrap();
+        let workspace_id = "20000000-0000-0000-0000-0000000000cb";
+        let device_id: String = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM devices WHERE revoked_at IS NULL ORDER BY created_at LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let context_body = Box::leak(
+            serde_json::to_string(&json!({
+                "workspaceId":workspace_id,"deviceId":device_id,
+                "storageProtocol":"direct_v2","workspaceEpoch":9,"changeSeq":31,
+                "serverTime":"2026-10-25T00:10:00+08:00","writable":true,
+                "readOnlyReason":null
+            }))
+            .unwrap()
+            .into_boxed_str(),
+        );
+        let server = TestHttpServer::start(vec![TestHttpResponse {
+            path: "/rest/v1/rpc/direct_cloud_context",
+            status: 200,
+            body: context_body,
+        }]);
+        configure_test_cloud_state(&database, &server.base_url(), workspace_id);
+        let session = test_session("force-refresh", Some(now_seconds() + 3600));
+        cache_session(workspace_id, &session).unwrap();
+        let cache = crate::cloud_read_cache::CloudReadCache::for_database(&database).unwrap();
+        let cache_key = crate::cloud_read_cache::CloudReadCacheKey {
+            account_id: &session.user_id,
+            workspace_id,
+            domain: "tasks",
+            query_key: "old-query",
+        };
+        cache
+            .save(
+                &cache_key,
+                &crate::cloud_read_cache::CloudReadCacheSnapshot {
+                    payload: json!({"old":true}),
+                    workspace_epoch: 1,
+                    change_seq: 3,
+                    fetched_at: now_seconds() * 1_000,
+                },
+                now_seconds() * 1_000,
+            )
+            .unwrap();
+        let business_before =
+            crate::storage_contract::business_data_fingerprint(&database).unwrap();
+
+        let state = direct_cloud_force_refresh_prepare_for_database(&database).unwrap();
+
+        assert_eq!((state.workspace_epoch, state.last_change_seq), (9, 31));
+        assert_eq!(
+            crate::storage_contract::business_data_fingerprint(&database).unwrap(),
+            business_before
+        );
+        let checkpoint = read_direct_cloud_checkpoint(&database.open().unwrap(), workspace_id);
+        assert_eq!((checkpoint.workspace_epoch, checkpoint.change_seq), (9, 31));
+        assert!(cache
+            .read(&cache_key, now_seconds() * 1_000)
+            .unwrap()
+            .is_none());
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("\"p_expected_epoch\":null"));
+    }
+
+    #[test]
+    fn stale_workspace_epoch_retries_mutation_with_the_same_operation_id() {
+        let _guard = lock_test_session_state();
+        reset_test_credentials();
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("epoch-mutation.sqlite3")).unwrap();
+        let workspace_id = "20000000-0000-0000-0000-0000000000ca";
+        let device_id: String = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM devices WHERE revoked_at IS NULL ORDER BY created_at LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let context_body = Box::leak(
+            serde_json::to_string(&json!({
+                "workspaceId":workspace_id,"deviceId":device_id,
+                "storageProtocol":"direct_v2","workspaceEpoch":7,"changeSeq":12,
+                "serverTime":"2026-10-24T23:00:00+08:00","writable":true,
+                "readOnlyReason":null
+            }))
+            .unwrap()
+            .into_boxed_str(),
+        );
+        let mutation_body = Box::leak(
+            serde_json::to_string(&json!({
+                "operationId":"70000000-0000-0000-0000-0000000000ca",
+                "metadata":{"workspaceId":workspace_id,"deviceId":device_id,
+                    "storageProtocol":"direct_v2","workspaceEpoch":7,"changeSeq":13,
+                    "serverTime":"2026-10-24T23:00:01+08:00","domains":["tasks"],
+                    "writable":true},
+                "data":{"saved":true}
+            }))
+            .unwrap()
+            .into_boxed_str(),
+        );
+        let server = TestHttpServer::start(vec![
+            TestHttpResponse {
+                path: "/rest/v1/rpc/direct_cloud_test_mutation",
+                status: 400,
+                body: r#"{"code":"P0001","message":"WORKSPACE_EPOCH_STALE: expected 1, current 7"}"#,
+            },
+            TestHttpResponse {
+                path: "/rest/v1/rpc/direct_cloud_context",
+                status: 200,
+                body: context_body,
+            },
+            TestHttpResponse {
+                path: "/rest/v1/rpc/direct_cloud_test_mutation",
+                status: 200,
+                body: mutation_body,
+            },
+        ]);
+        configure_test_cloud_state(&database, &server.base_url(), workspace_id);
+        cache_session(
+            workspace_id,
+            &test_session("epoch-mutation", Some(now_seconds() + 3600)),
+        )
+        .unwrap();
+        let operation_id = "70000000-0000-0000-0000-0000000000ca";
+        let response: DirectCloudMutationResponse<Value> = direct_cloud_mutation(
+            &database,
+            "direct_cloud_test_mutation",
+            Some(operation_id.to_string()),
+            json!({"title":"测试"}),
+        )
+        .unwrap();
+        assert_eq!(response.data, json!({"saved":true}));
+        let requests = server.finish();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].contains(operation_id));
+        assert!(requests[2].contains(operation_id));
+        assert!(requests[2].contains("\"p_expected_epoch\":7"));
     }
 
     #[test]

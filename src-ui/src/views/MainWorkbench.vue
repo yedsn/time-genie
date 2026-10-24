@@ -4,7 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { AlertTriangle, CalendarDays, CheckCircle2, Clock3, Copy, Database, FileText, Folder, Home, LoaderCircle, Minus, Pencil, Plus, RefreshCw, Save, Settings, Square, UserRound, X } from "lucide-vue-next";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useWorkdayStore, type Task } from "../store";
-import { checkAppUpdate, clearCloudReadCache, closeMainWindow, confirmDailyReportImport, configureCloud, downloadAndInstallUpdate, executeSeaTableTaskSync, getCloudSession, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listTodayTasks, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onOpenTimerTaskSelection, onTimerFactFollowed, onTrayCheckUpdate, previewDailyReportImport, previewSeaTableTaskSync, previewStorageMigration, probeCloudProject, registerCloudDevice, replaceCloudWithStagedLocalData, replaceLocalWithCloudDataCopy, restartApp, retryFailedSeaTableSync, revokeCloudDevice, setCloudStorageMode, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, stageLocalDataCopyToCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudProjectProbe, type CloudSessionSnapshot, type DailyReportImportPreviewItem, type DailyReportImportPreviewResult, type DailyReportImportTargetKind, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
+import { checkAppUpdate, clearCloudReadCache, closeMainWindow, confirmDailyReportImport, configureCloud, downloadAndInstallUpdate, executeSeaTableTaskSync, getCloudSession, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listTodayTasks, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onOpenTimerTaskSelection, onTimerFactFollowed, onTrayCheckUpdate, prepareDirectCloudForceRefresh, previewDailyReportImport, previewSeaTableTaskSync, previewStorageMigration, probeCloudProject, registerCloudDevice, replaceCloudWithStagedLocalData, replaceLocalWithCloudDataCopy, restartApp, retryFailedSeaTableSync, revokeCloudDevice, setCloudStorageMode, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, stageLocalDataCopyToCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudProjectProbe, type CloudSessionSnapshot, type DailyReportImportPreviewItem, type DailyReportImportPreviewResult, type DailyReportImportTargetKind, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
 import PlanListEditor from "../components/PlanListEditor.vue";
 import CompletedTaskHistory from "../components/CompletedTaskHistory.vue";
 import GlobalTimerBar from "../components/GlobalTimerBar.vue";
@@ -219,14 +219,14 @@ const cloudDockRequiresStorageAttention = computed(() => (
 const cloudDockSyncTitle = computed(() => {
   if (storageState.value?.mode !== "cloud") return "当前使用本地存储";
   if (!cloudSession.value?.signedIn) return "前往数据存储设置登录";
-  return cloudBusinessReadOnly.value ? "前往数据存储查看只读原因" : "重新读取 Supabase 最新数据";
+  return "忽略本机缓存和旧代次，强制重新读取 Supabase 最新数据";
 });
 const cloudDockSyncLabel = computed(() => {
   if (storageState.value?.mode !== "cloud" || !cloudSession.value?.signedIn) return "设置";
-  return cloudBusinessReadOnly.value ? "只读" : "刷新";
+  return "强制刷新";
 });
 const cloudStatePillTitle = computed(() => `${cloudSaveLabel.value}，点击查看云端状态`);
-const cloudDockWorkingLabel = computed(() => "刷新中");
+const cloudDockWorkingLabel = computed(() => "强制刷新中");
 const subjectScheduleStorageNote = computed(() => {
   if (storageState.value?.mode !== "cloud") return "保存后只写入本机。";
   return "保存后会直接提交到 Supabase，不会写入本机等待同步。";
@@ -545,15 +545,30 @@ async function logoutSupabase() {
 
 async function handleCloudDockSync() {
   if (directCloudEnabled.value) {
-    if (cloudBusinessReadOnly.value) {
-      await openCloudStorageSettings();
-      return;
-    }
     cloudSyncWorking.value = true;
     try {
-      await Promise.all([store.loadWorkspaceData(true), store.loadTimeData(true), store.refreshReports(true), store.loadUnassignedState(false, true), store.loadTodayOverview(undefined, true)]);
+      storageState.value = await prepareDirectCloudForceRefresh();
+      executionPanelOpen.value = false;
+      store.clearCloudBusinessMemory();
+      await store.refreshWorkspaceCalendar();
+      const workspaceLoaded = await store.loadWorkspaceData(true);
+      if (!workspaceLoaded) throw new Error("未能从 Supabase 重新读取事项数据");
+      const primaryResults = await Promise.allSettled([
+        store.loadTimeData(true),
+        store.refreshReports(true),
+        store.loadUnassignedState(false, true),
+        store.loadTimeHistory(store.timeHistoryPage, true),
+      ]);
+      const derivedResults = await Promise.allSettled([
+        store.loadTodayPlan(store.selectedSubjectId, true),
+        store.loadTodayOverview(undefined, true),
+      ]);
+      const refreshFailed = [...primaryResults, ...derivedResults].some((result) => (
+        result.status === "rejected" || result.value === false
+      ));
+      if (refreshFailed) throw new Error("部分云端数据未能重新读取，请检查连接后重试");
       storageState.value = await getStorageMode();
-      ElMessage.success("已重新读取 Supabase 最新数据");
+      ElMessage.success("已丢弃本机云端缓存，并强制读取 Supabase 最新数据");
     } catch (error) {
       ElMessage.error(error instanceof Error ? error.message : String(error));
     } finally {
@@ -1777,10 +1792,10 @@ async function handleCompletedTaskDelete(task: Task) {
             <button class="secondary-button compact" type="button" :disabled="cloudProbeWorking || cloudWorking" @click="probeSupabaseProject"><LoaderCircle v-if="cloudProbeWorking" class="sync-spin" :size="13" />{{ cloudProbeWorking ? '检测中...' : '重新检测' }}</button>
           </div>
           <div v-if="storageState?.mode === 'cloud'" class="cloud-sync-actions storage-status-actions">
-            <button v-if="directCloudEnabled" class="secondary-button compact" type="button" :disabled="cloudSyncWorking" data-direct-cloud-refresh @click="handleCloudDockSync"><LoaderCircle v-if="cloudSyncWorking" class="sync-spin" :size="13" />{{ cloudSyncWorking ? '刷新中...' : '刷新云端数据' }}</button>
+            <button v-if="directCloudEnabled" class="secondary-button compact" type="button" :disabled="cloudSyncWorking" data-direct-cloud-refresh @click="handleCloudDockSync"><LoaderCircle v-if="cloudSyncWorking" class="sync-spin" :size="13" />{{ cloudSyncWorking ? '强制刷新中...' : '强制刷新云端数据' }}</button>
             <button class="secondary-button compact" type="button" :disabled="cloudWorking" @click="clearPersistentCloudCache">清除云端缓存</button>
           </div>
-          <div v-if="cloudBusinessReadOnly" class="cloud-sync-banner offline" data-cloud-readonly-banner><AlertTriangle :size="16" /><div><strong>{{ storageState?.cacheSource ? '云端只读缓存' : '云端当前只读' }}</strong><span>{{ cloudReadOnlyReason }}{{ storageState?.cacheFetchedAt ? ` · 缓存更新于 ${formatSyncTime(storageState.cacheFetchedAt)}` : storageState?.lastSyncedAt ? ` · 最近刷新 ${formatSyncTime(storageState.lastSyncedAt)}` : '' }}</span></div><button class="secondary-button compact" type="button" :disabled="cloudSyncWorking" @click="handleCloudDockSync">查看连接状态</button></div>
+          <div v-if="cloudBusinessReadOnly" class="cloud-sync-banner offline" data-cloud-readonly-banner><AlertTriangle :size="16" /><div><strong>{{ storageState?.cacheSource ? '云端只读缓存' : '云端当前只读' }}</strong><span>{{ cloudReadOnlyReason }}{{ storageState?.cacheFetchedAt ? ` · 缓存更新于 ${formatSyncTime(storageState.cacheFetchedAt)}` : storageState?.lastSyncedAt ? ` · 最近刷新 ${formatSyncTime(storageState.lastSyncedAt)}` : '' }}</span></div><button class="secondary-button compact" type="button" :disabled="cloudSyncWorking" @click="handleCloudDockSync">强制刷新云端数据</button></div>
 
           <div class="storage-section storage-connection-section">
             <div class="storage-section-heading"><div><strong>连接配置</strong><small>用于连接当前 Supabase 项目</small></div><span>公开配置</span></div>

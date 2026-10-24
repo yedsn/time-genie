@@ -1721,6 +1721,10 @@ export async function clearCloudReadCache(): Promise<StorageModeSnapshot> {
   return await invoke("cloud_read_cache_clear");
 }
 
+export async function prepareDirectCloudForceRefresh(): Promise<StorageModeSnapshot> {
+  return await invoke("direct_cloud_force_refresh_prepare");
+}
+
 export async function configureCloud(projectUrl: string, anonKey: string): Promise<StorageModeSnapshot> {
   return await invoke("cloud_configure", { request: { projectUrl, anonKey } });
 }
