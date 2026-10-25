@@ -15,9 +15,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW, LoadImageW, PostMessageW,
     PostQuitMessage, RegisterClassW, SetForegroundWindow, TrackPopupMenu, TranslateMessage,
-    CW_USEDEFAULT, HICON, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, MF_SEPARATOR, MF_STRING,
-    MSG, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    CW_USEDEFAULT, HICON, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, MF_CHECKED, MF_SEPARATOR,
+    MF_STRING, MSG, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP,
+    WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 const TRAY_ID: u32 = 1;
@@ -30,6 +30,7 @@ const MENU_RESUME: usize = 4;
 const MENU_STOP: usize = 5;
 const MENU_CHECK_UPDATE: usize = 6;
 const MENU_QUIT: usize = 7;
+const MENU_TOGGLE_SHORTCUT: usize = 8;
 static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 static NATIVE_PRESENTATION: OnceLock<Mutex<NativePresentation>> = OnceLock::new();
 static NATIVE_WINDOW: AtomicIsize = AtomicIsize::new(0);
@@ -171,6 +172,14 @@ unsafe fn show_menu(window: HWND) {
         return;
     }
     append_item(menu, MENU_OPEN, "打开工作台");
+    if let Some(app) = APP_HANDLE.get() {
+        append_check_item(
+            menu,
+            MENU_TOGGLE_SHORTCUT,
+            "启用快捷键",
+            super::current_shortcuts_enabled(app),
+        );
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
     append_item(menu, MENU_START, "开始计时");
     append_item(menu, MENU_PAUSE, "暂停计时");
@@ -198,6 +207,7 @@ unsafe fn show_menu(window: HWND) {
     };
     match selected as usize {
         MENU_OPEN => super::show(app, "main"),
+        MENU_TOGGLE_SHORTCUT => super::toggle_shortcuts_from_tray(app),
         MENU_START => super::run_native_tray_timer_action(app, super::TrayTimerAction::Start),
         MENU_PAUSE => super::run_native_tray_timer_action(app, super::TrayTimerAction::Pause),
         MENU_RESUME => super::run_native_tray_timer_action(app, super::TrayTimerAction::Resume),
@@ -214,6 +224,12 @@ unsafe fn show_menu(window: HWND) {
 unsafe fn append_item(menu: *mut core::ffi::c_void, id: usize, label: &str) {
     let label = wide(label);
     AppendMenuW(menu, MF_STRING, id, label.as_ptr());
+}
+
+unsafe fn append_check_item(menu: *mut core::ffi::c_void, id: usize, label: &str, checked: bool) {
+    let label = wide(label);
+    let flags = MF_STRING | if checked { MF_CHECKED } else { 0 };
+    AppendMenuW(menu, flags, id, label.as_ptr());
 }
 
 unsafe fn load_icon() -> HICON {

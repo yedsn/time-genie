@@ -2076,6 +2076,18 @@ export async function onTrayCheckUpdate(handler: () => void) {
   }
 }
 
+export async function onShortcutsChanged(
+  handler: (payload: { enabled: boolean; mainWindowShortcut: string }) => void,
+) {
+  try {
+    return await listen("shortcuts-changed", ({ payload }) => {
+      handler(payload as { enabled: boolean; mainWindowShortcut: string });
+    });
+  } catch {
+    return () => {};
+  }
+}
+
 export async function onAppUpdateEvent(handler: (payload: AppUpdateEventPayload) => void) {
   try {
     return await listen("app-update-event", ({ payload }) => handler(payload as AppUpdateEventPayload));

@@ -4,7 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { AlertTriangle, CalendarDays, CheckCircle2, Clock3, Copy, Database, FileText, Folder, Home, Keyboard, LoaderCircle, Minus, Pencil, Plus, RefreshCw, Save, Settings, Square, UserRound, X } from "lucide-vue-next";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useWorkdayStore, type Task } from "../store";
-import { checkAppUpdate, clearCloudReadCache, closeMainWindow, confirmDailyReportImport, configureCloud, downloadAndInstallUpdate, executeSeaTableTaskSync, getCloudSession, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listTodayTasks, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onOpenTimerTaskSelection, onTimerFactFollowed, onTrayCheckUpdate, prepareDirectCloudForceRefresh, previewDailyReportImport, previewSeaTableTaskSync, previewStorageMigration, probeCloudProject, registerCloudDevice, replaceCloudWithStagedLocalData, replaceLocalWithCloudDataCopy, restartApp, retryFailedSeaTableSync, revokeCloudDevice, setCloudStorageMode, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, stageLocalDataCopyToCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudProjectProbe, type CloudSessionSnapshot, type DailyReportImportPreviewItem, type DailyReportImportPreviewResult, type DailyReportImportTargetKind, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
+import { checkAppUpdate, clearCloudReadCache, closeMainWindow, confirmDailyReportImport, configureCloud, downloadAndInstallUpdate, executeSeaTableTaskSync, getCloudSession, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listTodayTasks, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onOpenTimerTaskSelection, onShortcutsChanged, onTimerFactFollowed, onTrayCheckUpdate, prepareDirectCloudForceRefresh, previewDailyReportImport, previewSeaTableTaskSync, previewStorageMigration, probeCloudProject, registerCloudDevice, replaceCloudWithStagedLocalData, replaceLocalWithCloudDataCopy, restartApp, retryFailedSeaTableSync, revokeCloudDevice, setCloudStorageMode, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, stageLocalDataCopyToCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudProjectProbe, type CloudSessionSnapshot, type DailyReportImportPreviewItem, type DailyReportImportPreviewResult, type DailyReportImportTargetKind, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
 import PlanListEditor from "../components/PlanListEditor.vue";
 import CompletedTaskHistory from "../components/CompletedTaskHistory.vue";
 import GlobalTimerBar from "../components/GlobalTimerBar.vue";
@@ -148,6 +148,7 @@ const settingsDraft = reactive({
   trayMenuSuppressHover: true,
   trayIconStyle: "status-orb" as "status-orb" | "minimal" | "app-icon",
   startMinimized: false,
+  shortcutsEnabled: true,
   mainWindowShortcut: "Alt+T",
   storageMode: "local" as "local" | "cloud",
   supabaseProjectUrl: "",
@@ -257,6 +258,7 @@ let cloudDataRefreshTimer: number | undefined;
 let unlistenTimerFactFollowed: (() => void) | undefined;
 let unlistenTrayCheckUpdate: (() => void) | undefined;
 let unlistenAppUpdateEvent: (() => void) | undefined;
+let unlistenShortcutsChanged: (() => void) | undefined;
 const completingTaskIds = new Set<string>();
 const startingTimerTaskIds = new Set<string>();
 const recentCompletedTaskId = ref("");
@@ -416,6 +418,7 @@ async function loadSettings() {
     const trayIconStyle = settingString("device", "tray_icon_style", "status-orb");
     settingsDraft.trayIconStyle = trayIconStyle === "minimal" || trayIconStyle === "app-icon" ? trayIconStyle : "status-orb";
     settingsDraft.startMinimized = settingBoolean("device", "start_minimized");
+    settingsDraft.shortcutsEnabled = settingBoolean("device", "shortcuts_enabled", settingBoolean("device", "main_window_shortcut_enabled", true));
     settingsDraft.mainWindowShortcut = settingString("device", "main_window_shortcut", "Alt+T");
     settingsDraft.storageMode = settingsSnapshot.value.storageMode;
     settingsDraft.supabaseProjectUrl = settingString("device", "supabase_project_url");
@@ -440,6 +443,7 @@ async function saveSettings() {
     await updateSetting("device", "tray_menu_suppress_hover", settingsDraft.trayMenuSuppressHover);
     await updateSetting("device", "tray_icon_style", settingsDraft.trayIconStyle);
     await updateSetting("device", "start_minimized", settingsDraft.startMinimized);
+    await updateSetting("device", "shortcuts_enabled", settingsDraft.shortcutsEnabled);
     await updateSetting("device", "main_window_shortcut", settingsDraft.mainWindowShortcut.trim());
     await updateSetting("device", "completion_feedback_enabled", settingsDraft.completionFeedbackEnabled);
     setCompletionFeedbackEnabled(settingsDraft.completionFeedbackEnabled);
@@ -977,6 +981,10 @@ onMounted(async () => {
     void handleCheckUpdate();
   });
   unlistenAppUpdateEvent = await onAppUpdateEvent(updateProgressLabel);
+  unlistenShortcutsChanged = await onShortcutsChanged(({ enabled, mainWindowShortcut }) => {
+    settingsDraft.shortcutsEnabled = enabled;
+    settingsDraft.mainWindowShortcut = mainWindowShortcut;
+  });
 });
 
 onUnmounted(() => {
@@ -995,6 +1003,7 @@ onUnmounted(() => {
   unlistenTimerFactFollowed?.();
   unlistenTrayCheckUpdate?.();
   unlistenAppUpdateEvent?.();
+  unlistenShortcutsChanged?.();
   if (recentCompletedTimer) window.clearTimeout(recentCompletedTimer);
 });
 
@@ -1992,8 +2001,9 @@ async function handleCompletedTaskDelete(task: Task) {
 
         <div id="settings-shortcuts" data-settings-section="shortcuts" class="work-panel settings-panel">
           <div class="panel-title"><h2>快捷键</h2><span>当前设备独立设置</span></div>
+          <label class="switch-line"><input v-model="settingsDraft.shortcutsEnabled" :disabled="!settingsLoaded" type="checkbox" />启用快捷键</label>
           <label>快速打开主窗口<input v-model="settingsDraft.mainWindowShortcut" :disabled="!settingsLoaded" placeholder="Alt+T" /></label>
-          <p class="settings-help">默认 Alt+T。可使用 Ctrl、Alt、Shift、Super 与字母或数字组合，例如 Ctrl+Shift+T。主窗口激活时按 Esc 可关闭到托盘。</p>
+          <p class="settings-help">关闭后将停用全部应用快捷键，包括当前的 Alt+T 及以后新增的快捷键；Esc 隐藏主窗口始终可用，不受此开关影响。打开主窗口快捷键可使用 Ctrl、Alt、Shift、Super 与字母或数字组合，例如 Ctrl+Shift+T。</p>
           <button class="primary-button settings-save-button" type="button" :disabled="!settingsLoaded || settingsSaving || !settingsDraft.mainWindowShortcut.trim()" @click="saveSettings">{{ settingsSaving ? '保存中...' : '保存快捷键' }}</button>
         </div>
 

@@ -474,6 +474,7 @@ fn validate_setting_key(scope: &SettingsScope, key: &str) -> Result<(), String> 
         .as_slice(),
         SettingsScope::Device => [
             "main_window_shortcut",
+            "shortcuts_enabled",
             "tray_hover_enabled",
             "tray_menu_suppress_hover",
             "tray_icon_style",
@@ -510,6 +511,9 @@ fn validate_setting_value(key: &str, value: &Value) -> Result<(), String> {
             .is_none_or(|shortcut| shortcut.trim().is_empty() || shortcut.len() > 64)
     {
         return Err("打开主窗口快捷键不能为空且不能超过 64 个字符".to_string());
+    }
+    if key == "shortcuts_enabled" && !value.is_boolean() {
+        return Err("快捷键启用状态必须是布尔值".to_string());
     }
     if (key == "salary_hourly_rate" || key.starts_with("subject_salary_hourly_rate:"))
         && value
@@ -581,6 +585,24 @@ pub(crate) fn main_window_shortcut(database: &Database) -> String {
         })
         .and_then(|value| value.as_str().map(str::to_string))
         .unwrap_or_else(|| "Alt+T".to_string())
+}
+
+pub(crate) fn shortcuts_enabled(database: &Database) -> bool {
+    database
+        .open()
+        .ok()
+        .and_then(|connection| {
+            read_device_value(&connection, "shortcuts_enabled")
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    read_device_value(&connection, "main_window_shortcut_enabled")
+                        .ok()
+                        .flatten()
+                })
+        })
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true)
 }
 
 fn credential_entry(provider: &str, workspace_id: &str) -> Result<Entry, String> {
@@ -866,8 +888,17 @@ pub fn settings_update(
     let previous_shortcut = shortcut_change
         .as_ref()
         .map(|_| crate::current_main_window_shortcut(&app));
+    let shortcuts_enabled_change = (matches!(&request.scope, SettingsScope::Device)
+        && request.key == "shortcuts_enabled")
+        .then(|| request.value.as_bool())
+        .flatten();
+    let previous_shortcuts_enabled =
+        shortcuts_enabled_change.map(|_| crate::current_shortcuts_enabled(&app));
     if let Some(shortcut) = shortcut_change.as_deref() {
         crate::set_main_window_shortcut(&app, shortcut)?;
+    }
+    if let Some(enabled) = shortcuts_enabled_change {
+        crate::set_shortcuts_enabled(&app, enabled)?;
     }
     let refresh_tray =
         matches!(&request.scope, SettingsScope::Device) && request.key == "tray_icon_style";
@@ -889,6 +920,9 @@ pub fn settings_update(
         Err(error) => {
             if let Some(previous) = previous_shortcut {
                 let _ = crate::set_main_window_shortcut(&app, &previous);
+            }
+            if let Some(previous) = previous_shortcuts_enabled {
+                let _ = crate::set_shortcuts_enabled(&app, previous);
             }
             return Err(error);
         }
@@ -1202,6 +1236,39 @@ mod tests {
         let serialized = serde_json::to_string(&snapshot).unwrap();
         assert!(!serialized.to_ascii_lowercase().contains("refresh_token"));
         assert!(!serialized.to_ascii_lowercase().contains("base_api_token"));
+    }
+
+    #[test]
+    fn shortcuts_enabled_is_boolean_defaults_to_enabled_and_reads_legacy_value() {
+        let directory = tempdir().unwrap();
+        let database = Database::initialize_at(directory.path().join("shortcut.sqlite3")).unwrap();
+        assert!(shortcuts_enabled(&database));
+        update_device_setting(
+            &database,
+            "main_window_shortcut_enabled",
+            serde_json::json!(false),
+        )
+        .unwrap();
+        assert!(!shortcuts_enabled(&database));
+        update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "shortcuts_enabled".to_string(),
+                value: serde_json::json!(true),
+            },
+        )
+        .unwrap();
+        assert!(shortcuts_enabled(&database));
+        assert!(update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "shortcuts_enabled".to_string(),
+                value: serde_json::json!("false"),
+            },
+        )
+        .is_err());
     }
 
     #[test]

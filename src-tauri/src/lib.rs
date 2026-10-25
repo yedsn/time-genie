@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, Rect};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
@@ -70,6 +70,7 @@ const TRAY_MENU_SUPPRESS: Duration = Duration::from_millis(1200);
 const UPDATE_CHECK_MENU_LABEL: &str = "检查更新";
 const APP_UPDATE_EVENT: &str = "app-update-event";
 const TRAY_CHECK_UPDATE_EVENT: &str = "tray-check-update";
+const SHORTCUTS_CHANGED_EVENT: &str = "shortcuts-changed";
 const DEFAULT_UPDATER_ENDPOINT: &str =
     "https://github.com/OWNER/REPO/releases/latest/download/latest.json";
 const DEFAULT_UPDATER_PUBKEY: &str = "REPLACE_WITH_TAURI_UPDATER_PUBLIC_KEY";
@@ -79,6 +80,7 @@ static UPDATE_CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
 static MAIN_WINDOW_HWND: AtomicIsize = AtomicIsize::new(0);
 
 struct MainWindowShortcut(Mutex<String>);
+struct ShortcutsEnabled(AtomicBool);
 
 #[derive(Debug)]
 struct HoverState {
@@ -102,6 +104,7 @@ struct AppTrayIcon {
     _icon: TrayIcon<tauri::Wry>,
     default_icon: tauri::image::Image<'static>,
     timer_menu: TrayTimerMenu,
+    shortcuts_enabled: CheckMenuItem<tauri::Wry>,
     last_presentation_key: Mutex<String>,
 }
 
@@ -282,12 +285,13 @@ pub fn run() {
             cloud_sync::spawn_background_services(database.clone(), app.handle().clone());
             app.manage(database.clone());
             let main_window_shortcut = settings::main_window_shortcut(&database);
+            let shortcuts_enabled = settings::shortcuts_enabled(&database);
             app.manage(MainWindowShortcut(Mutex::new(main_window_shortcut.clone())));
-            if let Err(error) = app
-                .global_shortcut()
-                .register(main_window_shortcut.as_str())
-            {
-                eprintln!("主窗口快捷键 {main_window_shortcut} 注册失败: {error}");
+            app.manage(ShortcutsEnabled(AtomicBool::new(shortcuts_enabled)));
+            if shortcuts_enabled {
+                if let Err(error) = register_app_shortcuts(app.handle()) {
+                    eprintln!("应用快捷键注册失败: {error}");
+                }
             }
             #[cfg(target_os = "windows")]
             install_main_window_escape_handler(app.handle());
@@ -301,6 +305,14 @@ pub fn run() {
             }));
             let _ = HOVER_STATE.set(Arc::clone(&state));
             let show_main = MenuItem::with_id(app, "show_main", "打开工作台", true, None::<&str>)?;
+            let shortcuts_enabled_item = CheckMenuItem::with_id(
+                app,
+                "toggle_shortcuts",
+                "启用快捷键",
+                true,
+                shortcuts_enabled,
+                None::<&str>,
+            )?;
             let timer_menu = TrayTimerMenu {
                 start: MenuItem::with_id(app, "start_timer", "开始计时", true, None::<&str>)?,
                 pause: MenuItem::with_id(app, "pause_timer", "暂停计时", false, None::<&str>)?,
@@ -320,6 +332,7 @@ pub fn run() {
                 app,
                 &[
                     &show_main,
+                    &shortcuts_enabled_item,
                     &timer_menu.start,
                     &timer_menu.pause,
                     &timer_menu.resume,
@@ -357,6 +370,7 @@ pub fn run() {
                         hide(app, "hover");
                         match event.id().as_ref() {
                             "show_main" | "show_today" => show(app, "main"),
+                            "toggle_shortcuts" => toggle_shortcuts_from_tray(app),
                             "check_update" => {
                                 run_tray_update_check(app.clone(), check_update.clone())
                             }
@@ -423,6 +437,7 @@ pub fn run() {
                 _icon: tray_icon,
                 default_icon: default_tray_icon.to_owned(),
                 timer_menu,
+                shortcuts_enabled: shortcuts_enabled_item,
                 last_presentation_key: Mutex::new(initial_presentation.cache_key()),
             });
             let _ = refresh_tray_presentation(app.handle(), &database);
@@ -1207,6 +1222,59 @@ pub(crate) fn current_main_window_shortcut(app: &AppHandle) -> String {
         .unwrap_or_else(|_| "Alt+T".to_string())
 }
 
+pub(crate) fn current_shortcuts_enabled(app: &AppHandle) -> bool {
+    app.state::<ShortcutsEnabled>().0.load(Ordering::Acquire)
+}
+
+fn sync_shortcuts_ui(app: &AppHandle) {
+    let shortcut = current_main_window_shortcut(app);
+    let enabled = current_shortcuts_enabled(app);
+    if let Some(tray) = app.try_state::<AppTrayIcon>() {
+        let _ = tray.shortcuts_enabled.set_checked(enabled);
+    }
+    let _ = app.emit(
+        SHORTCUTS_CHANGED_EVENT,
+        serde_json::json!({ "enabled": enabled, "mainWindowShortcut": shortcut }),
+    );
+}
+
+fn toggle_shortcuts_from_tray(app: &AppHandle) {
+    let previous = current_shortcuts_enabled(app);
+    let enabled = !previous;
+    if let Err(error) = set_shortcuts_enabled(app, enabled) {
+        eprintln!("切换应用快捷键失败: {error}");
+        sync_shortcuts_ui(app);
+        return;
+    }
+    let database = app.state::<Database>();
+    if let Err(error) = settings::update_setting(
+        database.inner(),
+        settings::SettingsUpdate {
+            scope: settings::SettingsScope::Device,
+            key: "shortcuts_enabled".to_string(),
+            value: serde_json::json!(enabled),
+        },
+    ) {
+        let _ = set_shortcuts_enabled(app, previous);
+        eprintln!("保存应用快捷键启用状态失败: {error}");
+    }
+    sync_shortcuts_ui(app);
+}
+
+fn register_app_shortcuts(app: &AppHandle) -> Result<(), String> {
+    let shortcut = current_main_window_shortcut(app);
+    app.global_shortcut()
+        .register(shortcut.as_str())
+        .map_err(|error| format!("快捷键 {shortcut} 无效或已被占用: {error}"))
+}
+
+fn unregister_app_shortcuts(app: &AppHandle) -> Result<(), String> {
+    let shortcut = current_main_window_shortcut(app);
+    app.global_shortcut()
+        .unregister(shortcut.as_str())
+        .map_err(|error| format!("停用快捷键 {shortcut} 失败: {error}"))
+}
+
 fn is_escape_shortcut(shortcut: &Shortcut) -> bool {
     shortcut.matches(Modifiers::empty(), Code::Escape)
 }
@@ -1289,18 +1357,39 @@ pub(crate) fn set_main_window_shortcut(app: &AppHandle, shortcut: &str) -> Resul
     }
     let current = current_main_window_shortcut(app);
     if current.eq_ignore_ascii_case(shortcut) {
+        sync_shortcuts_ui(app);
         return Ok(());
     }
-    let manager = app.global_shortcut();
-    let _ = manager.unregister(current.as_str());
-    if let Err(error) = manager.register(shortcut) {
-        let _ = manager.register(current.as_str());
-        return Err(format!("快捷键 {shortcut} 无效或已被占用: {error}"));
+    if current_shortcuts_enabled(app) {
+        let manager = app.global_shortcut();
+        let _ = manager.unregister(current.as_str());
+        if let Err(error) = manager.register(shortcut) {
+            let _ = manager.register(current.as_str());
+            return Err(format!("快捷键 {shortcut} 无效或已被占用: {error}"));
+        }
     }
     *app.state::<MainWindowShortcut>()
         .0
         .lock()
         .map_err(|_| "快捷键状态不可用".to_string())? = shortcut.to_string();
+    sync_shortcuts_ui(app);
+    Ok(())
+}
+
+pub(crate) fn set_shortcuts_enabled(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let state = app.state::<ShortcutsEnabled>();
+    let previous = state.0.load(Ordering::Acquire);
+    if previous == enabled {
+        sync_shortcuts_ui(app);
+        return Ok(());
+    }
+    if enabled {
+        register_app_shortcuts(app)?;
+    } else {
+        unregister_app_shortcuts(app)?;
+    }
+    state.0.store(enabled, Ordering::Release);
+    sync_shortcuts_ui(app);
     Ok(())
 }
 
