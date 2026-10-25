@@ -780,7 +780,7 @@ pub(crate) fn clear_daily_estimate_for_day_plan_in_transaction(
     workspace_id: &str,
     task_id: &str,
     work_date: &str,
-    now: i64,
+    _now: i64,
     _cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
     _dependency_operation_id: Option<&str>,
 ) -> Result<(), String> {
@@ -968,24 +968,6 @@ fn set_recurring_task_estimate_with_cloud_operation(
     let result = load_task(&transaction, &request.task_id)?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(result)
-}
-
-#[cfg(test)]
-pub(crate) fn set_task_daily_estimate_for_cloud_test(
-    database: &Database,
-    request: TaskDailyEstimateSetRequest,
-    cloud_state: &crate::supabase::StorageModeSnapshot,
-) -> Result<TaskDailyEstimateDto, String> {
-    set_task_daily_estimate_with_cloud_operation(database, request, Some(cloud_state))
-}
-
-#[cfg(test)]
-pub(crate) fn set_task_daily_estimate_batch_for_cloud_test(
-    database: &Database,
-    request: TaskDailyEstimateBatchSetRequest,
-    cloud_state: &crate::supabase::StorageModeSnapshot,
-) -> Result<TaskDailyEstimateBatchSetResult, String> {
-    set_task_daily_estimate_batch_with_cloud_operation(database, request, Some(cloud_state))
 }
 
 #[cfg(test)]
@@ -1222,15 +1204,6 @@ fn create_positioned_task_with_cloud_operation(
 #[cfg(test)]
 pub fn update_task(database: &Database, request: TaskUpdateRequest) -> Result<TaskDto, String> {
     update_task_with_cloud_operation(database, request, None)
-}
-
-#[cfg(test)]
-pub(crate) fn update_task_for_cloud_test(
-    database: &Database,
-    request: TaskUpdateRequest,
-    state: &crate::supabase::StorageModeSnapshot,
-) -> Result<TaskDto, String> {
-    update_task_with_cloud_operation(database, request, Some((state, "task_update")))
 }
 
 fn update_task_with_cloud_operation(

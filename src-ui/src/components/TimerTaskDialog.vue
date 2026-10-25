@@ -13,7 +13,7 @@ import {
   type ExecutionPanelMode,
   type ExecutionPanelTaskRow,
 } from "../services/executionTaskPanelCore";
-import { contextMenuPosition, hierarchicalTaskSelectionRows, taskSubtreeIds, toggleTaskSelectionGroup } from "../services/planTaskInteractionCore";
+import { contextMenuPosition, hierarchicalTaskSelectionRows, orderedTaskSelectionWithAncestors, taskSubtreeIds, toggleTaskSelectionGroup } from "../services/planTaskInteractionCore";
 import { createTaskTreeSortable } from "../services/taskTreeSortable";
 import { parseActualMinutes } from "../services/quickActualAdjustmentCore";
 import { readRememberedPanelSubjectId, rememberPanelSubjectId } from "../services/executionPanelSubjectPreference";
@@ -324,7 +324,7 @@ async function keyboardMove(task: PanelTask, direction: "indent" | "outdent") {
 async function confirmAddExistingTodayTasks() {
   if (!todayPickerSelected.value.length) return;
   try {
-    await store.addTasksToToday([...todayPickerSelected.value]);
+    await store.addTasksToToday(orderedTaskSelectionWithAncestors(todayPickerSourceTasks.value, todayPickerSelected.value));
     await store.loadTodayPlan(subjectId.value);
     todayPickerSelected.value = [];
     todayPickerQuery.value = "";

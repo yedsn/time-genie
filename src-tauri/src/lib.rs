@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, Rect};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tauri_plugin_updater::UpdaterExt;
 use uuid::Uuid;
 
@@ -69,6 +70,8 @@ const DEFAULT_UPDATER_ENDPOINT: &str =
 const DEFAULT_UPDATER_PUBKEY: &str = "REPLACE_WITH_TAURI_UPDATER_PUBLIC_KEY";
 static HOVER_STATE: OnceLock<Arc<Mutex<HoverState>>> = OnceLock::new();
 static UPDATE_CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
+
+struct MainWindowShortcut(Mutex<String>);
 
 #[derive(Debug)]
 struct HoverState {
@@ -253,6 +256,15 @@ pub fn run() {
     };
     builder
         .plugin(tauri_plugin_dialog::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state == ShortcutState::Pressed {
+                        show(app, "main");
+                    }
+                })
+                .build(),
+        )
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
@@ -262,6 +274,14 @@ pub fn run() {
             automation_hooks::recover_interrupted_runs(&database).map_err(std::io::Error::other)?;
             cloud_sync::spawn_background_services(database.clone(), app.handle().clone());
             app.manage(database.clone());
+            let main_window_shortcut = settings::main_window_shortcut(&database);
+            app.manage(MainWindowShortcut(Mutex::new(main_window_shortcut.clone())));
+            if let Err(error) = app
+                .global_shortcut()
+                .register(main_window_shortcut.as_str())
+            {
+                eprintln!("主窗口快捷键 {main_window_shortcut} 注册失败: {error}");
+            }
             let state = Arc::new(Mutex::new(HoverState {
                 generation: 0,
                 pending: false,
@@ -1168,6 +1188,36 @@ fn show(app: &AppHandle, label: &str) {
     } else {
         eprintln!("窗口 {label} 不存在，无法显示");
     }
+}
+
+pub(crate) fn current_main_window_shortcut(app: &AppHandle) -> String {
+    app.state::<MainWindowShortcut>()
+        .0
+        .lock()
+        .map(|shortcut| shortcut.clone())
+        .unwrap_or_else(|_| "Alt+T".to_string())
+}
+
+pub(crate) fn set_main_window_shortcut(app: &AppHandle, shortcut: &str) -> Result<(), String> {
+    let shortcut = shortcut.trim();
+    if shortcut.is_empty() {
+        return Err("打开主窗口快捷键不能为空".to_string());
+    }
+    let current = current_main_window_shortcut(app);
+    if current.eq_ignore_ascii_case(shortcut) {
+        return Ok(());
+    }
+    let manager = app.global_shortcut();
+    let _ = manager.unregister(current.as_str());
+    if let Err(error) = manager.register(shortcut) {
+        let _ = manager.register(current.as_str());
+        return Err(format!("快捷键 {shortcut} 无效或已被占用: {error}"));
+    }
+    *app.state::<MainWindowShortcut>()
+        .0
+        .lock()
+        .map_err(|_| "快捷键状态不可用".to_string())? = shortcut.to_string();
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]

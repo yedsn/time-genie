@@ -1224,19 +1224,6 @@ fn create_template_with_cloud_operation(
     Ok(result)
 }
 
-#[cfg(test)]
-pub fn create_template_for_cloud_test(
-    database: &Database,
-    request: ReportTemplateCreateRequest,
-) -> Result<ReportTemplateDto, String> {
-    let state = crate::supabase::storage_mode(database)?;
-    create_template_with_cloud_operation(
-        database,
-        request,
-        Some((&state, "report_template_create")),
-    )
-}
-
 fn update_template_with_cloud_operation(
     database: &Database,
     request: ReportTemplateUpdateRequest,
@@ -1346,19 +1333,6 @@ fn set_default_template_with_cloud_operation(
     Ok(result)
 }
 
-#[cfg(test)]
-pub fn set_default_template_for_cloud_test(
-    database: &Database,
-    request: ReportTemplateSetDefaultRequest,
-) -> Result<ReportTemplateDto, String> {
-    let state = crate::supabase::storage_mode(database)?;
-    set_default_template_with_cloud_operation(
-        database,
-        request,
-        Some((&state, "report_template_set_default")),
-    )
-}
-
 fn delete_template_with_cloud_operation(
     database: &Database,
     request: ReportTemplateDeleteRequest,
@@ -1413,14 +1387,6 @@ fn delete_template_with_cloud_operation(
     }
     bump_revision(&transaction)?;
     transaction.commit().map_err(|error| error.to_string())
-}
-
-#[cfg(test)]
-pub fn delete_template_for_cloud_test(
-    database: &Database,
-    request: ReportTemplateDeleteRequest,
-) -> Result<(), String> {
-    delete_template_with_cloud_operation(database, request)
 }
 
 fn reorder_templates_with_cloud_operation(

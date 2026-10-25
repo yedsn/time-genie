@@ -6,7 +6,7 @@ import "md-editor-v3/lib/style.css";
 import { CalendarDays, CheckCircle2, Circle, Clock3, Copy, CornerDownRight, DatabaseZap, FileInput, FilePenLine, GripVertical, IndentDecrease, IndentIncrease, ListMinus, ListPlus, MessageSquareText, Minus, Play, Plus, Radio, Repeat2, TimerReset, Trash2 } from "lucide-vue-next";
 import type { Task } from "../store";
 import { isActivePlanTask } from "../services/completedTaskHistoryCore";
-import { contextMenuPosition, hierarchicalTaskSelectionRows, taskSubtreeIds, todayEstimateDraft, toggleTaskSelectionGroup } from "../services/planTaskInteractionCore";
+import { contextMenuPosition, hierarchicalTaskSelectionRows, orderedTaskSelectionWithAncestors, taskSubtreeIds, todayEstimateDraft, toggleTaskSelectionGroup } from "../services/planTaskInteractionCore";
 import { createTaskTreeSortable } from "../services/taskTreeSortable";
 import type { ActualAdjustmentBatchRequest, ActualAdjustmentBatchResult, ActualAdjustmentSnapshotRecord, ActualAdjustmentSnapshotTaskRecord } from "../services/tauri";
 import { adjustQuickEstimateMinutes, parseQuickEstimateMinutes } from "../services/quickPlanEstimateCore";
@@ -1068,7 +1068,10 @@ function todayImportEstimateChanged(task: Task, minutes?: number) {
 
 async function saveTodaySourceImport() {
   if (todayImportSaving.value) return;
-  const newlySelectedIds = todayImportSelection.value.filter((taskId) => !todayPlannedIds.value.has(taskId));
+  const newlySelectedIds = orderedTaskSelectionWithAncestors(
+    activeImportTasks.value,
+    todayImportSelection.value.filter((taskId) => !todayPlannedIds.value.has(taskId)),
+  );
   if (!newlySelectedIds.length) return;
   todayImportSaving.value = true;
   try {

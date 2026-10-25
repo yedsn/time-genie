@@ -94,6 +94,7 @@ import { clampHistoryPage, collectTodayEntryTaskIds, findEntryInHistory, isToday
 import { completedTaskHistoryFallbackPage, isCurrentCompletedTaskHistoryRequest } from "./services/completedTaskHistoryCore";
 import { canAcceptInlineTimerChild, inlineTimerParentUnavailableReason } from "./services/inlineTimerTaskCreationCore";
 import type { QuickPlanBatchRequest } from "./services/quickPlanTextCore";
+import { orderedTaskSelectionWithAncestors } from "./services/planTaskInteractionCore";
 import { beginTodayPlanRequest, isCurrentTodayPlanRequest, resolveTodayPlanOutcome } from "./services/todayPlanRequestCore";
 import {
   applyReportPage,
@@ -1252,16 +1253,17 @@ export const useWorkdayStore = defineStore("workday", () => {
 
   async function addTasksToToday(taskIds: string[]) {
     if (!taskIds.length) return;
-    const selectedTasks = taskIds.map((taskId) => [...todayPlanTasks, ...tasks].find((item) => item.id === taskId));
+    const orderedTaskIds = orderedTaskSelectionWithAncestors(tasks, taskIds);
+    const selectedTasks = orderedTaskIds.map((taskId) => tasks.find((item) => item.id === taskId));
     const subjectId = selectedTasks.find(Boolean)?.subjectId ?? selectedSubjectId.value;
     if (!subjectId) return;
     if (selectedTasks.some((task) => task && task.subjectId !== subjectId)) throw new Error("只能批量加入同一主体的事项");
     const workDate = await ensureWorkspaceCalendar();
-    await setTaskDayPlanBatch(subjectId, workDate, taskIds.map((taskId) => {
-      const task = [...todayPlanTasks, ...tasks].find((item) => item.id === taskId);
+    await setTaskDayPlanBatch(subjectId, workDate, orderedTaskIds.map((taskId) => {
+      const task = tasks.find((item) => item.id === taskId);
       return { taskId, state: "included" as const, expectedVersion: task?.dayPlanVersion };
     }));
-    for (const taskId of taskIds) {
+    for (const taskId of orderedTaskIds) {
       const source = tasks.find((task) => task.id === taskId);
       if (source) source.dayPlanState = "included";
     }

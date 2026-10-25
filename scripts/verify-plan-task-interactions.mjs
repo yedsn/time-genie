@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { contextMenuPosition, effectiveTodayEstimate, hierarchicalTaskSelectionRows, planTaskMoveIntent, taskDragTargetDepth, taskDragTargetInvalid, taskSubtreeIds, todayEstimateDraft, toggleTaskSelectionGroup } from "../.tmp-plan-task-interactions-test/planTaskInteractionCore.js";
+import { contextMenuPosition, effectiveTodayEstimate, hierarchicalTaskSelectionRows, orderedTaskSelectionWithAncestors, planTaskMoveIntent, taskDragTargetDepth, taskDragTargetInvalid, taskSubtreeIds, todayEstimateDraft, toggleTaskSelectionGroup } from "../.tmp-plan-task-interactions-test/planTaskInteractionCore.js";
 
 const rows = [
   { id: "a" },
@@ -36,6 +36,8 @@ assert.deepEqual(hierarchicalTaskSelectionRows(rows, selectableIds, [], { query:
 assert.deepEqual(toggleTaskSelectionGroup([], ["a1", "a2"]), ["a1", "a2"]);
 assert.deepEqual(toggleTaskSelectionGroup(["a1", "a2"], ["a1", "a2"]), []);
 assert.deepEqual(toggleTaskSelectionGroup(["b1"], ["a1", "a2"]), ["b1", "a1", "a2"]);
+assert.deepEqual(orderedTaskSelectionWithAncestors(rows, ["a2"]), ["a", "a2"]);
+assert.deepEqual(orderedTaskSelectionWithAncestors(rows, ["a2", "a1"]), ["a", "a1", "a2"]);
 assert.equal(taskDragTargetDepth(0, 80, 0), 0);
 assert.equal(taskDragTargetDepth(0, 100, 0), 1);
 assert.equal(taskDragTargetDepth(1, 20, 0), 1);

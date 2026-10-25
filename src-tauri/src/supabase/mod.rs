@@ -1234,7 +1234,8 @@ struct DirectCloudRecurrenceData {
 struct DirectCloudOccurrenceStatusData {
     task: DirectCloudTaskData,
     occurrence: crate::recurring::TaskOccurrenceDto,
-    instance: Option<DirectCloudTaskData>,
+    #[serde(rename = "instance")]
+    _instance: Option<DirectCloudTaskData>,
 }
 
 #[derive(Debug, Deserialize)]

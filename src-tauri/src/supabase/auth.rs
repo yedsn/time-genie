@@ -1228,6 +1228,7 @@ pub(crate) fn mark_auth_blocked(database: &Database, reason: &str) -> Result<(),
     write_direct_cloud_checkpoint(database, &checkpoint)
 }
 
+#[cfg(test)]
 pub(crate) fn clear_auth_blocked(database: &Database) -> Result<(), String> {
     let connection = database.open()?;
     let workspace_id = read_device_setting_string(&connection, "cloud_workspace_id")?;

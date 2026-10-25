@@ -1,7 +1,6 @@
 use chrono::{Datelike, Duration, NaiveDate};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::database::Database;
@@ -347,15 +346,6 @@ fn save_rule_with_cloud_operation(
 }
 
 #[cfg(test)]
-pub(crate) fn save_rule_for_cloud_test(
-    database: &Database,
-    request: RecurrenceSaveRequest,
-    cloud_state: &crate::supabase::StorageModeSnapshot,
-) -> Result<RecurrenceRuleDto, String> {
-    save_rule_with_cloud_operation(database, request, Some(cloud_state))
-}
-
-#[cfg(test)]
 pub fn close_rule(database: &Database, request: RecurrenceCloseRequest) -> Result<(), String> {
     close_rule_with_cloud_operation(database, request, None)
 }
@@ -417,38 +407,6 @@ fn close_rule_with_cloud_operation(
         bump_revision(&transaction)?;
     }
     transaction.commit().map_err(|error| error.to_string())
-}
-
-fn recurrence_rules_payload(
-    connection: &Connection,
-    workspace_id: &str,
-    task_id: &str,
-) -> Result<Vec<Value>, String> {
-    let mut statement = connection
-        .prepare(
-            "SELECT id, task_id, frequency, weekdays_mask, effective_start, effective_end, created_at, updated_at, version
-             FROM task_recurrence_rules WHERE workspace_id = ?1 AND task_id = ?2
-             ORDER BY effective_start, id",
-        )
-        .map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map(params![workspace_id, task_id], |row| {
-            Ok(json!({
-                "id": row.get::<_, String>(0)?,
-                "task_id": row.get::<_, String>(1)?,
-                "frequency": row.get::<_, String>(2)?,
-                "weekdays_mask": row.get::<_, Option<i64>>(3)?,
-                "effective_start": row.get::<_, String>(4)?,
-                "effective_end": row.get::<_, Option<String>>(5)?,
-                "created_at": row.get::<_, i64>(6)?,
-                "updated_at": row.get::<_, i64>(7)?,
-                "version": row.get::<_, i64>(8)?
-            }))
-        })
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    Ok(rows)
 }
 
 pub fn task_has_active_rule(

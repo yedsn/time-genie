@@ -105,6 +105,44 @@ export function toggleTaskSelectionGroup(selectedIds: readonly string[], groupId
   return [...selectedIds, ...normalizedGroup.filter((taskId) => !selected.has(taskId))];
 }
 
+export function orderedTaskSelectionWithAncestors(
+  tasks: readonly PlanTaskTreeItem[],
+  selectedIds: readonly string[],
+) {
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  const included = new Set<string>();
+  for (const selectedId of selectedIds) {
+    let current = byId.get(selectedId);
+    const branch = new Set<string>();
+    while (current && !branch.has(current.id)) {
+      included.add(current.id);
+      branch.add(current.id);
+      current = current.parentId ? byId.get(current.parentId) : undefined;
+    }
+  }
+
+  const children = new Map<string, PlanTaskTreeItem[]>();
+  const roots: PlanTaskTreeItem[] = [];
+  for (const task of tasks) {
+    if (!included.has(task.id)) continue;
+    if (task.parentId && included.has(task.parentId)) {
+      const rows = children.get(task.parentId) ?? [];
+      rows.push(task);
+      children.set(task.parentId, rows);
+    } else {
+      roots.push(task);
+    }
+  }
+
+  const ordered: string[] = [];
+  const append = (task: PlanTaskTreeItem) => {
+    ordered.push(task.id);
+    for (const child of children.get(task.id) ?? []) append(child);
+  };
+  for (const root of roots) append(root);
+  return ordered;
+}
+
 export function taskDragTargetDepth(relatedDepth: number, pointerX: number, listLeft: number, indentThreshold = 92): 0 | 1 {
   return relatedDepth > 0 || pointerX > listLeft + indentThreshold ? 1 : 0;
 }

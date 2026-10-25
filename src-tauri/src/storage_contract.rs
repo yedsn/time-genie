@@ -1,11 +1,14 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use serde_json::Value;
 
 use crate::database::Database;
 
+#[cfg(test)]
 pub const STORAGE_BOUNDARIES_JSON: &str = include_str!("../storage-boundaries.json");
 // Kept temporarily while the server-side retirement migration removes legacy protocol fields.
+#[cfg(test)]
 pub const LEGACY_SYNC_PROTOCOL: &str = "sync_v1";
 pub const DIRECT_CLOUD_PROTOCOL: &str = "direct_v2";
 
@@ -129,13 +132,7 @@ where
     }
 }
 
-pub fn direct_adapter_pending<T>(
-    domain: BusinessDomain,
-    operation: StorageOperation,
-) -> Result<T, String> {
-    Err(DomainStorageError::direct_adapter_pending(domain, operation).to_string())
-}
-
+#[cfg(test)]
 pub fn business_data_fingerprint(database: &Database) -> Result<String, String> {
     let manifest: Value = serde_json::from_str(STORAGE_BOUNDARIES_JSON)
         .map_err(|error| format!("存储边界清单无效: {error}"))?;

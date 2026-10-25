@@ -473,6 +473,7 @@ fn validate_setting_key(scope: &SettingsScope, key: &str) -> Result<(), String> 
         ]
         .as_slice(),
         SettingsScope::Device => [
+            "main_window_shortcut",
             "tray_hover_enabled",
             "tray_menu_suppress_hover",
             "tray_icon_style",
@@ -502,6 +503,13 @@ fn validate_setting_key(scope: &SettingsScope, key: &str) -> Result<(), String> 
 fn validate_setting_value(key: &str, value: &Value) -> Result<(), String> {
     if key.starts_with("subject_daily_report_directory:") && !value.is_string() {
         return Err("主体日报目录必须是字符串".to_string());
+    }
+    if key == "main_window_shortcut"
+        && value
+            .as_str()
+            .is_none_or(|shortcut| shortcut.trim().is_empty() || shortcut.len() > 64)
+    {
+        return Err("打开主窗口快捷键不能为空且不能超过 64 个字符".to_string());
     }
     if (key == "salary_hourly_rate" || key.starts_with("subject_salary_hourly_rate:"))
         && value
@@ -560,6 +568,19 @@ pub(crate) fn tray_icon_style(database: &Database) -> String {
                 .to_string()
         })
         .unwrap_or_else(|| crate::tray_presentation::DEFAULT_TRAY_ICON_STYLE.to_string())
+}
+
+pub(crate) fn main_window_shortcut(database: &Database) -> String {
+    database
+        .open()
+        .ok()
+        .and_then(|connection| {
+            read_device_value(&connection, "main_window_shortcut")
+                .ok()
+                .flatten()
+        })
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "Alt+T".to_string())
 }
 
 fn credential_entry(provider: &str, workspace_id: &str) -> Result<Entry, String> {
@@ -838,6 +859,16 @@ pub fn settings_update(
     database: tauri::State<'_, Database>,
     request: SettingsUpdate,
 ) -> Result<SettingsSnapshot, String> {
+    let shortcut_change = (matches!(&request.scope, SettingsScope::Device)
+        && request.key == "main_window_shortcut")
+        .then(|| request.value.as_str().map(str::trim).map(str::to_string))
+        .flatten();
+    let previous_shortcut = shortcut_change
+        .as_ref()
+        .map(|_| crate::current_main_window_shortcut(&app));
+    if let Some(shortcut) = shortcut_change.as_deref() {
+        crate::set_main_window_shortcut(&app, shortcut)?;
+    }
     let refresh_tray =
         matches!(&request.scope, SettingsScope::Device) && request.key == "tray_icon_style";
     let direct_request = request.clone();
@@ -852,7 +883,16 @@ pub fn settings_update(
             Ok(result)
         },
         |database| direct_update_setting_for_command(database, direct_request),
-    )?;
+    );
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(previous) = previous_shortcut {
+                let _ = crate::set_main_window_shortcut(&app, &previous);
+            }
+            return Err(error);
+        }
+    };
     if refresh_tray {
         let _ = crate::refresh_tray_presentation(&app, &database);
     }
@@ -1053,6 +1093,15 @@ mod tests {
             },
         )
         .unwrap();
+        update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "main_window_shortcut".to_string(),
+                value: serde_json::json!("Ctrl+Shift+T"),
+            },
+        )
+        .unwrap();
         let snapshot = get_settings(&database).unwrap();
         assert_eq!(
             snapshot.shared["salary_hourly_rate"],
@@ -1078,6 +1127,10 @@ mod tests {
         assert_eq!(
             snapshot.device["tray_icon_style"],
             serde_json::json!("minimal")
+        );
+        assert_eq!(
+            snapshot.device["main_window_shortcut"],
+            serde_json::json!("Ctrl+Shift+T")
         );
         update_setting(
             &database,
@@ -1134,6 +1187,15 @@ mod tests {
                 scope: SettingsScope::Device,
                 key: "tray_icon_style".to_string(),
                 value: serde_json::json!("unknown"),
+            },
+        )
+        .is_err());
+        assert!(update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "main_window_shortcut".to_string(),
+                value: serde_json::json!(""),
             },
         )
         .is_err());

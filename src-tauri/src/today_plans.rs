@@ -350,13 +350,6 @@ fn ensure_instance_recursive(
             return Err("VALIDATION_ERROR: 今日实例日期或来源无效".to_string());
         }
         if expected_kind == "member" && existing_kind.as_deref() == Some("context") {
-            let version: i64 = transaction
-                .query_row(
-                    "SELECT version FROM tasks WHERE id=?1",
-                    [source_task_id],
-                    |row| row.get(0),
-                )
-                .map_err(|error| error.to_string())?;
             transaction
                 .execute(
                     "UPDATE tasks SET day_instance_kind='member',title=?1,note=?2,project_name=?3,
@@ -373,13 +366,6 @@ fn ensure_instance_recursive(
         find_active_instance(transaction, workspace_id, source_task_id, work_date)?
     {
         if expected_kind == "member" && kind == "context" {
-            let version: i64 = transaction
-                .query_row(
-                    "SELECT version FROM tasks WHERE id=?1",
-                    [&instance_id],
-                    |row| row.get(0),
-                )
-                .map_err(|error| error.to_string())?;
             transaction
                 .execute(
                     "UPDATE tasks SET day_instance_kind='member',title=?1,note=?2,project_name=?3,

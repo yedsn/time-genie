@@ -100,13 +100,22 @@ async function catchUpCloudData() {
 
 function onKeydown(event: KeyboardEvent) {
   if (event.key !== "Escape" || event.repeat) return;
-  event.preventDefault();
-  if (view.value === "main" && store.unassignedDialogOpen) return;
+  if (view.value === "main" && (store.unassignedDialogOpen || hasVisibleDialog())) return;
   if (view.value === "hover") {
+    event.preventDefault();
     void hideHoverAfterKeyboardClose();
     return;
   }
-  if (view.value === "main") void closeMainWindow();
+  if (view.value === "main") {
+    queueMicrotask(() => {
+      if (!event.defaultPrevented) void closeMainWindow();
+    });
+  }
+}
+
+function hasVisibleDialog() {
+  return [...document.querySelectorAll<HTMLElement>(".el-dialog, .el-message-box")]
+    .some((element) => element.getClientRects().length > 0);
 }
 
 async function promptPendingUnassignedTimeOnce(sequence: number) {
@@ -224,7 +233,7 @@ onMounted(() => {
     if (unmounted) unlisten();
     else unlistenWorkDataChanged = unlisten;
   });
-  window.addEventListener("keydown", onKeydown);
+  window.addEventListener("keydown", onKeydown, true);
   window.addEventListener("online", handleNetworkOnline);
   document.addEventListener("visibilitychange", handleVisibilityChange);
   catchUpTimer = window.setInterval(() => {
@@ -262,7 +271,7 @@ onUnmounted(() => {
   if (refreshTimer) window.clearTimeout(refreshTimer);
   if (catchUpTimer) window.clearInterval(catchUpTimer);
   store.stopClock();
-  window.removeEventListener("keydown", onKeydown);
+  window.removeEventListener("keydown", onKeydown, true);
   window.removeEventListener("online", handleNetworkOnline);
   document.removeEventListener("visibilitychange", handleVisibilityChange);
   stopCompletionFeedback();

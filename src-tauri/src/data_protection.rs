@@ -541,11 +541,9 @@ pub struct BackupPreview {
     pub legacy_sync_diagnostics: Option<LegacySyncDiagnostics>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct ValidatedRescueBackup {
-    pub(crate) created_at: String,
-    pub(crate) checksum: String,
-    pub(crate) source_workspace_marker: String,
     pub(crate) pending_operation_count: i64,
     pub(crate) legacy_queue_operation_count: usize,
 }
@@ -1645,10 +1643,10 @@ fn validate_legacy_sync_diagnostics(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn validate_rescue_backup_for_abandon(
     path: &Path,
 ) -> Result<ValidatedRescueBackup, String> {
-    let bytes = fs::read(path).map_err(|error| format!("无法读取救援备份: {error}"))?;
     let validated = validate_backup_path(path)?;
     if validated.manifest.backup_kind != BACKUP_KIND_RESCUE {
         return Err("RESCUE_BACKUP_REQUIRED: 必须使用带旧同步诊断的救援备份".to_string());
@@ -1659,9 +1657,6 @@ pub(crate) fn validate_rescue_backup_for_abandon(
         .as_ref()
         .ok_or_else(|| "RESCUE_BACKUP_INCOMPLETE: 救援备份缺少旧同步诊断".to_string())?;
     Ok(ValidatedRescueBackup {
-        checksum: sha256_hex(&bytes),
-        created_at: validated.manifest.created_at,
-        source_workspace_marker: validated.manifest.source_workspace_marker,
         pending_operation_count: validated.manifest.pending_operation_count,
         legacy_queue_operation_count: diagnostics.operations.len(),
     })

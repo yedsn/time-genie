@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, h, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
-import { AlertTriangle, CalendarDays, CheckCircle2, Clock3, Copy, Database, FileText, Folder, Home, LoaderCircle, Minus, Pencil, Plus, RefreshCw, Save, Settings, Square, UserRound, X } from "lucide-vue-next";
+import { AlertTriangle, CalendarDays, CheckCircle2, Clock3, Copy, Database, FileText, Folder, Home, Keyboard, LoaderCircle, Minus, Pencil, Plus, RefreshCw, Save, Settings, Square, UserRound, X } from "lucide-vue-next";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useWorkdayStore, type Task } from "../store";
 import { checkAppUpdate, clearCloudReadCache, closeMainWindow, confirmDailyReportImport, configureCloud, downloadAndInstallUpdate, executeSeaTableTaskSync, getCloudSession, getSettings, getStorageMode, isMainWindowMaximized, listCloudDevices, listTodayTasks, minimizeMainWindow, onAppUpdateEvent, onCloudSyncStateChanged, onCurrentWindowResized, onNavigatePage, onOpenTimerTaskSelection, onTimerFactFollowed, onTrayCheckUpdate, prepareDirectCloudForceRefresh, previewDailyReportImport, previewSeaTableTaskSync, previewStorageMigration, probeCloudProject, registerCloudDevice, replaceCloudWithStagedLocalData, replaceLocalWithCloudDataCopy, restartApp, retryFailedSeaTableSync, revokeCloudDevice, setCloudStorageMode, setIntegrationSecret, setLocalStorageMode, signInCloud, signOutAllCloudDevices, signOutCloud, stageLocalDataCopyToCloud, testSeaTableConnection, toggleMainWindowMaximize, updateIntegrationConfig, updateSetting, type AppUpdateCheckResult, type AppUpdateEventPayload, type CloudDevice, type CloudProjectProbe, type CloudSessionSnapshot, type DailyReportImportPreviewItem, type DailyReportImportPreviewResult, type DailyReportImportTargetKind, type SeaTableSyncPreview, type SeaTableSyncResult, type SettingsSnapshot, type StorageMigrationPreview, type StorageModeSnapshot } from "../services/tauri";
@@ -74,6 +74,7 @@ const settingsNavGroups = [
     { id: "snapshots", label: "历史镜像", icon: Save }
   ] },
   { label: "行为与自动化", items: [
+    { id: "shortcuts", label: "快捷键", icon: Keyboard },
     { id: "feedback", label: "交互与托盘", icon: CheckCircle2 },
     { id: "hooks", label: "自动化钩子", icon: RefreshCw }
   ] },
@@ -147,6 +148,7 @@ const settingsDraft = reactive({
   trayMenuSuppressHover: true,
   trayIconStyle: "status-orb" as "status-orb" | "minimal" | "app-icon",
   startMinimized: false,
+  mainWindowShortcut: "Alt+T",
   storageMode: "local" as "local" | "cloud",
   supabaseProjectUrl: "",
   supabaseAnonKey: "",
@@ -414,6 +416,7 @@ async function loadSettings() {
     const trayIconStyle = settingString("device", "tray_icon_style", "status-orb");
     settingsDraft.trayIconStyle = trayIconStyle === "minimal" || trayIconStyle === "app-icon" ? trayIconStyle : "status-orb";
     settingsDraft.startMinimized = settingBoolean("device", "start_minimized");
+    settingsDraft.mainWindowShortcut = settingString("device", "main_window_shortcut", "Alt+T");
     settingsDraft.storageMode = settingsSnapshot.value.storageMode;
     settingsDraft.supabaseProjectUrl = settingString("device", "supabase_project_url");
     settingsDraft.supabaseAnonKey = settingString("device", "supabase_anon_key");
@@ -437,6 +440,7 @@ async function saveSettings() {
     await updateSetting("device", "tray_menu_suppress_hover", settingsDraft.trayMenuSuppressHover);
     await updateSetting("device", "tray_icon_style", settingsDraft.trayIconStyle);
     await updateSetting("device", "start_minimized", settingsDraft.startMinimized);
+    await updateSetting("device", "main_window_shortcut", settingsDraft.mainWindowShortcut.trim());
     await updateSetting("device", "completion_feedback_enabled", settingsDraft.completionFeedbackEnabled);
     setCompletionFeedbackEnabled(settingsDraft.completionFeedbackEnabled);
     await updateSetting("device", "completion_feedback_sound_enabled", settingsDraft.completionFeedbackSoundEnabled);
@@ -1984,6 +1988,13 @@ async function handleCompletedTaskDelete(task: Task) {
           <CloudSnapshotsSettings v-if="visitedHeavySettings.has('snapshots')" :enabled="storageState?.mode === 'cloud' && Boolean(cloudSession?.signedIn)" :after-restore="handleCloudSnapshotRestored" />
           <div v-else class="settings-section-placeholder">进入此区域时加载历史镜像</div>
           <p v-if="storageState?.mode === 'cloud' && storageState.workspaceEpoch === 1" class="settings-help">首次执行云端回滚前，请确保其他设备已升级到支持工作空间世代隔离的版本。回滚后旧客户端将被强制拒绝写入，以保护恢复后的数据。</p>
+        </div>
+
+        <div id="settings-shortcuts" data-settings-section="shortcuts" class="work-panel settings-panel">
+          <div class="panel-title"><h2>快捷键</h2><span>当前设备独立设置</span></div>
+          <label>快速打开主窗口<input v-model="settingsDraft.mainWindowShortcut" :disabled="!settingsLoaded" placeholder="Alt+T" /></label>
+          <p class="settings-help">默认 Alt+T。可使用 Ctrl、Alt、Shift、Super 与字母或数字组合，例如 Ctrl+Shift+T。主窗口激活时按 Esc 可关闭到托盘。</p>
+          <button class="primary-button settings-save-button" type="button" :disabled="!settingsLoaded || settingsSaving || !settingsDraft.mainWindowShortcut.trim()" @click="saveSettings">{{ settingsSaving ? '保存中...' : '保存快捷键' }}</button>
         </div>
 
         <div id="settings-feedback" data-settings-section="feedback" class="work-panel settings-panel">
