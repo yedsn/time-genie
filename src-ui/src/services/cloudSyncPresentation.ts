@@ -9,6 +9,8 @@ export type CloudSyncPresentationState = {
   saving?: boolean;
   lastSyncedAt?: number;
   lastError?: string;
+  realtimeConnected?: boolean;
+  realtimeError?: string;
 };
 
 export type CloudSyncAttentionLevel = "" | "critical" | "pending" | "offline";
@@ -90,6 +92,14 @@ export function cloudSyncPresentation(
 
   const accessState = state.cloudAccessState ?? (state.online ? "connecting" : "offline_readonly");
   if (accessState === "online_writable" && state.cloudWritable) {
+    if (state.realtimeConnected === false) {
+      return {
+        label: "云端在线",
+        detail: "实时更新连接已中断，正在自动重连；云端查询和保存仍可用",
+        needsAttention: true,
+        attentionLevel: "pending",
+      };
+    }
     return {
       label: "云端在线",
       detail: state.lastSyncedAt

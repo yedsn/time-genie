@@ -13,6 +13,14 @@ assert.equal(budget.count("query", "workspace"), 1);
 
 const store = readFileSync(new URL("../src-ui/src/store.ts", import.meta.url), "utf8");
 const functionBody = (name, nextName) => store.slice(store.indexOf(`async function ${name}`), store.indexOf(`async function ${nextName}`));
+const mainInitialization = functionBody("initializeWorkspace", "initializeHoverData");
+assert.equal((mainInitialization.match(/loadWorkbenchBootstrap\(\)/g) ?? []).length, 1, "主窗口冷启动必须且只能调用一次 bootstrap");
+assert.match(mainInitialization, /loadWorkspaceData\(false, false\)/, "bootstrap 后事项查询必须复用主体数据");
+assert.doesNotMatch(mainInitialization, /refreshWorkspaceCalendar|listSubjects/, "主窗口冷启动不得重复读取日历或主体");
+const hoverInitialization = store.slice(store.indexOf("async function initializeHoverData"), store.indexOf("function clearCloudBusinessMemory"));
+assert.match(hoverInitialization, /loadHoverTimeData\(\)/);
+assert.match(hoverInitialization, /loadUnassignedState\(\)/);
+assert.doesNotMatch(hoverInitialization, /loadWorkbenchBootstrap|loadWorkspaceData|loadReports|loadTodayOverview|listSubjects/, "悬浮窗必须保持最小请求预算");
 for (const [name, nextName] of [
   ["saveTask", "duplicateTask"],
   ["duplicateTask", "duplicateSingleTask"],

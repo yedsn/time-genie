@@ -2525,10 +2525,11 @@ fn local_timer_recovery(
 }
 
 #[tauri::command]
-pub fn timer_get_state(
+pub async fn timer_get_state(
     database: tauri::State<'_, Database>,
 ) -> Result<Option<TimeEntryDto>, String> {
-    timer_state_for_storage(&database)
+    let database = database.inner().clone();
+    crate::cloud_executor::run_for_storage(database, timer_state_for_storage).await
 }
 
 pub fn timer_state_for_storage(database: &Database) -> Result<Option<TimeEntryDto>, String> {
@@ -2633,35 +2634,44 @@ pub(crate) fn timer_stop_for_storage(
 }
 
 #[tauri::command]
-pub fn timer_start(
+pub async fn timer_start(
     app: tauri::AppHandle,
     database: tauri::State<'_, Database>,
     request: TimerStartRequest,
 ) -> Result<TimeEntryDto, String> {
-    let result = timer_start_for_storage(&database, request)?;
+    let database = database.inner().clone();
+    let storage = database.clone();
+    let result = crate::cloud_executor::run_for_storage(storage, move |database| {
+        timer_start_for_storage(database, request)
+    })
+    .await?;
     let _ = crate::refresh_tray_presentation_with_timer(&app, &database, Some(result.clone()));
     Ok(result)
 }
 
 #[tauri::command]
-pub fn timer_transition(
+pub async fn timer_transition(
     app: tauri::AppHandle,
     database: tauri::State<'_, Database>,
     request: TimerTransitionRequest,
 ) -> Result<TimerTransitionResultDto, String> {
-    let direct_request = request.clone();
-    let result = crate::storage_contract::route(
-        &database,
-        crate::storage_contract::BusinessDomain::Time,
-        crate::storage_contract::StorageOperation::Mutation,
-        |database| {
-            crate::supabase::ensure_repository_write_mode(database)?;
-            let state = crate::supabase::storage_mode(database)?;
-            let result = transition_timer_with_cloud_operation(database, request, Some(&state))?;
-            Ok(result)
-        },
-        |database| crate::supabase::direct_cloud_timer_transition(database, direct_request),
-    )?;
+    let database = database.inner().clone();
+    let storage = database.clone();
+    let result = crate::cloud_executor::run_for_storage(storage, move |database| {
+        let direct_request = request.clone();
+        crate::storage_contract::route(
+            database,
+            crate::storage_contract::BusinessDomain::Time,
+            crate::storage_contract::StorageOperation::Mutation,
+            |database| {
+                crate::supabase::ensure_repository_write_mode(database)?;
+                let state = crate::supabase::storage_mode(database)?;
+                transition_timer_with_cloud_operation(database, request, Some(&state))
+            },
+            |database| crate::supabase::direct_cloud_timer_transition(database, direct_request),
+        )
+    })
+    .await?;
     let _ = crate::refresh_tray_presentation_with_timer(
         &app,
         &database,
@@ -2671,52 +2681,72 @@ pub fn timer_transition(
 }
 
 #[tauri::command]
-pub fn timer_pause(
+pub async fn timer_pause(
     app: tauri::AppHandle,
     database: tauri::State<'_, Database>,
     request: TimerVersionRequest,
 ) -> Result<TimeEntryDto, String> {
-    let result = timer_pause_for_storage(&database, request)?;
+    let database = database.inner().clone();
+    let storage = database.clone();
+    let result = crate::cloud_executor::run_for_storage(storage, move |database| {
+        timer_pause_for_storage(database, request)
+    })
+    .await?;
     let _ = crate::refresh_tray_presentation_with_timer(&app, &database, Some(result.clone()));
     Ok(result)
 }
 
 #[tauri::command]
-pub fn timer_resume(
+pub async fn timer_resume(
     app: tauri::AppHandle,
     database: tauri::State<'_, Database>,
     request: TimerResumeRequest,
 ) -> Result<TimeEntryDto, String> {
-    let result = timer_resume_for_storage(&database, request)?;
+    let database = database.inner().clone();
+    let storage = database.clone();
+    let result = crate::cloud_executor::run_for_storage(storage, move |database| {
+        timer_resume_for_storage(database, request)
+    })
+    .await?;
     let _ = crate::refresh_tray_presentation_with_timer(&app, &database, Some(result.clone()));
     Ok(result)
 }
 
 #[tauri::command]
-pub fn timer_stop(
+pub async fn timer_stop(
     app: tauri::AppHandle,
     database: tauri::State<'_, Database>,
     request: TimerStopRequest,
 ) -> Result<TimerStopResultDto, String> {
-    let result = timer_stop_for_storage(&database, request)?;
+    let database = database.inner().clone();
+    let storage = database.clone();
+    let result = crate::cloud_executor::run_for_storage(storage, move |database| {
+        timer_stop_for_storage(database, request)
+    })
+    .await?;
     let _ = crate::refresh_tray_presentation_with_timer(&app, &database, None);
     Ok(result)
 }
 
 #[tauri::command]
-pub fn timer_recover(
+pub async fn timer_recover(
     app: tauri::AppHandle,
     database: tauri::State<'_, Database>,
     request: TimerRecoveryRequest,
 ) -> Result<TimerRecoveryResultDto, String> {
-    let direct_request = request.clone();
-    let result = crate::storage_contract::route(
-        &database,
-        crate::storage_contract::BusinessDomain::Time,
-        crate::storage_contract::StorageOperation::Mutation,
-        |database| local_timer_recovery(database, request),
-        |database| crate::supabase::direct_cloud_timer_recover(database, direct_request),
-    )?;
+    let database = database.inner().clone();
+    let storage = database.clone();
+    let result = crate::cloud_executor::run_for_storage(storage, move |database| {
+        let direct_request = request.clone();
+        crate::storage_contract::route(
+            database,
+            crate::storage_contract::BusinessDomain::Time,
+            crate::storage_contract::StorageOperation::Mutation,
+            |database| local_timer_recovery(database, request),
+            |database| crate::supabase::direct_cloud_timer_recover(database, direct_request),
+        )
+    })
+    .await?;
     let _ = crate::refresh_tray_presentation_with_timer(
         &app,
         &database,
@@ -2726,24 +2756,29 @@ pub fn timer_recover(
 }
 
 #[tauri::command]
-pub fn timer_takeover(
+pub async fn timer_takeover(
     app: tauri::AppHandle,
     database: tauri::State<'_, Database>,
     request: TimerTakeoverRequest,
 ) -> Result<TimerRecoveryResultDto, String> {
-    let direct_request = request.clone();
-    let local_request = TimerRecoveryRequest {
-        entry_id: request.entry_id,
-        expected_version: request.expected_version,
-        client_request_id: request.client_request_id,
-    };
-    let result = crate::storage_contract::route(
-        &database,
-        crate::storage_contract::BusinessDomain::Time,
-        crate::storage_contract::StorageOperation::Mutation,
-        |database| local_timer_recovery(database, local_request),
-        |database| crate::supabase::direct_cloud_timer_takeover(database, direct_request),
-    )?;
+    let database = database.inner().clone();
+    let storage = database.clone();
+    let result = crate::cloud_executor::run_for_storage(storage, move |database| {
+        let direct_request = request.clone();
+        let local_request = TimerRecoveryRequest {
+            entry_id: request.entry_id,
+            expected_version: request.expected_version,
+            client_request_id: request.client_request_id,
+        };
+        crate::storage_contract::route(
+            database,
+            crate::storage_contract::BusinessDomain::Time,
+            crate::storage_contract::StorageOperation::Mutation,
+            |database| local_timer_recovery(database, local_request),
+            |database| crate::supabase::direct_cloud_timer_takeover(database, direct_request),
+        )
+    })
+    .await?;
     let _ = crate::refresh_tray_presentation_with_timer(
         &app,
         &database,
@@ -2753,45 +2788,56 @@ pub fn timer_takeover(
 }
 
 #[tauri::command]
-pub fn time_entry_list(
+pub async fn time_entry_list(
     database: tauri::State<'_, Database>,
     request: TimeEntryListRequest,
 ) -> Result<TimeEntryListResult, String> {
-    let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
-        crate::storage_contract::BusinessDomain::Time,
-        crate::storage_contract::StorageOperation::Query,
-        |database| list_time_entries(database, request),
-        |database| {
-            crate::supabase::direct_cloud_time_entry_list_for_command(database, direct_request)
-        },
-    )
+    let database = database.inner().clone();
+    crate::cloud_executor::run_for_storage(database, move |database| {
+        let direct_request = request.clone();
+        crate::storage_contract::route(
+            database,
+            crate::storage_contract::BusinessDomain::Time,
+            crate::storage_contract::StorageOperation::Query,
+            |database| list_time_entries(database, request),
+            |database| {
+                crate::supabase::direct_cloud_time_entry_list_for_command(database, direct_request)
+            },
+        )
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn time_entry_history_list(
+pub async fn time_entry_history_list(
     database: tauri::State<'_, Database>,
     request: TimeEntryHistoryRequest,
 ) -> Result<TimeEntryHistoryResult, String> {
-    let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
-        crate::storage_contract::BusinessDomain::Time,
-        crate::storage_contract::StorageOperation::Query,
-        |database| list_time_entry_history(database, request),
-        |database| crate::supabase::direct_cloud_time_history_for_command(database, direct_request),
-    )
+    let database = database.inner().clone();
+    crate::cloud_executor::run_for_storage(database, move |database| {
+        let direct_request = request.clone();
+        crate::storage_contract::route(
+            database,
+            crate::storage_contract::BusinessDomain::Time,
+            crate::storage_contract::StorageOperation::Query,
+            |database| list_time_entry_history(database, request),
+            |database| {
+                crate::supabase::direct_cloud_time_history_for_command(database, direct_request)
+            },
+        )
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn time_entry_create_manual(
+pub async fn time_entry_create_manual(
     database: tauri::State<'_, Database>,
     request: ManualEntryRequest,
 ) -> Result<TimeEntryDto, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Time,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -2811,16 +2857,18 @@ pub fn time_entry_create_manual(
         },
         |database| crate::supabase::direct_cloud_manual_time_create(database, direct_request),
     )
+    .await
 }
 
 #[tauri::command]
-pub fn time_entry_update(
+pub async fn time_entry_update(
     database: tauri::State<'_, Database>,
     request: TimeEntryUpdateRequest,
 ) -> Result<TimeEntryDto, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Time,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -2835,16 +2883,18 @@ pub fn time_entry_update(
         },
         |database| crate::supabase::direct_cloud_time_entry_update(database, direct_request),
     )
+    .await
 }
 
 #[tauri::command]
-pub fn time_entry_update_disposition(
+pub async fn time_entry_update_disposition(
     database: tauri::State<'_, Database>,
     request: TimeEntryDispositionRequest,
 ) -> Result<TimeEntryDto, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Time,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -2859,16 +2909,18 @@ pub fn time_entry_update_disposition(
         },
         |database| crate::supabase::direct_cloud_time_entry_disposition(database, direct_request),
     )
+    .await
 }
 
 #[tauri::command]
-pub fn time_allocation_replace(
+pub async fn time_allocation_replace(
     database: tauri::State<'_, Database>,
     request: AllocationReplaceRequest,
 ) -> Result<TimeEntryDto, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Time,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -2883,6 +2935,7 @@ pub fn time_allocation_replace(
         },
         |database| crate::supabase::direct_cloud_time_allocation_replace(database, direct_request),
     )
+    .await
 }
 
 #[cfg(test)]

@@ -63,6 +63,7 @@ try {
         case "plugin:window|is_maximized": return false;
         case "plugin:window|is_focused": return true;
         case "work_calendar_get_context": return { timezone: "Asia/Shanghai", currentWorkDate: "2026-10-18", currentDayStartAt: currentNow - 3_600_000, currentDayEndAt: currentNow + 86_400_000 };
+        case "workbench_bootstrap_get": return { timezone: "Asia/Shanghai", currentWorkDate: "2026-10-18", currentDayStartAt: currentNow - 3_600_000, currentDayEndAt: currentNow + 86_400_000, subjects: [{ id: "subject", name: "默认", sortOrder: 10, openTaskCount: 1, version: 1 }] };
         case "subject_list": return [{ id: "subject", name: "默认", sortOrder: 10, openTaskCount: 1, version: 1 }];
         case "task_list": return { tasks: [task], revision: 1 };
         case "time_entry_list": return { entries: [entry], rawMinutes: 1, allocatedMinutes: 0, pendingMinutes: 1, breakMinutes: 0, revision: 1 };

@@ -44,6 +44,15 @@ assert.equal(directOnline.label, "云端在线");
 assert.match(directOnline.detail, /最近刷新 time:4321/);
 assert.equal(directOnline.needsAttention, false);
 
+const directRealtimeReconnecting = cloudSyncPresentation({
+  ...cloud, realtimeConnected: false, realtimeError: "NETWORK_ERROR: Broken pipe", lastSyncedAt: 4321,
+}, formatSyncTime);
+assert.equal(directRealtimeReconnecting.label, "云端在线");
+assert.match(directRealtimeReconnecting.detail, /正在自动重连/);
+assert.equal(directRealtimeReconnecting.needsAttention, true);
+assert.equal(directRealtimeReconnecting.attentionLevel, "pending");
+assert.equal(cloudSaveStatusLabel({ ...cloud, realtimeConnected: false }), "已直接保存到 Supabase");
+
 const directConnecting = cloudSyncPresentation({
   ...cloud, storageProtocol: "direct_v2", cloudAccessState: "connecting", cloudWritable: false,
 }, formatSyncTime);

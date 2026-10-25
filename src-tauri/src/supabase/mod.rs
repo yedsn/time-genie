@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 #[cfg(test)]
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use url::Url;
@@ -45,6 +46,9 @@ static DIRECT_CLOUD_ACCESS_STATES: OnceLock<Mutex<HashMap<String, DirectCloudAcc
 static DIRECT_CLOUD_REVALIDATIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 #[cfg(test)]
 static TEST_SESSION_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static SUPABASE_CLIENT_CACHE: OnceLock<Mutex<VecDeque<(String, SupabaseClient)>>> = OnceLock::new();
+static SUPABASE_CLIENT_CREATION_COUNT: AtomicU64 = AtomicU64::new(0);
+const SUPABASE_CLIENT_CACHE_CAPACITY: usize = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3105,6 +3109,7 @@ pub fn latest_change_seq(
     Ok(rows.first().map(|row| row.change_seq).unwrap_or(0))
 }
 
+#[derive(Clone)]
 pub(crate) struct SupabaseClient {
     pub(crate) project_url: String,
     anon_key: String,
@@ -3312,7 +3317,36 @@ fn map_supabase_request_error(error: reqwest::Error) -> String {
     format!("NETWORK_ERROR: Supabase 请求失败: {error}")
 }
 
-pub(crate) fn client(database: &Database) -> Result<SupabaseClient, String> {
+fn client_cache_key(project_url: &str, anon_key: &str) -> String {
+    let mut hasher = sha2::Sha256::new();
+    use sha2::Digest;
+    hasher.update(anon_key.as_bytes());
+    format!(
+        "{project_url}:{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
+    )
+}
+
+fn client_cache() -> &'static Mutex<VecDeque<(String, SupabaseClient)>> {
+    SUPABASE_CLIENT_CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+pub(crate) fn clear_client_cache() {
+    client_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+pub(crate) fn client_creation_count() -> u64 {
+    SUPABASE_CLIENT_CREATION_COUNT.load(Ordering::Relaxed)
+}
+
+fn client_with_cache(
+    database: &Database,
+    cache: &Mutex<VecDeque<(String, SupabaseClient)>>,
+    creation_count: &AtomicU64,
+) -> Result<SupabaseClient, String> {
     let connection = database.open()?;
     let project_url: String = connection
         .query_row(
@@ -3332,15 +3366,106 @@ pub(crate) fn client(database: &Database) -> Result<SupabaseClient, String> {
     if anon_key.trim().is_empty() {
         return Err("CLOUD_NOT_CONFIGURED: 尚未配置 Supabase anon key".to_string());
     }
+    let cache_key = client_cache_key(&project_url, &anon_key);
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(index) = cache.iter().position(|(key, _)| key == &cache_key) {
+        let (_, cached) = cache
+            .remove(index)
+            .expect("cached Supabase client disappeared");
+        cache.push_back((cache_key, cached.clone()));
+        return Ok(cached);
+    }
     let http = Client::builder()
         .timeout(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECONDS))
         .build()
         .map_err(|error| format!("NETWORK_ERROR: 无法初始化 Supabase 客户端: {error}"))?;
-    Ok(SupabaseClient {
+    let client = SupabaseClient {
         project_url,
         anon_key,
         http,
-    })
+    };
+    creation_count.fetch_add(1, Ordering::Relaxed);
+    while cache.len() >= SUPABASE_CLIENT_CACHE_CAPACITY {
+        cache.pop_front();
+    }
+    cache.push_back((cache_key, client.clone()));
+    Ok(client)
+}
+
+pub(crate) fn client(database: &Database) -> Result<SupabaseClient, String> {
+    client_with_cache(database, client_cache(), &SUPABASE_CLIENT_CREATION_COUNT)
+}
+
+#[cfg(test)]
+mod client_cache_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn configured_database(project_url: &str, anon_key: &str) -> Database {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("client-cache.sqlite3");
+        std::mem::forget(directory);
+        let database = Database::initialize_at(path).unwrap();
+        let connection = database.open().unwrap();
+        connection.execute(
+            "INSERT INTO device_settings(key,value_json,updated_at) VALUES('supabase_project_url',?1,1) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+            [serde_json::to_string(project_url).unwrap()],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO device_settings(key,value_json,updated_at) VALUES('supabase_anon_key',?1,1) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+            [serde_json::to_string(anon_key).unwrap()],
+        ).unwrap();
+        database
+    }
+
+    #[test]
+    fn reuses_clients_for_the_same_configuration_and_separates_configs() {
+        let cache = Mutex::new(VecDeque::new());
+        let creation_count = AtomicU64::new(0);
+        let first = configured_database("https://one.example.com", "anon-one");
+        client_with_cache(&first, &cache, &creation_count).unwrap();
+        client_with_cache(&first, &cache, &creation_count).unwrap();
+        assert_eq!(creation_count.load(Ordering::Relaxed), 1);
+
+        let second = configured_database("https://two.example.com", "anon-two");
+        client_with_cache(&second, &cache, &creation_count).unwrap();
+        assert_eq!(creation_count.load(Ordering::Relaxed), 2);
+        cache.lock().unwrap().clear();
+        client_with_cache(&first, &cache, &creation_count).unwrap();
+        assert_eq!(creation_count.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn normalizes_urls_and_keeps_parallel_configurations_isolated() {
+        let cache = Mutex::new(VecDeque::new());
+        let creation_count = AtomicU64::new(0);
+        let first = configured_database("https://one.example.com/", "anon-one");
+        let normalized = configured_database("https://one.example.com", "anon-one");
+        let second = configured_database("https://two.example.com", "anon-two");
+        std::thread::scope(|scope| {
+            let first_handle =
+                scope.spawn(|| client_with_cache(&first, &cache, &creation_count).unwrap());
+            let normalized_handle =
+                scope.spawn(|| client_with_cache(&normalized, &cache, &creation_count).unwrap());
+            let second_handle =
+                scope.spawn(|| client_with_cache(&second, &cache, &creation_count).unwrap());
+            assert_eq!(
+                first_handle.join().unwrap().project_url,
+                "https://one.example.com"
+            );
+            assert_eq!(
+                normalized_handle.join().unwrap().project_url,
+                "https://one.example.com"
+            );
+            assert_eq!(
+                second_handle.join().unwrap().project_url,
+                "https://two.example.com"
+            );
+        });
+        assert_eq!(creation_count.load(Ordering::Relaxed), 2);
+    }
 }
 
 pub(crate) fn current_session(database: &Database) -> Result<CloudSession, String> {
@@ -3716,10 +3841,11 @@ pub fn direct_cloud_force_refresh_prepare(
 }
 
 #[tauri::command]
-pub fn storage_mode_set_cloud(
+pub async fn storage_mode_set_cloud(
     database: tauri::State<'_, Database>,
 ) -> Result<StorageModeSnapshot, String> {
-    storage_mode_set_cloud_for_database(&database)
+    let database = database.inner().clone();
+    crate::cloud_executor::run(move || storage_mode_set_cloud_for_database(&database)).await
 }
 
 fn storage_mode_set_cloud_for_database(database: &Database) -> Result<StorageModeSnapshot, String> {
@@ -3768,59 +3894,75 @@ fn storage_mode_set_cloud_for_database(database: &Database) -> Result<StorageMod
 }
 
 #[tauri::command]
-pub fn cloud_configure(
+pub async fn cloud_configure(
     database: tauri::State<'_, Database>,
     request: CloudConfigureRequest,
 ) -> Result<StorageModeSnapshot, String> {
-    configure(&database, request)?;
-    storage_mode(&database)
+    let database = database.inner().clone();
+    crate::cloud_executor::run(move || {
+        configure(&database, request)?;
+        storage_mode(&database)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn cloud_project_probe(
+pub async fn cloud_project_probe(
     database: tauri::State<'_, Database>,
 ) -> Result<CloudProjectProbe, String> {
-    probe_cloud_project(&database)
+    let database = database.inner().clone();
+    crate::cloud_executor::run(move || probe_cloud_project(&database)).await
 }
 
 #[tauri::command]
-pub fn cloud_sign_in_password(
+pub async fn cloud_sign_in_password(
     database: tauri::State<'_, Database>,
     request: CloudSignInRequest,
 ) -> Result<CloudSessionSnapshot, String> {
-    sign_in_password(&database, request)
+    let database = database.inner().clone();
+    crate::cloud_executor::run(move || sign_in_password(&database, request)).await
 }
 
 #[tauri::command]
-pub fn cloud_sign_out(database: tauri::State<'_, Database>) -> Result<StorageModeSnapshot, String> {
-    sign_out(&database)?;
-    settings::update_setting(
-        &database,
-        SettingsUpdate {
-            scope: SettingsScope::Device,
-            key: "storage_mode".to_string(),
-            value: json!("local"),
-        },
-    )?;
-    crate::cloud_sync::disable_cloud_sync();
-    storage_mode(&database)
-}
-
-#[tauri::command]
-pub fn cloud_sign_out_all(
+pub async fn cloud_sign_out(
     database: tauri::State<'_, Database>,
 ) -> Result<StorageModeSnapshot, String> {
-    sign_out_all(&database)?;
-    settings::update_setting(
-        &database,
-        SettingsUpdate {
-            scope: SettingsScope::Device,
-            key: "storage_mode".to_string(),
-            value: json!("local"),
-        },
-    )?;
-    crate::cloud_sync::disable_cloud_sync();
-    storage_mode(&database)
+    let database = database.inner().clone();
+    crate::cloud_executor::run(move || {
+        sign_out(&database)?;
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("local"),
+            },
+        )?;
+        crate::cloud_sync::disable_cloud_sync();
+        storage_mode(&database)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn cloud_sign_out_all(
+    database: tauri::State<'_, Database>,
+) -> Result<StorageModeSnapshot, String> {
+    let database = database.inner().clone();
+    crate::cloud_executor::run(move || {
+        sign_out_all(&database)?;
+        settings::update_setting(
+            &database,
+            SettingsUpdate {
+                scope: SettingsScope::Device,
+                key: "storage_mode".to_string(),
+                value: json!("local"),
+            },
+        )?;
+        crate::cloud_sync::disable_cloud_sync();
+        storage_mode(&database)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -3831,10 +3973,11 @@ pub fn cloud_session_get(
 }
 
 #[tauri::command]
-pub fn cloud_workspace_bootstrap(
+pub async fn cloud_workspace_bootstrap(
     database: tauri::State<'_, Database>,
 ) -> Result<CloudWorkspace, String> {
-    workspace_bootstrap(&database)
+    let database = database.inner().clone();
+    crate::cloud_executor::run(move || workspace_bootstrap(&database)).await
 }
 
 #[tauri::command]

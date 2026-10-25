@@ -49,6 +49,7 @@ pub fn configure(database: &Database, request: CloudConfigureRequest) -> Result<
     if replacing_existing_connection {
         clear_all_saved_sessions(database)?;
     }
+    clear_client_cache();
     Ok(())
 }
 
@@ -132,8 +133,8 @@ pub fn sign_in_password(
     if request.email.trim().is_empty() || request.password.is_empty() {
         return Err("AUTH_FAILED: 邮箱和密码不能为空".to_string());
     }
-    let client = client(database)?;
-    let response = client.auth_token(
+    let api = client(database)?;
+    let response = api.auth_token(
         "password",
         json!({ "email": request.email.trim(), "password": request.password }),
     )?;
@@ -154,7 +155,9 @@ pub fn sign_in_password(
         expires_at: auth.expires_in.map(|seconds| now_seconds() + seconds),
     };
     save_session(database, &session)?;
-    let _ = workspace_bootstrap_with_session(database, &client, &session)?;
+    clear_client_cache();
+    let api = client(database)?;
+    let _ = workspace_bootstrap_with_session(database, &api, &session)?;
     crate::cloud_sync::wake_after_connection_ready();
     Ok(session_snapshot(&session))
 }
@@ -212,6 +215,7 @@ fn sign_out_with_scope(database: &Database, all_devices: bool) -> Result<(), Str
         }
     }
     clear_saved_session_for_workspace(database, &local_workspace_id(database)?)?;
+    clear_client_cache();
     mark_auth_blocked(
         database,
         if all_devices {

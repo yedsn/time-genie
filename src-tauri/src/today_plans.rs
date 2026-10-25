@@ -1075,62 +1075,80 @@ fn now_millis() -> i64 {
 }
 
 #[tauri::command]
-pub fn task_day_plan_snapshot(
+pub async fn task_day_plan_snapshot(
     database: tauri::State<'_, Database>,
     request: TaskDayPlanSnapshotRequest,
 ) -> Result<TaskDayPlanSnapshotDto, String> {
-    let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
-        crate::storage_contract::BusinessDomain::Planning,
-        crate::storage_contract::StorageOperation::Query,
-        |database| snapshot(database, request),
-        |database| {
-            crate::supabase::direct_cloud_day_plan_snapshot_for_command(database, direct_request)
-        },
-    )
+    let database = database.inner().clone();
+    crate::cloud_executor::run_for_storage(database, move |database| {
+        let direct_request = request.clone();
+        crate::storage_contract::route(
+            database,
+            crate::storage_contract::BusinessDomain::Planning,
+            crate::storage_contract::StorageOperation::Query,
+            |database| snapshot(database, request),
+            |database| {
+                crate::supabase::direct_cloud_day_plan_snapshot_for_command(
+                    database,
+                    direct_request,
+                )
+            },
+        )
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn task_day_plan_set(
+pub async fn task_day_plan_set(
     database: tauri::State<'_, Database>,
     request: TaskDayPlanSetRequest,
 ) -> Result<TaskDayPlanDto, String> {
-    let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
-        crate::storage_contract::BusinessDomain::Planning,
-        crate::storage_contract::StorageOperation::Mutation,
-        |database| {
-            crate::supabase::ensure_repository_write_mode(database)?;
-            let state = crate::supabase::storage_mode(database)?;
-            let result = set_day_plan(database, request, Some(&state))?;
-            Ok(result)
-        },
-        |database| crate::supabase::direct_cloud_day_plan_set_for_command(database, direct_request),
-    )
+    let database = database.inner().clone();
+    crate::cloud_executor::run_for_storage(database, move |database| {
+        let direct_request = request.clone();
+        crate::storage_contract::route(
+            database,
+            crate::storage_contract::BusinessDomain::Planning,
+            crate::storage_contract::StorageOperation::Mutation,
+            |database| {
+                crate::supabase::ensure_repository_write_mode(database)?;
+                let state = crate::supabase::storage_mode(database)?;
+                set_day_plan(database, request, Some(&state))
+            },
+            |database| {
+                crate::supabase::direct_cloud_day_plan_set_for_command(database, direct_request)
+            },
+        )
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn task_day_plan_batch_set(
+pub async fn task_day_plan_batch_set(
     database: tauri::State<'_, Database>,
     request: TaskDayPlanBatchSetRequest,
 ) -> Result<TaskDayPlanBatchSetResult, String> {
-    let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
-        crate::storage_contract::BusinessDomain::Planning,
-        crate::storage_contract::StorageOperation::Mutation,
-        |database| {
-            crate::supabase::ensure_repository_write_mode(database)?;
-            let state = crate::supabase::storage_mode(database)?;
-            let result = set_day_plan_batch(database, request, Some(&state))?;
-            Ok(result)
-        },
-        |database| {
-            crate::supabase::direct_cloud_day_plan_batch_set_for_command(database, direct_request)
-        },
-    )
+    let database = database.inner().clone();
+    crate::cloud_executor::run_for_storage(database, move |database| {
+        let direct_request = request.clone();
+        crate::storage_contract::route(
+            database,
+            crate::storage_contract::BusinessDomain::Planning,
+            crate::storage_contract::StorageOperation::Mutation,
+            |database| {
+                crate::supabase::ensure_repository_write_mode(database)?;
+                let state = crate::supabase::storage_mode(database)?;
+                set_day_plan_batch(database, request, Some(&state))
+            },
+            |database| {
+                crate::supabase::direct_cloud_day_plan_batch_set_for_command(
+                    database,
+                    direct_request,
+                )
+            },
+        )
+    })
+    .await
 }
 
 #[cfg(test)]

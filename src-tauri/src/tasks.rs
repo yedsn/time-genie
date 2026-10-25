@@ -1137,7 +1137,6 @@ pub(crate) fn create_task_in_transaction(
 fn create_positioned_task_with_cloud_operation(
     database: &Database,
     request: TaskCreatePositionedRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<TaskDto, String> {
     validate_title(&request.title)?;
     validate_estimate(request.estimate_minutes)?;
@@ -1319,7 +1318,6 @@ fn update_task_with_cloud_operation(
 fn update_today_recurring_instance_with_cloud_operation(
     database: &Database,
     mut request: TodayRecurringInstanceUpdateRequest,
-    cloud_state: Option<&crate::supabase::StorageModeSnapshot>,
 ) -> Result<TodayRecurringInstanceUpdateResult, String> {
     if let Some(note) = request.note.as_mut() {
         *note = note.take().and_then(|value| {
@@ -3235,28 +3233,31 @@ fn now_millis() -> i64 {
 }
 
 #[tauri::command]
-pub fn task_list(
+pub async fn task_list(
     database: tauri::State<'_, Database>,
     request: TaskListRequest,
 ) -> Result<TaskListResult, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Tasks,
         crate::storage_contract::StorageOperation::Query,
         |database| list_tasks(database, request),
         |database| crate::supabase::direct_cloud_task_list_for_command(database, direct_request),
     )
+    .await
 }
 
 #[tauri::command]
-pub fn task_list_completed_page(
+pub async fn task_list_completed_page(
     database: tauri::State<'_, Database>,
     request: CompletedTaskPageRequest,
 ) -> Result<CompletedTaskPageResult, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Tasks,
         crate::storage_contract::StorageOperation::Query,
         |database| list_completed_task_page(database, request),
@@ -3264,17 +3265,19 @@ pub fn task_list_completed_page(
             crate::supabase::direct_cloud_completed_task_page_for_command(database, direct_request)
         },
     )
+    .await
 }
 
 #[tauri::command]
-pub fn task_daily_estimate_set(
+pub async fn task_daily_estimate_set(
     database: tauri::State<'_, Database>,
     request: TaskDailyEstimateSetRequest,
     expected_daily_estimate_version: Option<i64>,
 ) -> Result<TaskDailyEstimateDto, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Planning,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -3284,7 +3287,7 @@ pub fn task_daily_estimate_set(
                 set_task_daily_estimate_with_cloud_operation(database, request, Some(&state))?;
             Ok(result)
         },
-        |database| {
+        move |database| {
             crate::supabase::direct_cloud_daily_estimate_set_for_command(
                 database,
                 direct_request,
@@ -3292,16 +3295,18 @@ pub fn task_daily_estimate_set(
             )
         },
     )
+    .await
 }
 
 #[tauri::command]
-pub fn task_daily_estimate_batch_set(
+pub async fn task_daily_estimate_batch_set(
     database: tauri::State<'_, Database>,
     request: TaskDailyEstimateBatchSetRequest,
 ) -> Result<TaskDailyEstimateBatchSetResult, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Planning,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -3321,16 +3326,18 @@ pub fn task_daily_estimate_batch_set(
             )
         },
     )
+    .await
 }
 
 #[tauri::command]
-pub fn task_plan_batch_apply(
+pub async fn task_plan_batch_apply(
     database: tauri::State<'_, Database>,
     request: TaskPlanBatchApplyRequest,
 ) -> Result<TaskPlanBatchApplyResult, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Planning,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -3350,16 +3357,18 @@ pub fn task_plan_batch_apply(
             )
         },
     )
+    .await
 }
 
 #[tauri::command]
-pub fn task_recurring_estimate_set(
+pub async fn task_recurring_estimate_set(
     database: tauri::State<'_, Database>,
     request: RecurringTaskEstimateSetRequest,
 ) -> Result<TaskDto, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Planning,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -3376,16 +3385,18 @@ pub fn task_recurring_estimate_set(
             )
         },
     )
+    .await
 }
 
 #[tauri::command]
-pub fn task_create(
+pub async fn task_create(
     database: tauri::State<'_, Database>,
     request: TaskCreateRequest,
 ) -> Result<TaskDto, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Tasks,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -3407,26 +3418,23 @@ pub fn task_create(
             )
         },
     )
+    .await
 }
 
 #[tauri::command]
-pub fn task_create_positioned(
+pub async fn task_create_positioned(
     database: tauri::State<'_, Database>,
     request: TaskCreatePositionedRequest,
 ) -> Result<TaskDto, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Tasks,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
             crate::supabase::ensure_repository_write_mode(database)?;
-            let state = crate::supabase::storage_mode(database)?;
-            let result = create_positioned_task_with_cloud_operation(
-                database,
-                request,
-                Some((&state, "task_create_positioned")),
-            )?;
+            let result = create_positioned_task_with_cloud_operation(database, request)?;
             Ok(result)
         },
         |database| {
@@ -3436,16 +3444,18 @@ pub fn task_create_positioned(
             )
         },
     )
+    .await
 }
 
 #[tauri::command]
-pub fn task_create_quick(
+pub async fn task_create_quick(
     database: tauri::State<'_, Database>,
     request: TaskCreateRequest,
 ) -> Result<TaskDto, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Tasks,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -3467,16 +3477,18 @@ pub fn task_create_quick(
             )
         },
     )
+    .await
 }
 
 #[tauri::command]
-pub fn task_update(
+pub async fn task_update(
     database: tauri::State<'_, Database>,
     request: TaskUpdateRequest,
 ) -> Result<TaskDto, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Tasks,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -3488,26 +3500,23 @@ pub fn task_update(
         },
         |database| crate::supabase::direct_cloud_task_update_for_command(database, direct_request),
     )
+    .await
 }
 
 #[tauri::command]
-pub fn task_today_recurring_update(
+pub async fn task_today_recurring_update(
     database: tauri::State<'_, Database>,
     request: TodayRecurringInstanceUpdateRequest,
 ) -> Result<TodayRecurringInstanceUpdateResult, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Planning,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
             crate::supabase::ensure_repository_write_mode(database)?;
-            let state = crate::supabase::storage_mode(database)?;
-            let result = update_today_recurring_instance_with_cloud_operation(
-                database,
-                request,
-                Some(&state),
-            )?;
+            let result = update_today_recurring_instance_with_cloud_operation(database, request)?;
             Ok(result)
         },
         |database| {
@@ -3517,14 +3526,19 @@ pub fn task_today_recurring_update(
             )
         },
     )
+    .await
 }
 
 #[tauri::command]
-pub fn task_set_completed(
+pub async fn task_set_completed(
     database: tauri::State<'_, Database>,
     request: TaskStatusRequest,
 ) -> Result<TaskDto, String> {
-    set_task_completed_for_command(&database, request)
+    let database = database.inner().clone();
+    crate::cloud_executor::run_for_storage(database, move |database| {
+        set_task_completed_for_command(database, request)
+    })
+    .await
 }
 
 pub(crate) fn set_task_completed_for_command(
@@ -3564,13 +3578,14 @@ pub(crate) fn set_task_completed_for_command(
 }
 
 #[tauri::command]
-pub fn task_delete_subtree(
+pub async fn task_delete_subtree(
     database: tauri::State<'_, Database>,
     request: TaskDeleteRequest,
 ) -> Result<(), String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Tasks,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -3581,16 +3596,18 @@ pub fn task_delete_subtree(
         },
         |database| crate::supabase::direct_cloud_task_delete_for_command(database, direct_request),
     )
+    .await
 }
 
 #[tauri::command]
-pub fn task_reorder_subtree(
+pub async fn task_reorder_subtree(
     database: tauri::State<'_, Database>,
     request: TaskReorderRequest,
 ) -> Result<TaskDto, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Tasks,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -3605,16 +3622,18 @@ pub fn task_reorder_subtree(
         },
         |database| crate::supabase::direct_cloud_task_reorder_for_command(database, direct_request),
     )
+    .await
 }
 
 #[tauri::command]
-pub fn task_move(
+pub async fn task_move(
     database: tauri::State<'_, Database>,
     request: TaskMoveRequest,
 ) -> Result<TaskDto, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Tasks,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -3626,16 +3645,18 @@ pub fn task_move(
         },
         |database| crate::supabase::direct_cloud_task_move_for_command(database, direct_request),
     )
+    .await
 }
 
 #[tauri::command]
-pub fn task_change_parent(
+pub async fn task_change_parent(
     database: tauri::State<'_, Database>,
     request: TaskChangeParentRequest,
 ) -> Result<TaskDto, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Tasks,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -3652,16 +3673,18 @@ pub fn task_change_parent(
             crate::supabase::direct_cloud_task_change_parent_for_command(database, direct_request)
         },
     )
+    .await
 }
 
 #[tauri::command]
-pub fn task_duplicate_subtree(
+pub async fn task_duplicate_subtree(
     database: tauri::State<'_, Database>,
     request: TaskDuplicateRequest,
 ) -> Result<TaskDuplicateResult, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Tasks,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -3678,6 +3701,7 @@ pub fn task_duplicate_subtree(
             crate::supabase::direct_cloud_task_duplicate_for_command(database, direct_request)
         },
     )
+    .await
 }
 
 #[tauri::command]
@@ -5740,7 +5764,6 @@ mod tests {
                 previous_sibling_id: Some(root.id.clone()),
                 next_sibling_id: Some(after.id.clone()),
             },
-            None,
         )
         .unwrap();
         assert!(root.sort_order < inserted.sort_order && inserted.sort_order < after.sort_order);
@@ -5759,7 +5782,6 @@ mod tests {
                 previous_sibling_id: None,
                 next_sibling_id: None,
             },
-            None,
         )
         .unwrap();
         assert_eq!(child.parent_id.as_deref(), Some(root.id.as_str()));
@@ -5778,7 +5800,6 @@ mod tests {
                 previous_sibling_id: None,
                 next_sibling_id: None,
             },
-            None,
         )
         .unwrap_err()
         .contains("最多支持两级"));
@@ -6409,7 +6430,6 @@ mod tests {
                 note: None,
                 project_name: None,
             },
-            None,
         )
         .unwrap_err();
         assert!(conflict.contains("VERSION_CONFLICT"));
@@ -6432,7 +6452,6 @@ mod tests {
                 note: Some(Some("未来备注".to_string())),
                 project_name: Some(Some("只改今天的项目".to_string())),
             },
-            None,
         )
         .unwrap();
         assert_eq!(result.instance.title, "未来新标题");

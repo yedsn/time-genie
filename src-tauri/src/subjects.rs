@@ -231,24 +231,27 @@ fn now_millis() -> i64 {
 }
 
 #[tauri::command]
-pub fn subject_list(database: tauri::State<'_, Database>) -> Result<Vec<SubjectDto>, String> {
-    crate::storage_contract::route(
-        &database,
+pub async fn subject_list(database: tauri::State<'_, Database>) -> Result<Vec<SubjectDto>, String> {
+    let database = database.inner().clone();
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Tasks,
         crate::storage_contract::StorageOperation::Query,
         list_subjects,
         crate::supabase::direct_cloud_subject_list,
     )
+    .await
 }
 
 #[tauri::command]
-pub fn subject_create(
+pub async fn subject_create(
     database: tauri::State<'_, Database>,
     request: SubjectCreateRequest,
 ) -> Result<SubjectCreateResult, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Tasks,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -263,16 +266,18 @@ pub fn subject_create(
         },
         |database| crate::supabase::direct_cloud_subject_create(database, direct_request),
     )
+    .await
 }
 
 #[tauri::command]
-pub fn subject_rename(
+pub async fn subject_rename(
     database: tauri::State<'_, Database>,
     request: SubjectRenameRequest,
 ) -> Result<SubjectDto, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Tasks,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -288,6 +293,7 @@ pub fn subject_rename(
         },
         |database| crate::supabase::direct_cloud_subject_rename(database, direct_request),
     )
+    .await
 }
 
 #[cfg(test)]

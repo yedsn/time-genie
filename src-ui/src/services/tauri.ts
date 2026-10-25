@@ -219,6 +219,12 @@ export type StorageModeSnapshot = {
   authBlocked: boolean;
   authBlockedReason?: string;
   workspaceEpoch: number;
+  realtimeConnected?: boolean;
+  realtimeError?: string;
+};
+
+export type WorkbenchBootstrapRecord = WorkspaceCalendarContext & {
+  subjects: SubjectRecord[];
 };
 
 export type DirectCloudReleaseMetrics = {
@@ -244,6 +250,15 @@ export type DirectCloudReleaseMetrics = {
   realtimeReconnectCount: number;
   copyFailureCount: number;
   lastErrorCode?: string;
+  cloudExecutor: {
+    maxConcurrentJobs: number;
+    queuedCount: number;
+    startedCount: number;
+    completedCount: number;
+    failedCount: number;
+    queueWaitTotalMs: number;
+  };
+  httpClientCreationCount: number;
 };
 
 export type CloudDevice = {
@@ -1626,6 +1641,10 @@ export async function getWorkspaceCalendarContext(): Promise<WorkspaceCalendarCo
   return await invoke<WorkspaceCalendarContext>("work_calendar_get_context");
 }
 
+export async function getWorkbenchBootstrap(): Promise<WorkbenchBootstrapRecord> {
+  return await invoke<WorkbenchBootstrapRecord>("workbench_bootstrap_get");
+}
+
 export async function listAutomationHooks(): Promise<AutomationHookRule[]> {
   return await invoke("automation_hook_list");
 }
@@ -1699,6 +1718,10 @@ export async function clearIntegrationSecret(provider: "seatable" | "supabase"):
 
 export async function getStorageMode(): Promise<StorageModeSnapshot> {
   return await invoke("storage_mode_get");
+}
+
+export async function wakeCloudConnection(): Promise<void> {
+  await invoke("cloud_connection_wake");
 }
 
 export async function getDirectCloudReleaseMetrics(): Promise<DirectCloudReleaseMetrics> {

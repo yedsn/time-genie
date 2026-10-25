@@ -100,6 +100,35 @@ pub fn route<T>(
     }
 }
 
+pub async fn route_async<T, Local, Direct>(
+    database: Database,
+    domain: BusinessDomain,
+    operation: StorageOperation,
+    sqlite: Local,
+    direct: Direct,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    Local: FnOnce(&Database) -> Result<T, String>,
+    Direct: FnOnce(&Database) -> Result<T, String> + Send + 'static,
+{
+    match storage_backend(&database)? {
+        StorageBackend::LocalSqlite => sqlite(&database),
+        StorageBackend::DirectSupabase => {
+            crate::cloud_executor::run(move || {
+                direct(&database).map_err(|error| {
+                    if error.trim().is_empty() {
+                        DomainStorageError::direct_adapter_pending(domain, operation).to_string()
+                    } else {
+                        error
+                    }
+                })
+            })
+            .await
+        }
+    }
+}
+
 pub fn direct_adapter_pending<T>(
     domain: BusinessDomain,
     operation: StorageOperation,
@@ -200,6 +229,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(unknown_marker, "cloud");
+    }
+
+    #[tokio::test]
+    async fn async_route_keeps_local_work_inline_and_runs_cloud_work_in_executor() {
+        let database = test_database();
+        let before = crate::cloud_executor::metrics().started_count;
+        let local = route_async(
+            database.clone(),
+            BusinessDomain::Tasks,
+            StorageOperation::Query,
+            |_| Ok("sqlite"),
+            |_| Ok("cloud"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(local, "sqlite");
+        assert_eq!(crate::cloud_executor::metrics().started_count, before);
+
+        set_device_value(&database, "storage_mode", "cloud");
+        let cloud = route_async(
+            database,
+            BusinessDomain::Tasks,
+            StorageOperation::Query,
+            |_| Ok("sqlite"),
+            |_| Ok("cloud"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cloud, "cloud");
+        assert_eq!(crate::cloud_executor::metrics().started_count, before + 1);
     }
 
     #[test]

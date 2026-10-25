@@ -36,6 +36,8 @@ pub struct DirectCloudReleaseMetricsSnapshot {
     pub average_query_latency_ms: f64,
     pub average_mutation_latency_ms: f64,
     pub average_client_apply_latency_ms: f64,
+    pub cloud_executor: crate::cloud_executor::CloudExecutorMetrics,
+    pub http_client_creation_count: u64,
 }
 
 static METRICS: OnceLock<Mutex<HashMap<String, DirectCloudReleaseMetrics>>> = OnceLock::new();
@@ -165,6 +167,8 @@ pub fn snapshot(workspace_id: &str) -> DirectCloudReleaseMetricsSnapshot {
         average_query_latency_ms,
         average_mutation_latency_ms,
         average_client_apply_latency_ms,
+        cloud_executor: crate::cloud_executor::metrics(),
+        http_client_creation_count: crate::supabase::client_creation_count(),
     }
 }
 
@@ -203,6 +207,7 @@ mod tests {
         assert_eq!(snapshot.metrics.refresh_followup_count, 1);
         assert_eq!(snapshot.average_mutation_latency_ms, 3.75);
         assert_eq!(snapshot.average_client_apply_latency_ms, 2.5);
+        assert_eq!(snapshot.cloud_executor.max_concurrent_jobs, 6);
         assert_eq!(
             snapshot.metrics.last_error_code.as_deref(),
             Some("DATA_COPY_HASH_MISMATCH")

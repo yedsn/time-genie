@@ -8,7 +8,9 @@ use crate::database::Database;
 use crate::direct_cloud_realtime::{
     RealtimeConnectionConfig, RealtimeListenerHooks, WorkspaceInvalidation,
 };
-use crate::supabase::{client, current_session, direct_cloud_workbench_bootstrap, storage_mode};
+use crate::supabase::{
+    client, current_session, direct_cloud_workbench_bootstrap, storage_mode, StorageModeSnapshot,
+};
 
 static REALTIME_ENABLED: AtomicBool = AtomicBool::new(false);
 static REALTIME_WAKEUP: OnceLock<Arc<Notify>> = OnceLock::new();
@@ -24,7 +26,7 @@ pub fn spawn_background_services(database: Database, app: AppHandle) {
         RealtimeListenerHooks {
             load_config: realtime_connection_config,
             is_enabled: realtime_enabled,
-            on_error: emit_cloud_error,
+            on_error: emit_realtime_error,
             on_connected: handle_realtime_connected,
             on_legacy_change: ignore_retired_legacy_change,
             workspace_epoch: realtime_workspace_epoch,
@@ -49,12 +51,19 @@ pub(crate) fn wake_after_connection_ready() {
 
 pub(crate) fn enter_direct_cloud_mode() {
     REALTIME_ENABLED.store(true, Ordering::Release);
-    realtime_wakeup().notify_waiters();
+    realtime_wakeup().notify_one();
+}
+
+#[tauri::command]
+pub fn cloud_connection_wake() {
+    if realtime_enabled() {
+        realtime_wakeup().notify_one();
+    }
 }
 
 pub(crate) fn disable_cloud_sync() {
     REALTIME_ENABLED.store(false, Ordering::Release);
-    realtime_wakeup().notify_waiters();
+    realtime_wakeup().notify_one();
 }
 
 pub(crate) fn emit_revalidated_query(
@@ -148,12 +157,16 @@ fn handle_realtime_connected(database: &Database, app: &AppHandle, _storage_prot
                         changed_by_device_id: None,
                     },
                 );
+                emit_cloud_state(&app, &database, true, None);
             }
-            Ok(Err(error)) => emit_cloud_error(&app, &database, &error),
-            Err(error) => emit_cloud_error(
+            Ok(Err(error)) => emit_cloud_state(&app, &database, true, Some(&error)),
+            Err(error) => emit_cloud_state(
                 &app,
                 &database,
-                &format!("SYNC_WORKER_ERROR: Realtime 初始查询失败: {error}"),
+                true,
+                Some(&format!(
+                    "SYNC_WORKER_ERROR: Realtime 初始查询失败: {error}"
+                )),
             ),
         }
     });
@@ -190,26 +203,93 @@ fn handle_realtime_invalidation(database: &Database, invalidation: &WorkspaceInv
     invalidate_persistent_read_cache(database, &invalidation.workspace_id, &invalidation.domains);
 }
 
-fn emit_cloud_error(app: &AppHandle, database: &Database, error: &str) {
+fn cloud_state_payload(
+    state: &StorageModeSnapshot,
+    realtime_connected: bool,
+    realtime_error: Option<&str>,
+) -> serde_json::Value {
+    let mut payload = serde_json::to_value(state).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "realtimeConnected".to_string(),
+            serde_json::json!(realtime_connected),
+        );
+        object.insert(
+            "realtimeError".to_string(),
+            realtime_error.map_or(serde_json::Value::Null, |error| serde_json::json!(error)),
+        );
+    }
+    payload
+}
+
+fn emit_cloud_state(
+    app: &AppHandle,
+    database: &Database,
+    realtime_connected: bool,
+    realtime_error: Option<&str>,
+) {
     if let Ok(state) = storage_mode(database) {
         let _ = app.emit(
             "cloud-sync-state-changed",
-            serde_json::json!({
-                "mode": state.mode,
-                "storageProtocol": state.storage_protocol,
-                "storageBackend": state.storage_backend,
-                "cloudAccessState": "offline_readonly",
-                "cloudWritable": false,
-                "readOnlyReason": error,
-                "workspaceId": state.workspace_id,
-                "deviceId": state.device_id,
-                "online": false,
-                "lastChangeSeq": state.last_change_seq,
-                "lastSyncedAt": state.last_synced_at,
-                "lastError": error,
-                "workspaceEpoch": state.workspace_epoch,
-                "error": error
-            }),
+            cloud_state_payload(&state, realtime_connected, realtime_error),
         );
+    }
+}
+
+fn emit_realtime_error(app: &AppHandle, database: &Database, error: &str) {
+    emit_cloud_state(app, database, false, Some(error));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn writable_cloud_state() -> StorageModeSnapshot {
+        StorageModeSnapshot {
+            mode: "cloud".to_string(),
+            storage_protocol: crate::storage_contract::DIRECT_CLOUD_PROTOCOL.to_string(),
+            storage_backend: "direct_supabase".to_string(),
+            cloud_access_state: "online_writable".to_string(),
+            cloud_writable: true,
+            read_only_reason: None,
+            workspace_id: "workspace-1".to_string(),
+            device_id: "device-1".to_string(),
+            online: true,
+            last_change_seq: 7,
+            last_synced_at: Some(123),
+            cache_source: None,
+            cache_fetched_at: None,
+            last_error: None,
+            auth_blocked: false,
+            auth_blocked_reason: None,
+            workspace_epoch: 1,
+        }
+    }
+
+    #[test]
+    fn realtime_failure_does_not_downgrade_rest_access_to_read_only() {
+        let payload = cloud_state_payload(
+            &writable_cloud_state(),
+            false,
+            Some("NETWORK_ERROR: Supabase Realtime 心跳失败: Broken pipe"),
+        );
+        assert_eq!(payload["cloudAccessState"], "online_writable");
+        assert_eq!(payload["cloudWritable"], true);
+        assert_eq!(payload["online"], true);
+        assert_eq!(payload["realtimeConnected"], false);
+        assert_eq!(
+            payload["realtimeError"],
+            "NETWORK_ERROR: Supabase Realtime 心跳失败: Broken pipe"
+        );
+        assert!(payload["readOnlyReason"].is_null());
+    }
+
+    #[test]
+    fn realtime_recovery_clears_only_the_realtime_error() {
+        let payload = cloud_state_payload(&writable_cloud_state(), true, None);
+        assert_eq!(payload["cloudAccessState"], "online_writable");
+        assert_eq!(payload["cloudWritable"], true);
+        assert_eq!(payload["realtimeConnected"], true);
+        assert!(payload["realtimeError"].is_null());
     }
 }

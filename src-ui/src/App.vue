@@ -1,9 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, watch } from "vue";
+import { computed, defineAsyncComponent, onMounted, onUnmounted, watch } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import MainWorkbench from "./views/MainWorkbench.vue";
-import HoverPanel from "./views/HoverPanel.vue";
-import { hideHoverAfterKeyboardClose, closeMainWindow, getSettings, getStorageMode, isCurrentWindowFocused, onCloudSyncStateChanged, onCurrentWindowFocusChanged, onOpenUnassignedResolution, onWorkDataChanged, type StorageModeSnapshot } from "./services/tauri";
+import { hideHoverAfterKeyboardClose, closeMainWindow, getSettings, getStorageMode, isCurrentWindowFocused, onCloudSyncStateChanged, onCurrentWindowFocusChanged, onOpenUnassignedResolution, onWorkDataChanged, wakeCloudConnection, type StorageModeSnapshot } from "./services/tauri";
 import { useWorkdayStore } from "./store";
 import { stopCompletionFeedback } from "./services/completionFeedback";
 import { applyAppTheme, getCachedAppTheme, isAppTheme } from "./services/theme";
@@ -15,6 +13,13 @@ import { shouldCalibrateTimer, TimerCalibrationSingleFlight } from "./services/t
 applyAppTheme(getCachedAppTheme());
 
 const store = useWorkdayStore();
+const asyncViewOptions = (loader: () => Promise<unknown>) => ({
+  loader: loader as () => Promise<{ default: object }>,
+  loadingComponent: { template: '<div class="view-loading">正在加载…</div>' },
+  delay: 80,
+});
+const MainWorkbench = defineAsyncComponent(asyncViewOptions(() => import("./views/MainWorkbench.vue")));
+const HoverPanel = defineAsyncComponent(asyncViewOptions(() => import("./views/HoverPanel.vue")));
 const params = new URLSearchParams(window.location.search);
 const view = computed(() => params.get("view") ?? "main");
 let unlistenWindowFocus: (() => void) | undefined;
@@ -127,6 +132,12 @@ function handleVisibilityChange() {
   if (document.visibilityState === "visible") void catchUpCloudData();
 }
 
+function handleNetworkOnline() {
+  if (view.value !== "main") return;
+  void wakeCloudConnection();
+  void catchUpCloudData();
+}
+
 function scheduleDomainRefresh(domains: string[], timerStoppedEntryId?: string) {
   domains.forEach((domain) => pendingRefreshDomains.add(domain));
   if (timerStoppedEntryId) pendingTimerStoppedEntryId = timerStoppedEntryId;
@@ -188,7 +199,7 @@ onMounted(() => {
     const theme = settings.device.app_theme;
     applyAppTheme(isAppTheme(theme) ? theme : "forest", true);
   }).catch(() => undefined);
-  store.startClock(true);
+  store.startClock(view.value === "hover" ? "hover" : "main");
   void getStorageMode().then(applyCloudAccessState).catch(() => undefined);
   void onCloudSyncStateChanged(applyCloudAccessState).then((unlisten) => {
     if (unmounted) unlisten();
@@ -214,6 +225,7 @@ onMounted(() => {
     else unlistenWorkDataChanged = unlisten;
   });
   window.addEventListener("keydown", onKeydown);
+  window.addEventListener("online", handleNetworkOnline);
   document.addEventListener("visibilitychange", handleVisibilityChange);
   catchUpTimer = window.setInterval(() => {
     const now = Date.now();
@@ -251,6 +263,7 @@ onUnmounted(() => {
   if (catchUpTimer) window.clearInterval(catchUpTimer);
   store.stopClock();
   window.removeEventListener("keydown", onKeydown);
+  window.removeEventListener("online", handleNetworkOnline);
   document.removeEventListener("visibilitychange", handleVisibilityChange);
   stopCompletionFeedback();
 });
@@ -260,3 +273,13 @@ onUnmounted(() => {
   <HoverPanel v-if="view === 'hover'" />
   <MainWorkbench v-else />
 </template>
+
+<style>
+.view-loading {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
+}
+</style>

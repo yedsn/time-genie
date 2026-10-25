@@ -74,17 +74,6 @@ pub fn get_state(database: &Database) -> Result<Option<UnassignedStateDto>, Stri
 #[cfg(test)]
 pub fn get_state_snapshot(database: &Database) -> Result<UnassignedStateSnapshotDto, String> {
     let current = get_state(database)?;
-    let connection = database.open()?;
-    let workspace_id = workspace_id(&connection)?;
-    load_state_snapshot(&connection, &workspace_id, current, now_millis())
-}
-
-fn load_state_snapshot(
-    _connection: &rusqlite::Connection,
-    _workspace_id: &str,
-    current: Option<UnassignedStateDto>,
-    _now: i64,
-) -> Result<UnassignedStateSnapshotDto, String> {
     Ok(UnassignedStateSnapshotDto { current })
 }
 
@@ -1402,40 +1391,45 @@ fn now_millis() -> i64 {
 }
 
 #[tauri::command]
-pub fn unassigned_get_state(
+pub async fn unassigned_get_state(
     database: tauri::State<'_, Database>,
 ) -> Result<Option<UnassignedStateDto>, String> {
-    crate::storage_contract::route(
-        &database,
+    let database = database.inner().clone();
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Time,
         crate::storage_contract::StorageOperation::Mutation,
         get_state,
         crate::supabase::direct_cloud_unassigned_ensure,
     )
+    .await
 }
 
 #[tauri::command]
-pub fn unassigned_get_state_snapshot(
+pub async fn unassigned_get_state_snapshot(
     database: tauri::State<'_, Database>,
 ) -> Result<UnassignedStateSnapshotDto, String> {
-    let current = crate::storage_contract::route(
-        &database,
+    let database = database.inner().clone();
+    let current = crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Time,
         crate::storage_contract::StorageOperation::Mutation,
         get_state,
         crate::supabase::direct_cloud_unassigned_ensure,
-    )?;
+    )
+    .await?;
     Ok(UnassignedStateSnapshotDto { current })
 }
 
 #[tauri::command]
-pub fn unassigned_get_session(
+pub async fn unassigned_get_session(
     database: tauri::State<'_, Database>,
     session_id: String,
 ) -> Result<UnassignedStateDto, String> {
+    let database = database.inner().clone();
     let direct_session_id = session_id.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Time,
         crate::storage_contract::StorageOperation::Query,
         |database| get_session_state(database, &session_id),
@@ -1444,31 +1438,35 @@ pub fn unassigned_get_session(
                 .ok_or_else(|| "NOT_FOUND: 未归属会话不存在或已处理".to_string())
         },
     )
+    .await
 }
 
 #[tauri::command]
-pub fn unassigned_resolve_work(
+pub async fn unassigned_resolve_work(
     database: tauri::State<'_, Database>,
     request: ResolveWorkRequest,
 ) -> Result<UnassignedResolveResult, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Time,
         crate::storage_contract::StorageOperation::Mutation,
         |database| resolve_work_for_sync(database, request),
         |database| crate::supabase::direct_cloud_unassigned_resolve_work(database, direct_request),
     )
+    .await
 }
 
 #[tauri::command]
-pub fn unassigned_resolve_break(
+pub async fn unassigned_resolve_break(
     database: tauri::State<'_, Database>,
     request: ResolveSessionRequest,
 ) -> Result<UnassignedResolveResult, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Time,
         crate::storage_contract::StorageOperation::Mutation,
         |database| resolve_break_for_sync(database, request),
@@ -1480,16 +1478,18 @@ pub fn unassigned_resolve_break(
             )
         },
     )
+    .await
 }
 
 #[tauri::command]
-pub fn unassigned_discard(
+pub async fn unassigned_discard(
     database: tauri::State<'_, Database>,
     request: ResolveSessionRequest,
 ) -> Result<UnassignedResolveResult, String> {
+    let database = database.inner().clone();
     let direct_request = request.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Time,
         crate::storage_contract::StorageOperation::Mutation,
         |database| discard_for_sync(database, request),
@@ -1501,6 +1501,7 @@ pub fn unassigned_discard(
             )
         },
     )
+    .await
 }
 
 #[cfg(test)]

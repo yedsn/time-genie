@@ -14,6 +14,8 @@ use crate::database::Database;
 const REALTIME_HEARTBEAT_SECONDS: u64 = 25;
 const REALTIME_RECONNECT_SECONDS: u64 = 5;
 pub(crate) const REALTIME_RECONNECT_MAX_SECONDS: u64 = 60;
+const REALTIME_CONNECT_TIMEOUT_SECONDS: u64 = 12;
+const REALTIME_JOIN_TIMEOUT_SECONDS: u64 = 12;
 
 #[derive(Debug, Clone)]
 pub(crate) struct RealtimeConnectionConfig {
@@ -53,6 +55,13 @@ pub(crate) fn realtime_change_seq(message: &Value) -> Option<i64> {
         .or_else(|| message.pointer("/payload/record/change_seq"))
         .or_else(|| message.pointer("/payload/data/new/change_seq"))
         .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+}
+
+fn is_realtime_heartbeat_reply(message: &Value, pending_ref: Option<&str>) -> bool {
+    pending_ref.is_some()
+        && message.get("event").and_then(Value::as_str) == Some("phx_reply")
+        && message.get("topic").and_then(Value::as_str) == Some("phoenix")
+        && message.get("ref").and_then(Value::as_str) == pending_ref
 }
 
 pub(crate) fn realtime_workspace_invalidation(
@@ -183,8 +192,18 @@ pub(crate) fn spawn_realtime_listener(
                     continue;
                 }
             };
-            if let Err(error) =
-                run_realtime_connection(&database, &app, &config, &mode_wakeup, hooks).await
+            let mut connected = false;
+            let mut reconnect_immediately = false;
+            if let Err(error) = run_realtime_connection(
+                &database,
+                &app,
+                &config,
+                &mode_wakeup,
+                hooks,
+                &mut connected,
+                &mut reconnect_immediately,
+            )
+            .await
             {
                 if (hooks.is_enabled)() {
                     (hooks.on_error)(&app, &database, &error);
@@ -193,6 +212,13 @@ pub(crate) fn spawn_realtime_listener(
             if !(hooks.is_enabled)() {
                 reconnect_attempt = 0;
                 continue;
+            }
+            if reconnect_immediately {
+                reconnect_attempt = 0;
+                continue;
+            }
+            if connected {
+                reconnect_attempt = 0;
             }
             crate::direct_cloud_observability::record_realtime_reconnect(&config.workspace_id);
             let jitter_seed = SystemTime::now()
@@ -215,11 +241,17 @@ async fn run_realtime_connection(
     config: &RealtimeConnectionConfig,
     mode_wakeup: &Arc<Notify>,
     hooks: RealtimeListenerHooks,
+    connected: &mut bool,
+    reconnect_immediately: &mut bool,
 ) -> Result<(), String> {
     let url = realtime_url(&config.project_url, &config.anon_key)?;
-    let (socket, _) = connect_async(url.as_str())
-        .await
-        .map_err(|error| format!("NETWORK_ERROR: Supabase Realtime 连接失败: {error}"))?;
+    let (socket, _) = tokio::time::timeout(
+        Duration::from_secs(REALTIME_CONNECT_TIMEOUT_SECONDS),
+        connect_async(url.as_str()),
+    )
+    .await
+    .map_err(|_| "NETWORK_ERROR: Supabase Realtime 连接超时".to_string())?
+    .map_err(|error| format!("NETWORK_ERROR: Supabase Realtime 连接失败: {error}"))?;
     let (mut writer, mut reader) = socket.split();
     let topic = format!(
         "realtime:{}:workspace_changes:{}",
@@ -257,15 +289,23 @@ async fn run_realtime_connection(
     let mut heartbeat = tokio::time::interval(Duration::from_secs(REALTIME_HEARTBEAT_SECONDS));
     heartbeat.tick().await;
     let mut heartbeat_ref = 2_u64;
+    let mut pending_heartbeat_ref: Option<String> = None;
+    let join_timeout = tokio::time::sleep(Duration::from_secs(REALTIME_JOIN_TIMEOUT_SECONDS));
+    tokio::pin!(join_timeout);
     loop {
         tokio::select! {
+            _ = &mut join_timeout, if !*connected => {
+                return Err("NETWORK_ERROR: Supabase Realtime 订阅确认超时".to_string());
+            }
             _ = mode_wakeup.notified() => {
-                if !(hooks.is_enabled)() {
-                    let _ = writer.send(Message::Close(None)).await;
-                    return Ok(());
-                }
+                *reconnect_immediately = true;
+                let _ = writer.send(Message::Close(None)).await;
+                return Ok(());
             }
             _ = heartbeat.tick() => {
+                if pending_heartbeat_ref.is_some() {
+                    return Err("NETWORK_ERROR: Supabase Realtime 心跳响应超时".to_string());
+                }
                 let heartbeat_database = database.clone();
                 let workspace_id = config.workspace_id.clone();
                 let current_workspace = tauri::async_runtime::spawn_blocking(move || {
@@ -284,6 +324,7 @@ async fn run_realtime_connection(
                     "topic": "phoenix", "event": "heartbeat", "payload": {}, "ref": reference
                 }).to_string().into())).await
                     .map_err(|error| format!("NETWORK_ERROR: Supabase Realtime 心跳失败: {error}"))?;
+                pending_heartbeat_ref = Some(reference);
             }
             incoming = reader.next() => match incoming {
                 Some(Ok(Message::Text(text))) => {
@@ -296,7 +337,10 @@ async fn run_realtime_connection(
                             .and_then(Value::as_str).unwrap_or("频道订阅被拒绝");
                         return Err(format!("CLOUD_REQUEST_FAILED: Supabase Realtime {reason}"));
                     } else if join_reply && message.pointer("/payload/status").and_then(Value::as_str) == Some("ok") {
+                        *connected = true;
                         (hooks.on_connected)(database, app, &config.storage_protocol);
+                    } else if is_realtime_heartbeat_reply(&message, pending_heartbeat_ref.as_deref()) {
+                        pending_heartbeat_ref = None;
                     } else if event == "postgres_changes" {
                         if config.storage_protocol == crate::storage_contract::DIRECT_CLOUD_PROTOCOL {
                             if let Some(invalidation) = realtime_workspace_invalidation(
@@ -347,6 +391,18 @@ mod tests {
             Some(43)
         );
         assert_eq!(realtime_change_seq(&json!({"payload":{}})), None);
+    }
+
+    #[test]
+    fn realtime_heartbeat_reply_only_clears_the_matching_pending_heartbeat() {
+        let reply = json!({"topic":"phoenix","event":"phx_reply","ref":"7"});
+        assert!(is_realtime_heartbeat_reply(&reply, Some("7")));
+        assert!(!is_realtime_heartbeat_reply(&reply, Some("8")));
+        assert!(!is_realtime_heartbeat_reply(&reply, None));
+        assert!(!is_realtime_heartbeat_reply(
+            &json!({"topic":"realtime:timegenie","event":"phx_reply","ref":"7"}),
+            Some("7"),
+        ));
     }
 
     #[test]

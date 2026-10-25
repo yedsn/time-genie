@@ -15,6 +15,7 @@ mod actual_time_adjustments;
 mod automation_hooks;
 #[cfg(test)]
 mod cloud_e2e;
+mod cloud_executor;
 mod cloud_read_cache;
 mod cloud_sync;
 mod daily_report_import;
@@ -438,11 +439,13 @@ pub fn run() {
             automation_hooks::automation_hook_test,
             settings::settings_get,
             work_calendar::work_calendar_get_context,
+            work_calendar::workbench_bootstrap_get,
             settings::settings_update,
             settings::integration_config_update,
             settings::integration_secret_set,
             settings::integration_secret_clear,
             supabase::storage_mode_get,
+            cloud_sync::cloud_connection_wake,
             supabase::direct_cloud_release_metrics_get,
             supabase::direct_cloud_client_metric_record,
             supabase::storage_mode_set_local,

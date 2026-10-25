@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, defineAsyncComponent, h, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import { AlertTriangle, CalendarDays, CheckCircle2, Clock3, Copy, Database, FileText, Folder, Home, LoaderCircle, Minus, Pencil, Plus, RefreshCw, Save, Settings, Square, UserRound, X } from "lucide-vue-next";
 import { ElMessage, ElMessageBox } from "element-plus";
@@ -11,11 +11,6 @@ import GlobalTimerBar from "../components/GlobalTimerBar.vue";
 import UnassignedTimeIndicator from "../components/UnassignedTimeIndicator.vue";
 import TimeTrackingWorkspace from "../components/TimeTrackingWorkspace.vue";
 import TodayOverviewWorkspace from "../components/TodayOverviewWorkspace.vue";
-import ReportWorkspace from "../components/ReportWorkspace.vue";
-import AutomationHooksSettings from "../components/AutomationHooksSettings.vue";
-import DataBackupSettings from "../components/DataBackupSettings.vue";
-import CloudOperationHistorySettings from "../components/CloudOperationHistorySettings.vue";
-import CloudSnapshotsSettings from "../components/CloudSnapshotsSettings.vue";
 import TimerStopConfirmationDialog from "../components/TimerStopConfirmationDialog.vue";
 import TimerTaskDialog from "../components/TimerTaskDialog.vue";
 import appIconUrl from "../../../src-tauri/icons/icon.svg";
@@ -30,6 +25,16 @@ import { cloneWorkSchedule, createDefaultWorkSchedule, loadSubjectWorkSchedule, 
 import { setHoverNavigationEnabled } from "../services/hoverNavigation";
 
 const store = useWorkdayStore();
+const asyncSectionOptions = (loader: () => Promise<unknown>) => ({
+  loader: loader as () => Promise<{ default: object }>,
+  loadingComponent: { template: '<div class="section-loading">正在加载功能…</div>' },
+  delay: 80,
+});
+const ReportWorkspace = defineAsyncComponent(asyncSectionOptions(() => import("../components/ReportWorkspace.vue")));
+const AutomationHooksSettings = defineAsyncComponent(asyncSectionOptions(() => import("../components/AutomationHooksSettings.vue")));
+const DataBackupSettings = defineAsyncComponent(asyncSectionOptions(() => import("../components/DataBackupSettings.vue")));
+const CloudOperationHistorySettings = defineAsyncComponent(asyncSectionOptions(() => import("../components/CloudOperationHistorySettings.vue")));
+const CloudSnapshotsSettings = defineAsyncComponent(asyncSectionOptions(() => import("../components/CloudSnapshotsSettings.vue")));
 const appVersion = __APP_VERSION__;
 const pages = [
   { id: "today", label: "今日", icon: Home },

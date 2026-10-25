@@ -31,6 +31,16 @@ pub struct WorkspaceCalendarContextDto {
     pub current_day_end_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkbenchBootstrapDto {
+    pub timezone: String,
+    pub current_work_date: String,
+    pub current_day_start_at: i64,
+    pub current_day_end_at: i64,
+    pub subjects: Vec<crate::subjects::SubjectDto>,
+}
+
 pub fn validate_timezone(value: &str) -> Result<Tz, String> {
     value
         .trim()
@@ -123,11 +133,12 @@ pub fn calendar_context_at(
 }
 
 #[tauri::command]
-pub fn work_calendar_get_context(
+pub async fn work_calendar_get_context(
     database: tauri::State<'_, Database>,
 ) -> Result<WorkspaceCalendarContextDto, String> {
-    crate::storage_contract::route(
-        &database,
+    let database = database.inner().clone();
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::SharedSettingsIntegrations,
         crate::storage_contract::StorageOperation::Query,
         |database| calendar_context_at(&database.open()?, now_millis()),
@@ -141,6 +152,51 @@ pub fn work_calendar_get_context(
             })
         },
     )
+    .await
+}
+
+#[tauri::command]
+pub async fn workbench_bootstrap_get(
+    database: tauri::State<'_, Database>,
+) -> Result<WorkbenchBootstrapDto, String> {
+    let database = database.inner().clone();
+    crate::storage_contract::route_async(
+        database,
+        crate::storage_contract::BusinessDomain::SharedSettingsIntegrations,
+        crate::storage_contract::StorageOperation::Query,
+        |database| {
+            let connection = database.open()?;
+            let calendar = calendar_context_at(&connection, now_millis())?;
+            Ok(WorkbenchBootstrapDto {
+                timezone: calendar.timezone,
+                current_work_date: calendar.current_work_date,
+                current_day_start_at: calendar.current_day_start_at,
+                current_day_end_at: calendar.current_day_end_at,
+                subjects: crate::subjects::list_subjects(database)?,
+            })
+        },
+        |database| {
+            let data = crate::supabase::direct_cloud_workbench_bootstrap(database)?.data;
+            Ok(WorkbenchBootstrapDto {
+                timezone: data.timezone,
+                current_work_date: data.current_work_date,
+                current_day_start_at: data.current_day_start_at,
+                current_day_end_at: data.current_day_end_at,
+                subjects: data
+                    .subjects
+                    .into_iter()
+                    .map(|subject| crate::subjects::SubjectDto {
+                        id: subject.id,
+                        name: subject.name,
+                        sort_order: subject.sort_order,
+                        open_task_count: subject.open_task_count,
+                        version: subject.version,
+                    })
+                    .collect(),
+            })
+        },
+    )
+    .await
 }
 
 pub fn day_bounds(timezone: Tz, work_date: &str) -> Result<DayBounds, String> {

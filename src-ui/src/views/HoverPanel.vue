@@ -39,7 +39,7 @@ const unassignedElapsed = computed(() => formatDuration(store.unassignedSeconds)
 const runRefreshSingleFlight = createSingleFlight(async () => {
   refreshing.value = true;
   try {
-    const results = await Promise.all([store.loadWorkspaceData(), store.loadTimeData(), store.loadUnassignedState()]);
+    const results = await Promise.all([store.loadHoverTimeData(), store.loadUnassignedState()]);
     return results.every((result) => result !== false);
   } finally {
     refreshing.value = false;

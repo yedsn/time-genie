@@ -22,6 +22,7 @@ export default defineConfig({
   build: {
     outDir: "../dist",
     emptyOutDir: true,
+    manifest: true,
     target: "es2020"
   }
 });

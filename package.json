@@ -18,6 +18,7 @@
         "test:unassigned-time-display": "tsc src-ui/src/services/unassignedTimeDisplayCore.ts --outDir .tmp-unassigned-time-display-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-unassigned-time-display.mjs",
         "test:work-data-refresh": "tsc src-ui/src/services/workDataRefresh.ts --outDir .tmp-work-data-refresh-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-work-data-refresh.mjs",
         "test:direct-cloud-interaction-performance": "tsc src-ui/src/services/directCloudQueryCoordinatorCore.ts src-ui/src/services/directCloudRequestBudgetCore.ts src-ui/src/services/workDataInvalidationCore.ts src-ui/src/services/timerCalibrationCore.ts src-ui/src/services/taskMutationStateCore.ts --outDir .tmp-direct-cloud-performance-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-direct-cloud-query-coordinator.mjs && node scripts/verify-direct-cloud-request-budget.mjs && node scripts/verify-work-data-invalidation.mjs && node scripts/verify-timer-calibration.mjs && node scripts/verify-task-mutation-state.mjs && node scripts/verify-direct-cloud-interaction-performance.mjs",
+        "test:application-responsiveness": "tsc src-ui/src/services/entityArrayChangeCore.ts --outDir .tmp-application-responsiveness-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-application-responsiveness.mjs && node scripts/benchmark-large-task-lists.mjs && node scripts/benchmark-large-task-lists-browser.mjs",
         "test:completed-task-history": "tsc src-ui/src/services/completedTaskHistoryCore.ts --outDir .tmp-completed-task-history-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-completed-task-history.mjs",
         "test:task-status-tabs-ui": "node scripts/verify-task-status-tabs-ui.mjs",
         "test:today-plan-ui": "node scripts/verify-today-plan-ui.mjs",
@@ -70,7 +71,6 @@
         "md-editor-v3": "^7.0.0",
         "pinia": "^2.3.0",
         "sortablejs": "^1.15.7",
-        "timegenie": "file:",
         "vue": "^3.5.13"
     },
     "devDependencies": {

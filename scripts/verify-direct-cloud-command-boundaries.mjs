@@ -57,7 +57,9 @@ for (const handler of handlers) {
     if (routedStorageHelpers.has(handler)) {
       const source = fs.readFileSync(path.join(sourceRoot, `${moduleName}.rs`), "utf8");
       const body = functionBody(source, functionName);
-      const helper = body.match(/([a-zA-Z0-9_]+_for_storage)\s*\(/)?.[1];
+      const helper = [...body.matchAll(/([a-zA-Z0-9_]+_for_storage)\s*\(/g)]
+        .map((match) => match[1])
+        .find((name) => name !== "run_for_storage");
       if (!helper || !functionBody(source, helper).includes("storage_contract::route")) {
         uncovered.push(`${handler}（路由辅助函数无效）`);
       }

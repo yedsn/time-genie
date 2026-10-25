@@ -876,23 +876,27 @@ fn current_revision(connection: &rusqlite::Connection) -> Result<i64, String> {
 }
 
 #[tauri::command]
-pub fn today_work_overview_get(
+pub async fn today_work_overview_get(
     database: tauri::State<'_, Database>,
     request: TodayWorkOverviewRequest,
 ) -> Result<TodayWorkOverviewDto, String> {
-    let direct_request = TodayWorkOverviewRequest {
-        subject_id: request.subject_id.clone(),
-        today_date: request.today_date.clone(),
-        history_days: request.history_days,
-        trend_days: request.trend_days,
-    };
-    crate::storage_contract::route(
-        &database,
-        crate::storage_contract::BusinessDomain::Planning,
-        crate::storage_contract::StorageOperation::Query,
-        |database| get_today_work_overview(database, request),
-        |database| crate::supabase::direct_cloud_today_overview(database, direct_request),
-    )
+    let database = database.inner().clone();
+    crate::cloud_executor::run_for_storage(database, move |database| {
+        let direct_request = TodayWorkOverviewRequest {
+            subject_id: request.subject_id.clone(),
+            today_date: request.today_date.clone(),
+            history_days: request.history_days,
+            trend_days: request.trend_days,
+        };
+        crate::storage_contract::route(
+            database,
+            crate::storage_contract::BusinessDomain::Planning,
+            crate::storage_contract::StorageOperation::Query,
+            |database| get_today_work_overview(database, request),
+            |database| crate::supabase::direct_cloud_today_overview(database, direct_request),
+        )
+    })
+    .await
 }
 
 #[cfg(test)]

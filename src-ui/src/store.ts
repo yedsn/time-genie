@@ -14,6 +14,7 @@ import {
   duplicateTaskSubtree,
   getTodayWorkOverview,
   getWorkspaceCalendarContext,
+  getWorkbenchBootstrap,
   getTimerState,
   getUnassignedStateSnapshot,
   listCompletedTaskPage,
@@ -83,10 +84,12 @@ import {
   type ActualAdjustmentBatchRequest,
   type ActualAdjustmentSnapshotRecord,
   type TaskDayPlanSnapshotRecord,
+  type WorkspaceCalendarContext,
   recordDirectCloudClientMetric,
 } from "./services/tauri";
 import { TRANSIENT_MISSING_STATE_REFRESH_LIMIT, transientMissingStateResult } from "./services/transientStateGuard";
 import { canSubmitUnassignedResolution } from "./services/unassignedResolutionGuard";
+import { replaceVersionedArrayIfChanged } from "./services/entityArrayChangeCore";
 import { clampHistoryPage, collectTodayEntryTaskIds, findEntryInHistory, isTodayTimeEntry } from "./services/timeEntryHistoryCore";
 import { completedTaskHistoryFallbackPage, isCurrentCompletedTaskHistoryRequest } from "./services/completedTaskHistoryCore";
 import { canAcceptInlineTimerChild, inlineTimerParentUnavailableReason } from "./services/inlineTimerTaskCreationCore";
@@ -404,8 +407,9 @@ export const useWorkdayStore = defineStore("workday", () => {
     return subjects.find((subject) => subject.id === todayOverviewSubjectId.value);
   });
 
-  function startClock(trackUnassigned = true) {
-    void initializeWorkspace(trackUnassigned);
+  function startClock(viewMode: "main" | "hover" = "main") {
+    if (viewMode === "hover") void initializeHoverData();
+    else void initializeWorkspace();
     if (!clock) {
       clock = window.setInterval(() => {
         now.value = Date.now();
@@ -422,10 +426,14 @@ export const useWorkdayStore = defineStore("workday", () => {
     clock = undefined;
   }
 
-  async function initializeWorkspace(trackUnassigned: boolean) {
-    await refreshWorkspaceCalendar();
-    await Promise.all([loadWorkspaceData(), loadTimeData(), trackUnassigned ? loadUnassignedState() : Promise.resolve()]);
+  async function initializeWorkspace() {
+    await loadWorkbenchBootstrap();
+    await Promise.all([loadWorkspaceData(false, false), loadTimeData(), loadUnassignedState()]);
     await loadTodayOverview();
+  }
+
+  async function initializeHoverData() {
+    await Promise.all([loadHoverTimeData(), loadUnassignedState()]);
   }
 
   function clearCloudBusinessMemory() {
@@ -456,6 +464,25 @@ export const useWorkdayStore = defineStore("workday", () => {
     return context;
   }
 
+  function applyWorkspaceCalendar(context: WorkspaceCalendarContext) {
+    workspaceTimezone.value = context.timezone;
+    workspaceToday.value = context.currentWorkDate;
+    workspaceDayStartAt.value = context.currentDayStartAt;
+    workspaceDayEndAt.value = context.currentDayEndAt;
+  }
+
+  async function loadWorkbenchBootstrap() {
+    const bootstrap = await getWorkbenchBootstrap();
+    applyWorkspaceCalendar(bootstrap);
+    replaceArrayIfChanged(subjects, bootstrap.subjects.map((subject) => ({
+      id: subject.id,
+      name: subject.name,
+      version: subject.version,
+      openTaskCount: subject.openTaskCount,
+    })));
+    return bootstrap;
+  }
+
   async function ensureWorkspaceCalendar() {
     if (!workspaceToday.value || Date.now() >= workspaceDayEndAt.value) {
       await refreshWorkspaceCalendar();
@@ -463,23 +490,25 @@ export const useWorkdayStore = defineStore("workday", () => {
     return workspaceToday.value;
   }
 
-  async function loadWorkspaceDataNow(isCurrent: () => boolean = () => true) {
+  async function loadWorkspaceDataNow(isCurrent: () => boolean = () => true, loadSubjects = true) {
     const requestSeq = ++workspaceRequestSeq;
     workspaceLoading.value = true;
     try {
       const todayDate = await ensureWorkspaceCalendar();
       const [subjectRecords, taskResult, todayTaskResult] = await Promise.all([
-        listSubjects(),
+        loadSubjects ? listSubjects() : Promise.resolve(undefined),
         listTasks(undefined, undefined, todayDate),
         listTodayTasks(undefined, todayDate),
       ]);
       if (requestSeq !== workspaceRequestSeq || !isCurrent()) return true;
-      replaceArrayIfChanged(subjects, subjectRecords.map((subject) => ({
-        id: subject.id,
-        name: subject.name,
-        version: subject.version,
-        openTaskCount: subject.openTaskCount,
-      })));
+      if (subjectRecords) {
+        replaceArrayIfChanged(subjects, subjectRecords.map((subject) => ({
+          id: subject.id,
+          name: subject.name,
+          version: subject.version,
+          openTaskCount: subject.openTaskCount,
+        })));
+      }
       // Keep unsaved draft rows while background refreshes replace persisted data.
       const unsavedTasks = tasks.filter((task) => task.version <= 0);
       const loadedTasks = taskResult.tasks.map(toUiTask);
@@ -499,9 +528,9 @@ export const useWorkdayStore = defineStore("workday", () => {
         if (previousIndex >= 0) mergedTasks.splice(previousIndex, 0, draft);
         else mergedTasks.push(draft);
       }
-      replaceArrayIfChanged(tasks, mergedTasks);
+      replaceVersionedArrayIfChanged(tasks, mergedTasks);
       const loadedTodayTasks = todayTaskResult.tasks.map(toUiTask);
-      replaceArrayIfChanged(todayTasks, loadedTodayTasks);
+      replaceVersionedArrayIfChanged(todayTasks, loadedTodayTasks);
       const fallbackSubjectId = subjects[0]?.id ?? "";
       if (!subjects.some((subject) => subject.id === selectedSubjectId.value)) selectedSubjectId.value = fallbackSubjectId;
       if (todayOverviewSubjectId.value && !subjects.some((subject) => subject.id === todayOverviewSubjectId.value)) todayOverviewSubjectId.value = "";
@@ -525,8 +554,8 @@ export const useWorkdayStore = defineStore("workday", () => {
     }
   }
 
-  async function loadWorkspaceData(force = false) {
-    const result = await queryCoordinator.run("workspace", (isCurrent) => loadWorkspaceDataNow(isCurrent), { force, maxAgeMs: 1_000 });
+  async function loadWorkspaceData(force = false, loadSubjects = true) {
+    const result = await queryCoordinator.run("workspace", (isCurrent) => loadWorkspaceDataNow(isCurrent, loadSubjects), { force, maxAgeMs: 1_000 });
     return result ?? true;
   }
 
@@ -666,7 +695,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       } else {
         timerStateMissingRefreshes = transientMissingStateResult(Boolean(previousActiveEntry), activeStateStillPresent, timerStateMissingRefreshes).missingRefreshes;
       }
-      replaceArrayIfChanged(entries, nextEntries);
+      replaceVersionedArrayIfChanged(entries, nextEntries);
       if (timerStopConfirmationEntryId.value && !entries.some((entry) => entry.id === timerStopConfirmationEntryId.value)) {
         timerStopConfirmationEntryId.value = "";
       }
@@ -676,6 +705,17 @@ export const useWorkdayStore = defineStore("workday", () => {
       return true;
     } catch (error) {
       console.error("加载计时数据失败", error);
+      return false;
+    }
+  }
+
+  async function loadHoverTimeData() {
+    try {
+      const activeEntry = await getTimerState();
+      replaceArrayIfChanged(entries, activeEntry ? [toUiTimeEntry(activeEntry)] : []);
+      return true;
+    } catch (error) {
+      console.error("加载悬浮窗计时数据失败", error);
       return false;
     }
   }
@@ -2772,7 +2812,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     now, todayMinutes, allocatedMinutes, pendingMinutes, doneCount, todayCompletionDoneCount, todayCompletionTotalCount, todayCompletionPercent, unassignedSeconds, unassignedStartedAt,
     unassignedFirstStartedAt, unassignedLastEndedAt, unassignedDialogOpen, unassignedWorkDate, unassignedSessionId, unassignedVersion,
     unassignedCurrentSession,
-    workspaceLoaded, workspaceLoading, executionSnapshots, executionSnapshotLoading, clearCloudBusinessMemory, invalidateCloudDomains, loadExecutionSnapshot, saveExecutionTaskTitle, saveExecutionTaskNote, saveExecutionTaskDetails, deleteExecutionTask, loadWorkspaceData, loadTodayPlan, setTodayPlanMembership, addTasksToToday, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadMoreReports, refreshReports, loadReportsThroughId, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addTaskSelectionDraft, addChildTask, addTaskRelative, createTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTodayImport, saveTaskPlanBatch, loadActualAdjustmentSnapshot, saveActualAdjustmentBatch, removeActualAdjustment, duplicateTask, duplicateSingleTask, deleteTask, moveTask, reorderTask, movePlanTask,
+    workspaceLoaded, workspaceLoading, executionSnapshots, executionSnapshotLoading, clearCloudBusinessMemory, invalidateCloudDomains, loadExecutionSnapshot, saveExecutionTaskTitle, saveExecutionTaskNote, saveExecutionTaskDetails, deleteExecutionTask, loadWorkspaceData, loadTodayPlan, setTodayPlanMembership, addTasksToToday, loadCompletedTasks, selectPlanTaskTab, selectCompletedTasksPage, markCompletedTasksStale, reopenCompletedTask, saveCompletedTask, deleteCompletedTask, loadTimeData, loadHoverTimeData, loadTimeHistory, selectTimeHistoryPage, loadUnassignedState, loadReports, loadMoreReports, refreshReports, loadReportsThroughId, loadTodayOverview, selectTodayOverviewSubject, entryDurationSeconds, taskPathLabel, taskDisplayLabel, timeEntryLabel, startClock, stopClock, selectPage, selectSubject, addSubject, renameSubject, commitTaskToggle, toggleTask, setTaskRecurrence, addTask, addQuickTask, addTaskSelectionDraft, addChildTask, addTaskRelative, createTaskRelative, saveTask, saveTaskNote, saveTaskTodayEstimate, saveTaskEstimateBatch, saveTodayImport, saveTaskPlanBatch, loadActualAdjustmentSnapshot, saveActualAdjustmentBatch, removeActualAdjustment, duplicateTask, duplicateSingleTask, deleteTask, moveTask, reorderTask, movePlanTask,
     addTodayTask, addTodayChildTask, addTodayTaskRelative, saveTodayTask, saveTodayTaskToFuture, deleteTodayTask, saveTodayTaskNote, saveTodayTaskNoteToFuture, saveTodayTaskTodayEstimate, commitTodayTaskToggle, toggleTodayTask, moveTodayTask, indentTodayTask, outdentTodayTask, duplicateTodayTask, duplicateSingleTodayTask,
     indentTask, outdentTask, moveExecutionTask, startTimer, transitionTimer, pauseTimer, resumeTimer, stopTimer, openTimerStopConfirmation, dismissTimerStopConfirmation, confirmTimerStopAllocation, resolveTimerStopDisposition, allocate, addManualEntry, correctTimeEntry, setTimeEntryDisposition, createReport, updateReportScope, saveReportContent, regenerateReport, deleteReport, getReportTemplate, saveReportTemplate, loadReportTemplates, createReportTemplate, updateReportTemplate, duplicateReportTemplate, setDefaultReportTemplate, deleteReportTemplate, reorderReportTemplates, getReportTemplatePlaceholders, publicReportText, previewObsidianReport, writeObsidianReport,
     beginUnassignedTracking, pauseUnassignedTracking, promptUnassignedResolution, dismissUnassignedResolution, resolveUnassignedTime

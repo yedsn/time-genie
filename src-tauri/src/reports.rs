@@ -1362,7 +1362,6 @@ pub fn set_default_template_for_cloud_test(
 fn delete_template_with_cloud_operation(
     database: &Database,
     request: ReportTemplateDeleteRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<(), String> {
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
@@ -1421,12 +1420,7 @@ pub fn delete_template_for_cloud_test(
     database: &Database,
     request: ReportTemplateDeleteRequest,
 ) -> Result<(), String> {
-    let state = crate::supabase::storage_mode(database)?;
-    delete_template_with_cloud_operation(
-        database,
-        request,
-        Some((&state, "report_template_delete")),
-    )
+    delete_template_with_cloud_operation(database, request)
 }
 
 fn reorder_templates_with_cloud_operation(
@@ -1482,7 +1476,6 @@ fn reorder_templates_with_cloud_operation(
 fn save_template_with_cloud_operation(
     database: &Database,
     request: ReportTemplateSaveRequest,
-    cloud_operation: Option<(&crate::supabase::StorageModeSnapshot, &str)>,
 ) -> Result<ReportTemplateDto, String> {
     validate_report_type(&request.report_type)?;
     validate_template(&request.report_type, &request.content)?;
@@ -1497,7 +1490,6 @@ fn save_template_with_cloud_operation(
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    let base_version = existing.as_ref().map(|(_, version)| *version);
     let now = now_millis();
     let transaction = connection
         .transaction()
@@ -3217,10 +3209,11 @@ fn now_millis() -> i64 {
 }
 
 #[tauri::command]
-pub fn report_list(
+pub async fn report_list(
     database: tauri::State<'_, Database>,
     request: ReportListRequest,
 ) -> Result<ReportListResult, String> {
+    let database = database.inner().clone();
     let direct_request = ReportListRequest {
         report_type: request.report_type.clone(),
         subject_id: request.subject_id.clone(),
@@ -3228,69 +3221,76 @@ pub fn report_list(
         page: request.page,
         page_size: request.page_size,
     };
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Query,
         |database| list_reports(database, request),
         |database| direct_report_list_for_command(database, direct_request),
     )
+    .await
 }
 #[tauri::command]
-pub fn report_task_suggestions(
+pub async fn report_task_suggestions(
     database: tauri::State<'_, Database>,
     request: ReportTaskSuggestionRequest,
 ) -> Result<Vec<ReportTaskSuggestionDto>, String> {
+    let database = database.inner().clone();
     let direct_request = ReportTaskSuggestionRequest {
         report_type: request.report_type.clone(),
         reference_date: request.reference_date.clone(),
         subject_id: request.subject_id.clone(),
         include_task_ids: request.include_task_ids.clone(),
     };
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Query,
         |database| suggest_report_tasks(database, request),
         |database| direct_report_task_suggestions_for_command(database, direct_request),
     )
+    .await
 }
 #[tauri::command]
-pub fn report_work_period_preview(
+pub async fn report_work_period_preview(
     database: tauri::State<'_, Database>,
     request: ReportWorkPeriodPreviewRequest,
 ) -> Result<String, String> {
+    let database = database.inner().clone();
     let direct_request = ReportWorkPeriodPreviewRequest {
         subject_id: request.subject_id.clone(),
         reference_date: request.reference_date.clone(),
     };
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Query,
         |database| preview_report_work_period(database, request),
         |database| direct_report_work_period_preview_for_command(database, direct_request),
     )
+    .await
 }
 
 #[tauri::command]
-pub fn report_preview(
+pub async fn report_preview(
     database: tauri::State<'_, Database>,
     request: ReportPreviewRequest,
 ) -> Result<String, String> {
+    let database = database.inner().clone();
     let direct_request = ReportPreviewRequest {
         report_type: request.report_type.clone(),
         reference_date: request.reference_date.clone(),
         subject_id: request.subject_id.clone(),
         template_id: request.template_id.clone(),
     };
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Query,
         |database| preview_report(database, request),
         |database| direct_report_preview_for_command(database, direct_request),
     )
+    .await
 }
 
 pub fn preview_report(
@@ -3960,10 +3960,11 @@ fn direct_public_report_for_command(
 }
 
 #[tauri::command]
-pub fn report_create(
+pub async fn report_create(
     database: tauri::State<'_, Database>,
     request: ReportCreateRequest,
 ) -> Result<ReportDto, String> {
+    let database = database.inner().clone();
     let direct_request = ReportCreateRequest {
         report_type: request.report_type.clone(),
         reference_date: request.reference_date.clone(),
@@ -3972,8 +3973,8 @@ pub fn report_create(
         template_id: request.template_id.clone(),
         client_request_id: request.client_request_id.clone(),
     };
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -3989,12 +3990,14 @@ pub fn report_create(
         },
         |database| direct_report_create_for_command(database, direct_request),
     )
+    .await
 }
 #[tauri::command]
-pub fn report_update_scope(
+pub async fn report_update_scope(
     database: tauri::State<'_, Database>,
     request: ReportScopeUpdateRequest,
 ) -> Result<ReportDto, String> {
+    let database = database.inner().clone();
     let direct_request = ReportScopeUpdateRequest {
         report_id: request.report_id.clone(),
         report_type: request.report_type.clone(),
@@ -4004,8 +4007,8 @@ pub fn report_update_scope(
         template_id: request.template_id.clone(),
         expected_version: request.expected_version,
     };
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -4020,19 +4023,21 @@ pub fn report_update_scope(
         },
         |database| direct_report_scope_update_for_command(database, direct_request),
     )
+    .await
 }
 #[tauri::command]
-pub fn report_save_content(
+pub async fn report_save_content(
     database: tauri::State<'_, Database>,
     request: ReportContentSaveRequest,
 ) -> Result<ReportDto, String> {
+    let database = database.inner().clone();
     let direct_request = ReportContentSaveRequest {
         report_id: request.report_id.clone(),
         markdown: request.markdown.clone(),
         expected_version: request.expected_version,
     };
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -4047,18 +4052,20 @@ pub fn report_save_content(
         },
         |database| direct_report_content_save_for_command(database, direct_request),
     )
+    .await
 }
 #[tauri::command]
-pub fn report_regenerate(
+pub async fn report_regenerate(
     database: tauri::State<'_, Database>,
     request: ReportVersionRequest,
 ) -> Result<ReportDto, String> {
+    let database = database.inner().clone();
     let direct_request = ReportVersionRequest {
         report_id: request.report_id.clone(),
         expected_version: request.expected_version,
     };
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -4073,18 +4080,20 @@ pub fn report_regenerate(
         },
         |database| direct_report_regenerate_for_command(database, direct_request),
     )
+    .await
 }
 #[tauri::command]
-pub fn report_delete(
+pub async fn report_delete(
     database: tauri::State<'_, Database>,
     request: ReportVersionRequest,
 ) -> Result<(), String> {
+    let database = database.inner().clone();
     let direct_request = ReportVersionRequest {
         report_id: request.report_id.clone(),
         expected_version: request.expected_version,
     };
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -4095,112 +4104,119 @@ pub fn report_delete(
         },
         |database| direct_report_delete_for_command(database, direct_request),
     )
+    .await
 }
 #[tauri::command]
-pub fn report_public_text(
+pub async fn report_public_text(
     database: tauri::State<'_, Database>,
     request: ReportVersionRequest,
 ) -> Result<PublicReportDto, String> {
+    let database = database.inner().clone();
     let direct_request = ReportVersionRequest {
         report_id: request.report_id.clone(),
         expected_version: request.expected_version,
     };
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Query,
         |database| public_report(database, request),
         |database| direct_public_report_for_command(database, direct_request),
     )
+    .await
 }
 #[tauri::command]
-pub fn report_template_get(
+pub async fn report_template_get(
     database: tauri::State<'_, Database>,
     request: ReportTemplateGetRequest,
 ) -> Result<ReportTemplateDto, String> {
+    let database = database.inner().clone();
     let direct_request = ReportTemplateGetRequest {
         report_type: request.report_type.clone(),
         subject_id: request.subject_id.clone(),
     };
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Query,
         |database| get_template(database, request),
         |database| direct_template_get_for_command(database, direct_request),
     )
+    .await
 }
 #[tauri::command]
-pub fn report_template_save(
+pub async fn report_template_save(
     database: tauri::State<'_, Database>,
     request: ReportTemplateSaveRequest,
 ) -> Result<ReportTemplateDto, String> {
+    let database = database.inner().clone();
     let direct_request = ReportTemplateSaveRequest {
         report_type: request.report_type.clone(),
         subject_id: request.subject_id.clone(),
         content: request.content.clone(),
         expected_version: request.expected_version,
     };
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
             crate::supabase::ensure_repository_write_mode(database)?;
-            let state = crate::supabase::storage_mode(database)?;
-            let result = save_template_with_cloud_operation(
-                database,
-                request,
-                Some((&state, "report_template_save")),
-            )?;
+            let result = save_template_with_cloud_operation(database, request)?;
             Ok(result)
         },
         |database| direct_template_save_for_command(database, direct_request),
     )
+    .await
 }
 #[tauri::command]
-pub fn report_template_list(
+pub async fn report_template_list(
     database: tauri::State<'_, Database>,
     request: ReportTemplateListRequest,
 ) -> Result<Vec<ReportTemplateDto>, String> {
+    let database = database.inner().clone();
     let direct_report_type = request.report_type.clone();
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Query,
         |database| list_templates(database, request),
         |database| direct_template_list_for_command(database, direct_report_type),
     )
+    .await
 }
 #[tauri::command]
-pub fn report_template_get_by_id(
+pub async fn report_template_get_by_id(
     database: tauri::State<'_, Database>,
     request: ReportTemplateIdRequest,
 ) -> Result<ReportTemplateDto, String> {
+    let database = database.inner().clone();
     let direct_request = ReportTemplateIdRequest {
         template_id: request.template_id.clone(),
     };
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Query,
         |database| get_template_by_id(database, request),
         |database| direct_template_get_by_id_for_command(database, direct_request),
     )
+    .await
 }
 #[tauri::command]
-pub fn report_template_create(
+pub async fn report_template_create(
     database: tauri::State<'_, Database>,
     request: ReportTemplateCreateRequest,
 ) -> Result<ReportTemplateDto, String> {
+    let database = database.inner().clone();
     let direct_request = ReportTemplateCreateRequest {
         report_type: request.report_type.clone(),
         name: request.name.clone(),
         description: request.description.clone(),
         content: request.content.clone(),
     };
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -4215,12 +4231,14 @@ pub fn report_template_create(
         },
         |database| direct_template_create_for_command(database, direct_request),
     )
+    .await
 }
 #[tauri::command]
-pub fn report_template_update(
+pub async fn report_template_update(
     database: tauri::State<'_, Database>,
     request: ReportTemplateUpdateRequest,
 ) -> Result<ReportTemplateDto, String> {
+    let database = database.inner().clone();
     let direct_request = ReportTemplateUpdateRequest {
         template_id: request.template_id.clone(),
         name: request.name.clone(),
@@ -4229,8 +4247,8 @@ pub fn report_template_update(
         sort_order: request.sort_order,
         expected_version: request.expected_version,
     };
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -4245,19 +4263,21 @@ pub fn report_template_update(
         },
         |database| direct_template_update_for_command(database, direct_request),
     )
+    .await
 }
 #[tauri::command]
-pub fn report_template_duplicate(
+pub async fn report_template_duplicate(
     database: tauri::State<'_, Database>,
     request: ReportTemplateDuplicateRequest,
 ) -> Result<ReportTemplateDto, String> {
+    let database = database.inner().clone();
     let direct_request = ReportTemplateDuplicateRequest {
         template_id: request.template_id.clone(),
         name: request.name.clone(),
         description: request.description.clone(),
     };
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -4272,18 +4292,20 @@ pub fn report_template_duplicate(
         },
         |database| direct_template_duplicate_for_command(database, direct_request),
     )
+    .await
 }
 #[tauri::command]
-pub fn report_template_set_default(
+pub async fn report_template_set_default(
     database: tauri::State<'_, Database>,
     request: ReportTemplateSetDefaultRequest,
 ) -> Result<ReportTemplateDto, String> {
+    let database = database.inner().clone();
     let direct_request = ReportTemplateSetDefaultRequest {
         template_id: request.template_id.clone(),
         expected_version: request.expected_version,
     };
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -4298,45 +4320,44 @@ pub fn report_template_set_default(
         },
         |database| direct_template_set_default_for_command(database, direct_request),
     )
+    .await
 }
 #[tauri::command]
-pub fn report_template_delete(
+pub async fn report_template_delete(
     database: tauri::State<'_, Database>,
     request: ReportTemplateDeleteRequest,
 ) -> Result<(), String> {
+    let database = database.inner().clone();
     let direct_request = ReportTemplateDeleteRequest {
         template_id: request.template_id.clone(),
         replacement_template_id: request.replacement_template_id.clone(),
         expected_version: request.expected_version,
     };
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
             crate::supabase::ensure_repository_write_mode(database)?;
-            let state = crate::supabase::storage_mode(database)?;
-            delete_template_with_cloud_operation(
-                database,
-                request,
-                Some((&state, "report_template_delete")),
-            )?;
+            delete_template_with_cloud_operation(database, request)?;
             Ok(())
         },
         |database| direct_template_delete_for_command(database, direct_request),
     )
+    .await
 }
 #[tauri::command]
-pub fn report_template_reorder(
+pub async fn report_template_reorder(
     database: tauri::State<'_, Database>,
     request: ReportTemplateReorderRequest,
 ) -> Result<Vec<ReportTemplateDto>, String> {
+    let database = database.inner().clone();
     let direct_request = ReportTemplateReorderRequest {
         report_type: request.report_type.clone(),
         template_ids: request.template_ids.clone(),
     };
-    crate::storage_contract::route(
-        &database,
+    crate::storage_contract::route_async(
+        database,
         crate::storage_contract::BusinessDomain::Reports,
         crate::storage_contract::StorageOperation::Mutation,
         |database| {
@@ -4351,6 +4372,7 @@ pub fn report_template_reorder(
         },
         |database| direct_template_reorder_for_command(database, direct_request),
     )
+    .await
 }
 #[tauri::command]
 pub fn report_template_placeholders(
@@ -4746,7 +4768,6 @@ mod tests {
                 content: "# {{日期}}\n{{今日事项}}".to_string(),
                 expected_version: None,
             },
-            Some((&state, "report_template_save")),
         )
         .unwrap();
         delete_report_with_cloud_operation(
@@ -6267,7 +6288,6 @@ mod tests {
                 replacement_template_id: None,
                 expected_version: daily[0].version,
             },
-            None,
         )
         .unwrap_err();
         assert!(error.contains("至少需要保留"));
@@ -6290,7 +6310,6 @@ mod tests {
                 replacement_template_id: None,
                 expected_version: second.version,
             },
-            None,
         )
         .unwrap();
         let connection = database.open().unwrap();
