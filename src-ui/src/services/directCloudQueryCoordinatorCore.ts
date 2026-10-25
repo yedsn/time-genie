@@ -67,6 +67,14 @@ export class DirectCloudQueryCoordinator {
     return !state || state.staleSequence > state.appliedSequence;
   }
 
+  isFresh(key: string, maxAgeMs = Number.POSITIVE_INFINITY) {
+    const state = this.states.get(key);
+    return Boolean(state
+      && state.loadedAt > 0
+      && state.staleSequence <= state.appliedSequence
+      && this.now() - state.loadedAt <= Math.max(0, maxAgeMs));
+  }
+
   clear() {
     this.generation += 1;
     this.states.clear();

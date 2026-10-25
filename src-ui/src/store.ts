@@ -102,10 +102,14 @@ import {
   beginReportReset,
   createReportPaginationState,
   failReportPage,
+  isCurrentReportRequest,
+  normalizeReportFilters,
+  reportFilterKey,
   type ReportListFilters,
   type ReportPageToken,
 } from "./services/reportPaginationCore";
 import { DirectCloudQueryCoordinator, directCloudQueryKey } from "./services/directCloudQueryCoordinatorCore";
+import { recordWorkbenchNavigationMetric } from "./services/workbenchNavigationMetrics";
 import { applyCreatedTask, collectTaskSubtreeIds, removeTaskSubtree, upsertAuthoritativeTask } from "./services/taskMutationStateCore";
 
 export type TaskStatus = "open" | "done";
@@ -322,8 +326,11 @@ export const useWorkdayStore = defineStore("workday", () => {
   let unassignedStateMissingRefreshes = 0;
   let todayOverviewRequestSeq = 0;
   let workspaceRequestSeq = 0;
-  const queryCoordinator = new DirectCloudQueryCoordinator(undefined, (metric) => {
+  const queryCoordinator = new DirectCloudQueryCoordinator(undefined, (metric, key) => {
     const mapped = metric === "skipped_fresh" ? "suppressed" : metric;
+    if (metric === "started" || metric === "followup") {
+      recordWorkbenchNavigationMetric("domainQueryStarted", key.split(":", 1)[0]);
+    }
     if (mapped === "started" || mapped === "reused" || mapped === "suppressed" || mapped === "followup") {
       void recordDirectCloudClientMetric(mapped).catch(() => undefined);
     }
@@ -399,9 +406,6 @@ export const useWorkdayStore = defineStore("workday", () => {
   const completedTasksError = ref("");
   const completedTasksStale = ref(true);
   let completedTasksRequestSeq = 0;
-  watch(activePage, (page, previousPage) => {
-    if (page === "plan" && previousPage !== "plan") planTaskTab.value = "today";
-  });
   const todayOverviewSubject = computed(() => {
     if (!todayOverviewSubjectId.value) return undefined;
     return subjects.find((subject) => subject.id === todayOverviewSubjectId.value);
@@ -444,6 +448,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     todayPlanTasks.splice(0, todayPlanTasks.length);
     entries.splice(0, entries.length);
     timeHistoryGroups.splice(0, timeHistoryGroups.length);
+    Object.assign(reportPagination, createReportPaginationState<ReportRecord>(reportPagination.pageSize));
     reports.value = [];
     completedTasks.splice(0, completedTasks.length);
     selectedSubjectId.value = "";
@@ -753,7 +758,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   async function loadTodayOverview(subjectId = todayOverviewSubjectId.value, force = false) {
     const todayDate = await ensureWorkspaceCalendar();
     const scopedSubjectId = subjectId && subjects.some((subject) => subject.id === subjectId) ? subjectId : "";
-    const result = await queryCoordinator.run(directCloudQueryKey("todayOverview", scopedSubjectId, todayDate), (isCurrent) => loadTodayOverviewNow(subjectId, isCurrent), { force, maxAgeMs: 5_000 });
+    const result = await queryCoordinator.run(directCloudQueryKey("todayOverview", scopedSubjectId, todayDate), (isCurrent) => loadTodayOverviewNow(subjectId, isCurrent), { force, maxAgeMs: Number.POSITIVE_INFINITY });
     return result ?? true;
   }
 
@@ -804,15 +809,31 @@ export const useWorkdayStore = defineStore("workday", () => {
 
   async function requestReportPages(token: ReportPageToken, targetPage: number, replace: boolean, force = false) {
     const key = directCloudQueryKey("reports", JSON.stringify(reportPagination.filters), targetPage);
-    const result = await queryCoordinator.run(key, (isCurrent) => requestReportPagesNow(token, targetPage, replace, isCurrent), { force: force || !replace, maxAgeMs: replace ? 2_000 : 0 });
+    const result = await queryCoordinator.run(key, (isCurrent) => requestReportPagesNow(token, targetPage, replace, isCurrent), { force: force || !replace, maxAgeMs: replace ? Number.POSITIVE_INFINITY : 0 });
+    if (result === false && reportPagination.loading && isCurrentReportRequest(reportPagination, token)) {
+      return await queryCoordinator.run(
+        key,
+        (isCurrent) => requestReportPagesNow(token, targetPage, replace, isCurrent),
+        { force: true, maxAgeMs: 0 },
+      ) ?? true;
+    }
     return result ?? true;
   }
 
   async function loadReports(filters?: Partial<ReportListFilters>) {
     if (!filters) return await refreshReports();
-    const token = beginReportReset(reportPagination, filters);
+    const normalized = normalizeReportFilters(filters);
+    const sameFilters = reportFilterKey(normalized) === reportFilterKey(reportPagination.filters);
+    const key = directCloudQueryKey("reports", JSON.stringify(normalized), 1);
+    if (sameFilters && reportPagination.loading) return true;
+    if (sameFilters && reportPagination.page > 0 && queryCoordinator.isFresh(key)) return true;
+    if (sameFilters && reportPagination.page > 0) {
+      const token = beginReportRefresh(reportPagination);
+      return await requestReportPages(token, Math.max(1, reportPagination.loadedPageDepth), true);
+    }
+    const token = beginReportReset(reportPagination, normalized);
     reports.value = [];
-    return await requestReportPages(token, 1, true);
+    return await requestReportPages(token, 1, true, true);
   }
 
   async function loadMoreReports() {
@@ -842,8 +863,12 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function refreshReports(force = false) {
+    if (reportPagination.loading) return true;
+    const targetPage = Math.max(1, reportPagination.loadedPageDepth);
+    const key = directCloudQueryKey("reports", JSON.stringify(reportPagination.filters), targetPage);
+    if (!force && reportPagination.page > 0 && queryCoordinator.isFresh(key)) return true;
     const token = beginReportRefresh(reportPagination);
-    return await requestReportPages(token, Math.max(1, reportPagination.loadedPageDepth), true, force);
+    return await requestReportPages(token, targetPage, true, force);
   }
 
   async function loadReportsThroughId(reportId: string, filters: Partial<ReportListFilters>) {
@@ -933,7 +958,7 @@ export const useWorkdayStore = defineStore("workday", () => {
 
   async function loadTimeHistory(page = timeHistoryPage.value, force = false) {
     const targetPage = Math.max(1, Math.round(page));
-    return await queryCoordinator.run(directCloudQueryKey("timeHistory", targetPage), (isCurrent) => loadTimeHistoryNow(targetPage, isCurrent), { force, maxAgeMs: 10_000 });
+    return await queryCoordinator.run(directCloudQueryKey("timeHistory", targetPage), (isCurrent) => loadTimeHistoryNow(targetPage, isCurrent), { force, maxAgeMs: Number.POSITIVE_INFINITY });
   }
 
   async function selectTimeHistoryPage(page: number) {
@@ -1025,15 +1050,16 @@ export const useWorkdayStore = defineStore("workday", () => {
 
   function selectPage(page: string) {
     activePage.value = page;
-    if (page === "plan") { planTaskTab.value = "today"; void loadTodayPlan(selectedSubjectId.value, true).catch(() => undefined); }
+    if (page === "plan" && planTaskTab.value === "today") void loadTodayPlan(selectedSubjectId.value).catch(() => undefined);
   }
 
   function selectSubject(subjectId: string) {
     if (!subjects.some((subject) => subject.id === subjectId)) return;
+    const subjectChanged = selectedSubjectId.value !== subjectId;
     selectedSubjectId.value = subjectId;
     activePage.value = "plan";
     planTaskTab.value = "today";
-    void loadTodayPlan(subjectId, true).catch(() => undefined);
+    void loadTodayPlan(subjectId, subjectChanged).catch(() => undefined);
     completedTasksRequestSeq += 1;
     completedTasks.splice(0);
     completedTasksSubjectId.value = "";
@@ -1130,7 +1156,7 @@ export const useWorkdayStore = defineStore("workday", () => {
 
   async function selectPlanTaskTab(tab: PlanTaskTab) {
     planTaskTab.value = tab;
-    if (tab === "today") { await loadTodayPlan(selectedSubjectId.value, true).catch(() => undefined); return; }
+    if (tab === "today") { await loadTodayPlan(selectedSubjectId.value).catch(() => undefined); return; }
     if (tab === "active") return;
     const subjectChanged = completedTasksSubjectId.value !== selectedSubjectId.value;
     if (subjectChanged) completedTasksPage.value = 1;
@@ -1182,7 +1208,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   async function loadTodayPlan(subjectId = selectedSubjectId.value, force = false) {
     if (!subjectId) return undefined;
     const workDate = await ensureWorkspaceCalendar();
-    return await queryCoordinator.run(directCloudQueryKey("todayPlan", subjectId, workDate), (isCurrent) => loadTodayPlanNow(subjectId, isCurrent), { force, maxAgeMs: 2_000 });
+    return await queryCoordinator.run(directCloudQueryKey("todayPlan", subjectId, workDate), (isCurrent) => loadTodayPlanNow(subjectId, isCurrent), { force, maxAgeMs: Number.POSITIVE_INFINITY });
   }
 
   async function reloadTodayPlanForSubject(subjectId = selectedSubjectId.value) {

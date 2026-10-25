@@ -30,8 +30,14 @@ const reportListRef = ref<HTMLElement>();
 const reportSubjectId = ref("");
 const rememberedReportSubjectId = ref(readRememberedPanelSubjectId());
 const selectedReportId = ref("");
+const editorReportId = ref("");
 const editorDraft = ref("");
 const editorMode = ref<"edit" | "preview">("edit");
+type PendingReportSwitch =
+  | { kind: "report"; report: ReportRecord }
+  | { kind: "subject"; subjectId: string };
+const reportSwitchDialogOpen = ref(false);
+const pendingReportSwitch = ref<PendingReportSwitch>();
 const reportDialogOpen = ref(false);
 const dialogMode = ref<"create" | "scope">("create");
 const draftType = ref<ReportType>("daily");
@@ -97,7 +103,11 @@ const visibleDraftTasks = computed(() => {
   }
   return draftTasks.value.filter((task) => matchingIds.has(task.taskId));
 });
-const hasUnsavedChanges = computed(() => Boolean(selectedReport.value && selectedReport.value.markdown !== editorDraft.value));
+const hasUnsavedChanges = computed(() => Boolean(
+  selectedReport.value
+  && editorReportId.value === selectedReport.value.id
+  && selectedReport.value.markdown !== editorDraft.value
+));
 const dialogTitle = computed(() => dialogMode.value === "create" ? "创建报告" : "调整报告范围");
 const existingDraftReport = computed(() => {
   if (dialogMode.value !== "create") return undefined;
@@ -166,7 +176,16 @@ const draftTemplatePreview = computed(() => {
 });
 
 watch(selectedReport, (report) => {
-  editorDraft.value = report?.markdown ?? "";
+  if (!report) {
+    editorReportId.value = "";
+    editorDraft.value = "";
+    return;
+  }
+  const sameEditorReport = editorReportId.value === report.id;
+  const hasLocalDraft = sameEditorReport && editorDraft.value !== report.markdown;
+  if (hasLocalDraft) return;
+  editorReportId.value = report.id;
+  editorDraft.value = report.markdown;
 }, { immediate: true });
 
 watch(reportQuery, (query) => {
@@ -218,26 +237,56 @@ watch(() => store.subjects.map((subject) => subject.id).join("|"), () => {
   }
 }, { immediate: true });
 
-async function selectReportSubject(subjectId: string) {
+function selectReportSubject(subjectId: string) {
   if (subjectId === reportSubjectId.value || !store.subjects.some((subject) => subject.id === subjectId)) return;
   if (hasUnsavedChanges.value && selectedReport.value?.subjectId !== subjectId) {
-    try {
-      await ElMessageBox.confirm("当前报告有未保存修改，保存后再切换主体。", "保存当前修改", {
-        type: "warning",
-        confirmButtonText: "保存并切换",
-        cancelButtonText: "留在当前主体",
-        customClass: "work-confirm-dialog",
-        closeOnClickModal: false,
-      });
-    } catch {
-      return;
-    }
-    if (!await saveMarkdown(false)) return;
+    openReportSwitchDialog({ kind: "subject", subjectId });
+    return;
   }
+  applyReportSwitch({ kind: "subject", subjectId });
+}
+
+function applyReportSwitch(target: PendingReportSwitch) {
+  if (target.kind === "report") {
+    selectedReportId.value = target.report.id;
+    return;
+  }
+  const subjectId = target.subjectId;
   reportSubjectId.value = subjectId;
   selectedReportId.value = "";
   rememberedReportSubjectId.value = subjectId;
   rememberPanelSubjectId(subjectId);
+}
+
+function openReportSwitchDialog(target: PendingReportSwitch) {
+  pendingReportSwitch.value = target;
+  reportSwitchDialogOpen.value = true;
+}
+
+function cancelReportSwitch() {
+  if (reportSaving.value) return;
+  reportSwitchDialogOpen.value = false;
+  pendingReportSwitch.value = undefined;
+}
+
+function discardReportChangesAndSwitch() {
+  if (reportSaving.value || !pendingReportSwitch.value) return;
+  const target = pendingReportSwitch.value;
+  if (selectedReport.value) {
+    editorReportId.value = selectedReport.value.id;
+    editorDraft.value = selectedReport.value.markdown;
+  }
+  reportSwitchDialogOpen.value = false;
+  pendingReportSwitch.value = undefined;
+  applyReportSwitch(target);
+}
+
+async function saveReportChangesAndSwitch() {
+  const target = pendingReportSwitch.value;
+  if (!target || !await saveMarkdown(false)) return;
+  reportSwitchDialogOpen.value = false;
+  pendingReportSwitch.value = undefined;
+  applyReportSwitch(target);
 }
 
 function reportTypeLabel(type: ReportType) {
@@ -551,6 +600,7 @@ async function saveReportDialog() {
         selectedReportId.value = updated.id;
         reportSubjectId.value = updated.subjectId;
         rememberPanelSubjectId(updated.subjectId);
+        editorReportId.value = updated.id;
         editorDraft.value = updated.markdown;
         reportFilter.value = "all";
         reportDialogOpen.value = false;
@@ -568,6 +618,8 @@ async function saveReportDialog() {
       selectedReportId.value = report.id;
       reportSubjectId.value = report.subjectId;
       rememberPanelSubjectId(report.subjectId);
+      editorReportId.value = report.id;
+      editorDraft.value = report.markdown;
       reportFilter.value = "all";
       reportDialogOpen.value = false;
       editorMode.value = "edit";
@@ -611,6 +663,7 @@ async function saveReportDialog() {
       selectedReportId.value = updated.id;
       reportSubjectId.value = updated.subjectId;
       rememberPanelSubjectId(updated.subjectId);
+      editorReportId.value = updated.id;
       editorDraft.value = updated.markdown;
       reportFilter.value = "all";
       reportDialogOpen.value = false;
@@ -624,22 +677,13 @@ async function saveReportDialog() {
   }
 }
 
-async function selectReport(report: ReportRecord) {
+function selectReport(report: ReportRecord) {
+  if (selectedReport.value?.id === report.id) return;
   if (hasUnsavedChanges.value && selectedReport.value?.id !== report.id) {
-    try {
-      await ElMessageBox.confirm("当前报告有未保存修改，保存后再切换到其他报告。", "保存当前修改", {
-        type: "warning",
-        confirmButtonText: "保存并切换",
-        cancelButtonText: "留在当前报告",
-        customClass: "work-confirm-dialog",
-        closeOnClickModal: false
-      });
-    } catch {
-      return;
-    }
-    await saveMarkdown(false);
+    openReportSwitchDialog({ kind: "report", report });
+    return;
   }
-  selectedReportId.value = report.id;
+  applyReportSwitch({ kind: "report", report });
 }
 
 async function saveMarkdown(showMessage = true) {
@@ -648,6 +692,8 @@ async function saveMarkdown(showMessage = true) {
   reportSaving.value = true;
   try {
     const updated = await store.saveReportContent(report, editorDraft.value);
+    editorReportId.value = updated.id;
+    editorDraft.value = updated.markdown;
     if (showMessage) ElMessage.success("报告内容已保存");
     return updated;
   } catch (error) {
@@ -800,7 +846,7 @@ async function writeObsidianReport() {
 }
 
 function onWorkspaceKeydown(event: KeyboardEvent) {
-  if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "s" || !selectedReport.value) return;
+  if (store.activePage !== "reports" || !(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "s" || !selectedReport.value) return;
   event.preventDefault();
   if (hasUnsavedChanges.value) void saveMarkdown();
 }
@@ -867,7 +913,10 @@ async function regenerateReport(report: ReportRecord) {
   reportSaving.value = true;
   try {
     const updated = await store.regenerateReport(report);
-    if (selectedReportId.value === updated.id) editorDraft.value = updated.markdown;
+    if (selectedReportId.value === updated.id) {
+      editorReportId.value = updated.id;
+      editorDraft.value = updated.markdown;
+    }
     ElMessage.success("报告已重新生成");
   } catch (error) {
     ElMessage.error(errorText(error, "报告重新生成失败"));
@@ -920,7 +969,10 @@ async function refreshReimbursements(report: ReportRecord) {
     const result = await querySeaTableReimbursements({ subjectId: report.subjectId, ...range });
     const current = reports.value.find((item) => item.id === report.id) ?? report;
     const updated = await store.regenerateReport(current);
-    if (selectedReportId.value === updated.id) editorDraft.value = updated.markdown;
+    if (selectedReportId.value === updated.id) {
+      editorReportId.value = updated.id;
+      editorDraft.value = updated.markdown;
+    }
     ElMessage.success(`已汇总 ${result.items.length} 项待报销，共 ¥${result.total.toFixed(2)}`);
   } catch (error) {
     ElMessage.error(errorText(error, "待报销查询失败，报告内容未修改"));
@@ -1098,6 +1150,15 @@ function existingReportId(error: unknown) {
       <p>报告会按日期或周期保存，可以继续编辑，也可以从事项重复生成。</p>
       <button class="primary-button" type="button" @click="openCreateDialog"><Plus :size="15" />创建第一份报告</button>
     </section>
+
+    <el-dialog v-model="reportSwitchDialogOpen" class="report-switch-dialog" title="保存当前修改" width="min(480px, 92vw)" append-to-body :show-close="false" :close-on-click-modal="false" :close-on-press-escape="false">
+      <p>当前报告有未保存的修改。切换前请选择如何处理这些内容。</p>
+      <template #footer>
+        <button class="secondary-button" type="button" :disabled="reportSaving" @click="cancelReportSwitch">取消</button>
+        <button class="secondary-button danger" type="button" :disabled="reportSaving" @click="discardReportChangesAndSwitch">放弃修改并切换</button>
+        <button class="primary-button" type="button" :disabled="reportSaving" @click="saveReportChangesAndSwitch"><Check :size="14" />{{ reportSaving ? '保存中...' : '保存并切换' }}</button>
+      </template>
+    </el-dialog>
 
     <el-dialog v-model="reportDialogOpen" class="report-create-dialog" :title="dialogTitle" width="min(780px, 94vw)" append-to-body destroy-on-close>
       <div class="report-create-form">

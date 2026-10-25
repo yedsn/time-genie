@@ -423,6 +423,48 @@ pre {
   padding-bottom: 22px;
   overscroll-behavior: contain;
 }
+.workbench-page {
+  min-height: 100%;
+}
+.workbench-page.first-entry {
+  animation: workbench-page-ready 120ms ease-out;
+}
+@keyframes workbench-page-ready {
+  from { opacity: 0.72; }
+  to { opacity: 1; }
+}
+.section-loading {
+  min-height: 320px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-content: start;
+  gap: 14px;
+}
+.section-loading > span {
+  min-height: 116px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: linear-gradient(100deg, var(--panel) 20%, var(--panel-strong) 42%, var(--panel) 64%);
+  background-size: 220% 100%;
+  animation: workbench-skeleton 1.2s ease-in-out infinite;
+}
+.section-loading > span:first-child { grid-column: 1 / -1; min-height: 56px; }
+.section-loading > small { grid-column: 1 / -1; color: var(--muted); }
+.settings-section-placeholder {
+  min-height: 72px;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 12px;
+}
+@keyframes workbench-skeleton {
+  from { background-position: 100% 0; }
+  to { background-position: -100% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .workbench-page.first-entry,
+  .section-loading > span { animation: none; }
+}
 .topbar {
   grid-row: 1;
   min-height: 52px;
@@ -1358,6 +1400,12 @@ pre {
 .report-write-dialog .el-dialog__headerbtn .el-dialog__close { color: var(--muted); }
 .report-write-dialog .el-dialog__body { padding: 14px 18px; }
 .report-write-dialog .el-dialog__footer { padding: 0 18px 16px; display: flex; justify-content: flex-end; gap: 8px; }
+.report-switch-dialog.el-dialog { --el-dialog-bg-color: var(--panel); --el-text-color-primary: var(--text); border: 1px solid var(--line); border-radius: 9px; background: var(--panel); box-shadow: 0 24px 70px var(--shadow-color); }
+.report-switch-dialog .el-dialog__header { padding: 17px 18px 10px; }
+.report-switch-dialog .el-dialog__title { color: var(--text); font-size: 16px; font-weight: 650; }
+.report-switch-dialog .el-dialog__body { padding: 4px 18px 18px; }
+.report-switch-dialog .el-dialog__body p { margin: 0; color: var(--text-soft); font-size: 13px; line-height: 1.65; }
+.report-switch-dialog .el-dialog__footer { display: flex; justify-content: flex-end; gap: 8px; padding: 0 18px 16px; }
 .report-write-content { display: grid; gap: 12px; }
 .report-write-target { min-width: 0; display: grid; gap: 3px; padding: 10px 12px; border-radius: 6px; background: var(--surface-soft); }
 .report-write-target span { color: var(--muted); font-size: 10px; }

@@ -23,18 +23,37 @@ import { APP_THEMES, applyAppTheme, isAppTheme, type AppTheme } from "../service
 import type { ExecutionPanelMode } from "../services/executionTaskPanelCore";
 import { cloneWorkSchedule, createDefaultWorkSchedule, loadSubjectWorkSchedule, saveSubjectWorkSchedule, type WorkScheduleDay } from "../services/subjectWorkScheduleMock";
 import { setHoverNavigationEnabled } from "../services/hoverNavigation";
+import { recordWorkbenchNavigationMetric } from "../services/workbenchNavigationMetrics";
 
 const store = useWorkdayStore();
+type AsyncSectionModule = { default: object };
+function cachedSectionLoader(name: string, factory: () => Promise<AsyncSectionModule>) {
+  let modulePromise: Promise<AsyncSectionModule> | undefined;
+  return () => {
+    if (!modulePromise) {
+      modulePromise = factory().then((module) => {
+        recordWorkbenchNavigationMetric("modulePreloaded", name);
+        return module;
+      });
+    }
+    return modulePromise;
+  };
+}
 const asyncSectionOptions = (loader: () => Promise<unknown>) => ({
   loader: loader as () => Promise<{ default: object }>,
-  loadingComponent: { template: '<div class="section-loading">正在加载功能…</div>' },
-  delay: 80,
+  loadingComponent: { template: '<div class="section-loading" role="status"><span></span><span></span><span></span><small>正在准备页面…</small></div>' },
+  delay: 40,
 });
-const ReportWorkspace = defineAsyncComponent(asyncSectionOptions(() => import("../components/ReportWorkspace.vue")));
-const AutomationHooksSettings = defineAsyncComponent(asyncSectionOptions(() => import("../components/AutomationHooksSettings.vue")));
-const DataBackupSettings = defineAsyncComponent(asyncSectionOptions(() => import("../components/DataBackupSettings.vue")));
-const CloudOperationHistorySettings = defineAsyncComponent(asyncSectionOptions(() => import("../components/CloudOperationHistorySettings.vue")));
-const CloudSnapshotsSettings = defineAsyncComponent(asyncSectionOptions(() => import("../components/CloudSnapshotsSettings.vue")));
+const loadReportWorkspace = cachedSectionLoader("reports", () => import("../components/ReportWorkspace.vue"));
+const loadAutomationHooksSettings = cachedSectionLoader("settings-hooks", () => import("../components/AutomationHooksSettings.vue"));
+const loadDataBackupSettings = cachedSectionLoader("settings-backup", () => import("../components/DataBackupSettings.vue"));
+const loadCloudOperationHistorySettings = cachedSectionLoader("settings-history", () => import("../components/CloudOperationHistorySettings.vue"));
+const loadCloudSnapshotsSettings = cachedSectionLoader("settings-snapshots", () => import("../components/CloudSnapshotsSettings.vue"));
+const ReportWorkspace = defineAsyncComponent(asyncSectionOptions(loadReportWorkspace));
+const AutomationHooksSettings = defineAsyncComponent(asyncSectionOptions(loadAutomationHooksSettings));
+const DataBackupSettings = defineAsyncComponent(asyncSectionOptions(loadDataBackupSettings));
+const CloudOperationHistorySettings = defineAsyncComponent(asyncSectionOptions(loadCloudOperationHistorySettings));
+const CloudSnapshotsSettings = defineAsyncComponent(asyncSectionOptions(loadCloudSnapshotsSettings));
 const appVersion = __APP_VERSION__;
 const pages = [
   { id: "today", label: "今日", icon: Home },
@@ -136,8 +155,61 @@ const settingsDraft = reactive({
   seatableToken: ""
 });
 const activeSettingsSection = ref("appearance");
+const visitedPages = reactive(new Set<string>());
+const enteringPages = reactive(new Set<string>());
+const visitedHeavySettings = reactive(new Set<string>());
+const contentScrollRef = ref<HTMLElement>();
+const pageScrollPositions = new Map<string, number>();
+let idlePreloadHandle: number | undefined;
+const pageEntryTimers = new Map<string, number>();
 
-function scrollToSettingsSection(sectionId: string) {
+function markHeavySettingVisited(sectionId: string) {
+  if (!["backup", "history", "snapshots", "hooks"].includes(sectionId)) return;
+  visitedHeavySettings.add(sectionId);
+  if (sectionId === "backup") void loadDataBackupSettings();
+  if (sectionId === "history") void loadCloudOperationHistorySettings();
+  if (sectionId === "snapshots") void loadCloudSnapshotsSettings();
+  if (sectionId === "hooks") void loadAutomationHooksSettings();
+}
+
+function preloadPage(pageId: string) {
+  if (pageId === "reports") void loadReportWorkspace();
+}
+
+function scheduleIdlePreload() {
+  const run = () => { idlePreloadHandle = undefined; void loadReportWorkspace(); };
+  const idleWindow = window as Window & { requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number };
+  if (idleWindow.requestIdleCallback) {
+    idlePreloadHandle = idleWindow.requestIdleCallback(run, { timeout: 2_000 });
+  } else {
+    idlePreloadHandle = globalThis.setTimeout(run, 1_000);
+  }
+}
+
+watch(() => store.activePage, async (page, previousPage) => {
+  if (previousPage) {
+    pageScrollPositions.set(previousPage, contentScrollRef.value?.scrollTop ?? 0);
+    recordWorkbenchNavigationMetric("pageDeactivated", previousPage);
+  }
+  if (!visitedPages.has(page)) {
+    visitedPages.add(page);
+    enteringPages.add(page);
+    const previousTimer = pageEntryTimers.get(page);
+    if (previousTimer) window.clearTimeout(previousTimer);
+    pageEntryTimers.set(page, window.setTimeout(() => {
+      enteringPages.delete(page);
+      pageEntryTimers.delete(page);
+    }, 140));
+    recordWorkbenchNavigationMetric("pageMounted", page);
+  }
+  recordWorkbenchNavigationMetric("pageActivated", page);
+  await nextTick();
+  if (contentScrollRef.value) contentScrollRef.value.scrollTop = pageScrollPositions.get(page) ?? 0;
+}, { immediate: true });
+
+async function scrollToSettingsSection(sectionId: string) {
+  markHeavySettingVisited(sectionId);
+  await nextTick();
   const target = document.querySelector<HTMLElement>(`[data-settings-section="${sectionId}"]`);
   if (!target) return;
   activeSettingsSection.value = sectionId;
@@ -169,6 +241,11 @@ function handleSettingsScroll(event: Event) {
   const marker = container.getBoundingClientRect().top + 28;
   const current = sections.reduce((closest, section) => Math.abs(section.getBoundingClientRect().top - marker) < Math.abs(closest.getBoundingClientRect().top - marker) ? section : closest);
   activeSettingsSection.value = current.dataset.settingsSection || activeSettingsSection.value;
+  const bounds = container.getBoundingClientRect();
+  for (const section of sections) {
+    const rect = section.getBoundingClientRect();
+    if (rect.top <= bounds.bottom + 240 && rect.bottom >= bounds.top - 240) markHeavySettingVisited(section.dataset.settingsSection || "");
+  }
 }
 let unlistenWindowResize: (() => void) | undefined;
 let unlistenNavigatePage: (() => void) | undefined;
@@ -850,6 +927,7 @@ function previewTheme(theme: AppTheme) {
 
 onMounted(async () => {
   await loadSettings();
+  scheduleIdlePreload();
   windowMaximized.value = await isMainWindowMaximized();
   unlistenWindowResize = await onCurrentWindowResized((maximized) => {
     windowMaximized.value = maximized;
@@ -898,6 +976,13 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  for (const timer of pageEntryTimers.values()) window.clearTimeout(timer);
+  pageEntryTimers.clear();
+  if (idlePreloadHandle !== undefined) {
+    const idleWindow = window as Window & { cancelIdleCallback?: (handle: number) => void };
+    if (idleWindow.cancelIdleCallback) idleWindow.cancelIdleCallback(idlePreloadHandle);
+    else globalThis.clearTimeout(idlePreloadHandle);
+  }
   if (cloudDataRefreshTimer) window.clearTimeout(cloudDataRefreshTimer);
   unlistenWindowResize?.();
   unlistenNavigatePage?.();
@@ -1553,7 +1638,7 @@ async function handleCompletedTaskDelete(task: Task) {
       </div>
       <nav class="nav-list">
         <template v-for="page in pages" :key="page.id">
-          <button v-hover-switch :class="{ active: store.activePage === page.id }" @click="store.selectPage(page.id)">
+          <button v-hover-switch :class="{ active: store.activePage === page.id }" :aria-current="store.activePage === page.id ? 'page' : undefined" @pointerenter="preloadPage(page.id)" @click="store.selectPage(page.id)">
             <component :is="page.icon" :size="17" />
             <span>{{ page.label }}</span>
             <i v-if="page.id === 'settings' && storageState?.mode === 'cloud' && cloudSaveNeedsAttention" :class="['nav-sync-indicator', { conflict: cloudSyncAttentionLevel === 'critical' }]" :title="cloudSyncLabel"></i>
@@ -1595,18 +1680,21 @@ async function handleCompletedTaskDelete(task: Task) {
         </fieldset>
       </header>
 
-      <div class="content-scroll" @scroll="handleSettingsScroll">
+      <div ref="contentScrollRef" class="content-scroll" @scroll="handleSettingsScroll">
         <div v-if="cloudBusinessReadOnly && store.activePage !== 'settings'" class="cloud-sync-banner offline workspace-readonly-banner"><AlertTriangle :size="16" /><div><strong>{{ storageState?.cacheSource ? '当前显示只读缓存' : '当前页面只读' }}</strong><span>{{ cloudReadOnlyReason }}{{ storageState?.cacheFetchedAt ? ` · 缓存更新于 ${formatSyncTime(storageState.cacheFetchedAt)}` : storageState?.lastSyncedAt ? ` · 最近刷新 ${formatSyncTime(storageState.lastSyncedAt)}` : '' }}</span></div><button class="secondary-button compact" type="button" @click="openCloudStorageSettings">查看云端状态</button></div>
         <fieldset class="workspace-readonly-fieldset readonly-fieldset" :disabled="cloudBusinessReadOnly && store.activePage !== 'settings'">
         <TodayOverviewWorkspace
-          v-if="store.activePage === 'today'"
+          v-if="visitedPages.has('today')"
+          v-show="store.activePage === 'today'"
+          :class="['workbench-page', { 'first-entry': enteringPages.has('today') }]"
+          data-workbench-page="today"
           @open-timer="openTimerTaskDialog"
           @open-plan="store.activePage = 'plan'"
           @import-daily-report="openDailyReportFromToday"
           @resolve-unassigned="store.promptUnassignedResolution(true)"
         />
 
-      <section v-else-if="store.activePage === 'plan'" class="plan-edit-layout">
+      <section v-if="visitedPages.has('plan')" v-show="store.activePage === 'plan'" :class="['plan-edit-layout', 'workbench-page', { 'first-entry': enteringPages.has('plan') }]" data-workbench-page="plan">
         <div class="plan-task-tabs" role="tablist" aria-label="事项状态">
           <button v-hover-switch type="button" role="tab" :aria-selected="store.planTaskTab === 'today'" :class="{ active: store.planTaskTab === 'today' }" @click="store.selectPlanTaskTab('today')">
             <span>今日</span><strong>{{ store.todayPlanTasks.filter((task) => task.subjectId === store.selectedSubjectId && task.todayMember).length }}</strong>
@@ -1722,19 +1810,22 @@ async function handleCompletedTaskDelete(task: Task) {
       </section>
 
       <TimeTrackingWorkspace
-        v-else-if="store.activePage === 'timer'"
+        v-if="visitedPages.has('timer')"
+        v-show="store.activePage === 'timer'"
+        :class="['workbench-page', { 'first-entry': enteringPages.has('timer') }]"
+        data-workbench-page="timer"
         @open-entry-allocation="openEntryAllocation"
       />
 
-      <ReportWorkspace v-else-if="store.activePage === 'reports'" />
+      <ReportWorkspace v-if="visitedPages.has('reports')" v-show="store.activePage === 'reports'" :class="['workbench-page', { 'first-entry': enteringPages.has('reports') }]" data-workbench-page="reports" />
 
-      <section v-else class="settings-layout">
+      <section v-if="visitedPages.has('settings')" v-show="store.activePage === 'settings'" :class="['settings-layout', 'workbench-page', { 'first-entry': enteringPages.has('settings') }]" data-workbench-page="settings">
         <aside class="settings-page-nav" aria-label="设置页导航">
           <div class="settings-page-nav-head"><span class="settings-page-nav-mark"><Settings :size="16" /></span><div><strong>设置</strong><small>快速定位设置区域</small></div></div>
           <nav class="settings-page-nav-list">
             <section v-for="group in settingsNavGroups" :key="group.label" class="settings-page-nav-group">
               <div class="settings-page-nav-group-title">{{ group.label }}</div>
-              <button v-for="item in group.items" :key="item.id" v-hover-switch class="settings-page-nav-item" :class="{ active: activeSettingsSection === item.id }" type="button" @click="scrollToSettingsSection(item.id)"><component :is="item.icon" :size="14" /><span>{{ item.label }}</span></button>
+              <button v-for="item in group.items" :key="item.id" v-hover-switch class="settings-page-nav-item" :class="{ active: activeSettingsSection === item.id }" :aria-current="activeSettingsSection === item.id ? 'location' : undefined" type="button" @pointerenter="markHeavySettingVisited(item.id)" @click="scrollToSettingsSection(item.id)"><component :is="item.icon" :size="14" /><span>{{ item.label }}</span></button>
             </section>
           </nav>
         </aside>
@@ -1880,15 +1971,18 @@ async function handleCompletedTaskDelete(task: Task) {
         </div>
 
         <div id="settings-backup" data-settings-section="backup" class="work-panel settings-panel settings-backup-panel">
-          <DataBackupSettings @imported="handleBackupImported" />
+          <DataBackupSettings v-if="visitedHeavySettings.has('backup')" @imported="handleBackupImported" />
+          <div v-else class="settings-section-placeholder">进入此区域时加载本地备份功能</div>
         </div>
 
         <div id="settings-history" data-settings-section="history" class="work-panel settings-panel settings-history-panel">
-          <CloudOperationHistorySettings :enabled="storageState?.mode === 'cloud' && Boolean(cloudSession?.signedIn)" />
+          <CloudOperationHistorySettings v-if="visitedHeavySettings.has('history')" :enabled="storageState?.mode === 'cloud' && Boolean(cloudSession?.signedIn)" />
+          <div v-else class="settings-section-placeholder">进入此区域时加载操作记录</div>
         </div>
 
         <div id="settings-snapshots" data-settings-section="snapshots" class="work-panel settings-panel settings-snapshots-panel">
-          <CloudSnapshotsSettings :enabled="storageState?.mode === 'cloud' && Boolean(cloudSession?.signedIn)" :after-restore="handleCloudSnapshotRestored" />
+          <CloudSnapshotsSettings v-if="visitedHeavySettings.has('snapshots')" :enabled="storageState?.mode === 'cloud' && Boolean(cloudSession?.signedIn)" :after-restore="handleCloudSnapshotRestored" />
+          <div v-else class="settings-section-placeholder">进入此区域时加载历史镜像</div>
           <p v-if="storageState?.mode === 'cloud' && storageState.workspaceEpoch === 1" class="settings-help">首次执行云端回滚前，请确保其他设备已升级到支持工作空间世代隔离的版本。回滚后旧客户端将被强制拒绝写入，以保护恢复后的数据。</p>
         </div>
 
@@ -1920,7 +2014,8 @@ async function handleCompletedTaskDelete(task: Task) {
         </div>
 
         <div id="settings-hooks" data-settings-section="hooks" class="work-panel settings-panel settings-hooks-panel">
-          <AutomationHooksSettings />
+          <AutomationHooksSettings v-if="visitedHeavySettings.has('hooks')" />
+          <div v-else class="settings-section-placeholder">进入此区域时加载自动化钩子</div>
         </div>
 
         <div id="settings-update" data-settings-section="update" class="work-panel settings-panel settings-update-panel">

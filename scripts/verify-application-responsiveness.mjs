@@ -12,7 +12,7 @@ const executor = readFileSync(new URL("../src-tauri/src/cloud_executor.rs", impo
 
 assert.match(app, /defineAsyncComponent/);
 assert.doesNotMatch(app, /import MainWorkbench from|import HoverPanel from/);
-for (const component of ["ReportWorkspace", "DataBackupSettings", "CloudOperationHistorySettings", "CloudSnapshotsSettings"]) assert.match(main, new RegExp("const " + component + " = defineAsyncComponent"));
+for (const component of ["ReportWorkspace", "DataBackupSettings", "CloudOperationHistorySettings", "CloudSnapshotsSettings", "AutomationHooksSettings"]) assert.match(main, new RegExp("const " + component + " = defineAsyncComponent"));
 assert.match(store, /await loadWorkbenchBootstrap\(\)/);
 assert.match(store, /loadWorkspaceData\(false, false\)/);
 assert.match(store, /async function initializeHoverData/);
@@ -38,7 +38,7 @@ if (existsSync(manifestPath)) {
   assert.ok(main?.isDynamicEntry, "MainWorkbench 未形成动态 chunk");
   assert.notEqual(hover.file, main.file);
   const hoverCode = readFileSync(new URL("../dist/" + hover.file, import.meta.url), "utf8");
-  assert.doesNotMatch(hoverCode, /MainWorkbench|md-editor-v3|DataBackupSettings|CloudOperationHistorySettings|CloudSnapshotsSettings/);
+  assert.doesNotMatch(hoverCode, /MainWorkbench|md-editor-v3|DataBackupSettings|CloudOperationHistorySettings|CloudSnapshotsSettings|AutomationHooksSettings/);
   const initialFiles = [appEntry.file, ...(appEntry.css ?? [])];
   const initialGzipBytes = initialFiles.reduce((sum, file) => sum + gzipSync(readFileSync(new URL("../dist/" + file, import.meta.url))).byteLength, 0);
   console.log(JSON.stringify({ buildBoundary: { hoverChunk: hover.file, mainChunk: main.file, initialFiles, initialGzipBytes, initialRawBytes: initialFiles.reduce((sum, file) => sum + statSync(new URL("../dist/" + file, import.meta.url)).size, 0) } }, null, 2));
