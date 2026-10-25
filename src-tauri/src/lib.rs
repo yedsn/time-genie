@@ -1,3 +1,5 @@
+#[cfg(target_os = "windows")]
+use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -6,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, Rect};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tauri_plugin_updater::UpdaterExt;
 use uuid::Uuid;
 
@@ -51,8 +53,11 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetCursorPos, GetWindowRect, GetWindowThreadProcessId, SetForegroundWindow,
-    SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE,
+    CallNextHookEx, DispatchMessageW, EnumWindows, GetAncestor, GetCursorPos, GetForegroundWindow,
+    GetMessageW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow,
+    SetWindowPos, SetWindowsHookExW, ShowWindow, ShowWindowAsync, TranslateMessage,
+    UnhookWindowsHookEx, GA_ROOT, KBDLLHOOKSTRUCT, MSG, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE,
+    SW_RESTORE, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
 };
 
 const HOVER_SHOW_DELAY: Duration = Duration::from_millis(300);
@@ -70,6 +75,8 @@ const DEFAULT_UPDATER_ENDPOINT: &str =
 const DEFAULT_UPDATER_PUBKEY: &str = "REPLACE_WITH_TAURI_UPDATER_PUBLIC_KEY";
 static HOVER_STATE: OnceLock<Arc<Mutex<HoverState>>> = OnceLock::new();
 static UPDATE_CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+static MAIN_WINDOW_HWND: AtomicIsize = AtomicIsize::new(0);
 
 struct MainWindowShortcut(Mutex<String>);
 
@@ -282,6 +289,8 @@ pub fn run() {
             {
                 eprintln!("主窗口快捷键 {main_window_shortcut} 注册失败: {error}");
             }
+            #[cfg(target_os = "windows")]
+            install_main_window_escape_handler(app.handle());
             let state = Arc::new(Mutex::new(HoverState {
                 generation: 0,
                 pending: false,
@@ -1198,10 +1207,85 @@ pub(crate) fn current_main_window_shortcut(app: &AppHandle) -> String {
         .unwrap_or_else(|_| "Alt+T".to_string())
 }
 
+fn is_escape_shortcut(shortcut: &Shortcut) -> bool {
+    shortcut.matches(Modifiers::empty(), Code::Escape)
+}
+
+#[cfg(target_os = "windows")]
+fn install_main_window_escape_handler(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        eprintln!("主窗口 Esc 处理器安装失败: 找不到主窗口");
+        return;
+    };
+    let Ok(hwnd) = window.hwnd() else {
+        eprintln!("主窗口 Esc 处理器安装失败: 无法获取主窗口句柄");
+        return;
+    };
+    MAIN_WINDOW_HWND.store(hwnd.0 as isize, Ordering::Release);
+    if let Err(error) = std::thread::Builder::new()
+        .name("main-window-escape".to_string())
+        .spawn(run_main_window_escape_hook)
+    {
+        eprintln!("主窗口 Esc 处理线程启动失败: {error}");
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_main_window_escape_hook() {
+    unsafe {
+        let hook = SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            Some(main_window_escape_hook),
+            std::ptr::null_mut(),
+            0,
+        );
+        if hook.is_null() {
+            eprintln!(
+                "主窗口 Esc 处理器安装失败: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let mut message: MSG = std::mem::zeroed();
+        while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        UnhookWindowsHookEx(hook);
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn main_window_escape_hook(
+    code: i32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    if code >= 0 && (wparam as u32 == WM_KEYDOWN || wparam as u32 == WM_SYSKEYDOWN) {
+        let keyboard = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
+        let main_hwnd = MAIN_WINDOW_HWND.load(Ordering::Acquire) as HWND;
+        if keyboard.vkCode == 0x1B && !main_hwnd.is_null() {
+            let foreground = unsafe { GetForegroundWindow() };
+            let foreground_root = unsafe { GetAncestor(foreground, GA_ROOT) };
+            if foreground_root == main_hwnd && unsafe { IsWindowVisible(main_hwnd) } != 0 {
+                unsafe { ShowWindowAsync(main_hwnd, SW_HIDE) };
+                return 1;
+            }
+        }
+    }
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
 pub(crate) fn set_main_window_shortcut(app: &AppHandle, shortcut: &str) -> Result<(), String> {
     let shortcut = shortcut.trim();
     if shortcut.is_empty() {
         return Err("打开主窗口快捷键不能为空".to_string());
+    }
+    if shortcut
+        .parse::<Shortcut>()
+        .is_ok_and(|shortcut| is_escape_shortcut(&shortcut))
+    {
+        return Err("Esc 固定用于关闭主窗口，不能设为打开快捷键".to_string());
     }
     let current = current_main_window_shortcut(app);
     if current.eq_ignore_ascii_case(shortcut) {

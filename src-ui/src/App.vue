@@ -100,22 +100,15 @@ async function catchUpCloudData() {
 
 function onKeydown(event: KeyboardEvent) {
   if (event.key !== "Escape" || event.repeat) return;
-  if (view.value === "main" && (store.unassignedDialogOpen || hasVisibleDialog())) return;
   if (view.value === "hover") {
     event.preventDefault();
     void hideHoverAfterKeyboardClose();
     return;
   }
   if (view.value === "main") {
-    queueMicrotask(() => {
-      if (!event.defaultPrevented) void closeMainWindow();
-    });
+    event.preventDefault();
+    void closeMainWindow();
   }
-}
-
-function hasVisibleDialog() {
-  return [...document.querySelectorAll<HTMLElement>(".el-dialog, .el-message-box")]
-    .some((element) => element.getClientRects().length > 0);
 }
 
 async function promptPendingUnassignedTimeOnce(sequence: number) {
