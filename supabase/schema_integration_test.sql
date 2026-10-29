@@ -6199,7 +6199,7 @@ begin
   -- This task appeared after the editor captured its baseline and must survive.
   perform timegenie.direct_cloud_task_create(
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
-    '4f000000-0000-0000-0000-000000000537',1,
+    '4f000000-0000-0000-0000-000000009537',1,
     '{"id":"63000000-0000-0000-0000-0000000000f3","subjectId":"52000000-0000-0000-0000-0000000000b2","title":"编辑期间新增事项"}'::jsonb
   );
   batch_result:=timegenie.direct_cloud_task_plan_batch_apply(
@@ -6302,11 +6302,20 @@ begin
      or (planning_probe->'task'->>'version')::bigint<>1 then
     raise exception 'direct plan batch changed a task outside its editor baseline: %',planning_probe;
   end if;
+  -- Deleting a parent cannot remove or orphan children outside the preview.
+  begin
+    perform timegenie.direct_cloud_task_plan_batch_apply(
+      '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
+      '4f000000-0000-0000-0000-000000009542',1,
+      '{"subjectId":"52000000-0000-0000-0000-0000000000b2","baselineTasks":[{"taskId":"63000000-0000-0000-0000-0000000000f1","expectedVersion":2}],"finalItems":[],"confirmedDeleteTaskIds":["63000000-0000-0000-0000-0000000000f1"]}'::jsonb
+    );
+    raise exception 'direct plan batch accepted parent deletion with unconfirmed children';
+  exception when others then if sqlerrm not like '%VERSION_CONFLICT%' then raise; end if; end;
   -- A listed existing task must also belong to the validated editor baseline.
   begin
     perform timegenie.direct_cloud_task_plan_batch_apply(
       '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
-      '4f000000-0000-0000-0000-000000000538',1,
+      '4f000000-0000-0000-0000-000000009538',1,
       '{"subjectId":"52000000-0000-0000-0000-0000000000b2","baselineTasks":[],"finalItems":[{"lineKey":"unvalidated","taskId":"63000000-0000-0000-0000-0000000000f3","title":"不得写入"}],"confirmedDeleteTaskIds":[]}'::jsonb
     );
     raise exception 'direct plan batch accepted an existing task outside the baseline';
@@ -6314,19 +6323,19 @@ begin
   -- A completed day instance is a valid editor row; retain its completion state.
   batch_parent:=timegenie.direct_cloud_task_day_plan_set(
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
-    '4f000000-0000-0000-0000-000000000539',1,
+    '4f000000-0000-0000-0000-000000009539',1,
     jsonb_build_object('taskId','63000000-0000-0000-0000-0000000000f3',
       'workDate',current_date,'state','included')
   );
   batch_today_instance_id:=(batch_parent->'data'->'instance'->>'id')::uuid;
   perform timegenie.direct_cloud_task_set_status(
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
-    '4f000000-0000-0000-0000-000000000540',1,
+    '4f000000-0000-0000-0000-000000009540',1,
     jsonb_build_object('id',batch_today_instance_id,'expectedVersion',1,'done',true)
   );
   perform timegenie.direct_cloud_task_plan_batch_apply(
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
-    '4f000000-0000-0000-0000-000000000541',1,
+    '4f000000-0000-0000-0000-00000000053a',1,
     jsonb_build_object('subjectId','52000000-0000-0000-0000-0000000000b2',
       'dayInstanceDate',current_date,
       'baselineTasks',jsonb_build_array(jsonb_build_object(
@@ -6351,7 +6360,7 @@ begin
   );
   concurrency_task:=timegenie.direct_cloud_task_create(
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
-    '4f000000-0000-0000-0000-000000000541',1,
+    '4f000000-0000-0000-0000-000000009541',1,
     '{"id":"63000000-0000-0000-0000-000000000101","subjectId":"51000000-0000-0000-0000-0000000000b1","title":"双设备并发事项"}'::jsonb
   );
   perform timegenie.direct_cloud_task_update(
@@ -7857,7 +7866,7 @@ do $$ begin
     raise exception 'rejected legacy lease changed coordination state';
   end if;
   if (select count(*) from timegenie.unassigned_sessions where workspace_id='20000000-0000-0000-0000-00000000000a')<>1
-     or (select count(*) from timegenie.actual_time_adjustments where workspace_id='20000000-0000-0000-0000-00000000000a')<>9
+     or (select count(*) from timegenie.actual_time_adjustments where workspace_id='20000000-0000-0000-0000-00000000000a')<>10
      or exists(select 1 from timegenie.workspace_restore_locks where workspace_id='20000000-0000-0000-0000-00000000000a')
      or exists(select 1 from timegenie.workspace_snapshots where workspace_id='20000000-0000-0000-0000-00000000000a') then
     raise exception 'rejected legacy write changed protected workspace state';

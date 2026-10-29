@@ -178,7 +178,7 @@ function entrySubjectId(entry: TimeEntry) {
   const allocationSubjectId = entry.allocations?.find((allocation) => allocation.subjectId)?.subjectId;
   if (allocationSubjectId) return allocationSubjectId;
   const taskId = entry.allocations?.[0]?.taskId ?? entry.defaultTask;
-  return store.tasks.find((task) => task.id === taskId)?.subjectId ?? store.selectedSubjectId;
+  return [...store.todayPlanTasks, ...store.tasks].find((task) => task.id === taskId)?.subjectId ?? store.selectedSubjectId;
 }
 
 function openEntryAllocation(entry: TimeEntry) {

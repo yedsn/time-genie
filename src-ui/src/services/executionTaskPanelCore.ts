@@ -64,18 +64,37 @@ export type ExecutionPanelTask = {
 };
 
 /**
- * 开始执行与未归属时间分配共享今日事项树：只允许当前主体的今日成员及其父级上下文；
+ * 所有模式共享今日事项树：只允许当前主体的今日成员及其父级上下文；
  * 当天已完成成员继续显示，点击“继续”时由计时转换恢复完成状态。
- * 只有历史时间记录的归属调整沿用调用方给出的完整事项范围。
+ * 调整归属时额外保留原分配事项的确切 ID 和父级，不混入其他长期事项。
  */
 export function executionPanelSourceTasks<T extends ExecutionPanelTask>(
   tasks: readonly T[],
   subjectId: string,
   mode: ExecutionPanelMode,
+  originalTasks: readonly T[] = [],
+  originalTaskIds: readonly string[] = [],
 ): T[] {
-  if (mode === "entry-allocation") return [...tasks];
-  return tasks.filter((task) => task.subjectId === subjectId
+  const todayTasks = tasks.filter((task) => task.subjectId === subjectId
     && (Boolean(task.todayMember) || Boolean(task.todayContext)));
+  if (mode !== "entry-allocation") return todayTasks;
+  // 今日快照优先；仅补入原归属和它们的父级，并按 ID 去重。
+  const byId = new Map([...originalTasks, ...todayTasks]
+    .filter((task) => task.subjectId === subjectId).map((task) => [task.id, task]));
+  const originalIds = new Set(originalTaskIds);
+  const included = new Set(todayTasks.map((task) => task.id));
+  for (const taskId of originalIds) {
+    let currentId: string | undefined = taskId;
+    const visited = new Set<string>();
+    while (currentId && byId.has(currentId) && !visited.has(currentId)) {
+      visited.add(currentId);
+      included.add(currentId);
+      currentId = byId.get(currentId)?.parentId;
+    }
+  }
+  const orderedIds = new Set([...todayTasks, ...originalTasks].map((task) => task.id));
+  return [...orderedIds].filter((taskId) => included.has(taskId) && byId.has(taskId))
+    .map((taskId) => ({ ...byId.get(taskId)!, pinned: originalIds.has(taskId) }));
 }
 
 export type ExecutionPanelCurrentStatus = {

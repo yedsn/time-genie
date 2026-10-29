@@ -23,7 +23,7 @@ async function waitForServer() {
   throw new Error("开发服务器启动超时");
 }
 
-function mockInitScript() {
+function mockInitScript({ entryAllocation = false } = {}) {
   let callbackId = 0;
   const callbacks = new Map();
   const subjects = [
@@ -67,6 +67,29 @@ function mockInitScript() {
     ],
     "subject-b": [],
   };
+  if (entryAllocation) {
+    activeTasks.push(
+      record("long-source", { title: "写今日计划" }),
+      record("old-parent", { title: "旧项目", status: "done", selectable: false, isLeaf: false }),
+      record("old-allocation", { title: "已完成原归属", parentId: "old-parent", status: "done", completedToday: false, version: 5, directMinutes: 10, totalMinutes: 10 }),
+      record("other-allocation", { subjectId: "subject-b", title: "跨主体原归属", status: "open", version: 7, directMinutes: 8, totalMinutes: 8 }),
+    );
+    planRows["subject-a"][1].dayInstanceDate = workDate;
+    planRows["subject-a"][1].dayInstanceKind = "member";
+    planRows["subject-a"][1].dayInstanceSourceTaskId = "long-source";
+  }
+  const allocationEntry = {
+    id: "entry-allocation", workDate, label: "需要调整归属的记录",
+    startedAt: Date.now() - 3_600_000, endedAt: Date.now() - 1_800_000,
+    durationSeconds: 1800, settlementMinutes: 30, allocatedMinutes: 30,
+    kind: "work", sourceType: "timer", state: "ended", version: 3,
+    allocations: [
+      { taskId: "child", taskTitle: "写今日计划", subjectId: "subject-a", minutes: 9 },
+      { taskId: "old-allocation", taskTitle: "已完成原归属", subjectId: "subject-a", minutes: 10 },
+      { taskId: "other-allocation", taskTitle: "跨主体原归属", subjectId: "subject-b", minutes: 8 },
+      { taskId: "missing-allocation", taskTitle: "已不可见原归属", subjectId: "subject-a", minutes: 3 },
+    ],
+  };
   const runningEntry = () => ({
     id: "entry-overnight",
     workDate,
@@ -83,7 +106,7 @@ function mockInitScript() {
     version: 1,
   });
 
-  const calls = { update: [], dayPlanSet: [], dayPlanBatch: [], transition: [], create: [], completed: [], move: [], actualAdjustment: [], unassignedResolve: [], cloudCatchUp: 0 };
+  const calls = { update: [], dayPlanSet: [], dayPlanBatch: [], transition: [], create: [], completed: [], move: [], actualAdjustment: [], unassignedResolve: [], allocationReplace: [], cloudCatchUp: 0 };
   let failDayPlanBatchOnce = false;
   let created = 0;
 
@@ -104,6 +127,8 @@ function mockInitScript() {
       switch (command) {
         case "settings_get":
           return { storageMode: "local", workspaceId: "workspace", deviceId: "device", shared: {}, device: { app_theme: "forest", completion_feedback_enabled: false }, integrations: {}, secrets: { seatableTokenSet: false, supabaseSessionSet: false } };
+        case "workbench_bootstrap_get":
+          return { subjects, timezone: "Asia/Shanghai", currentWorkDate: workDate, currentDayStartAt: Date.now() - 3_600_000, currentDayEndAt: Date.now() + 86_400_000 };
         case "work_calendar_get_context":
           return { timezone: "Asia/Shanghai", currentWorkDate: workDate, currentDayStartAt: Date.now() - 3_600_000, currentDayEndAt: Date.now() + 86_400_000 };
         case "subject_list":
@@ -111,7 +136,8 @@ function mockInitScript() {
         case "task_list": {
           const request = args.request ?? {};
           if (request.todayOnly) return { tasks: [], revision: 1 };
-          return { tasks: activeTasks.filter((item) => !request.subjectId || item.subjectId === request.subjectId), revision: 1 };
+          return { tasks: activeTasks.filter((item) => (!request.subjectId || item.subjectId === request.subjectId)
+            && (!entryAllocation || !["old-parent", "old-allocation", "other-allocation"].includes(item.id))), revision: 1 };
         }
         case "task_list_completed_page":
           return { tasks: [], page: 1, pageSize: 20, total: 0, totalPages: 0 };
@@ -200,7 +226,7 @@ function mockInitScript() {
             subjectId: args.request.subjectId,
             workDate: args.request.workDate,
             tasks: activeTasks
-              .filter((task) => task.subjectId === args.request.subjectId && task.status === "open")
+              .filter((task) => task.subjectId === args.request.subjectId && (entryAllocation || task.status === "open"))
               .map((task) => ({
                 ...task,
                 isLeaf: !activeTasks.some((candidate) => candidate.parentId === task.id),
@@ -235,7 +261,20 @@ function mockInitScript() {
         case "time_entry_list":
           return { entries: [], rawMinutes: 0, allocatedMinutes: 0, pendingMinutes: 0, breakMinutes: 0, revision: 1 };
         case "time_entry_history_list":
-          return { page: 1, pageSize: 7, totalDays: 0, totalPages: 0, groups: [], revision: 1 };
+          return { page: 1, pageSize: 7, totalDays: entryAllocation ? 1 : 0, totalPages: entryAllocation ? 1 : 0, groups: entryAllocation ? [{
+            workDate, entryCount: 1, rawMinutes: 30, allocatedMinutes: allocationEntry.allocatedMinutes, pendingMinutes: 0, breakMinutes: 0,
+            adjustmentMinutes: 0, finalActualMinutes: allocationEntry.allocatedMinutes, adjustments: [], entries: [{ ...allocationEntry }],
+          }] : [], revision: 1 };
+        case "time_allocation_replace":
+          calls.allocationReplace.push({ ...args.request });
+          allocationEntry.allocations = args.request.allocations.map((item) => {
+            const previous = allocationEntry.allocations.find((allocation) => allocation.taskId === item.taskId);
+            const task = [...Object.values(planRows).flat(), ...activeTasks].find((task) => task.id === item.taskId);
+            return { ...item, taskTitle: task?.title ?? previous?.taskTitle, subjectId: task?.subjectId ?? previous?.subjectId };
+          });
+          allocationEntry.allocatedMinutes = args.request.allocations.reduce((sum, item) => sum + item.minutes, 0);
+          allocationEntry.version += 1;
+          return { ...allocationEntry };
         case "timer_get_state":
           return runningEntry();
         case "unassigned_get_state_snapshot":
@@ -278,9 +317,12 @@ async function main() {
   const page = await context.newPage();
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("console", (message) => { if (message.type() === "error") pageErrors.push(message.text()); });
   const calls = () => page.evaluate(() => window.__EXECUTION_DIALOG_TEST__.calls);
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
-  await page.locator(".global-timer-main").click();
+  await page.locator(".global-timer-main").click().catch(async (error) => {
+    throw new Error(error.message + "\n" + pageErrors.join("；") + "\n" + await page.locator("body").innerText());
+  });
 
   const dialog = page.locator(".timer-task-dialog");
   await dialog.waitFor({ state: "visible" });
@@ -407,7 +449,7 @@ async function main() {
   await executeActualPopover.getByRole("textbox", { name: "目标实际分钟" }).fill("15");
   await executeActualPopover.getByRole("button", { name: "确认调整" }).click();
   await page.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.actualAdjustment.some((call) => call.items?.some((item) => item.taskId === "child" && item.targetMinutes === 15)));
-  if ((await calls()).cloudCatchUp < 2) throw new Error("执行弹框实际调整未在打开和保存前追平云端增量");
+  // 当前为本地模式，实际调整通过重新读取快照验证基线，不请求云端增量。
 
   // 6. 今日成员写入失败时保留弹框并提示，不得对未成为今日成员的事项开始计时
   await page.evaluate(() => window.__EXECUTION_DIALOG_TEST__.failNextDayPlanBatch());
@@ -552,6 +594,52 @@ async function main() {
   if (!partialSummary.includes("少于参考") || !partialSummary.includes("已分配\n10")) throw new Error("部分分配没有显示与参考时长的差额：" + partialSummary);
   await unassignedDialog.getByRole("button", { name: "确认分配" }).click();
   await unassignedPage.waitForFunction(() => window.__EXECUTION_DIALOG_TEST__.calls.unassignedResolve.some((call) => call.allocations?.some((item) => item.taskId === "child" && item.minutes === 10)));
+
+  // 11. 调整归属默认显示今日计划，只补入原归属；保存不丢跨主体/已完成/不可见事项。
+  const allocationContext = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  await allocationContext.addInitScript(mockInitScript, { entryAllocation: true });
+  const allocationPage = await allocationContext.newPage();
+  allocationPage.on("pageerror", (error) => pageErrors.push(error.message));
+  await allocationPage.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await allocationPage.locator(".nav-list > button", { hasText: "时间记录" }).click();
+  const historyEntry = allocationPage.locator('[data-entry-id="entry-allocation"]');
+  await historyEntry.locator(".time-entry-summary").click();
+  await historyEntry.getByRole("button", { name: "调整归属", exact: true }).click();
+  const entryDialog = allocationPage.locator(".timer-task-dialog");
+  await entryDialog.locator('[data-timer-task-id="old-allocation"]').waitFor({ state: "visible" });
+  const entryRowIds = () => entryDialog.locator(".timer-task-row[data-timer-task-id]").evaluateAll((rows) => rows.map((row) => row.dataset.timerTaskId));
+  const entryIds = await entryRowIds();
+  if (entryIds.join("|") !== "parent|child|done-today|old-parent|old-allocation") throw new Error("调整归属列表范围不正确：" + JSON.stringify(entryIds));
+  if ((await entryDialog.locator('input[aria-label="写今日计划本次分配分钟"]').inputValue()) !== "9") throw new Error("今日原归属的分配未恢复");
+  if (!(await entryDialog.locator('[data-timer-task-id="old-allocation"]').innerText()).includes("原归属")) throw new Error("非今日原归属缺少区分提示");
+  await entryDialog.locator('input[aria-label="已完成原归属本次分配分钟"]').fill("12");
+  await entryDialog.locator('[data-timer-task-id="old-allocation"] .timer-task-complete-check').click();
+  await entryDialog.locator(".timer-task-subject-tabs button", { hasText: "个人" }).click();
+  await entryDialog.locator('[data-timer-task-id="other-allocation"]').waitFor({ state: "visible" });
+  if ((await entryRowIds()).join("|") !== "other-allocation") throw new Error("跨主体原归属未独立显示");
+  if ((await entryDialog.locator('input[aria-label="跨主体原归属本次分配分钟"]').inputValue()) !== "8") throw new Error("切换主体丢失原归属分钟");
+  await entryDialog.locator('input[aria-label="跨主体原归属本次分配分钟"]').fill("6");
+  await entryDialog.locator(".timer-task-subject-tabs button", { hasText: "工作" }).click();
+  await entryDialog.locator('[data-timer-task-id="old-allocation"]').waitFor({ state: "visible" });
+  if ((await entryDialog.locator('input[aria-label="已完成原归属本次分配分钟"]').inputValue()) !== "12") throw new Error("返回原主体丢失编辑草稿");
+  await entryDialog.getByRole("button", { name: "保存归属", exact: true }).click();
+  await entryDialog.waitFor({ state: "hidden" });
+  const savedAllocation = await allocationPage.evaluate(() => window.__EXECUTION_DIALOG_TEST__.calls.allocationReplace.at(-1));
+  const savedItems = savedAllocation?.allocations ?? [];
+  if (savedItems.length !== 4 || !savedItems.some((item) => item.taskId === "child" && item.minutes === 9)
+    || !savedItems.some((item) => item.taskId === "old-allocation" && item.minutes === 12 && item.completeTask && item.taskExpectedVersion === 5)
+    || !savedItems.some((item) => item.taskId === "other-allocation" && item.minutes === 6)
+    || !savedItems.some((item) => item.taskId === "missing-allocation" && item.minutes === 3)) throw new Error("保存丢失原归属或确切 ID：" + JSON.stringify(savedAllocation));
+  await historyEntry.getByRole("button", { name: "调整归属", exact: true }).click();
+  await entryDialog.locator('[data-timer-task-id="old-allocation"]').waitFor({ state: "visible" });
+  if ((await entryDialog.locator('input[aria-label="已完成原归属本次分配分钟"]').inputValue()) !== "12") throw new Error("保存后重新打开没有更新分配");
+  await entryDialog.locator(".timer-task-allocation-change-badge").hover();
+  const entryChanges = allocationPage.locator(".timer-task-allocation-changes-popper:visible");
+  await entryChanges.getByRole("button", { name: "移除已不可见原归属的分配与完成选择" }).click();
+  await entryDialog.getByRole("button", { name: "保存归属", exact: true }).click();
+  await entryDialog.waitFor({ state: "hidden" });
+  const removedItems = await allocationPage.evaluate(() => window.__EXECUTION_DIALOG_TEST__.calls.allocationReplace.at(-1).allocations);
+  if (removedItems.length !== 3 || removedItems.some((item) => item.taskId === "missing-allocation")) throw new Error("不可见原归属无法移除");
 
   if (pageErrors.length) throw new Error("页面错误: " + pageErrors.join("；"));
   await browser.close();

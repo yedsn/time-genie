@@ -2638,13 +2638,19 @@ export const useWorkdayStore = defineStore("workday", () => {
   async function allocate(entryId: string, allocations: TimeAllocation[]): Promise<BatchCompletionResult | undefined> {
     const entry = findTimeEntry(entryId);
     if (!entry) return;
+    const allocationTasks = new Map([...tasks, ...Object.values(executionSnapshots).flatMap((snapshot) => snapshot.tasks), ...todayPlanTasks]
+      .map((task) => [task.id, task]));
+    const originalTaskIds = new Set((entry.allocations ?? []).map((allocation) => allocation.taskId));
     const normalized: Array<{ taskId: string; minutes: number; note?: string; completeTask: boolean; taskExpectedVersion?: number }> = [];
     for (const item of allocations) {
       const minutes = Math.max(0, Math.round(Number(item.minutes) || 0));
       if (!item.taskId || (minutes <= 0 && !item.completeTask)) continue;
-      const taskId = await persistTimerTask(item.taskId);
+      const knownTask = allocationTasks.get(item.taskId);
+      // 原归属可能是已完成/其他主体的事项，不要求它仍在当前待办缓存中。
+      const taskId = (knownTask && knownTask.version > 0) || originalTaskIds.has(item.taskId)
+        ? item.taskId : await persistTimerTask(item.taskId);
       if (!taskId) throw new Error("分配事项保存失败");
-      const task = [...todayPlanTasks, ...tasks].find((candidate) => candidate.id === taskId);
+      const task = allocationTasks.get(taskId);
       normalized.push({
         taskId,
         minutes,
@@ -2654,12 +2660,12 @@ export const useWorkdayStore = defineStore("workday", () => {
       });
     }
     const completionCandidates = new Set(normalized
-      .filter((allocation) => allocation.completeTask && [...todayPlanTasks, ...tasks].find((task) => task.id === allocation.taskId)?.status !== "done")
+      .filter((allocation) => allocation.completeTask && allocationTasks.get(allocation.taskId)?.status !== "done")
       .map((allocation) => allocation.taskId));
     markTimeDataChanged();
     const affectedSubjectIds = new Set((entry.allocations ?? []).map((allocation) => allocation.subjectId).filter((subjectId): subjectId is string => Boolean(subjectId)));
     for (const allocation of normalized) {
-      const task = [...todayPlanTasks, ...tasks].find((candidate) => candidate.id === allocation.taskId);
+      const task = allocationTasks.get(allocation.taskId);
       if (task) affectedSubjectIds.add(task.subjectId);
     }
     replaceTimeEntry(await replaceTimeAllocations(entry.id, entry.version, normalized));

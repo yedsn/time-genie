@@ -41,6 +41,7 @@
    - `supabase/20261023j_timegenie_direct_cloud_import_export.sql`
    - `supabase/20261023k_timegenie_direct_cloud_release_guard.sql`
    - `supabase/20261023n_timegenie_direct_cloud_interaction_performance.sql`
+   - `supabase/20261029b_timegenie_plan_batch_baseline_scope.sql`
 3. 执行后确认 `timegenie.workspaces.storage_protocol` 列为 `text not null default 'sync_v1'`，且约束只允许 `sync_v1` 和 `direct_v2`。
 4. 在仓库根目录运行 `npm run test:supabase:schema`。该命令会启动临时 PostgreSQL，部署 schema、重复执行协议补丁并运行权限及协议屏障集成测试。
 

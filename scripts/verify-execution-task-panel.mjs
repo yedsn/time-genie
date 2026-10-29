@@ -68,7 +68,7 @@ assert.deepEqual(reconciled, { c1: { value: 10 }, c2: { value: 20 } });
 const merged = mergeDraftRecord(reconciled, ["c1", "new"], (taskId) => ({ value: taskId === "new" ? 0 : 99 }));
 assert.deepEqual(merged, { c1: { value: 10 }, new: { value: 0 } });
 
-// 开始执行与未归属时间分配使用相同的今日成员（含当天已完成）及父级上下文；历史归属不缩窄范围
+// 所有模式使用相同的今日成员（含当天已完成）及父级上下文
 const planTasks = [
   { id: "parent", subjectId: "a", title: "项目", status: "open", selectable: false, directMinutes: 0, totalMinutes: 0, todayContext: true },
   { id: "today-open", subjectId: "a", parentId: "parent", title: "今日未完成", status: "open", selectable: true, directMinutes: 0, totalMinutes: 0, todayMember: true },
@@ -78,8 +78,26 @@ const planTasks = [
   { id: "cross-day-active", subjectId: "a", title: "跨日计时", status: "open", selectable: true, directMinutes: 0, totalMinutes: 0 },
 ];
 assert.deepEqual(executionPanelSourceTasks(planTasks, "a", "execute").map((task) => task.id), ["parent", "today-open", "today-done"]);
-assert.deepEqual(executionPanelSourceTasks(planTasks, "a", "entry-allocation").map((task) => task.id), planTasks.map((task) => task.id));
+assert.deepEqual(executionPanelSourceTasks(planTasks, "a", "entry-allocation").map((task) => task.id), ["parent", "today-open", "today-done"]);
 assert.deepEqual(executionPanelSourceTasks(planTasks, "a", "unassigned-allocation").map((task) => task.id), ["parent", "today-open", "today-done"]);
+
+// 同名长期来源不混入；已完成原归属及父级仍可调整，ID 不映射到今日副本。
+const originalTasks = [
+  { ...planTasks[1], id: "source", todayMember: false, title: "今日未完成" },
+  { ...planTasks[0], id: "old-parent", status: "done", todayContext: false },
+  { ...planTasks[2], id: "old-allocation", parentId: "old-parent", todayMember: false, completedToday: false },
+  { ...planTasks[1], title: "过期标题" },
+  { ...planTasks[4], id: "other-allocation", todayMember: false, status: "done" },
+];
+const allocationRows = executionPanelRows(executionPanelSourceTasks(planTasks, "a", "entry-allocation", originalTasks, ["old-allocation", "other-allocation", "missing"]), "a");
+assert.deepEqual(allocationRows.map((row) => [row.task.id, row.depth]), [["parent", 0], ["today-open", 1], ["today-done", 0], ["old-parent", 0], ["old-allocation", 1]]);
+assert.equal(allocationRows.find((row) => row.task.id === "today-open").task.title, "今日未完成");
+assert.equal(allocationRows.find((row) => row.task.id === "old-allocation").pinned, true);
+assert.equal(allocationRows.some((row) => row.task.id === "source"), false);
+const sourceAllocated = executionPanelSourceTasks(planTasks, "a", "entry-allocation", originalTasks, ["source"]);
+assert.equal(sourceAllocated.filter((task) => task.title === "今日未完成").length, 2, "长期来源本身是原归属时保留两个确切 ID");
+assert.equal(sourceAllocated.find((task) => task.id === "source").pinned, true);
+assert.deepEqual(executionPanelRows(executionPanelSourceTasks(planTasks, "b", "entry-allocation", originalTasks, ["old-allocation", "other-allocation"]), "b").map((row) => row.task.id), ["other-subject", "other-allocation"]);
 
 const executeRows = executionPanelRows(executionPanelSourceTasks(planTasks, "a", "execute"), "a");
 assert.deepEqual(executeRows.map((row) => row.task.id), ["parent", "today-open", "today-done"]);

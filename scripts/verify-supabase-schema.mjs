@@ -72,6 +72,7 @@ const legacyUnassignedSuccessorIdempotencyPatchFile = path.join(repoRoot, "supab
 const unassignedSuccessorBoundaryPatchFile = path.join(repoRoot, "supabase", "20261024c_timegenie_unassigned_successor_boundary.sql");
 const retireLegacySyncPatchFile = path.join(repoRoot, "supabase", "20261024d_timegenie_retire_legacy_sync.sql");
 const directReadonlyQueriesPatchFile = path.join(repoRoot, "supabase", "20261024e_timegenie_direct_cloud_readonly_queries.sql");
+const planBatchBaselineScopePatchFile = path.join(repoRoot, "supabase", "20261029b_timegenie_plan_batch_baseline_scope.sql");
 
 const binaryNames = process.platform === "win32"
   ? {
@@ -172,6 +173,24 @@ function verifyStaticSchemaInvariants() {
   const directRecurrenceMutationPatch = fs.readFileSync(directRecurrenceMutationPatchFile, "utf8");
   const directTaskDomainRoutingPatch = fs.readFileSync(directTaskDomainRoutingPatchFile, "utf8");
   const schemaIntegrationTest = fs.readFileSync(schemaTestFile, "utf8");
+  const planBatchBaselineScopePatch = fs.readFileSync(planBatchBaselineScopePatchFile, "utf8");
+  if (!schema.includes("\\ir 20261029b_timegenie_plan_batch_baseline_scope.sql")
+      || (schemaIntegrationTest.match(/\\ir 20261029b_timegenie_plan_batch_baseline_scope\.sql/g) ?? []).length < 2) {
+    throw new Error("The plan batch baseline scope patch must be deployed and tested idempotently.");
+  }
+  for (const expected of [
+    "day_instance_date is not null or task.status='open'",
+    "if not task_id=any(baseline_ids)",
+    "from unnest(baseline_ids) id where not id=any(final_existing_ids)",
+    "未确认删除的子事项",
+  ]) {
+    if (!planBatchBaselineScopePatch.includes(expected)) {
+      throw new Error(`The plan batch baseline scope patch is missing: ${expected}`);
+    }
+  }
+  if (planBatchBaselineScopePatch.includes("当前主体的进行中事项集合已变化")) {
+    throw new Error("Plan batches must not require the entire current subject set to match the editor baseline.");
+  }
   const directCloudProtocolDoc = fs.readFileSync(
     path.join(repoRoot, "docs", "direct-cloud-storage-protocol.md"),
     "utf8",

@@ -11,11 +11,13 @@
 - [x] 2.1 新增可增量部署的 Supabase 报告修复迁移，扩展 `direct_cloud_report_render` 按稳定事项汇总时间分配与实际用时调整，并验证同一事项只生成一行
 - [x] 2.2 在直连报告渲染中读取 `report_duration_format` 并为日报叶子事项输出合计实际用时，验证分钟与一位小数小时两种格式以及父级不重复计时
 - [x] 2.3 用正式的周期归一化、`direct_cloud_report_scope_task_ids` 和 `direct_cloud_report_render` 重写 `direct_cloud_report_preview`，验证无关进行中事项和每日实例不会进入自动日报
-- [ ] 2.4 将新迁移接入 `supabase/schema.sql` 和 `supabase/schema_integration_test.sql`，重复执行迁移并验证函数部署幂等、权限授权和 schema 集成测试通过
+- [x] 2.4 将新迁移接入 `supabase/schema.sql` 和 `supabase/schema_integration_test.sql`，重复执行迁移并验证函数部署幂等、权限授权和 schema 集成测试通过
 
 ## 3. 对齐应用请求与回归验证
 
 - [x] 3.1 核对并在必要时调整 Rust 直连预览适配与前端 `previewReport` 请求，使预览和创建传递相同的日期、主体与模板语义，并通过 `npm run typecheck`
 - [x] 3.2 运行报告相关 Rust 测试，验证本地模式的事项聚合、时长格式、预览不落库和预览创建一致性全部通过
 - [x] 3.3 运行 Supabase schema 集成测试，验证直连模式下预览 Markdown 等于创建 Markdown、报告总工时等于各事项合计，并且重新生成保持相同口径
-- [ ] 3.4 执行报告创建弹窗的人工验收：为同一事项准备多条当天时间记录，确认预览与保存结果均只显示一条事项及其合计实际用时
+- [x] 3.4 执行报告创建弹窗的人工验收：为同一事项准备多条当天时间记录，确认预览与保存结果均只显示一条事项及其合计实际用时
+
+验收记录：通过 `scripts/serve-report-preview-acceptance.mjs` 在隔离本地 PostgreSQL 上加载真实 `ReportWorkspace.vue` 与 Pinia 请求路径，点击“创建”和“生成并保存”。20 + 25 + 每日实例 15 + 调整 5 分钟仅生成一条 `合并事项 <实际：1h5min>`，无关进行中事项与每日实例名称均不出现；预览、创建响应及数据库保存的完整 Markdown 相等，关联事项数为 1。该验收覆盖真实报告组件，不包含原生 Tauri 窗口或线上 Supabase 部署。
