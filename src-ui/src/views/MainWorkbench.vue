@@ -1256,10 +1256,9 @@ async function confirmPlanImport() {
       expectedVersion: importPreview.value.version,
       clientRequestId: importRequestId.value || crypto.randomUUID(),
     });
-    await store.loadWorkspaceData();
     if (result.targetKind === "day_instance" && result.sourceDate === store.workspaceToday) {
-      await Promise.all([store.loadTodayPlan(importSubjectId.value), store.loadTodayOverview()]);
-    }
+      await Promise.all([store.loadWorkspaceData(true), store.loadTodayPlan(importSubjectId.value, true), store.loadTodayOverview(undefined, true)]);
+    } else await store.loadWorkspaceData(true);
     importDialogOpen.value = false;
     const suffix = result.targetKind === "day_instance" && result.sourceDate !== store.workspaceToday ? `，已写入 ${result.sourceDate}` : "";
     ElMessage.success(result.alreadyConfirmed ? "该批日报已经确认过" : `已导入 ${result.createdCount} 条事项${suffix}`);

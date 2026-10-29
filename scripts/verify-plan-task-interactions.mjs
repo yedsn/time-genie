@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { contextMenuPosition, effectiveTodayEstimate, hierarchicalTaskSelectionRows, orderedTaskSelectionWithAncestors, planTaskMoveIntent, taskDragTargetDepth, taskDragTargetInvalid, taskSubtreeIds, todayEstimateDraft, toggleTaskSelectionGroup } from "../.tmp-plan-task-interactions-test/planTaskInteractionCore.js";
+import { contextMenuPosition, effectiveTodayEstimate, hierarchicalTaskSelectionRows, orderedPlanTaskTree, orderedTaskSelectionWithAncestors, planTaskMoveIntent, taskDragTargetDepth, taskDragTargetInvalid, taskSubtreeIds, todayEstimateDraft, toggleTaskSelectionGroup } from "../.tmp-plan-task-interactions-test/planTaskInteractionCore.js";
 
 const rows = [
   { id: "a" },
@@ -8,6 +8,17 @@ const rows = [
   { id: "b" },
   { id: "b1", parentId: "b" },
 ];
+const mixedRows = [rows[2], rows[4], rows[3], rows[1], rows[0]];
+const mixedRowsBefore = [...mixedRows];
+assert.deepEqual(orderedPlanTaskTree(mixedRows).map((row) => row.id), ["b", "b1", "a", "a2", "a1"]);
+assert.deepEqual(mixedRows, mixedRowsBefore);
+assert.equal(orderedPlanTaskTree(mixedRows)[0], rows[3]);
+assert.deepEqual(orderedPlanTaskTree(rows), rows);
+assert.deepEqual(orderedPlanTaskTree([]), []);
+const orphan = { id: "orphan", parentId: "missing" };
+assert.deepEqual(orderedPlanTaskTree([orphan, rows[0], rows[1]]), [orphan, rows[0], rows[1]]);
+const grandchild = { id: "a11", parentId: "a1" };
+assert.deepEqual(orderedPlanTaskTree([grandchild, rows[1], rows[0]]).map((row) => row.id), ["a", "a1", "a11"]);
 assert.deepEqual(planTaskMoveIntent([rows[0], rows[2], rows[1], ...rows.slice(3)], "a2", new Set(["a2"]), 1, false), { parentId: "a", previousSiblingId: undefined, nextSiblingId: "a1" });
 assert.deepEqual(planTaskMoveIntent([rows[0], rows[1], rows[2], rows[3], rows[4]], "a1", new Set(["a1"]), 1, false), { parentId: "a", previousSiblingId: undefined, nextSiblingId: "a2" });
 assert.deepEqual(planTaskMoveIntent([rows[0], rows[2], rows[1], rows[3], rows[4]], "a2", new Set(["a2"]), 1, false), { parentId: "a", previousSiblingId: undefined, nextSiblingId: "a1" });

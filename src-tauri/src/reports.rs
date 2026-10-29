@@ -5666,6 +5666,106 @@ mod tests {
     }
 
     #[test]
+    fn daily_report_aggregates_multiple_entries_adjustments_and_day_instance() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::initialize_at(directory.path().join("daily-report-aggregation.sqlite3"))
+                .unwrap();
+        let connection = database.open().unwrap();
+        let workspace_id: String = connection
+            .query_row("SELECT id FROM workspaces LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                day_instance_date: None,
+                parent_id: None,
+                title: "聚合日报事项".into(),
+                planned_date: Some("2026-09-29".into()),
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        for minutes in [20, 25] {
+            create_manual_entry(
+                &database,
+                ManualEntryRequest {
+                    task_id: Some(task.id.clone()),
+                    work_date: "2026-09-29".into(),
+                    started_at: None,
+                    ended_at: None,
+                    minutes: Some(minutes),
+                    note: None,
+                    complete_task: false,
+                    task_expected_version: None,
+                    client_request_id: Uuid::now_v7().to_string(),
+                },
+            )
+            .unwrap();
+        }
+        let instance_id = Uuid::now_v7().to_string();
+        let now = chrono::Local::now().timestamp_millis();
+        let connection = database.open().unwrap();
+        connection.execute(
+            "INSERT INTO tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,created_at,updated_at,version,day_instance_date,day_instance_kind,day_instance_source_task_id)
+             VALUES(?1,?2,?3,'聚合日报事项实例','open','manual',10,?4,?4,1,'2026-09-29','member',?5)",
+            params![instance_id, workspace_id, subject_id, now, task.id],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO time_entries(id,workspace_id,work_date,kind,source_type,state,default_task_id,label_snapshot,started_at,ended_at,duration_seconds,created_at,updated_at,version)
+             VALUES(?1,?2,'2026-09-29','work','manual','ended',?3,'实例投入',?4,?4,900,?4,?4,1)",
+            params!["aggregation-instance-entry", workspace_id, instance_id, now],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO time_allocations(id,workspace_id,entry_id,task_id,minutes,created_at,updated_at,version)
+             VALUES(?1,?2,'aggregation-instance-entry',?3,15,?4,?4,1)",
+            params!["aggregation-instance-allocation", workspace_id, instance_id, now],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,batch_id,created_at,updated_at,version)
+             VALUES(?1,?2,?3,?4,'2026-09-29',5,60,65,?5,?6,?6,1)",
+            params![Uuid::now_v7().to_string(), workspace_id, subject_id.clone(), task.id, Uuid::now_v7().to_string(), now],
+        ).unwrap();
+        drop(connection);
+
+        let preview = preview_report(
+            &database,
+            ReportPreviewRequest {
+                report_type: "daily".into(),
+                reference_date: "2026-09-29".into(),
+                subject_id: subject_id.clone(),
+                template_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(preview.matches("聚合日报事项 <实际：1h5min>").count(), 1);
+        assert!(preview.contains("聚合日报事项 <实际：1h5min>"));
+        assert!(!preview.contains("聚合日报事项实例"));
+        let report = create_report(
+            &database,
+            ReportCreateRequest {
+                report_type: "daily".into(),
+                reference_date: "2026-09-29".into(),
+                subject_id,
+                task_ids: Vec::new(),
+                template_id: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(report.markdown, preview);
+        assert_eq!(report.task_ids, vec![task.id]);
+    }
+
+    #[test]
     fn recurring_daily_report_uses_occurrence_status_and_tomorrow_rule() {
         let directory = tempdir().unwrap();
         let database =

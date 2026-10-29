@@ -124,6 +124,39 @@ export function serializeQuickPlanLines(lines: readonly QuickPlanDraftLine[]) {
   return lines.map((line) => `${line.depth ? "  " : ""}- ${line.text}`).join("\n");
 }
 
+/** Append source-plan text as new today items without reusing source task identities. */
+export function appendQuickPlanImport(
+  draft: readonly QuickPlanDraftLine[],
+  tasks: readonly QuickPlanTask[],
+  sourceIdsByTaskId: ReadonlyMap<string, string> = new Map(),
+): QuickPlanDraftLine[] {
+  const lines = draft.map((line) => ({ ...line }));
+  const lineKeyBySourceId = new Map<string, string>();
+  for (const line of lines) {
+    const sourceId = line.taskId ? sourceIdsByTaskId.get(line.taskId) : undefined;
+    if (sourceId) lineKeyBySourceId.set(sourceId, line.lineKey);
+    if (line.lineKey.startsWith("import:")) lineKeyBySourceId.set(line.lineKey.slice(7), line.lineKey);
+  }
+  for (const task of tasks) {
+    if (lineKeyBySourceId.has(task.id)) continue;
+    const parentKey = task.parentId ? lineKeyBySourceId.get(task.parentId) : undefined;
+    const parentIndex = parentKey ? lines.findIndex((line) => line.lineKey === parentKey && line.depth === 0) : -1;
+    const line: QuickPlanDraftLine = {
+      lineKey: `import:${task.id}`,
+      text: task.title,
+      depth: parentIndex >= 0 ? 1 : 0,
+    };
+    let insertAt = lines.length;
+    if (parentIndex >= 0) {
+      insertAt = parentIndex + 1;
+      while (insertAt < lines.length && lines[insertAt].depth === 1) insertAt += 1;
+    }
+    lines.splice(insertAt, 0, line);
+    lineKeyBySourceId.set(task.id, line.lineKey);
+  }
+  return lines;
+}
+
 export function reconcileQuickPlanText(
   previous: readonly QuickPlanDraftLine[],
   text: string,

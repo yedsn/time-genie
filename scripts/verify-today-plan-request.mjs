@@ -40,7 +40,21 @@ assert.match(storeSource, /const tasks = reactive<Task\[\]>\(initialTasks\)/);
 assert.match(storeSource, /function todayPlanTask\(taskId: string\)[\s\S]*return todayPlanTasks\.find/);
 assert.match(storeSource, /function replaceTodayTask\(record: TaskRecord\)[\s\S]*todayPlanTasks\.splice/);
 assert.match(storeSource, /async function saveTodayTask\([\s\S]*updateTaskRecord\([\s\S]*reloadTodayPlanForSubject/);
+assert.match(storeSource, /async function saveTaskPlanBatch\([\s\S]*dayInstanceDate\) await loadTodayPlan\(request\.subjectId, true\)[\s\S]*loadWorkspaceData\(true, false\)/, "批量编辑计划保存后必须强制刷新对应列表");
+assert.match(storeSource, /async function saveActualAdjustmentBatch\([\s\S]*loadWorkspaceData\(true, false\)[\s\S]*loadTodayPlan\(request\.subjectId, true\)/, "实际用时保存后必须刷新待办和今日计划");
+assert.match(storeSource, /function preserveTaskDerivedState\([\s\S]*todayMember: current\.todayMember[\s\S]*directMinutes: current\.directMinutes[\s\S]*selectable: current\.selectable/, "事项基础更新不得清空今日状态、实际用时和可计时状态");
+assert.match(storeSource, /async function refreshTaskRowsAfterTimeMutation\([\s\S]*loadActualAdjustmentSnapshot\(subjectId\)[\s\S]*applyActualSnapshotTask/, "时间变更后必须读取受影响主体的权威事项快照");
+for (const functionName of ["confirmTimerStopAllocation", "resolveTimerStopDisposition", "allocate", "addManualEntry", "correctTimeEntry", "setTimeEntryDisposition", "resolveUnassignedTime"]) {
+  const functionStart = storeSource.indexOf("async function " + functionName);
+  const functionEnd = storeSource.indexOf("\n  async function ", functionStart + 1);
+  const functionBody = storeSource.slice(functionStart, functionEnd < 0 ? storeSource.length : functionEnd);
+  assert.match(functionBody, /refreshTaskRowsAfterTimeMutation/, functionName + " 完成后必须立即更新受影响事项行");
+}
 assert.doesNotMatch(storeSource, /function replaceTodayTask\(record: TaskRecord\)[\s\S]{0,500}replaceTask\(/, "今日实例写入不得复用来源事项数组替换函数");
+assert.match(storeSource, /function replaceTask\(record: TaskRecord\)[\s\S]*if \(record\.dayInstanceDate\) return replaceTodayTask\(record\)/, "执行面板更新今日实例时不得写入进行中事项数组");
+
+const mainSource = readFileSync(new URL("../src-ui/src/views/MainWorkbench.vue", import.meta.url), "utf8");
+assert.match(mainSource, /confirmPlanImport\([\s\S]*loadWorkspaceData\(true\)[\s\S]*loadTodayPlan\(importSubjectId\.value, true\)/, "日报导入后必须绕过旧缓存刷新今日计划");
 
 const dialogSource = readFileSync(new URL("../src-ui/src/components/TimerTaskDialog.vue", import.meta.url), "utf8");
 assert.match(dialogSource, /const todayPlanPanelTasks = store\.todayPlanTasks/);

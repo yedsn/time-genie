@@ -3948,3 +3948,11 @@ notify pgrst, 'reload schema';
 -- Keep direct-cloud authorization compatible with PostgREST read-only query
 -- transactions by avoiding unnecessary row locks.
 \ir 20261024e_timegenie_direct_cloud_readonly_queries.sql
+
+-- Keep report previews aligned with authoritative report generation and show
+-- stable-task aggregated actual minutes in generated daily report items.
+\ir 20261029_timegenie_report_preview_task_aggregation.sql
+
+-- Batch plan edits use the editor baseline, preserving later additions and
+-- supporting completed today instances while retaining version protection.
+\ir 20261029b_timegenie_plan_batch_baseline_scope.sql

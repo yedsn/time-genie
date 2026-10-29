@@ -18,3 +18,17 @@ for (const marker of [".quick-plan-dialog", ".quick-plan-editor", ".quick-plan-e
   assert.equal(styles.includes(marker), true, `missing style marker: ${marker}`);
 }
 console.log("quick plan text editing UI checks passed");
+
+const importBar = component.slice(component.indexOf('class="quick-plan-import-bar"'), component.indexOf("<MdEditor"));
+assert.equal(component.includes("v-if=\"mode === 'today'\" class=\"quick-plan-import-bar\""), true);
+assert.equal(importBar.includes('@click="openQuickPlanImport"'), true);
+assert.equal(importBar.includes("从进行中导入"), true);
+const openImport = component.slice(component.indexOf("function openQuickPlanImport()"), component.indexOf("function importQuickPlanText()"));
+assert.equal(openImport.includes('todaySourceImportTarget.value = "text"'), true);
+assert.equal(openImport.includes("todayImportSelection.value = [...todayImportSelectableIds.value]"), true);
+const importText = component.slice(component.indexOf("function importQuickPlanText()"), component.indexOf("function handleQuickPlanTextareaKey"));
+assert.equal(importText.includes("appendQuickPlanImport"), true);
+assert.equal(importText.includes("orderedTaskSelectionWithAncestors"), true);
+assert.equal(importText.includes("props.saveTodayImport"), false, "text import must remain an unsaved draft");
+assert.equal(styles.includes(".quick-plan-import-bar"), true);
+console.log("quick plan text import UI checks passed");

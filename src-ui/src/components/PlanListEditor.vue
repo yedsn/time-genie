@@ -6,12 +6,12 @@ import "md-editor-v3/lib/style.css";
 import { CalendarDays, CheckCircle2, Circle, Clock3, Copy, CornerDownRight, DatabaseZap, FileInput, FilePenLine, GripVertical, IndentDecrease, IndentIncrease, ListMinus, ListPlus, MessageSquareText, Minus, Play, Plus, Radio, Repeat2, TimerReset, Trash2 } from "lucide-vue-next";
 import type { Task } from "../store";
 import { isActivePlanTask } from "../services/completedTaskHistoryCore";
-import { contextMenuPosition, hierarchicalTaskSelectionRows, orderedTaskSelectionWithAncestors, taskSubtreeIds, todayEstimateDraft, toggleTaskSelectionGroup } from "../services/planTaskInteractionCore";
+import { contextMenuPosition, hierarchicalTaskSelectionRows, orderedPlanTaskTree, orderedTaskSelectionWithAncestors, taskSubtreeIds, todayEstimateDraft, toggleTaskSelectionGroup } from "../services/planTaskInteractionCore";
 import { createTaskTreeSortable } from "../services/taskTreeSortable";
 import type { ActualAdjustmentBatchRequest, ActualAdjustmentBatchResult, ActualAdjustmentSnapshotRecord, ActualAdjustmentSnapshotTaskRecord } from "../services/tauri";
 import { adjustQuickEstimateMinutes, parseQuickEstimateMinutes } from "../services/quickPlanEstimateCore";
 import { actualAdjustmentSummary, eligibleActualAdjustmentParents, parentTargetTotal, parseActualMinutes, type ActualAdjustmentDraft, type ActualAdjustmentNewTaskDraft } from "../services/quickActualAdjustmentCore";
-import { analyzeQuickPlanDraft, buildQuickPlanBatchRequest, createQuickPlanBaseline, createQuickPlanDraft, reconcileQuickPlanText, serializeQuickPlanLines, type QuickPlanBaselineTask, type QuickPlanBatchRequest, type QuickPlanDraftLine } from "../services/quickPlanTextCore";
+import { analyzeQuickPlanDraft, appendQuickPlanImport, buildQuickPlanBatchRequest, createQuickPlanBaseline, createQuickPlanDraft, reconcileQuickPlanText, serializeQuickPlanLines, type QuickPlanBaselineTask, type QuickPlanBatchRequest, type QuickPlanDraftLine } from "../services/quickPlanTextCore";
 
 const props = defineProps<{
   tasks: Task[];
@@ -71,6 +71,7 @@ const rowsRef = ref<HTMLElement | null>(null);
 const todayImportRowsRef = ref<HTMLElement | null>(null);
 const todayImportOpen = ref(false);
 const todaySourceImportOpen = ref(false);
+const todaySourceImportTarget = ref<"today" | "text">("today");
 const todayImportSelection = ref<string[]>([]);
 const todayImportEstimates = ref<Record<string, string>>({});
 const todayImportErrors = ref<Record<string, string>>({});
@@ -167,7 +168,9 @@ const quickPlanMarkdownToolbars = [
 
 const mode = computed(() => props.mode ?? "active");
 const editableTasks = computed(() => mode.value === "today" ? (props.displayTasks ?? []) : props.tasks);
-const scopedDisplayTasks = computed(() => (props.displayTasks ?? []).filter((task) => task.subjectId === props.subjectId));
+const scopedDisplayTasks = computed(() => orderedPlanTaskTree(
+  (props.displayTasks ?? []).filter((task) => task.subjectId === props.subjectId),
+));
 const todayStatusById = computed(() => new Map(
   (props.todayStatusTasks ?? [])
     .filter((task) => task.subjectId === props.subjectId)
@@ -245,7 +248,7 @@ const todayImportInstanceRows = computed(() => todayImportInstanceTasks.value
     allocatable: Boolean(task.todayMember) && !todayImportInstanceTasks.value.some((candidate) => candidate.parentId === task.id),
   })));
 const todayImportCandidateSelectableIds = computed(() => new Set(activeImportTasks.value
-  .filter((task) => !todayPlannedIds.value.has(task.id)
+  .filter((task) => (todaySourceImportTarget.value === "text" || !todayPlannedIds.value.has(task.id))
     && !activeImportTasks.value.some((candidate) => candidate.parentId === task.id))
   .map((task) => task.id)));
 const todayImportCandidateRows = computed(() => hierarchicalTaskSelectionRows(
@@ -602,6 +605,24 @@ function updateQuickPlanText(text: string) {
   if (!result.errors.length) quickPlanLines.value = result.lines;
 }
 
+function openQuickPlanImport() {
+  todaySourceImportTarget.value = "text";
+  todayImportSelection.value = [...todayImportSelectableIds.value];
+  todaySourceImportOpen.value = true;
+}
+
+function importQuickPlanText() {
+  const orderedIds = orderedTaskSelectionWithAncestors(activeImportTasks.value, todayImportSelection.value);
+  const taskById = new Map(activeImportTasks.value.map((task) => [task.id, task]));
+  const sourceIdsByTaskId = new Map(displayedTasks.value.flatMap((task) => task.dayInstanceSourceTaskId
+    ? [[task.id, task.dayInstanceSourceTaskId] as const] : []));
+  quickPlanLines.value = appendQuickPlanImport(quickPlanLines.value, orderedIds.map((id) => taskById.get(id)!), sourceIdsByTaskId);
+  const sourceKeys = new Set(quickPlanSourceLines.value.map((line) => line.lineKey));
+  quickPlanSourceLines.value.push(...quickPlanLines.value.filter((line) => !sourceKeys.has(line.lineKey)).map((line) => ({ ...line })));
+  quickPlanText.value = serializeQuickPlanLines(quickPlanLines.value);
+  todaySourceImportOpen.value = false;
+}
+
 function handleQuickPlanTextareaKey(event: KeyboardEvent) {
   if (event.key !== "Tab") return;
   event.preventDefault();
@@ -857,6 +878,7 @@ function openTodayImport() {
 }
 
 function openTodaySourceImport() {
+  todaySourceImportTarget.value = "today";
   todayImportSelection.value = [];
   todayImportErrors.value = {};
   todaySourceImportOpen.value = true;
@@ -1068,6 +1090,10 @@ function todayImportEstimateChanged(task: Task, minutes?: number) {
 
 async function saveTodaySourceImport() {
   if (todayImportSaving.value) return;
+  if (todaySourceImportTarget.value === "text") {
+    importQuickPlanText();
+    return;
+  }
   const newlySelectedIds = orderedTaskSelectionWithAncestors(
     activeImportTasks.value,
     todayImportSelection.value.filter((taskId) => !todayPlannedIds.value.has(taskId)),
@@ -1598,7 +1624,7 @@ onBeforeUnmount(() => {
     <el-dialog v-model="todaySourceImportOpen" class="recurrence-dialog today-source-import-dialog" modal-class="today-source-import-overlay" title="从进行中导入" width="min(720px, 94vw)" append-to-body align-center :close-on-click-modal="false">
       <section class="today-source-import-view">
         <div class="today-source-import-head">
-          <div><strong>选择要导入今日计划的事项</strong><span>这里只选择事项；重复事项会自动使用每次预计，导入后仍可调整。</span></div>
+          <div><strong>选择要导入今日计划的事项</strong><span>{{ todaySourceImportTarget === 'text' ? '默认勾选全部进行中事项；保留层级，导入后可继续编辑，预览并保存后生效。' : '这里只选择事项；重复事项会自动使用每次预计，导入后仍可调整。' }}</span></div>
           <button class="secondary-button compact today-source-select-all" type="button" :disabled="!todayImportSelectableIds.length" @click="toggleAllTodaySourceTasks">{{ todayImportAllSelected ? '取消全选' : '全选' }}</button>
         </div>
         <div v-if="todayImportCandidateRows.length" class="today-import-list today-import-candidate-list">
@@ -1664,6 +1690,10 @@ onBeforeUnmount(() => {
     >
       <div v-if="quickPlanMode === 'edit'" class="quick-plan-workspace">
         <div class="quick-plan-help"><strong>{{ subjectName }}{{ mode === 'today' ? ' · 今日' : '' }}</strong><span>{{ mode === 'today' ? '这里只编辑今日事项；删除已有行会移出今日，不会删除事项本体。' : '这里编辑当前主体的全部进行中事项。' }} 每项必须以“- ”开头；一级写作“- 事项”，二级写作“&nbsp;&nbsp;- 子事项”。Tab / Shift+Tab 调整层级。</span></div>
+        <div v-if="mode === 'today'" class="quick-plan-import-bar">
+          <button class="secondary-button compact" type="button" :disabled="Boolean(quickPlanPasteErrors.length)" @click="openQuickPlanImport"><FileInput :size="14" />从进行中导入</button>
+          <span>导入事项文本，保留已有编辑内容</span>
+        </div>
         <MdEditor
           ref="quickPlanEditorRef"
           class="quick-plan-editor"

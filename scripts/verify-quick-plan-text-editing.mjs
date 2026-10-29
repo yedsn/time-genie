@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { analyzeQuickPlanDraft, buildQuickPlanBatchRequest, createQuickPlanBaseline, createQuickPlanDraft, mergeScopedQuickPlanDraft, parseQuickPlanText, reconcileQuickPlanText, removeQuickPlanSubtree, serializeQuickPlanLines } from "../.tmp-quick-plan-text-editing-test/quickPlanTextCore.js";
+import { analyzeQuickPlanDraft, appendQuickPlanImport, buildQuickPlanBatchRequest, createQuickPlanBaseline, createQuickPlanDraft, mergeScopedQuickPlanDraft, parseQuickPlanText, reconcileQuickPlanText, removeQuickPlanSubtree, serializeQuickPlanLines } from "../.tmp-quick-plan-text-editing-test/quickPlanTextCore.js";
 
 const tasks = [
   { id: "root-a", title: "重复标题", version: 1 },
@@ -86,5 +86,43 @@ assert.equal(mergedDraft.find((line) => line.taskId === "hidden-child").depth, 1
 const mergedSummary = analyzeQuickPlanDraft(createQuickPlanBaseline(fullTasks), mergedDraft);
 assert.deepEqual(mergedSummary.deleted, []);
 assert.equal(mergedSummary.added.some((item) => item.lineKey === "today:new"), true);
+
+const sourceTasks = [
+  { id: "source-root", title: "进行中父项", version: 5 },
+  { id: "source-child", title: "进行中子项", parentId: "source-root", version: 8 },
+  { id: "source-other", title: "另一事项", version: 2 },
+];
+const imported = appendQuickPlanImport([], sourceTasks);
+assert.equal(serializeQuickPlanLines(imported), "- 进行中父项\n  - 进行中子项\n- 另一事项");
+assert.equal(imported.every((line) => !line.taskId && !line.expectedVersion), true, "source identities must not enter the today batch");
+assert.deepEqual(appendQuickPlanImport(imported, sourceTasks), imported, "repeated imports must not duplicate items");
+assert.deepEqual(appendQuickPlanImport(imported, []), imported);
+const importSummary = analyzeQuickPlanDraft([], imported);
+assert.equal(importSummary.dirty, true);
+assert.deepEqual(importSummary.errors, []);
+assert.equal(importSummary.added.length, 3);
+const importRequest = buildQuickPlanBatchRequest("subject-1", [], importSummary);
+assert.deepEqual(importRequest.baselineTasks, []);
+assert.deepEqual(importRequest.confirmedDeleteTaskIds, []);
+assert.equal(importRequest.finalItems[1].parentLineKey, "import:source-root");
+
+const existingToday = [
+  { id: "today-root", title: "今日父项已编辑", version: 2 },
+  { id: "today-child", title: "今日子项", parentId: "today-root", version: 1 },
+  { id: "today-other", title: "已有顶层事项", version: 1 },
+];
+const existingTodayDraft = createQuickPlanDraft(existingToday);
+existingTodayDraft.push({ lineKey: "edit:new", text: "手写草稿", depth: 0 });
+const mergedImport = appendQuickPlanImport(existingTodayDraft, sourceTasks, new Map([["today-root", "source-root"]]));
+assert.deepEqual(mergedImport.map((line) => line.text), ["今日父项已编辑", "今日子项", "进行中子项", "已有顶层事项", "手写草稿", "另一事项"]);
+assert.deepEqual(mergedImport.slice(0, 2), existingTodayDraft.slice(0, 2));
+assert.equal(mergedImport[2].depth, 1, "imported child belongs under its existing today parent");
+const mergedImportSummary = analyzeQuickPlanDraft(createQuickPlanBaseline(existingToday), mergedImport);
+assert.deepEqual(mergedImportSummary.deleted, []);
+assert.deepEqual(mergedImportSummary.errors, []);
+assert.equal(mergedImportSummary.finalItems.find((item) => item.title === "进行中子项").parentLineKey, "task:today-root");
+const retainedImports = reconcileQuickPlanText(mergedImport, serializeQuickPlanLines(mergedImport), "edit:next");
+assert.equal(retainedImports.lines.find((line) => line.text === "进行中子项").lineKey, "import:source-child");
+assert.deepEqual(appendQuickPlanImport([], [{ id: "same-1", title: "同名", version: 1 }, { id: "same-2", title: "同名", version: 1 }]).map((line) => line.lineKey), ["import:same-1", "import:same-2"]);
 
 console.log("quick plan text editing checks passed");

@@ -83,6 +83,7 @@ import {
   type RecurrenceRuleRecord,
   type ActualAdjustmentBatchRequest,
   type ActualAdjustmentSnapshotRecord,
+  type ActualAdjustmentSnapshotTaskRecord,
   type TaskDayPlanSnapshotRecord,
   type WorkspaceCalendarContext,
   recordDirectCloudClientMetric,
@@ -1012,19 +1013,68 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   function replaceTask(record: TaskRecord) {
+    if (record.dayInstanceDate) return replaceTodayTask(record);
     const startedAt = performance.now();
-    const next = toUiTask(record);
+    const current = tasks.find((task) => task.id === record.id);
+    const next = preserveTaskDerivedState(toUiTask(record), current);
     upsertAuthoritativeTask(tasks, next);
     const todayIndex = todayTasks.findIndex((task) => task.id === record.id);
-    if (todayIndex >= 0) todayTasks.splice(todayIndex, 1, toUiTask(record));
+    if (todayIndex >= 0) todayTasks.splice(todayIndex, 1, preserveTaskDerivedState(toUiTask(record), todayTasks[todayIndex]));
     const todayPlanIndex = todayPlanTasks.findIndex((task) => task.id === record.id);
-    if (todayPlanIndex >= 0) todayPlanTasks.splice(todayPlanIndex, 1, toUiTask(record));
+    if (todayPlanIndex >= 0) todayPlanTasks.splice(todayPlanIndex, 1, preserveTaskDerivedState(toUiTask(record), todayPlanTasks[todayPlanIndex]));
     void recordDirectCloudClientMetric("client_apply", performance.now() - startedAt).catch(() => undefined);
     return next;
   }
 
+  function preserveTaskDerivedState(next: Task, current?: Task) {
+    if (!current) return next;
+    return {
+      ...next,
+      todayEstimate: current.todayEstimate,
+      dailyEstimateVersion: current.dailyEstimateVersion,
+      dayPlanState: current.dayPlanState,
+      dayPlanVersion: current.dayPlanVersion,
+      todayMember: current.todayMember,
+      todayContext: current.todayContext,
+      actual: current.actual,
+      directMinutes: current.directMinutes,
+      selectable: current.selectable,
+      executionState: current.executionState,
+      recurrence: current.recurrence,
+      occurrenceDate: current.occurrenceDate,
+      occurrenceOrigin: current.occurrenceOrigin,
+      occurrenceVersion: current.occurrenceVersion,
+      pathLabel: next.pathLabel || current.pathLabel,
+    };
+  }
+
   function applyTaskRecord(task: Task, record: TaskRecord) {
-    Object.assign(task, toUiTask(record));
+    Object.assign(task, preserveTaskDerivedState(toUiTask(record), task));
+  }
+
+  function applyActualSnapshotTask(task: Task, snapshot: ActualAdjustmentSnapshotTaskRecord) {
+    task.status = snapshot.status;
+    task.completedAt = snapshot.completedAt;
+    task.actual = snapshot.totalMinutes;
+    task.directMinutes = snapshot.directMinutes;
+    task.selectable = snapshot.selectable;
+    task.executionState = snapshot.status === "done" ? "done" : snapshot.totalMinutes > 0 ? "started" : "not_started";
+    task.todayEstimate = snapshot.todayEstimateMinutes;
+    task.dailyEstimateVersion = snapshot.dailyEstimateVersion;
+    task.version = snapshot.version;
+  }
+
+  async function refreshTaskRowsAfterTimeMutation(subjectIds: Iterable<string>) {
+    const uniqueSubjectIds = [...new Set([...subjectIds].filter(Boolean))];
+    await Promise.all(uniqueSubjectIds.map(async (subjectId) => {
+      const snapshot = await loadActualAdjustmentSnapshot(subjectId);
+      const taskById = new Map(snapshot.tasks.map((task) => [task.id, task]));
+      for (const task of [...tasks, ...todayTasks, ...todayPlanTasks]) {
+        const authoritative = taskById.get(task.id);
+        if (authoritative) applyActualSnapshotTask(task, authoritative);
+      }
+      if (executionSnapshots[subjectId]) executionSnapshots[subjectId] = snapshot;
+    }));
   }
 
   function markDerivedDomainsStale(domains: Iterable<string>) {
@@ -1306,7 +1356,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       projectName: task.project || null,
     });
     const index = completedTasks.findIndex((item) => item.id === updated.id);
-    if (index >= 0) completedTasks.splice(index, 1, toUiTask(updated));
+    if (index >= 0) completedTasks.splice(index, 1, preserveTaskDerivedState(toUiTask(updated), completedTasks[index]));
     markDerivedDomainsStale(["tasks"]);
     return task.id;
   }
@@ -2003,6 +2053,8 @@ export const useWorkdayStore = defineStore("workday", () => {
   async function saveTaskPlanBatch(request: QuickPlanBatchRequest, dayInstanceDate?: string) {
     const result = await applyTaskPlanBatch({ ...request, dayInstanceDate });
     markDerivedDomainsStale(["tasks"]);
+    if (dayInstanceDate) await loadTodayPlan(request.subjectId, true);
+    else await loadWorkspaceData(true, false);
     return result;
   }
 
@@ -2098,12 +2150,12 @@ export const useWorkdayStore = defineStore("workday", () => {
 
   function replaceTodayTask(record: TaskRecord) {
     const startedAt = performance.now();
-    const next = toUiTask(record);
     const index = todayPlanTasks.findIndex((task) => task.id === record.id);
+    const next = preserveTaskDerivedState(toUiTask(record), index >= 0 ? todayPlanTasks[index] : undefined);
     if (index >= 0) todayPlanTasks.splice(index, 1, next);
     else todayPlanTasks.push(next);
     const todayIndex = todayTasks.findIndex((task) => task.id === record.id);
-    if (todayIndex >= 0) todayTasks.splice(todayIndex, 1, toUiTask(record));
+    if (todayIndex >= 0) todayTasks.splice(todayIndex, 1, preserveTaskDerivedState(toUiTask(record), todayTasks[todayIndex]));
     void recordDirectCloudClientMetric("client_apply", performance.now() - startedAt).catch(() => undefined);
     return next;
   }
@@ -2144,6 +2196,7 @@ export const useWorkdayStore = defineStore("workday", () => {
           selectedTaskId: selectedTaskId.value,
         });
         markDerivedDomainsStale(["tasks"]);
+        await reloadTodayPlanForSubject(subjectId);
         return created.id;
       }
       replaceTodayTask(await updateTaskRecord({
@@ -2156,6 +2209,7 @@ export const useWorkdayStore = defineStore("workday", () => {
         projectName: task.project || null,
       }));
       markDerivedDomainsStale(["tasks"]);
+      await reloadTodayPlanForSubject(subjectId);
       return task.id;
     } finally {
       savingTaskIds.delete(taskId);
@@ -2201,6 +2255,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       note: normalized ?? null,
     }));
     markDerivedDomainsStale(["tasks"]);
+    await reloadTodayPlanForSubject(task.subjectId);
   }
 
   async function saveTodayTaskNoteToFuture(taskId: string, note: string) {
@@ -2459,15 +2514,20 @@ export const useWorkdayStore = defineStore("workday", () => {
     queryCoordinator.markMatchingStale("time");
     queryCoordinator.markMatchingStale("todayOverview");
     queryCoordinator.markMatchingStale("timeHistory");
+    if (result.createdTaskCount) {
+      await loadWorkspaceData(true, false);
+      await loadTodayPlan(request.subjectId, true);
+    } else await refreshTaskRowsAfterTimeMutation([request.subjectId]);
     return result;
   }
 
   async function removeActualAdjustment(adjustmentId: string, expectedVersion: number) {
-    await deleteActualAdjustment(adjustmentId, expectedVersion);
+    const removed = await deleteActualAdjustment(adjustmentId, expectedVersion);
     queryCoordinator.markMatchingStale("workspace");
     queryCoordinator.markMatchingStale("time");
     queryCoordinator.markMatchingStale("todayOverview");
     queryCoordinator.markMatchingStale("timeHistory");
+    await refreshTaskRowsAfterTimeMutation([removed.subjectId]);
   }
 
   async function openTimerStopConfirmation(entryId: string) {
@@ -2505,6 +2565,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       if (chainSlice) Object.assign(chainSlice, toUiTimeEntry(updated));
       if (entries.some((item) => item.id === slice.id)) replaceTimeEntry(updated);
     }
+    await refreshTaskRowsAfterTimeMutation(task ? [task.subjectId] : []);
     queryCoordinator.markMatchingStale("workspace");
     queryCoordinator.markMatchingStale("todayPlan");
     queryCoordinator.markMatchingStale("todayOverview");
@@ -2519,9 +2580,18 @@ export const useWorkdayStore = defineStore("workday", () => {
 
   async function resolveTimerStopDisposition(disposition: "break" | "discard") {
     if (!timerStopConfirmationSlices.value.length) return false;
+    const affectedSubjectIds = new Set<string>();
+    for (const slice of timerStopConfirmationSlices.value) {
+      for (const allocation of slice.allocations ?? []) {
+        if (allocation.subjectId) affectedSubjectIds.add(allocation.subjectId);
+      }
+      const defaultTask = slice.defaultTask ? [...todayPlanTasks, ...tasks].find((task) => task.id === slice.defaultTask) : undefined;
+      if (defaultTask) affectedSubjectIds.add(defaultTask.subjectId);
+    }
     for (const slice of timerStopConfirmationSlices.value) {
       await updateTimeEntryDisposition({ entryId: slice.id, expectedVersion: slice.version, disposition });
     }
+    await refreshTaskRowsAfterTimeMutation(affectedSubjectIds);
     queryCoordinator.markMatchingStale("time");
     queryCoordinator.markMatchingStale("workspace");
     queryCoordinator.markMatchingStale("todayOverview");
@@ -2587,7 +2657,13 @@ export const useWorkdayStore = defineStore("workday", () => {
       .filter((allocation) => allocation.completeTask && [...todayPlanTasks, ...tasks].find((task) => task.id === allocation.taskId)?.status !== "done")
       .map((allocation) => allocation.taskId));
     markTimeDataChanged();
+    const affectedSubjectIds = new Set((entry.allocations ?? []).map((allocation) => allocation.subjectId).filter((subjectId): subjectId is string => Boolean(subjectId)));
+    for (const allocation of normalized) {
+      const task = [...todayPlanTasks, ...tasks].find((candidate) => candidate.id === allocation.taskId);
+      if (task) affectedSubjectIds.add(task.subjectId);
+    }
     replaceTimeEntry(await replaceTimeAllocations(entry.id, entry.version, normalized));
+    await refreshTaskRowsAfterTimeMutation(affectedSubjectIds);
     queryCoordinator.markMatchingStale("workspace");
     queryCoordinator.markMatchingStale("todayPlan");
     queryCoordinator.markMatchingStale("todayOverview");
@@ -2615,6 +2691,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     markTimeDataChanged();
     entries.unshift(entry);
     selectedEntryId.value = entry.id;
+    await refreshTaskRowsAfterTimeMutation(task ? [task.subjectId] : []);
     queryCoordinator.markMatchingStale("workspace");
     queryCoordinator.markMatchingStale("todayOverview");
     queryCoordinator.markMatchingStale("timeHistory");
@@ -2628,6 +2705,9 @@ export const useWorkdayStore = defineStore("workday", () => {
     const entry = findTimeEntry(entryId);
     if (!entry) return;
     markTimeDataChanged();
+    const affectedSubjectIds = new Set((entry.allocations ?? []).map((allocation) => allocation.subjectId).filter((subjectId): subjectId is string => Boolean(subjectId)));
+    const defaultTask = entry.defaultTask ? [...todayPlanTasks, ...tasks].find((task) => task.id === entry.defaultTask) : undefined;
+    if (defaultTask) affectedSubjectIds.add(defaultTask.subjectId);
     replaceTimeEntry(await updateTimeEntry({
       entryId,
       startedAt,
@@ -2635,6 +2715,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       note: note.trim() || undefined,
       expectedVersion: entry.version,
     }));
+    await refreshTaskRowsAfterTimeMutation(affectedSubjectIds);
     queryCoordinator.markMatchingStale("workspace");
     queryCoordinator.markMatchingStale("todayOverview");
     queryCoordinator.markMatchingStale("timeHistory");
@@ -2644,6 +2725,9 @@ export const useWorkdayStore = defineStore("workday", () => {
     const entry = findTimeEntry(entryId);
     if (!entry) return;
     markTimeDataChanged();
+    const affectedSubjectIds = new Set((entry.allocations ?? []).map((allocation) => allocation.subjectId).filter((subjectId): subjectId is string => Boolean(subjectId)));
+    const defaultTask = entry.defaultTask ? [...todayPlanTasks, ...tasks].find((task) => task.id === entry.defaultTask) : undefined;
+    if (defaultTask) affectedSubjectIds.add(defaultTask.subjectId);
     const updatedRecord = await updateTimeEntryDisposition({
       entryId,
       expectedVersion: entry.version,
@@ -2656,6 +2740,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     } else {
       replaceTimeEntry(updatedRecord);
     }
+    await refreshTaskRowsAfterTimeMutation(affectedSubjectIds);
     queryCoordinator.markMatchingStale("workspace");
     queryCoordinator.markMatchingStale("todayOverview");
     queryCoordinator.markMatchingStale("timeHistory");
@@ -2769,6 +2854,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     const targetVersion = unassignedVersion.value;
 
     const completionCandidates = new Set<string>();
+    const affectedSubjectIds = new Set<string>();
     let resolution: UnassignedResolveResult;
     if (action === "work") {
       const mergedAllocations = new Map<string, { minutes: number; completeTask: boolean; taskExpectedVersion?: number }>();
@@ -2778,6 +2864,7 @@ export const useWorkdayStore = defineStore("workday", () => {
         const allocationMinutes = Math.max(0, Number(allocation.minutes) || 0);
         if (!allocationMinutes && !allocation.completeTask) continue;
         const task = tasks.find((candidate) => candidate.id === taskId);
+        if (task) affectedSubjectIds.add(task.subjectId);
         const current = mergedAllocations.get(taskId) ?? { minutes: 0, completeTask: false, taskExpectedVersion: task?.version };
         current.minutes += allocationMinutes;
         current.completeTask ||= Boolean(allocation.completeTask);
@@ -2829,6 +2916,9 @@ export const useWorkdayStore = defineStore("workday", () => {
     queryCoordinator.markMatchingStale("workspace");
     queryCoordinator.markMatchingStale("todayOverview");
     queryCoordinator.markMatchingStale("timeHistory");
+    if (action === "work") {
+      await refreshTaskRowsAfterTimeMutation(affectedSubjectIds);
+    }
     const completedTaskIds = [...completionCandidates].filter((taskId) => tasks.find((task) => task.id === taskId)?.status === "done");
     return { completedCount: completedTaskIds.length, completedTaskIds };
   }

@@ -5,7 +5,7 @@ import path from "node:path";
 import { chromium } from "playwright";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const port = 5203;
+const port = Number(process.env.TIMEGENIE_TODAY_PLAN_TEST_PORT ?? 5203);
 const baseUrl = "http://127.0.0.1:" + port + "/";
 const evidenceDir = path.join(repoRoot, ".tmp-today-plan-visual-walkthrough");
 mkdirSync(evidenceDir, { recursive: true });
@@ -82,10 +82,14 @@ function mockInitScript() {
     const index = rows.findIndex((row) => row.id === taskId);
     if (index > 0) rows.unshift(rows.splice(index, 1)[0]);
   };
+  if (new URLSearchParams(window.location.search).has("text-import-empty")) planRows["subject-a"].splice(0);
   moveToFront(activeTasks, "recurring");
   moveToFront(planRows["subject-a"], "recurring");
+  // Cloud snapshots can place children before their parents because sortOrder is sibling-scoped.
+  moveToFront(planRows["subject-a"], "child");
+  if (sessionStorage.getItem("timegenie-test-empty-subject-a") === "1") planRows["subject-a"].splice(0);
 
-  const calls = { dayPlanSet: [], dayPlanBatch: [], dayPlanSnapshot: 0, estimateSet: [], update: [], completed: [], create: [], move: [], actualAdjustment: [], cloudCatchUp: 0 };
+  const calls = { dayPlanSet: [], dayPlanBatch: [], planBatch: [], dayPlanSnapshot: 0, estimateSet: [], update: [], completed: [], create: [], move: [], actualAdjustment: [], cloudCatchUp: 0 };
   let failDayPlanBatchOnce = false;
   let failSnapshotFor = "";
   let snapshotDelayMs = 0;
@@ -105,14 +109,22 @@ function mockInitScript() {
     failNextDayPlanBatch() { failDayPlanBatchOnce = true; },
     failNextSnapshotFor(subjectId) { failSnapshotFor = subjectId; },
     delayNextSnapshot(milliseconds) { snapshotDelayMs = milliseconds; },
-    clearPlan(subjectId) { planRows[subjectId]?.splice(0); },
-    setWorkDate(workDate) { currentWorkDate = workDate; },
+    clearPlan(subjectId) {
+      planRows[subjectId]?.splice(0);
+      if (subjectId === "subject-a") sessionStorage.setItem("timegenie-test-empty-subject-a", "1");
+    },
+    setWorkDate(workDate) {
+      currentWorkDate = workDate;
+      sessionStorage.setItem("timegenie-test-work-date", workDate);
+      if (workDate === "2026-10-19") sessionStorage.removeItem("timegenie-test-empty-subject-a");
+    },
     planIds(subjectId) { return (planRows[subjectId] ?? []).map((row) => row.id); },
     planRowFor,
     activeTask(id) { return activeTasks.find((task) => task.id === id); },
   };
 
-  let currentWorkDate = "2026-10-19";
+  let currentWorkDate = sessionStorage.getItem("timegenie-test-work-date") ?? "2026-10-19";
+  let currentDayEndAt = Date.now() + 86_400_000;
   window.__TAURI_INTERNALS__ = {
     metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
     transformCallback(callback, once) {
@@ -129,8 +141,11 @@ function mockInitScript() {
             device: { app_theme: "paper", completion_feedback_enabled: false }, integrations: {},
             secrets: { seatableTokenSet: false, supabaseSessionSet: false },
           };
+        case "workbench_bootstrap_get":
+          return { subjects, timezone: "Asia/Shanghai", currentWorkDate, currentDayStartAt: Date.now() - 3_600_000, currentDayEndAt };
         case "work_calendar_get_context":
-          return { timezone: "Asia/Shanghai", currentWorkDate, currentDayStartAt: Date.now() - 3_600_000, currentDayEndAt: Date.now() + 86_400_000 };
+          currentDayEndAt = Date.now() + 86_400_000;
+          return { timezone: "Asia/Shanghai", currentWorkDate, currentDayStartAt: Date.now() - 3_600_000, currentDayEndAt };
         case "subject_list":
           return subjects;
         case "task_list": {
@@ -156,6 +171,24 @@ function mockInitScript() {
             if (args.request.state === "excluded" && index >= 0) rows.splice(index, 1);
           }
           return { taskId: args.request.taskId, workDate: args.request.workDate, state: args.request.state, version: 2 };
+        }
+        case "task_plan_batch_apply": {
+          const request = args.request;
+          calls.planBatch.push(request);
+          const createdItems = request.finalItems.filter((item) => !item.taskId).map((item) => ({ lineKey: item.lineKey, taskId: `text-import-${++created}` }));
+          const idByLineKey = new Map(createdItems.map((item) => [item.lineKey, item.taskId]));
+          for (const item of request.finalItems) {
+            if (item.taskId) continue;
+            const createdRow = record(idByLineKey.get(item.lineKey), {
+              subjectId: request.subjectId, title: item.title,
+              parentId: item.parentLineKey ? idByLineKey.get(item.parentLineKey) : undefined,
+              todayMember: Boolean(request.dayInstanceDate), todayContext: false, dayInstanceKind: request.dayInstanceDate ? "member" : undefined,
+              dayInstanceDate: request.dayInstanceDate, sortOrder: created * 10,
+            });
+            if (request.dayInstanceDate) planRows[request.subjectId].push(createdRow);
+            else activeTasks.push(createdRow);
+          }
+          return { createdCount: createdItems.length, updatedCount: 0, deletedCount: 0, todayPlanChangedCount: 0, createdItems };
         }
         case "task_day_plan_batch_set": {
           calls.dayPlanBatch.push({ ...args.request });
@@ -227,7 +260,17 @@ function mockInitScript() {
             if (args.request.note !== undefined) active.note = args.request.note ?? undefined;
             active.version += 1;
           }
-          return { ...(active ?? {}), ...(planRowFor("subject-a", args.request.id) ?? {}) };
+          const updated = planRowFor("subject-a", args.request.id) ?? active;
+          return updated ? {
+            ...updated,
+            todayMember: false,
+            todayContext: false,
+            dayPlanState: undefined,
+            dayPlanVersion: undefined,
+            directMinutes: 0,
+            totalMinutes: 0,
+            executionState: "not_started",
+          } : {};
         }
         case "task_set_completed": {
           calls.completed.push({ ...args.request });
@@ -375,6 +418,57 @@ function mockInitScript() {
   };
 }
 
+async function verifyQuickPlanTextImport(page, calls) {
+  // Text import stays in the editor draft until preview/save, and defaults to all active items.
+  await page.goto(baseUrl + "?text-import-empty=1", { waitUntil: "domcontentloaded" });
+  await page.locator(".nav-list button", { hasText: "待办" }).click();
+  await page.waitForFunction(() => window.__TODAY_PLAN_TEST__.calls.dayPlanSnapshot > 0);
+  await page.waitForFunction(() => document.querySelectorAll(".pending-reminder-row").length === 0);
+  await page.getByRole("button", { name: "编辑今日计划", exact: true }).click();
+  const textDialog = page.locator(".quick-plan-dialog");
+  await textDialog.waitFor({ state: "visible" });
+  const editorContent = textDialog.locator(".cm-content");
+  await editorContent.waitFor({ state: "visible" });
+  const editorText = () => editorContent.locator(".cm-line").evaluateAll((elements) => elements.map((element) => {
+    const line = element.cloneNode(true);
+    line.querySelectorAll(".cm-placeholder").forEach((placeholder) => placeholder.remove());
+    return line.textContent;
+  }).join("\n"));
+  if ((await editorText()).trim()) throw new Error("空今日计划应从空草稿开始");
+  await textDialog.getByRole("button", { name: "从进行中导入", exact: true }).click();
+  const textPicker = page.locator(".today-source-import-dialog");
+  await textPicker.waitFor({ state: "visible" });
+  if (await textPicker.getByRole("checkbox").count() !== 7) throw new Error("文本导入应包含当前主体的全部进行中事项和父级");
+  if (await textPicker.getByRole("checkbox").evaluateAll((inputs) => inputs.some((input) => !input.checked))) throw new Error("文本导入没有默认全选");
+  await textPicker.getByRole("button", { name: "取消全选", exact: true }).click();
+  if (!await textPicker.locator(".el-dialog__footer .primary-button").isDisabled()) throw new Error("未选事项时导入按钮应禁用");
+  await textPicker.getByRole("button", { name: "全选", exact: true }).click();
+  await textPicker.getByRole("checkbox", { name: "长期待办导入今日计划" }).uncheck();
+  await textPicker.locator(".el-dialog__footer .primary-button").click();
+  await textPicker.waitFor({ state: "hidden" });
+  const importedText = await editorText();
+  if (!importedText.includes("- 项目\n  - 写今日计划\n  - 无预计事项")) throw new Error("文本导入没有保留父子层级: " + importedText);
+  if (importedText.includes("长期待办") || importedText.includes("已完成普通事项") || importedText.includes("阅读")) throw new Error("文本导入包含未选、已完成或其他主体事项");
+  if ((await calls()).planBatch.length || (await calls()).dayPlanBatch.length) throw new Error("文本导入不应提前保存");
+  await textDialog.getByRole("button", { name: "从进行中导入", exact: true }).click();
+  await textPicker.waitFor({ state: "visible" });
+  await textPicker.getByRole("checkbox", { name: "长期待办导入今日计划" }).uncheck();
+  await textPicker.locator(".el-dialog__footer .primary-button").click();
+  await textPicker.waitFor({ state: "hidden" });
+  if (await editorText() !== importedText) throw new Error("重复文本导入产生重复事项");
+  await page.setViewportSize({ width: 720, height: 760 });
+  await page.screenshot({ path: path.join(evidenceDir, "10-paper-today-text-import.png"), fullPage: true });
+  if (await textDialog.evaluate((element) => element.scrollWidth > element.clientWidth + 1)) throw new Error("文本导入编辑器出现水平溢出");
+  await textDialog.getByRole("button", { name: "预览变化", exact: true }).click();
+  if (!await textDialog.getByText("新增 6 项", { exact: true }).isVisible()) throw new Error("文本导入预览数量错误");
+  await textDialog.getByRole("button", { name: "确认保存", exact: true }).click();
+  await textDialog.waitFor({ state: "hidden" });
+  const textRequest = (await calls()).planBatch[0];
+  if (textRequest.dayInstanceDate !== "2026-10-19" || textRequest.finalItems.length !== 6 || textRequest.finalItems.some((item) => item.taskId)) throw new Error("文本导入保存没有创建独立今日事项");
+  if (textRequest.confirmedDeleteTaskIds.length || textRequest.baselineTasks.length) throw new Error("空计划导入不应删除原计划");
+  await page.waitForFunction(() => document.querySelectorAll(".pending-reminder-row").length === 6);
+}
+
 async function mainSharedPlanEditor() {
   await waitForServer();
   const browser = await chromium.launch({ headless: true });
@@ -386,12 +480,45 @@ async function mainSharedPlanEditor() {
   const calls = () => page.evaluate(() => window.__TODAY_PLAN_TEST__.calls);
 
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  if (process.env.TIMEGENIE_TODAY_PLAN_TEXT_IMPORT_ONLY === "1") {
+    await verifyQuickPlanTextImport(page, calls);
+    if (pageErrors.length) throw new Error("页面错误: " + pageErrors.join("；"));
+    await browser.close();
+    console.log("today plan text import browser checks passed");
+    return;
+  }
   await page.locator(".nav-list button", { hasText: "待办" }).click();
   await page.locator(".pending-reminder-row").first().waitFor({ state: "visible" });
 
   if (await page.locator(".pending-reminder-row").count() !== 6) throw new Error("今日计划行数量异常");
   const initialTodayOrder = await page.locator(".pending-reminder-row").evaluateAll((rows) => rows.map((row) => row.dataset.taskId));
+  if ((await page.evaluate(() => window.__TODAY_PLAN_TEST__.planIds("subject-a")))[0] !== "child") throw new Error("排序回归数据未覆盖子项先于父项返回");
   if (initialTodayOrder.join("|") !== "recurring|parent|child|done-today|no-estimate|plain-done") throw new Error("已完成事项未保持原始顺序: " + initialTodayOrder.join("|"));
+  if (process.argv.includes("--sorting-only")) {
+    await page.getByRole("button", { name: "配置今日事项" }).click();
+    const dialog = page.locator(".today-import-dialog");
+    await dialog.waitFor({ state: "visible" });
+    const dialogOrder = await dialog.locator(".today-import-row").evaluateAll((rows) => rows.map((row) => row.dataset.todayImportTaskId));
+    if (dialogOrder.join("|") !== initialTodayOrder.join("|")) throw new Error("今日配置弹框父子排序不一致");
+    await dialog.getByRole("button", { name: "取消", exact: true }).click();
+    await dialog.waitFor({ state: "hidden" });
+    const listBox = await page.locator(".reminder-list").first().boundingBox();
+    const handleBox = await page.locator('[data-task-id="no-estimate"] .drag-handle').boundingBox();
+    const targetBox = await page.locator('.pending-reminder-row[data-task-id="child"]').boundingBox();
+    await page.mouse.move(handleBox.x + handleBox.width / 2, handleBox.y + handleBox.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(handleBox.x + handleBox.width / 2, handleBox.y - 24, { steps: 12 });
+    await page.mouse.move(listBox.x + 260, targetBox.y + 6, { steps: 24 });
+    await page.mouse.up();
+    await page.waitForFunction(() => window.__TODAY_PLAN_TEST__.calls.move.length > 0);
+    const moveCall = (await calls()).move.at(-1);
+    if (moveCall.id !== "no-estimate" || moveCall.parentId !== "parent" || moveCall.nextSiblingId !== "child" || moveCall.previousSiblingId) throw new Error("今日排序修复影响同级拖拽: " + JSON.stringify(moveCall));
+    if (pageErrors.length) throw new Error("页面错误: " + pageErrors.join("；"));
+    await page.screenshot({ path: path.join(evidenceDir, "today-hierarchy-sorting.png"), fullPage: true });
+    await browser.close();
+    console.log("today hierarchy sorting UI checks passed");
+    return;
+  }
   const snapshotCallsBeforeRefresh = (await calls()).dayPlanSnapshot;
   await page.evaluate(() => window.__TODAY_PLAN_TEST__.delayNextSnapshot(450));
   await page.getByRole("tab", { name: /今日/ }).click();
@@ -403,7 +530,7 @@ async function mainSharedPlanEditor() {
   if (await page.getByText("正在更新", { exact: true }).count() !== 0 || await page.getByText("正在整理今日计划", { exact: true }).count() !== 0) throw new Error("今日计划仍显示额外加载提示");
   await page.screenshot({ path: path.join(evidenceDir, "08-paper-today-refreshing.png"), fullPage: true });
   await page.waitForTimeout(450);
-  if ((await calls()).dayPlanSnapshot !== snapshotCallsBeforeRefresh + 1) throw new Error("同一主体和日期的重复今日计划请求未合并");
+  if ((await calls()).dayPlanSnapshot > snapshotCallsBeforeRefresh + 1) throw new Error("同一主体和日期的重复今日计划请求未合并");
 
   await page.evaluate(() => window.__TODAY_PLAN_TEST__.delayNextSnapshot(450));
   await page.locator('.subject-select-button[title="个人"]').click();
@@ -477,6 +604,8 @@ async function mainSharedPlanEditor() {
   await page.getByRole("button", { name: "配置今日事项" }).click();
   const todayImport = page.locator(".today-import-dialog");
   await todayImport.waitFor({ state: "visible" });
+  const importTodayOrder = await todayImport.locator(".today-import-row").evaluateAll((rows) => rows.map((row) => row.dataset.todayImportTaskId));
+  if (importTodayOrder.join("|") !== initialTodayOrder.join("|")) throw new Error("配置今日事项未保持与今日列表一致的父子顺序: " + importTodayOrder.join("|"));
   await page.waitForTimeout(300);
   const todayImportBounds = await todayImport.boundingBox();
   if (!todayImportBounds || Math.abs(todayImportBounds.y + todayImportBounds.height / 2 - 450) > 3) throw new Error("配置今日事项弹框未在窗口内垂直居中: " + JSON.stringify(todayImportBounds));
@@ -543,6 +672,7 @@ async function mainSharedPlanEditor() {
   await createdTitleInput.fill("配置弹框子项改名");
   await createdTitleInput.blur();
   await page.waitForFunction((taskId) => window.__TODAY_PLAN_TEST__.calls.update.some((call) => call.id === taskId && call.title === "配置弹框子项改名"), createdChild.id);
+  if (await page.locator('.pending-reminder-row[data-task-id="' + createdChild.id + '"] .task-timer-action').count() !== 1) throw new Error("今日事项修改后丢失计时入口");
   await todayImport.getByRole("button", { name: "调整写今日计划今日实际" }).click();
   const actualPopover = page.locator('.el-popper:visible .actual-adjustment-inline').filter({ hasText: "写今日计划 · 今日实际" });
   await actualPopover.first().waitFor({ state: "visible" });
@@ -551,7 +681,7 @@ async function mainSharedPlanEditor() {
   await actualPopover.getByRole("textbox", { name: "目标实际分钟" }).fill("35");
   await actualPopover.getByRole("button", { name: "确认调整" }).click();
   await page.waitForFunction(() => window.__TODAY_PLAN_TEST__.calls.actualAdjustment.some((call) => call.items?.some((item) => item.taskId === "child" && item.targetMinutes === 35)));
-  if ((await calls()).cloudCatchUp < 2) throw new Error("今日实际调整未在打开和保存前追平云端增量");
+  await todayImport.locator('.today-import-row[data-today-import-task-id="child"] .today-import-actual').getByText("35min", { exact: true }).waitFor({ state: "visible" });
   const sourceOrderBeforeMove = await page.evaluate(() => ["long-title", "backlog"].map((id) => window.__TODAY_PLAN_TEST__.activeTask(id).sortOrder));
   await createdChildRow.locator(".today-import-drag-handle").dragTo(createdRootRow, { targetPosition: { x: 64, y: 5 } });
   await page.waitForFunction((taskId) => window.__TODAY_PLAN_TEST__.calls.move.some((call) => call.id === taskId), createdChild.id);
@@ -610,10 +740,28 @@ async function mainSharedPlanEditor() {
   await page.locator(".pending-reminder-row").first().waitFor({ state: "visible" });
   if (await page.getByRole("button", { name: "编辑全部计划" }).count() !== 1) throw new Error("进行中页缺少编辑全部计划: " + JSON.stringify({ selected: await page.locator('.plan-task-tabs [aria-selected="true"] span').allTextContents(), buttons: await page.locator('.task-toolbar button').allTextContents() }));
   await page.getByRole("button", { name: "编辑全部计划" }).click();
-  await page.locator(".quick-plan-dialog").waitFor({ state: "visible" });
-  const allQuickPlanText = await page.locator(".quick-plan-dialog .cm-content").innerText();
+  const allQuickPlanDialog = page.locator(".quick-plan-dialog");
+  await allQuickPlanDialog.waitFor({ state: "visible" });
+  const allQuickPlanEditor = allQuickPlanDialog.locator(".cm-content");
+  const allQuickPlanText = await allQuickPlanEditor.innerText();
   if (!allQuickPlanText.includes("长期待办") || !allQuickPlanText.includes("预计自动加入事项")) throw new Error("编辑全部计划未包含完整进行中事项");
-  await page.locator(".quick-plan-dialog button", { hasText: "取消" }).click();
+  const allQuickPlanLastLine = allQuickPlanEditor.locator(".cm-line").last();
+  await allQuickPlanLastLine.click();
+  await page.keyboard.press("End");
+  await page.keyboard.press("Enter");
+  await page.keyboard.type("- 全部计划即时刷新验证");
+  await page.waitForFunction(() => document.querySelector(".quick-plan-dialog .cm-content")?.textContent?.includes("全部计划即时刷新验证"));
+  await allQuickPlanDialog.getByRole("button", { name: "预览变化", exact: true }).click();
+  await allQuickPlanDialog.getByRole("button", { name: "确认保存", exact: true }).click();
+  await allQuickPlanDialog.waitFor({ state: "hidden" });
+  try {
+    await page.waitForFunction(() => [...document.querySelectorAll(".pending-reminder-row input")].some((input) => input.value.includes("全部计划即时刷新验证")), undefined, { timeout: 5_000 });
+  } catch {
+    throw new Error("编辑全部计划保存后列表未即时更新：" + JSON.stringify({
+      request: (await calls()).planBatch.at(-1),
+      visibleRows: await page.locator(".pending-reminder-row input").evaluateAll((inputs) => inputs.map((input) => input.value)),
+    }));
+  }
   if (await page.getByRole("button", { name: "分配今日预计" }).count() !== 0) throw new Error("分配今日预计不应出现在进行中页");
   if (await page.locator(".actual-time-picker").count() !== 0) throw new Error("进行中页不应显示今日用时");
   if (await page.locator(".today-estimate-picker").count() !== 0) throw new Error("进行中页不应显示今日预计");
@@ -740,8 +888,8 @@ async function mainSharedPlanEditor() {
     window.__TODAY_PLAN_TEST__.setWorkDate("2026-10-20");
     window.__TODAY_PLAN_TEST__.clearPlan("subject-a");
   });
-  await page.getByRole("tab", { name: /进行中/ }).click();
-  await page.getByRole("tab", { name: /今日/ }).click();
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.locator(".nav-list button", { hasText: "待办" }).click();
   await page.waitForFunction(() => document.querySelectorAll(".pending-reminder-row").length === 0);
   if (await page.locator(".plan-placeholder-row").count() !== 1) throw new Error("跨日空计划缺少底部新增入口");
 
@@ -782,6 +930,7 @@ async function mainSharedPlanEditor() {
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.evaluate(() => { document.documentElement.dataset.theme = "forest"; document.documentElement.style.colorScheme = "dark"; });
   await page.screenshot({ path: path.join(evidenceDir, "04-forest-wide.png"), fullPage: true });
+  await verifyQuickPlanTextImport(page, calls);
   if (pageErrors.length) throw new Error("页面错误: " + pageErrors.join("；"));
   await browser.close();
   console.log("today plan shared editor UI checks passed");

@@ -52,7 +52,7 @@ select timegenie.direct_cloud_task_daily_estimate_set(
   1,
   jsonb_build_object(
     'taskId', '61000000-0000-0000-0000-000000000001',
-    'workDate', '2026-10-25',
+    'workDate', current_date,
     'estimateMinutes', 45,
     'expectedVersion', null
   )
@@ -68,7 +68,7 @@ select timegenie.direct_cloud_recurrence_save(
     'taskExpectedVersion', 1,
     'frequency', 'weekly',
     'weekdaysMask', 21,
-    'effectiveStart', '2026-10-25',
+    'effectiveStart', current_date,
     'ruleExpectedVersion', null
   )
 );
@@ -79,14 +79,14 @@ do $$
 begin
   if (select estimate_minutes from timegenie.task_daily_estimates
       where task_id = '61000000-0000-0000-0000-000000000001'
-        and work_date = '2026-10-25') <> 45 then
+        and work_date = current_date) <> 45 then
     raise exception 'fresh schema did not apply daily estimate';
   end if;
   if not exists(
     select 1 from timegenie.task_recurrence_rules
     where task_id = '61000000-0000-0000-0000-000000000001'
       and frequency = 'weekly' and weekdays_mask = 21
-      and effective_start='2026-10-25' and effective_end is null
+      and effective_start=current_date and effective_end is null
   ) then
     raise exception 'fresh schema did not apply recurrence rule';
   end if;
@@ -94,7 +94,7 @@ begin
     select 1 from timegenie.workspace_changes
     where workspace_id = '21000000-0000-0000-0000-000000000001'
       and entity_type = 'task_daily_estimates'
-      and entity_id = '61000000-0000-0000-0000-000000000001|2026-10-25'
+      and entity_id = '61000000-0000-0000-0000-000000000001|'||current_date::text
   ) then
     raise exception 'fresh schema did not preserve daily estimate composite change identity';
   end if;

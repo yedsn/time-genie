@@ -2037,7 +2037,8 @@ fn apply_task_plan_batch_with_cloud_operation(
     let mut statement = transaction
         .prepare(
             "SELECT id,version,title,parent_id,status,sort_order FROM tasks
-             WHERE workspace_id=?1 AND subject_id=?2 AND status='open' AND deleted_at IS NULL
+             WHERE workspace_id=?1 AND subject_id=?2 AND deleted_at IS NULL
+               AND (?3 IS NOT NULL OR status='open')
                AND ((?3 IS NULL AND day_instance_date IS NULL) OR day_instance_date=?3)",
         )
         .map_err(|error| error.to_string())?;
@@ -2062,12 +2063,6 @@ fn apply_task_plan_batch_with_cloud_operation(
         current.insert(id, (version, title, parent_id, status, sort_order));
     }
     drop(statement);
-    let current_ids: HashSet<&str> = current.keys().map(String::as_str).collect();
-    if current_ids.len() != baseline_seen.len()
-        || !current_ids.iter().all(|id| baseline_seen.contains(id))
-    {
-        return Err("VERSION_CONFLICT: 当前主体的进行中事项集合已变化".to_string());
-    }
     for baseline_item in &request.baseline_tasks {
         let Some((version, _, _, _, _)) = current.get(&baseline_item.task_id) else {
             return Err("VERSION_CONFLICT: 基线事项已不存在".to_string());
@@ -2100,7 +2095,7 @@ fn apply_task_plan_batch_with_cloud_operation(
         parent_by_line.insert(item.line_key.clone(), item.parent_line_key.clone());
         depth_by_line.insert(item.line_key.clone(), depth);
         if let Some(task_id) = item.task_id.as_deref() {
-            if !current.contains_key(task_id) {
+            if !baseline_seen.contains(task_id) || !current.contains_key(task_id) {
                 return Err("VERSION_CONFLICT: 最终事项不属于打开时的主体".to_string());
             }
         }
@@ -2173,7 +2168,7 @@ fn apply_task_plan_batch_with_cloud_operation(
             ).map_err(|error| error.to_string())?;
             continue;
         };
-        if status != "open" {
+        if request.day_instance_date.is_none() && status != "open" {
             return Err("VERSION_CONFLICT: 事项状态已变化".to_string());
         }
         if title != item.title.trim() || current_parent != parent_id || current_order != order {
@@ -2228,10 +2223,12 @@ fn apply_task_plan_batch_with_cloud_operation(
         }
     }
 
-    let actual_deleted: HashSet<String> = current
-        .keys()
-        .filter(|id| !task_seen.contains(id.as_str()))
-        .cloned()
+    // Only the editor baseline can be deleted; later additions must be preserved.
+    let actual_deleted: HashSet<String> = request
+        .baseline_tasks
+        .iter()
+        .filter(|item| !task_seen.contains(item.task_id.as_str()))
+        .map(|item| item.task_id.clone())
         .collect();
     if actual_deleted
         .iter()
@@ -2240,6 +2237,23 @@ fn apply_task_plan_batch_with_cloud_operation(
         != confirmed_delete
     {
         return Err("VALIDATION_ERROR: 删除确认范围已变化，请重新预览".to_string());
+    }
+    for task_id in &actual_deleted {
+        let mut statement = transaction.prepare(
+            "SELECT id FROM tasks WHERE workspace_id=?1 AND parent_id=?2 AND deleted_at IS NULL",
+        ).map_err(|error| error.to_string())?;
+        for row in statement
+            .query_map(params![workspace_id, task_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| error.to_string())?
+        {
+            if !actual_deleted.contains(&row.map_err(|error| error.to_string())?) {
+                return Err(
+                    "VERSION_CONFLICT: 待删除父事项存在未确认删除的子事项，请重新预览".to_string(),
+                );
+            }
+        }
     }
     for task_id in &actual_deleted {
         let Some((version, _, _, _, _)) = current.get(task_id) else {
@@ -6061,6 +6075,240 @@ mod tests {
     }
 
     #[test]
+    fn plan_batch_preserves_tasks_added_after_the_editor_baseline() {
+        let database = database();
+        let subject_id: String = database
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let kept = create_test_task(&database, &subject_id, None, "保留事项");
+        let removed = create_test_task(&database, &subject_id, None, "确认删除事项");
+        let request = TaskPlanBatchApplyRequest {
+            subject_id: subject_id.clone(),
+            day_instance_date: None,
+            baseline_tasks: vec![&kept, &removed]
+                .into_iter()
+                .map(|task| TaskPlanBatchBaselineItem {
+                    task_id: task.id.clone(),
+                    expected_version: task.version,
+                })
+                .collect(),
+            final_items: vec![TaskPlanBatchFinalItem {
+                line_key: "keep".to_string(),
+                task_id: Some(kept.id.clone()),
+                title: "保留事项改名".to_string(),
+                parent_line_key: None,
+            }],
+            confirmed_delete_task_ids: vec![removed.id.clone()],
+            today_plan_change: None,
+        };
+        let added = create_test_task(&database, &subject_id, None, "后台新增事项");
+        let added_child = create_test_task(
+            &database,
+            &subject_id,
+            Some(kept.id.clone()),
+            "后台新增子项",
+        );
+        let result = apply_task_plan_batch_with_cloud_operation(&database, request, None).unwrap();
+        assert_eq!(result.deleted_count, 1);
+        let connection = database.open().unwrap();
+        assert_eq!(
+            load_task(&connection, &kept.id).unwrap().title,
+            "保留事项改名"
+        );
+        for task in [&added, &added_child] {
+            let after = load_task(&connection, &task.id).unwrap();
+            assert_eq!(after.title, task.title);
+            assert_eq!(after.parent_id, task.parent_id);
+            assert_eq!(after.version, task.version);
+        }
+    }
+
+    #[test]
+    fn plan_batch_allows_completed_today_items_and_unrelated_actual_changes() {
+        let database = database();
+        let subject_id: String = database
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let work_date = Local::now().format("%Y-%m-%d").to_string();
+        let instance = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                parent_id: None,
+                day_instance_date: Some(work_date.clone()),
+                title: "今日事项".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let completed = set_task_status(
+            &database,
+            TaskStatusRequest {
+                id: instance.id.clone(),
+                expected_version: instance.version,
+                done: true,
+                occurrence_date: None,
+                occurrence_expected_version: None,
+            },
+        )
+        .unwrap();
+        let request = TaskPlanBatchApplyRequest {
+            subject_id: subject_id.clone(),
+            day_instance_date: Some(work_date.clone()),
+            baseline_tasks: vec![TaskPlanBatchBaselineItem {
+                task_id: completed.id.clone(),
+                expected_version: completed.version,
+            }],
+            final_items: vec![TaskPlanBatchFinalItem {
+                line_key: "done".to_string(),
+                task_id: Some(completed.id.clone()),
+                title: "今日已完成事项改名".to_string(),
+                parent_line_key: None,
+            }],
+            confirmed_delete_task_ids: vec![],
+            today_plan_change: None,
+        };
+        let connection = database.open().unwrap();
+        let workspace_id = workspace_id(&connection).unwrap();
+        let fingerprint = crate::actual_time_adjustments::snapshot(
+            &database,
+            crate::actual_time_adjustments::ActualAdjustmentSnapshotRequest {
+                subject_id: subject_id.clone(),
+                work_date: work_date.clone(),
+                execution_only: Some(true),
+            },
+        )
+        .unwrap()
+        .tasks
+        .into_iter()
+        .find(|task| task.id == completed.id)
+        .unwrap()
+        .adjustment_fingerprint;
+        drop(connection);
+        crate::actual_time_adjustments::apply_batch(
+            &database,
+            crate::actual_time_adjustments::ActualAdjustmentBatchRequest {
+                subject_id: subject_id.clone(),
+                work_date: work_date.clone(),
+                client_request_id: Uuid::now_v7().to_string(),
+                batch_id: Uuid::now_v7().to_string(),
+                note: None,
+                day_instance_date: Some(work_date.clone()),
+                items: vec![crate::actual_time_adjustments::ActualAdjustmentBatchItem {
+                    task_id: completed.id.clone(),
+                    expected_task_version: completed.version,
+                    baseline_minutes: 0,
+                    target_minutes: 35,
+                    delta_minutes: 35,
+                    adjustment_fingerprint: fingerprint,
+                }],
+                new_tasks: vec![],
+            },
+        )
+        .unwrap();
+        let result = apply_task_plan_batch_with_cloud_operation(&database, request, None).unwrap();
+        assert_eq!(result.deleted_count, 0);
+        let connection = database.open().unwrap();
+        let after = load_task(&connection, &completed.id).unwrap();
+        assert_eq!(after.title, "今日已完成事项改名");
+        assert_eq!(after.status, "done");
+        assert_eq!(after.completed_at, completed.completed_at);
+        assert_eq!(
+            crate::actual_time_adjustments::direct_actual_minutes(
+                &connection,
+                &workspace_id,
+                &completed.id,
+                Some(&work_date),
+            )
+            .unwrap(),
+            35
+        );
+    }
+
+    #[test]
+    fn plan_batch_rejects_real_baseline_changes_and_unconfirmed_new_children() {
+        for mutation in [
+            "UPDATE tasks SET title='其他窗口改名',version=version+1 WHERE id=?1",
+            "UPDATE tasks SET subject_id='subject-other',version=version+1 WHERE id=?1",
+            "UPDATE tasks SET status='done',completed_at=1,version=version+1 WHERE id=?1",
+            "UPDATE tasks SET deleted_at=1,version=version+1 WHERE id=?1",
+        ] {
+            let database = database();
+            let subject_id: String = database
+                .open()
+                .unwrap()
+                .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+                .unwrap();
+            let task = create_test_task(&database, &subject_id, None, "基线事项");
+            // A move to another subject is also a real edit, not an unrelated set change.
+            database.open().unwrap().execute(
+                "INSERT INTO subjects(id,workspace_id,name,created_at,updated_at,version) SELECT 'subject-other',workspace_id,'其他主体',0,0,1 FROM tasks WHERE id=?1",
+                [&task.id],
+            ).unwrap();
+            let request = TaskPlanBatchApplyRequest {
+                subject_id,
+                day_instance_date: None,
+                baseline_tasks: vec![TaskPlanBatchBaselineItem {
+                    task_id: task.id.clone(),
+                    expected_version: task.version,
+                }],
+                final_items: vec![],
+                confirmed_delete_task_ids: vec![task.id.clone()],
+                today_plan_change: None,
+            };
+            database
+                .open()
+                .unwrap()
+                .execute(mutation, [&task.id])
+                .unwrap();
+            let error =
+                apply_task_plan_batch_with_cloud_operation(&database, request, None).unwrap_err();
+            assert!(error.starts_with("VERSION_CONFLICT:"), "{error}");
+        }
+        let database = database();
+        let subject_id: String = database
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let parent = create_test_task(&database, &subject_id, None, "待删除父项");
+        let child = create_test_task(
+            &database,
+            &subject_id,
+            Some(parent.id.clone()),
+            "未确认的新子项",
+        );
+        let error = apply_task_plan_batch_with_cloud_operation(
+            &database,
+            TaskPlanBatchApplyRequest {
+                subject_id,
+                day_instance_date: None,
+                baseline_tasks: vec![TaskPlanBatchBaselineItem {
+                    task_id: parent.id.clone(),
+                    expected_version: parent.version,
+                }],
+                final_items: vec![],
+                confirmed_delete_task_ids: vec![parent.id.clone()],
+                today_plan_change: None,
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(error.starts_with("VERSION_CONFLICT:"), "{error}");
+        let connection = database.open().unwrap();
+        assert!(load_task(&connection, &parent.id).is_ok());
+        assert!(load_task(&connection, &child.id).is_ok());
+    }
+
+    #[test]
     fn plan_batch_rejects_conflicts_and_delete_scope_mismatch() {
         let database = database();
         let subject_id: String = database
@@ -6137,7 +6385,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(conflict.contains("集合已变化") || conflict.contains("版本"));
+        assert!(conflict.starts_with("VERSION_CONFLICT:"));
     }
 
     #[test]

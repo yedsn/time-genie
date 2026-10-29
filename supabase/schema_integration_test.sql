@@ -117,6 +117,8 @@ end $$;
 \ir 20261022i_timegenie_direct_cloud_recurrence_mutations.sql
 \ir 20261022j_timegenie_direct_cloud_task_domain_routing.sql
 \ir 20261022k_timegenie_direct_cloud_timer_mutations.sql
+\ir 20261029b_timegenie_plan_batch_baseline_scope.sql
+\ir 20261029b_timegenie_plan_batch_baseline_scope.sql
 \ir 20261022k_timegenie_direct_cloud_timer_mutations.sql
 \ir 20261022l_timegenie_direct_cloud_timer_recovery.sql
 \ir 20261022l_timegenie_direct_cloud_timer_recovery.sql
@@ -128,6 +130,8 @@ end $$;
 \ir 20261022o_timegenie_direct_cloud_time_entry_mutations.sql
 \ir 20261023a_timegenie_direct_cloud_report_mutations.sql
 \ir 20261023a_timegenie_direct_cloud_report_mutations.sql
+\ir 20261029_timegenie_report_preview_task_aggregation.sql
+\ir 20261029_timegenie_report_preview_task_aggregation.sql
 \ir 20261023b_timegenie_direct_cloud_report_template_mutations.sql
 \ir 20261023b_timegenie_direct_cloud_report_template_mutations.sql
 \ir 20261023c_timegenie_direct_cloud_shared_settings_mutations.sql
@@ -5179,10 +5183,18 @@ values('61000000-0000-0000-0000-0000000000a1','20000000-0000-0000-0000-000000000
 insert into timegenie.tasks(id,workspace_id,subject_id,parent_id,title,status,source_type,sort_order) values
   ('61000000-0000-0000-0000-0000000000a2','20000000-0000-0000-0000-00000000000a','51000000-0000-0000-0000-0000000000a1',null,'汇总事项','open','manual',5),
   ('61000000-0000-0000-0000-0000000000a3','20000000-0000-0000-0000-00000000000a','51000000-0000-0000-0000-0000000000a1','61000000-0000-0000-0000-0000000000a2','叶子事项','open','manual',5),
-  ('61000000-0000-0000-0000-0000000000a4','20000000-0000-0000-0000-00000000000a','51000000-0000-0000-0000-0000000000a1',null,'归档日实例','open','manual',20);
+  ('61000000-0000-0000-0000-0000000000a4','20000000-0000-0000-0000-00000000000a','51000000-0000-0000-0000-0000000000a1',null,'归档日实例','open','manual',20),
+  ('61000000-0000-0000-0000-0000000000a6','20000000-0000-0000-0000-00000000000a','51000000-0000-0000-0000-0000000000a1',null,'无关进行中事项','open','manual',40);
 update timegenie.tasks set day_instance_date=(now() at time zone 'Pacific/Kiritimati')::date,
   day_instance_kind='member',day_instance_source_task_id='61000000-0000-0000-0000-0000000000a1'
 where id='61000000-0000-0000-0000-0000000000a4';
+insert into timegenie.tasks(
+  id,workspace_id,subject_id,title,status,source_type,sort_order,day_instance_date,day_instance_kind,day_instance_source_task_id
+) values(
+  '61000000-0000-0000-0000-0000000000a7','20000000-0000-0000-0000-00000000000a',
+  '51000000-0000-0000-0000-0000000000a1','未来叶子事项实例','open','manual',5,
+  (now() at time zone 'Pacific/Kiritimati')::date+40,'member','61000000-0000-0000-0000-0000000000a3'
+);
 insert into timegenie.tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,deleted_at)
 values('61000000-0000-0000-0000-0000000000a5','20000000-0000-0000-0000-00000000000a','51000000-0000-0000-0000-0000000000a1','已删除事项','open','manual',30,now());
 insert into timegenie.tasks(id,workspace_id,subject_id,title,status,source_type,sort_order,completed_at)
@@ -5211,11 +5223,29 @@ insert into timegenie.time_entries(
   ('91000000-0000-0000-0000-0000000000a1','20000000-0000-0000-0000-00000000000a',(now() at time zone 'Pacific/Kiritimati')::date-1,'work','timer','ended','61000000-0000-0000-0000-0000000000a3','跨日前段',now()-interval '26 hours',now()-interval '25 hours',3600,1,'91000000-0000-0000-0000-0000000000aa',now()-interval '25 hours',now()-interval '25 hours'),
   ('91000000-0000-0000-0000-0000000000a2','20000000-0000-0000-0000-00000000000a',(now() at time zone 'Pacific/Kiritimati')::date,'work','timer','paused','61000000-0000-0000-0000-0000000000a3','跨日后段',now()-interval '2 hours',null,1800,2,'91000000-0000-0000-0000-0000000000aa','2026-10-22 10:00:00+00',now()-interval '30 minutes'),
   ('91000000-0000-0000-0000-0000000000a3','20000000-0000-0000-0000-00000000000a',(now() at time zone 'Pacific/Kiritimati')::date,'break','manual','ended',null,'休息时间',now()-interval '4 hours',now()-interval '3 hours 45 minutes',900,1,null,null,now()-interval '3 hours 45 minutes');
+insert into timegenie.time_entries(
+  id,workspace_id,work_date,kind,source_type,state,default_task_id,label_snapshot,started_at,ended_at,duration_seconds,version
+) values
+  ('91000000-0000-0000-0000-0000000000a6','20000000-0000-0000-0000-00000000000a',(now() at time zone 'Pacific/Kiritimati')::date+40,'work','manual','ended','61000000-0000-0000-0000-0000000000a3','未来日报记录一',now(),now()+interval '20 minutes',1200,1),
+  ('91000000-0000-0000-0000-0000000000a7','20000000-0000-0000-0000-00000000000a',(now() at time zone 'Pacific/Kiritimati')::date+40,'work','manual','ended','61000000-0000-0000-0000-0000000000a3','未来日报记录二',now()+interval '30 minutes',now()+interval '55 minutes',1500,1),
+  ('91000000-0000-0000-0000-0000000000a8','20000000-0000-0000-0000-00000000000a',(now() at time zone 'Pacific/Kiritimati')::date+40,'work','manual','ended','61000000-0000-0000-0000-0000000000a7','未来重复实例记录',now()+interval '60 minutes',now()+interval '75 minutes',900,1);
 insert into timegenie.time_segments(id,workspace_id,entry_id,sequence_no,started_at,ended_at,duration_seconds) values
   ('92000000-0000-0000-0000-0000000000a1','20000000-0000-0000-0000-00000000000a','91000000-0000-0000-0000-0000000000a2',1,now()-interval '2 hours',now()-interval '90 minutes',1800),
   ('92000000-0000-0000-0000-0000000000a2','20000000-0000-0000-0000-00000000000a','91000000-0000-0000-0000-0000000000a2',2,now()-interval '1 hour',null,0);
 insert into timegenie.time_allocations(id,workspace_id,entry_id,task_id,minutes)
-values('93000000-0000-0000-0000-0000000000a1','20000000-0000-0000-0000-00000000000a','91000000-0000-0000-0000-0000000000a2','61000000-0000-0000-0000-0000000000a3',20);
+values
+  ('93000000-0000-0000-0000-0000000000a1','20000000-0000-0000-0000-00000000000a','91000000-0000-0000-0000-0000000000a2','61000000-0000-0000-0000-0000000000a3',20),
+  ('93000000-0000-0000-0000-0000000000a4','20000000-0000-0000-0000-00000000000a','91000000-0000-0000-0000-0000000000a6','61000000-0000-0000-0000-0000000000a3',20),
+  ('93000000-0000-0000-0000-0000000000a5','20000000-0000-0000-0000-00000000000a','91000000-0000-0000-0000-0000000000a7','61000000-0000-0000-0000-0000000000a3',25),
+  ('93000000-0000-0000-0000-0000000000a6','20000000-0000-0000-0000-00000000000a','91000000-0000-0000-0000-0000000000a8','61000000-0000-0000-0000-0000000000a7',15);
+insert into timegenie.actual_time_adjustments(
+  id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,source_type,batch_id
+) values(
+  '81000000-0000-0000-0000-0000000000a2','20000000-0000-0000-0000-00000000000a',
+  '51000000-0000-0000-0000-0000000000a1','61000000-0000-0000-0000-0000000000a3',
+  (now() at time zone 'Pacific/Kiritimati')::date+40,5,45,50,'quick_actual_adjustment',
+  '41000000-0000-0000-0000-0000000000a2'
+);
 insert into timegenie.unassigned_sessions(
   id,workspace_id,work_date,state,threshold_seconds,duration_seconds,first_started_at,shared_source,migration_state,last_continuous_at
 ) values('94000000-0000-0000-0000-0000000000a1','20000000-0000-0000-0000-00000000000a',(now() at time zone 'Pacific/Kiritimati')::date,'collecting',300,0,now()-interval '10 minutes','cloud','adopted',now());
@@ -5428,8 +5458,8 @@ declare protocol_value jsonb; context_value jsonb; upgraded jsonb; repeated json
   bootstrap_value jsonb; today_overview_value jsonb; expected_work_date text; task_list_value jsonb; task_detail_value jsonb;
   completed_page_one jsonb; completed_page_two jsonb; today_plan_value jsonb; tomorrow_plan_value jsonb;
   today_plan_repeat jsonb; tomorrow_plan_repeat jsonb; time_state_value jsonb; history_one jsonb; history_two jsonb;
-  report_page_one jsonb; report_page_two jsonb; report_detail_value jsonb; report_templates_value jsonb; report_preview_value jsonb; weekly_preview_value jsonb;
-  report_created jsonb; report_create_retry jsonb; report_scope_updated jsonb; report_saved jsonb; report_save_retry jsonb;
+  report_page_one jsonb; report_page_two jsonb; report_detail_value jsonb; report_templates_value jsonb; report_preview_value jsonb; future_report_preview jsonb; future_hours_preview jsonb; weekly_preview_value jsonb;
+  report_created jsonb; report_create_retry jsonb; report_initial_regenerated jsonb; report_scope_updated jsonb; report_saved jsonb; report_save_retry jsonb;
   report_regenerated jsonb; report_deleted jsonb; report_delete_retry jsonb; report_mutation_detail jsonb;
   report_mutation_id uuid; report_snapshot_count integer; report_operation_probe jsonb;
   report_database_probe jsonb;
@@ -5462,6 +5492,7 @@ declare protocol_value jsonb; context_value jsonb; upgraded jsonb; repeated json
   status_task jsonb; status_done jsonb; status_retry jsonb; status_reopened jsonb; status_probe jsonb;
   duplicate_parent jsonb; duplicate_child jsonb; duplicate_result jsonb; duplicate_retry jsonb;
   batch_subject jsonb; batch_parent jsonb; batch_removed jsonb; batch_result jsonb; batch_retry jsonb;
+  batch_today_instance_id uuid;
   direct_manual_snapshot jsonb; direct_automatic_snapshot jsonb; direct_snapshot_payload jsonb;
   today_update jsonb; today_update_probe jsonb; today_instance_version bigint; today_source_version bigint;
   concurrency_task jsonb;
@@ -5683,7 +5714,7 @@ begin
   begin
     perform timegenie.direct_cloud_task_update(
       '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
-      '4e000000-0000-0000-0000-000000000119',1,
+      '4e000000-0000-0000-0000-00000000011a',1,
       '{"id":"61000000-0000-0000-0000-0000000000b1","expectedVersion":1,"title":"失败请求不应记录成功历史"}'::jsonb
     );
     raise exception 'stale direct task update was accepted';
@@ -6165,6 +6196,12 @@ begin
     '4f000000-0000-0000-0000-000000000533',1,
     '{"id":"63000000-0000-0000-0000-0000000000f2","subjectId":"52000000-0000-0000-0000-0000000000b2","title":"批量删除事项","plannedDate":"2026-10-31"}'::jsonb
   );
+  -- This task appeared after the editor captured its baseline and must survive.
+  perform timegenie.direct_cloud_task_create(
+    '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
+    '4f000000-0000-0000-0000-000000000537',1,
+    '{"id":"63000000-0000-0000-0000-0000000000f3","subjectId":"52000000-0000-0000-0000-0000000000b2","title":"编辑期间新增事项"}'::jsonb
+  );
   batch_result:=timegenie.direct_cloud_task_plan_batch_apply(
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
     '4f000000-0000-0000-0000-000000000534',1,
@@ -6256,6 +6293,56 @@ begin
   if planning_probe->'task'->>'title' is distinct from '批量父事项改名'
      or (planning_probe->'task'->>'version')::bigint<>2 then
     raise exception 'failed plan batch did not roll back its earlier update: %',planning_probe;
+  end if;
+  planning_probe:=timegenie.integration_direct_planning_probe(
+    '20000000-0000-0000-0000-00000000000a','63000000-0000-0000-0000-0000000000f3','2026-10-30'
+  );
+  if planning_probe->'task'->>'title' is distinct from '编辑期间新增事项'
+     or planning_probe->'task'->>'deletedAt' is not null
+     or (planning_probe->'task'->>'version')::bigint<>1 then
+    raise exception 'direct plan batch changed a task outside its editor baseline: %',planning_probe;
+  end if;
+  -- A listed existing task must also belong to the validated editor baseline.
+  begin
+    perform timegenie.direct_cloud_task_plan_batch_apply(
+      '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
+      '4f000000-0000-0000-0000-000000000538',1,
+      '{"subjectId":"52000000-0000-0000-0000-0000000000b2","baselineTasks":[],"finalItems":[{"lineKey":"unvalidated","taskId":"63000000-0000-0000-0000-0000000000f3","title":"不得写入"}],"confirmedDeleteTaskIds":[]}'::jsonb
+    );
+    raise exception 'direct plan batch accepted an existing task outside the baseline';
+  exception when others then if sqlerrm not like '%VERSION_CONFLICT%' then raise; end if; end;
+  -- A completed day instance is a valid editor row; retain its completion state.
+  batch_parent:=timegenie.direct_cloud_task_day_plan_set(
+    '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
+    '4f000000-0000-0000-0000-000000000539',1,
+    jsonb_build_object('taskId','63000000-0000-0000-0000-0000000000f3',
+      'workDate',current_date,'state','included')
+  );
+  batch_today_instance_id:=(batch_parent->'data'->'instance'->>'id')::uuid;
+  perform timegenie.direct_cloud_task_set_status(
+    '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
+    '4f000000-0000-0000-0000-000000000540',1,
+    jsonb_build_object('id',batch_today_instance_id,'expectedVersion',1,'done',true)
+  );
+  perform timegenie.direct_cloud_task_plan_batch_apply(
+    '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
+    '4f000000-0000-0000-0000-000000000541',1,
+    jsonb_build_object('subjectId','52000000-0000-0000-0000-0000000000b2',
+      'dayInstanceDate',current_date,
+      'baselineTasks',jsonb_build_array(jsonb_build_object(
+        'taskId',batch_today_instance_id,'expectedVersion',2)),
+      'finalItems',jsonb_build_array(jsonb_build_object('lineKey','done',
+        'taskId',batch_today_instance_id,'title','今日完成项改名')),
+      'confirmedDeleteTaskIds','[]'::jsonb)
+  );
+  planning_probe:=timegenie.integration_direct_planning_probe(
+    '20000000-0000-0000-0000-00000000000a',batch_today_instance_id,current_date
+  );
+  if planning_probe->'task'->>'title' is distinct from '今日完成项改名'
+     or planning_probe->'task'->>'status' is distinct from 'done'
+     or (planning_probe->'task'->>'version')::bigint<>3
+     or (planning_probe->>'statusEventCount')::integer<>1 then
+    raise exception 'direct plan batch failed to preserve completed today instance state: %',planning_probe;
   end if;
 
   perform timegenie.device_authorize(
@@ -6477,11 +6564,11 @@ begin
      or jsonb_typeof(bootstrap_value->'data'->'subjects') is distinct from 'array'
      or jsonb_array_length(bootstrap_value->'data'->'subjects')<>2
      or bootstrap_value->'data'->'subjects'->0->>'id' is distinct from '51000000-0000-0000-0000-0000000000a1'
-     or bootstrap_value->'data'->'subjects'->0->>'openTaskCount' is distinct from '4'
+     or bootstrap_value->'data'->'subjects'->0->>'openTaskCount' is distinct from '6'
      or (bootstrap_value->'data'->'summary'->>'subjectCount')::integer<>jsonb_array_length(bootstrap_value->'data'->'subjects')
-     or (bootstrap_value->'data'->'summary'->>'openTaskCount')::integer<>4
+     or (bootstrap_value->'data'->'summary'->>'openTaskCount')::integer<>6
      or (bootstrap_value->'data'->'summary'->>'completedTaskCount')::integer<>25
-     or (bootstrap_value->'data'->'summary'->>'taskCount')::integer<>29
+     or (bootstrap_value->'data'->'summary'->>'taskCount')::integer<>31
      or (bootstrap_value->'data'->'currentDayStartAt')::bigint>=(bootstrap_value->'data'->'currentDayEndAt')::bigint
      or bootstrap_value->'data'->'device'->>'id' is distinct from '30000000-0000-0000-0000-00000000000a'
      or not coalesce((bootstrap_value->'data'->'device'->>'writable')::boolean,false) then
@@ -6502,15 +6589,15 @@ begin
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',1,
     '51000000-0000-0000-0000-0000000000a1',false,null
   );
-  if jsonb_array_length(task_list_value->'data'->'tasks')<>3
+  if jsonb_array_length(task_list_value->'data'->'tasks')<>4
      or task_list_value->'data'->'tasks'->0->>'id' is distinct from '61000000-0000-0000-0000-0000000000a2'
      or task_list_value->'data'->'tasks'->1->>'id' is distinct from '61000000-0000-0000-0000-0000000000a3'
      or task_list_value->'data'->'tasks'->1->>'pathLabel' is distinct from '汇总事项 / 叶子事项'
      or (task_list_value->'data'->'tasks'->1->>'depth')::integer<>1
      or (task_list_value->'data'->'tasks'->0->>'selectable')::boolean
      or not (task_list_value->'data'->'tasks'->1->>'selectable')::boolean
-     or (task_list_value->'data'->'tasks'->0->>'totalMinutes')::integer<>90
-     or (task_list_value->'data'->'tasks'->1->>'directMinutes')::integer<>90
+     or (task_list_value->'data'->'tasks'->0->>'totalMinutes')::integer<>140
+     or (task_list_value->'data'->'tasks'->1->>'directMinutes')::integer<>140
      or exists(select 1 from jsonb_array_elements(task_list_value->'data'->'tasks') item where item->>'title' in('归档日实例','已删除事项')) then
     raise exception 'direct active task tree contract is invalid: %',task_list_value;
   end if;
@@ -6652,16 +6739,44 @@ begin
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a','daily',expected_work_date::date,
     '51000000-0000-0000-0000-0000000000a1','a1000000-0000-0000-0000-0000000000a1',1
   );
+  perform timegenie.direct_cloud_shared_setting_update(
+    '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
+    '4f000000-0000-0000-0000-000000000700',1,
+    jsonb_build_object('key','report_duration_format','value','hours')
+  );
+  future_hours_preview:=timegenie.direct_cloud_report_preview(
+    '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a','daily',expected_work_date::date+40,
+    '51000000-0000-0000-0000-0000000000a1','a1000000-0000-0000-0000-0000000000a1',1
+  );
+  perform timegenie.direct_cloud_shared_setting_update(
+    '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
+    '4f000000-0000-0000-0000-000000000709',1,
+    jsonb_build_object('key','report_duration_format','value','minutes','expectedVersion',1)
+  );
+  future_report_preview:=timegenie.direct_cloud_report_preview(
+    '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a','daily',expected_work_date::date+40,
+    '51000000-0000-0000-0000-0000000000a1','a1000000-0000-0000-0000-0000000000a1',1
+  );
   weekly_preview_value:=timegenie.direct_cloud_report_preview(
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a','weekly',expected_work_date::date,
     '51000000-0000-0000-0000-0000000000a1','a1000000-0000-0000-0000-0000000000a2',1
   );
-  if report_preview_value->'data'->>'markdown' not like '%直连主体一%'
+  if report_preview_value->'data'->>'subjectName' is distinct from '直连主体一'
      or report_preview_value->'data'->>'markdown' not like '%叶子事项%'
+     or report_preview_value->'data'->>'markdown' not like '%叶子事项 <实际：50min>%'
+     or report_preview_value->'data'->>'markdown' like '%归档日实例%'
+     or report_preview_value->'data'->>'markdown' like '%无关进行中事项%'
      or report_preview_value->'data'->>'markdown' like '%{{%'
+     or (report_preview_value->'data'->'context'->>'totalMinutes')::integer<>50
+     or future_hours_preview->'data'->>'markdown' not like '%叶子事项 <实际：1.1h>%'
+     or regexp_count(future_hours_preview->'data'->>'markdown','叶子事项 <实际：1.1h>')<>1
+     or future_report_preview->'data'->>'markdown' not like '%叶子事项 <实际：1h5min>%'
+     or regexp_count(future_report_preview->'data'->>'markdown','叶子事项 <实际：1h5min>')<>1
+     or future_report_preview->'data'->>'markdown' like '%未来叶子事项实例%'
+     or future_report_preview->'data'->>'markdown' like '%无关进行中事项%'
      or weekly_preview_value->'data'->'context'->>'dailyCollection' not like '%已保存日报正文%'
      or weekly_preview_value->'data'->>'markdown' like '%{{日报合集}}%' then
-    raise exception 'direct report preview contract is invalid: % / %',report_preview_value,weekly_preview_value;
+    raise exception 'direct report preview contract is invalid: % / % / % / %',report_preview_value,future_report_preview,future_hours_preview,weekly_preview_value;
   end if;
   report_created:=timegenie.direct_cloud_report_create(
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
@@ -6669,7 +6784,7 @@ begin
     jsonb_build_object(
       'reportType','daily','referenceDate',expected_work_date::date+40,
       'subjectId','51000000-0000-0000-0000-0000000000a1',
-      'taskIds',jsonb_build_array('61000000-0000-0000-0000-0000000000a2','61000000-0000-0000-0000-0000000000a3'),
+      'taskIds',jsonb_build_array(),
       'templateId','a1000000-0000-0000-0000-0000000000a1'
     )
   );
@@ -6679,7 +6794,7 @@ begin
     jsonb_build_object(
       'reportType','daily','referenceDate',expected_work_date::date+40,
       'subjectId','51000000-0000-0000-0000-0000000000a1',
-      'taskIds',jsonb_build_array('61000000-0000-0000-0000-0000000000a2','61000000-0000-0000-0000-0000000000a3'),
+      'taskIds',jsonb_build_array(),
       'templateId','a1000000-0000-0000-0000-0000000000a1'
     )
   );
@@ -6693,7 +6808,7 @@ begin
     jsonb_build_object('expectedEpoch',1,'payload',jsonb_build_object(
       'reportType','daily','referenceDate',expected_work_date::date+40,
       'subjectId','51000000-0000-0000-0000-0000000000a1',
-      'taskIds',jsonb_build_array('61000000-0000-0000-0000-0000000000a2','61000000-0000-0000-0000-0000000000a3'),
+      'taskIds',jsonb_build_array(),
       'templateId','a1000000-0000-0000-0000-0000000000a1'
     ))
   );
@@ -6703,11 +6818,25 @@ begin
      or (report_created->'data'->'report'->>'version')::bigint<>1
      or report_created->'data'->'report'->>'contentSource' is distinct from 'generated'
      or nullif(report_created->'data'->'report'->>'inputRevisionHash','') is null
-     or jsonb_array_length(report_created->'data'->'report'->'taskIds')<>2
+     or jsonb_array_length(report_created->'data'->'report'->'taskIds')<>1
+     or report_created->'data'->'report'->>'markdown' is distinct from future_report_preview->'data'->>'markdown'
+     or report_created->'data'->'report'->>'markdown' not like '%叶子事项 <实际：1h5min>%'
      or (report_database_probe->>'reportCount')::integer<>1
-     or (report_database_probe->>'taskCount')::integer<>2
+     or (report_database_probe->>'taskCount')::integer<>1
      or (report_database_probe->>'operationCount')::integer<>1 then
     raise exception 'direct report create was not authoritative/idempotent: % / % / %',report_created,report_create_retry,report_operation_probe;
+  end if;
+  report_initial_regenerated:=timegenie.direct_cloud_report_regenerate(
+    '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
+    '4f000000-0000-0000-0000-000000000710',1,
+    jsonb_build_object('reportId',report_mutation_id,'expectedVersion',1)
+  );
+  if report_initial_regenerated->'data'->'report'->>'markdown' is distinct from future_report_preview->'data'->>'markdown'
+     or regexp_count(report_initial_regenerated->'data'->'report'->>'markdown','叶子事项 <实际：1h5min>')<>1
+     or report_initial_regenerated->'data'->'report'->>'markdown' like '%未来叶子事项实例%'
+     or (report_initial_regenerated->'data'->'report'->>'generatedCount')::integer<>2
+     or (report_initial_regenerated->'data'->'report'->>'version')::bigint<>2 then
+    raise exception 'direct report initial regeneration changed preview aggregation: %',report_initial_regenerated;
   end if;
   report_snapshot_count:=(report_database_probe->>'taskCount')::integer;
   begin
@@ -6715,7 +6844,7 @@ begin
       '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
       '4f000000-0000-0000-0000-000000000702',1,
       jsonb_build_object(
-        'reportId',report_mutation_id,'expectedVersion',1,'reportType','weekly',
+        'reportId',report_mutation_id,'expectedVersion',2,'reportType','weekly',
         'referenceDate',expected_work_date::date+40,'subjectId','51000000-0000-0000-0000-0000000000a1',
         'taskIds',jsonb_build_array('61000000-0000-0000-0000-0000000000a3','61000000-0000-0000-0000-000000000999'),
         'templateId','a1000000-0000-0000-0000-0000000000a2'
@@ -6726,7 +6855,7 @@ begin
   report_database_probe:=timegenie.integration_direct_report_probe(
     '20000000-0000-0000-0000-00000000000a',report_mutation_id,'4f000000-0000-0000-0000-000000000702'
   );
-  if (report_database_probe->>'version')::bigint<>1
+  if (report_database_probe->>'version')::bigint<>2
      or (report_database_probe->>'taskCount')::integer<>report_snapshot_count
      or (report_database_probe->>'operationCount')::integer<>0 then
     raise exception 'failed report scope update left partial data';
@@ -6735,14 +6864,14 @@ begin
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
     '4f000000-0000-0000-0000-000000000703',1,
     jsonb_build_object(
-      'reportId',report_mutation_id,'expectedVersion',1,'reportType','weekly',
+      'reportId',report_mutation_id,'expectedVersion',2,'reportType','weekly',
       'referenceDate',expected_work_date::date+40,'subjectId','51000000-0000-0000-0000-0000000000a1',
       'taskIds',jsonb_build_array('61000000-0000-0000-0000-0000000000a3'),
       'templateId','a1000000-0000-0000-0000-0000000000a2'
     )
   );
   if not (report_scope_updated->'data'->>'needsRegeneration')::boolean
-     or (report_scope_updated->'data'->'report'->>'version')::bigint<>2
+     or (report_scope_updated->'data'->'report'->>'version')::bigint<>3
      or report_scope_updated->'data'->'report'->>'markdown' is distinct from report_created->'data'->'report'->>'markdown'
      or jsonb_array_length(report_scope_updated->'data'->'report'->'taskIds')<>1 then
     raise exception 'direct report scope update did not preserve content or replace snapshots atomically: %',report_scope_updated;
@@ -6762,36 +6891,36 @@ begin
   report_saved:=timegenie.direct_cloud_report_content_save(
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
     '4f000000-0000-0000-0000-000000000705',1,
-    jsonb_build_object('reportId',report_mutation_id,'expectedVersion',2,'markdown','# 人工编辑报告')
+    jsonb_build_object('reportId',report_mutation_id,'expectedVersion',3,'markdown','# 人工编辑报告')
   );
   report_save_retry:=timegenie.direct_cloud_report_content_save(
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
     '4f000000-0000-0000-0000-000000000705',1,
-    jsonb_build_object('reportId',report_mutation_id,'expectedVersion',2,'markdown','# 人工编辑报告')
+    jsonb_build_object('reportId',report_mutation_id,'expectedVersion',3,'markdown','# 人工编辑报告')
   );
   if report_saved is distinct from report_save_retry
      or report_saved->'data'->'report'->>'contentSource' is distinct from 'edited'
      or report_saved->'data'->'report'->>'markdown' is distinct from '# 人工编辑报告'
-     or (report_saved->'data'->'report'->>'version')::bigint<>3 then
+     or (report_saved->'data'->'report'->>'version')::bigint<>4 then
     raise exception 'direct report content save was not versioned/idempotent: % / %',report_saved,report_save_retry;
   end if;
   begin
     perform timegenie.direct_cloud_report_content_save(
       '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
       '4f000000-0000-0000-0000-000000000706',1,
-      jsonb_build_object('reportId',report_mutation_id,'expectedVersion',2,'markdown','# 陈旧内容')
+      jsonb_build_object('reportId',report_mutation_id,'expectedVersion',3,'markdown','# 陈旧内容')
     );
     raise exception 'stale report content save was accepted';
   exception when others then if sqlerrm not like '%VERSION_CONFLICT%' then raise; end if; end;
   report_regenerated:=timegenie.direct_cloud_report_regenerate(
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
     '4f000000-0000-0000-0000-000000000707',1,
-    jsonb_build_object('reportId',report_mutation_id,'expectedVersion',3)
+    jsonb_build_object('reportId',report_mutation_id,'expectedVersion',4)
   );
   if report_regenerated->'data'->'report'->>'contentSource' is distinct from 'generated'
      or report_regenerated->'data'->'report'->>'markdown'='# 人工编辑报告'
-     or (report_regenerated->'data'->'report'->>'generatedCount')::integer<>2
-     or (report_regenerated->'data'->'report'->>'version')::bigint<>4
+     or (report_regenerated->'data'->'report'->>'generatedCount')::integer<>3
+     or (report_regenerated->'data'->'report'->>'version')::bigint<>5
      or nullif(report_regenerated->'data'->'report'->>'inputRevisionHash','') is null then
     raise exception 'direct report regeneration did not restore generated content: %',report_regenerated;
   end if;
@@ -6803,18 +6932,18 @@ begin
   end if;
   report_deleted:=timegenie.direct_cloud_report_delete(
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
-    '4f000000-0000-0000-0000-000000000708',1,jsonb_build_object('reportId',report_mutation_id,'expectedVersion',4)
+    '4f000000-0000-0000-0000-000000000708',1,jsonb_build_object('reportId',report_mutation_id,'expectedVersion',5)
   );
   report_delete_retry:=timegenie.direct_cloud_report_delete(
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
-    '4f000000-0000-0000-0000-000000000708',1,jsonb_build_object('reportId',report_mutation_id,'expectedVersion',4)
+    '4f000000-0000-0000-0000-000000000708',1,jsonb_build_object('reportId',report_mutation_id,'expectedVersion',5)
   );
   report_database_probe:=timegenie.integration_direct_report_probe(
     '20000000-0000-0000-0000-00000000000a',report_mutation_id,'4f000000-0000-0000-0000-000000000708'
   );
   if report_deleted is distinct from report_delete_retry
      or report_deleted->'data'->'report'->>'deletedAt' is null
-     or (report_deleted->'data'->'report'->>'version')::bigint<>5
+     or (report_deleted->'data'->'report'->>'version')::bigint<>6
      or not (report_database_probe->>'deleted')::boolean
      or (report_database_probe->>'operationCount')::integer<>1 then
     raise exception 'direct report delete was not soft/idempotent: % / %',report_deleted,report_delete_retry;
@@ -7089,7 +7218,7 @@ begin
     '4f000000-0000-0000-0000-000000000743',1,
     jsonb_build_object('items',jsonb_build_array(
       jsonb_build_object('key','user_name','value','直连用户-批量','expectedVersion',3),
-      jsonb_build_object('key','report_duration_format','value','hours')
+      jsonb_build_object('key','report_duration_format','value','hours','expectedVersion',2)
     ))
   );
   settings_batch_retry:=timegenie.direct_cloud_shared_settings_batch_update(
@@ -7097,7 +7226,7 @@ begin
     '4f000000-0000-0000-0000-000000000743',1,
     jsonb_build_object('items',jsonb_build_array(
       jsonb_build_object('key','user_name','value','直连用户-批量','expectedVersion',3),
-      jsonb_build_object('key','report_duration_format','value','hours')
+      jsonb_build_object('key','report_duration_format','value','hours','expectedVersion',2)
     ))
   );
   settings_probe:=timegenie.integration_direct_settings_probe(
@@ -7714,7 +7843,7 @@ do $$ begin
   if exists(
     select 1 from timegenie.cloud_operation_logs
     where workspace_id='20000000-0000-0000-0000-00000000000a'
-      and operation_id='4e000000-0000-0000-0000-000000000119'
+      and operation_id='4e000000-0000-0000-0000-00000000011a'
   ) then raise exception 'failed direct mutation recorded a successful operation history row'; end if;
   if (select count(*) from timegenie.processed_operations where workspace_id='20000000-0000-0000-0000-00000000000a' and operation_id='4e000000-0000-0000-0000-000000000001')<>1
      or (select count(*) from timegenie.workspace_changes where workspace_id='20000000-0000-0000-0000-00000000000a' and entity_type='workspace_reset')<>1
@@ -8317,6 +8446,8 @@ reset role;
 \ir 20261024d_timegenie_retire_legacy_sync.sql
 \ir 20261024e_timegenie_direct_cloud_readonly_queries.sql
 \ir 20261024e_timegenie_direct_cloud_readonly_queries.sql
+\ir 20261029_timegenie_report_preview_task_aggregation.sql
+\ir 20261029_timegenie_report_preview_task_aggregation.sql
 
 insert into auth.users(id) values('fa000000-0000-0000-0000-000000000001')
 on conflict(id) do nothing;

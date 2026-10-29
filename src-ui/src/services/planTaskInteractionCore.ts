@@ -9,6 +9,29 @@ export type PlanTaskMoveIntent = {
   nextSiblingId?: string;
 };
 
+export function orderedPlanTaskTree<T extends PlanTaskTreeItem>(tasks: readonly T[]): T[] {
+  const taskIds = new Set(tasks.map((task) => task.id));
+  const children = new Map<string, T[]>();
+  const roots: T[] = [];
+  for (const task of tasks) {
+    if (task.parentId && taskIds.has(task.parentId)) {
+      const siblings = children.get(task.parentId) ?? [];
+      siblings.push(task);
+      children.set(task.parentId, siblings);
+    } else {
+      roots.push(task);
+    }
+  }
+
+  const ordered: T[] = [];
+  const append = (task: T) => {
+    ordered.push(task);
+    for (const child of children.get(task.id) ?? []) append(child);
+  };
+  for (const root of roots) append(root);
+  return ordered;
+}
+
 export function taskSubtreeIds(rows: readonly PlanTaskTreeItem[], taskId: string) {
   const ids = new Set([taskId]);
   let changed = true;

@@ -117,7 +117,7 @@
 | `direct_cloud_task_daily_estimate_batch_set` | `task_daily_estimate_batch_set` | `subjectId`、`workDate`、`items[]`：`taskId`、`expectedTaskVersion`、`expectedDailyEstimateVersion`、`estimateMinutes` | 所有事项必须属于同一主体；任一项版本失败则整批回滚。返回 `changedCount` 和按输入顺序排列的 `items`。 |
 | `direct_cloud_task_day_plan_set` | `task_day_plan_set` | `taskId`、`workDate`、`state`（`included`/`excluded`）、`expectedVersion` | `expectedVersion` 是 `task_day_plans.version`；首次创建时为空。同状态重试不增加业务版本。 |
 | `direct_cloud_task_day_plan_batch_set` | `task_day_plan_batch_set` | `subjectId`、`workDate`、`items[]`：`taskId`、`state`、`expectedVersion` | 批量计划整体事务提交；重复事项或跨主体事项直接拒绝。 |
-| `direct_cloud_task_plan_batch_apply` | `task_plan_batch_apply` | `subjectId`、`baselineTasks[]`、`finalItems[]`、`confirmedDeleteTaskIds[]`；可选 `dayInstanceDate`、`todayPlanChange` | `baselineTasks` 必须精确覆盖打开时主体（或指定今日实例日期）的未完成事项及版本；`confirmedDeleteTaskIds` 必须精确匹配最终项中缺少的事项。新增、改名、父级、删除和今日计划变更在同一事务提交。 |
+| `direct_cloud_task_plan_batch_apply` | `task_plan_batch_apply` | `subjectId`、`baselineTasks[]`、`finalItems[]`、`confirmedDeleteTaskIds[]`；可选 `dayInstanceDate`、`todayPlanChange` | `baselineTasks` 是打开编辑器时的事项 ID 和版本；每项仍须属于该主体及日期范围且版本匹配，今日实例允许包含已完成项。打开后新增的非基线事项保留，已有 `finalItems` 必须属于基线；`confirmedDeleteTaskIds` 精确匹配基线中从最终项移除的事项。待删父项存在未确认删除的子项时拒绝整批。新增、改名、父级、删除和今日计划变更在同一事务提交。 |
 
 版本对象必须分开处理：
 
@@ -126,7 +126,7 @@
 - 今日计划使用 `task_day_plans.version`，载荷字段为 `expectedVersion`。
 - 重复规则使用 `task_recurrence_rules.version`，载荷字段为 `ruleExpectedVersion`；事项自身仍使用 `taskExpectedVersion`。
 - 今日重复实例编辑同时校验实例和来源模板版本。
-- 批量计划使用集合级 `baselineTasks` 加逐项 `expectedVersion`，不是逐条请求。
+- 批量计划以 `baselineTasks` 限定编辑和删除范围，再逐项检查 `expectedVersion`；不要求保存时整个主体集合与打开时完全一致，也不会静默覆盖真实版本冲突。
 
 ### 可执行示例
 

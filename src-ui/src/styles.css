@@ -1851,7 +1851,11 @@ pre {
 .quick-plan-workspace, .quick-plan-summary { min-height: 0; width: 100%; display: flex; flex-direction: column; gap: 12px; }
 .quick-plan-help { display: grid; gap: 3px; }
 .quick-plan-help span { color: var(--muted); font-size: 12px; }
+.quick-plan-import-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.quick-plan-import-bar span { color: var(--muted); font-size: 12px; }
 .quick-plan-editor { min-height: 240px; flex: 1; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2); font-family: inherit; --md-color: var(--text); --md-hover-color: var(--text); --md-bk-color: var(--panel-2); --md-bk-color-outstand: var(--panel-3); --md-border-color: var(--line); }
+.quick-plan-editor.md-editor { --md-color: var(--text); --md-hover-color: var(--text); --md-bk-color: var(--panel-2); --md-bk-color-outstand: var(--panel-3); --md-border-color: var(--line); }
+.quick-plan-editor .md-editor-content .cm-editor { background: var(--panel-2); }
 .quick-plan-editor:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 16%, transparent); }
 .quick-plan-editor .md-editor-toolbar-wrapper { min-height: 42px; padding: 5px 9px; font-family: inherit; font-size: 15px; }
 .quick-plan-editor .md-editor-toolbar-item { font-family: inherit; }
