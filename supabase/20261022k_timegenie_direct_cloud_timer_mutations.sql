@@ -9,6 +9,8 @@ create or replace function timegenie.direct_cloud_timer_start(
 set search_path=timegenie,extensions,pg_catalog as $$
 #variable_conflict use_variable
 declare request_value jsonb; cached jsonb; raw_value jsonb; entry_id uuid; result_value jsonb;
+declare task_id uuid; plan_expected_version bigint; plan_value jsonb;
+declare work_date date;
 declare lease_token uuid;
 begin
   perform timegenie.assert_direct_v2_workspace(p_workspace_id,p_device_id,p_expected_epoch);
@@ -17,22 +19,37 @@ begin
     'payload',coalesce(p_payload,'{}'::jsonb)-'leaseToken'
   );
   perform pg_advisory_xact_lock(hashtextextended(p_workspace_id::text||':active-timer',0));
+  perform pg_advisory_xact_lock(hashtextextended(p_workspace_id::text||':planning',0));
   cached:=timegenie.direct_cloud_operation_result(p_workspace_id,p_operation_id,'direct_timer_start',request_value);
   if cached is not null then return cached; end if;
   lease_token:=nullif(p_payload->>'leaseToken','')::uuid;
   perform timegenie.direct_cloud_tracking_claim_lease(
     p_workspace_id,p_device_id,lease_token
   );
+  task_id:=nullif(p_payload->>'taskId','')::uuid;
   raw_value:=timegenie.timer_start_pre_direct_v2(
-    p_workspace_id,nullif(p_payload->>'taskId','')::uuid,p_device_id,
+    p_workspace_id,task_id,p_device_id,
     timegenie.calendar_stable_uuid('direct-timer-start:'||p_operation_id::text),
     nullif(btrim(coalesce(p_payload->>'note','')),'')
   );
+  work_date:=(raw_value->>'work_date')::date;
+  if task_id is not null and exists(
+    select 1 from timegenie.tasks task
+    where task.workspace_id=p_workspace_id and task.id=task_id
+      and task.deleted_at is null and task.day_instance_date is null
+  ) then
+    select plan.version into plan_expected_version from timegenie.task_day_plans plan
+    where plan.workspace_id=p_workspace_id and plan.task_id=task_id
+      and plan.work_date=work_date;
+    plan_value:=timegenie.direct_cloud_day_plan_apply(
+      p_workspace_id,p_device_id,task_id,work_date,'included',plan_expected_version
+    );
+  end if;
   entry_id:=(raw_value->>'id')::uuid;
   result_value:=timegenie.direct_cloud_mutation_response(
     p_workspace_id,p_device_id,p_operation_id,
     jsonb_build_object('entry',timegenie.direct_cloud_time_entry_project(p_workspace_id,entry_id)),
-    array['time','unassigned'],p_expected_epoch
+    array['time','tasks','planning','unassigned'],p_expected_epoch
   );
   perform timegenie.record_direct_cloud_operation(
     p_workspace_id,p_operation_id,p_device_id,'direct_timer_start',request_value,result_value
@@ -314,6 +331,7 @@ declare new_task jsonb; task_title text; day_date date; sort_value integer;
 declare previous_stop_result jsonb; slices_value jsonb; total_duration bigint;
 declare total_settlement bigint; active_entry jsonb; created_task jsonb;
 declare recurring_value boolean:=false; occurrence_value jsonb; plan_value jsonb;
+declare plan_expected_version bigint;
 declare lease_token uuid;
 begin
   perform timegenie.assert_direct_v2_workspace(p_workspace_id,p_device_id,p_expected_epoch);
@@ -440,11 +458,19 @@ begin
     );
     target_task_id:=created_task_id;
     created_task:=timegenie.direct_cloud_task_project(p_workspace_id,created_task_id);
-    if day_date is null then
-      plan_value:=timegenie.direct_cloud_day_plan_apply(
-        p_workspace_id,p_device_id,target_task_id,work_date,'included',null
-      );
-    end if;
+  end if;
+
+  if exists(
+    select 1 from timegenie.tasks task
+    where task.workspace_id=p_workspace_id and task.id=target_task_id
+      and task.deleted_at is null and task.day_instance_date is null
+  ) then
+    select plan.version into plan_expected_version from timegenie.task_day_plans plan
+    where plan.workspace_id=p_workspace_id and plan.task_id=target_task_id
+      and plan.work_date=work_date;
+    plan_value:=timegenie.direct_cloud_day_plan_apply(
+      p_workspace_id,p_device_id,target_task_id,work_date,'included',plan_expected_version
+    );
   end if;
 
   if active_found and created_task_id is null and reopen_version is null
@@ -456,7 +482,7 @@ begin
       p_workspace_id,p_device_id,p_operation_id,jsonb_build_object(
         'createdTask',null,'previousStopResult',null,'activeEntry',active_entry,
         'transitionAt',(extract(epoch from transition_at)*1000)::bigint,'noOp',true
-      ),array['time'],p_expected_epoch
+      ),array['time','tasks','planning'],p_expected_epoch
     );
     perform timegenie.record_direct_cloud_operation(
       p_workspace_id,p_operation_id,p_device_id,'direct_timer_transition',

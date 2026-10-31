@@ -935,7 +935,7 @@ export type ReportTaskSuggestion = {
   actualMinutes: number;
   dailyEstimateMinutes?: number;
   sortOrder: number;
-  periodStatus: "completed" | "active" | "planned" | "context";
+  periodStatus: "completed" | "active" | "included" | "planned" | "context";
   defaultSelected: boolean;
   candidateRole: "selectable" | "context";
 };
@@ -1337,15 +1337,19 @@ export async function getTimerState(): Promise<TimeEntryRecord | null> {
 
 export async function startTimerRecord(taskId?: string, note?: string): Promise<TimeEntryRecord> {
   const clientRequestId = crypto.randomUUID();
-  return await invoke<TimeEntryRecord>("timer_start", {
+  const result = await invoke<TimeEntryRecord>("timer_start", {
     request: { taskId, note, clientRequestId },
   });
+  await notifyWorkDataChanged(["tasks", "time", "unassigned"], "timer-start");
+  return result;
 }
 
 export async function transitionTimerRecord(request: TimerTransitionRequest): Promise<TimerTransitionResultRecord> {
-  return await invoke<TimerTransitionResultRecord>("timer_transition", {
+  const result = await invoke<TimerTransitionResultRecord>("timer_transition", {
     request: { ...request, clientRequestId: request.clientRequestId ?? crypto.randomUUID() },
   });
+  if (!result.noOp) await notifyWorkDataChanged(["tasks", "time", "unassigned"], "timer-transition");
+  return result;
 }
 
 export async function pauseTimerRecord(entryId: string, expectedVersion: number): Promise<TimeEntryRecord> {

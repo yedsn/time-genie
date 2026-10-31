@@ -49,6 +49,7 @@ set search_path=timegenie,extensions,pg_catalog as $$
 declare request_value jsonb; cached jsonb; result_value jsonb;
 declare task_id uuid; expected_version bigint; done_value boolean; task_row timegenie.tasks%rowtype;
 declare target_status text; completed_value timestamptz; before_value jsonb; after_value jsonb;
+declare work_date_value date; plan_expected_version bigint; plan_value jsonb; plan_instance_id uuid;
 begin
   perform timegenie.assert_direct_v2_workspace(p_workspace_id,p_device_id,p_expected_epoch);
   request_value:=jsonb_build_object('expectedEpoch',p_expected_epoch,'payload',coalesce(p_payload,'{}'::jsonb));
@@ -77,6 +78,28 @@ begin
       updated_by_device_id=p_device_id,version=version+1 where id=task_id;
     insert into timegenie.task_status_events(id,workspace_id,task_id,status,occurred_at,source_type)
     values(gen_random_uuid(),p_workspace_id,task_id,target_status,now(),'user');
+  end if;
+  -- Completing an in-progress task also materializes it in the current work
+  -- day's plan so the today workspace and the daily report both show it.
+  if done_value and task_row.day_instance_date is null then
+    perform pg_advisory_xact_lock(hashtextextended(p_workspace_id::text||':planning',0));
+    work_date_value:=timegenie.workspace_work_date(p_workspace_id);
+    select plan.version into plan_expected_version from timegenie.task_day_plans plan
+    where plan.workspace_id=p_workspace_id and plan.task_id=task_id and plan.work_date=work_date_value;
+    plan_value:=timegenie.direct_cloud_day_plan_apply(
+      p_workspace_id,p_device_id,task_id,work_date_value,'included',plan_expected_version
+    );
+    plan_instance_id:=nullif(plan_value->'instance'->>'id','')::uuid;
+    if plan_instance_id is not null then
+      update timegenie.tasks set status='done',completed_at=coalesce(completed_at,now()),
+        updated_at=now(),updated_by_device_id=p_device_id,version=version+1
+      where workspace_id=p_workspace_id and id=plan_instance_id
+        and status='open' and deleted_at is null;
+      if found then
+        insert into timegenie.task_status_events(id,workspace_id,task_id,status,occurred_at,source_type)
+        values(gen_random_uuid(),p_workspace_id,plan_instance_id,'done',now(),'user');
+      end if;
+    end if;
   end if;
   after_value:=(select to_jsonb(task) from timegenie.tasks task where task.id=task_id);
   result_value:=timegenie.direct_cloud_mutation_response(

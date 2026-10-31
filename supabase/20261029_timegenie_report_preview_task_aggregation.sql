@@ -61,19 +61,78 @@ begin
         and adjustment.deleted_at is null
     ) value join timegenie.tasks task on task.id=value.task_id
     group by coalesce(task.day_instance_source_task_id,task.id)
+  ), completed as (
+    select task.id as task_id from timegenie.tasks task
+    where task.workspace_id=p_workspace_id and task.subject_id=p_subject_id and task.deleted_at is null
+      and (task.day_instance_date is null or task.day_instance_source_task_id is null)
+      and task.status='done'
+      and task.completed_at>=timegenie.workspace_day_start(p_workspace_id,p_period_start)
+      and task.completed_at<timegenie.workspace_day_end(p_workspace_id,p_period_end)
+    union
+    select occurrence.task_id from timegenie.task_occurrences occurrence
+    join timegenie.tasks task on task.id=occurrence.task_id and task.workspace_id=occurrence.workspace_id
+    where occurrence.workspace_id=p_workspace_id and task.subject_id=p_subject_id and task.deleted_at is null
+      and occurrence.occurrence_date between p_period_start and p_period_end and occurrence.status='done'
+    union
+    select instance.day_instance_source_task_id from timegenie.tasks instance
+    where instance.workspace_id=p_workspace_id and instance.subject_id=p_subject_id and instance.deleted_at is null
+      and instance.day_instance_source_task_id is not null and instance.status='done'
+      and instance.day_instance_date between p_period_start and p_period_end
   ), selected as (
-    select item.task_id,item.ordinality,task.title,
-      timegenie.direct_cloud_report_task_path(p_workspace_id,item.task_id) as path_label,
-      coalesce(actuals.minutes,0) as actual_minutes
+    select item.task_id,
+      coalesce(actuals.minutes,0) as actual_minutes,
+      exists(select 1 from completed where completed.task_id=item.task_id) as period_completed
     from unnest(coalesce(p_task_ids,'{}'::uuid[])) with ordinality item(task_id,ordinality)
     join timegenie.tasks task on task.workspace_id=p_workspace_id and task.id=item.task_id
     left join actuals on actuals.task_id=item.task_id
   )
+  -- Selected items keep the task hierarchy: roots use an ordered list and
+  -- children use indented dashes, the same shape as the plan section.
   select string_agg(
-    ordinality::text||'. '||coalesce(path_label,title)||
-      case when actual_minutes>0 then ' <实际：'||timegenie.direct_cloud_report_duration(actual_minutes,duration_format_value)||'>' else '' end,
-    E'\n' order by ordinality
-  ) into task_lines from selected;
+    case when line.depth=0 then line.current_root::text||'. ' else repeat('   ',line.depth)||'- ' end||
+    case when line.is_leaf_selected then (case when line.period_completed then '🟢' else '🔴' end)||' ' else '' end||
+    line.title||
+    case when line.is_leaf_selected and line.actual_minutes>0
+         then ' <实际：'||timegenie.direct_cloud_report_duration(line.actual_minutes,duration_format_value)||'>' else '' end,
+    E'\n' order by line.order_path
+  ) into task_lines
+  from (
+    with recursive included_tasks as (
+      select item.task_id as id from unnest(coalesce(p_task_ids,'{}'::uuid[])) item(task_id)
+      union
+      select parent.id from included_tasks child
+      join timegenie.tasks child_task on child_task.id=child.id
+      join timegenie.tasks parent on parent.id=child_task.parent_id
+      where parent.workspace_id=p_workspace_id and parent.deleted_at is null
+    ), item_tree as (
+      select task.id,task.title,task.parent_id,0 as depth,
+             array[lpad(task.sort_order::text,20,'0')||':'||to_char(task.created_at,'YYYYMMDDHH24MISSUS')||':'||task.id::text] as order_path
+      from timegenie.tasks task join included_tasks included on included.id=task.id
+      where task.parent_id is null
+         or not exists(select 1 from included_tasks parent where parent.id=task.parent_id)
+      union all
+      select child.id,child.title,child.parent_id,parent.depth+1,
+             parent.order_path||(lpad(child.sort_order::text,20,'0')||':'||to_char(child.created_at,'YYYYMMDDHH24MISSUS')||':'||child.id::text)
+      from item_tree parent
+      join timegenie.tasks child on child.parent_id=parent.id
+      join included_tasks included on included.id=child.id
+      where child.workspace_id=p_workspace_id and child.deleted_at is null
+    ), item_roots as (
+      select order_path,row_number() over (order by order_path) as root_index
+      from item_tree where depth=0
+    ), item_lines as (
+      select tree.*,
+             (select roots.root_index from item_roots roots
+              where tree.order_path[1:array_length(roots.order_path,1)]=roots.order_path) as current_root
+      from item_tree tree
+    )
+    select line.title,line.depth,line.order_path,line.current_root,
+           coalesce(selected.actual_minutes,0) as actual_minutes,
+           coalesce(selected.period_completed,false) as period_completed,
+           selected.task_id is not null
+             and not exists(select 1 from item_tree child where child.parent_id=line.id) as is_leaf_selected
+    from item_lines line left join selected on selected.task_id=line.id
+  ) line;
 
   select coalesce(sum(value.minutes),0)::bigint into total_minutes_value from (
     select allocation.minutes::bigint as minutes
@@ -87,10 +146,67 @@ begin
     where adjustment.workspace_id=p_workspace_id and adjustment.work_date between p_period_start and p_period_end
       and adjustment.deleted_at is null and coalesce(task.day_instance_source_task_id,task.id)=any(coalesce(p_task_ids,'{}'::uuid[]))
   ) value;
-  select string_agg(timegenie.direct_cloud_report_task_path(p_workspace_id,task.id),E'\n' order by task.sort_order,task.created_at,task.id) into tomorrow_plan
-  from timegenie.tasks task where task.workspace_id=p_workspace_id and task.subject_id=p_subject_id
-    and task.deleted_at is null and task.status='open' and task.planned_date=p_period_start+1
-    and (task.day_instance_date is null or task.day_instance_source_task_id is null);
+  -- The plan section starts from every in-progress task, not only items that
+  -- were explicitly planned for the next work day. Roots stay an ordered list
+  -- and children use indented dashes, matching the report item hierarchy.
+  select string_agg(
+    case when line.depth=0 then line.root_index::text||'. '||line.title
+         else repeat('   ',line.depth)||'- '||line.title end,
+    E'\n' order by line.order_path
+  ) into tomorrow_plan
+  from (
+    with recursive open_tasks as (
+      select task.id,task.parent_id,task.title,task.sort_order,task.created_at
+      from timegenie.tasks task
+      where task.workspace_id=p_workspace_id and task.subject_id=p_subject_id
+        and task.deleted_at is null
+        and (task.day_instance_date is null or task.day_instance_source_task_id is null)
+        and case when exists(
+          select 1 from timegenie.task_recurrence_rules rule
+          where rule.workspace_id=p_workspace_id and rule.task_id=task.id
+            and rule.effective_start<=p_period_start+1
+            and (rule.effective_end is null or rule.effective_end>=p_period_start+1)
+            and (
+              rule.frequency='daily'
+              or (rule.frequency='weekdays' and extract(isodow from p_period_start+1)::integer<6)
+              or (rule.frequency='weekly' and (rule.weekdays_mask & (1 << (extract(isodow from p_period_start+1)::integer-1)))<>0)
+            )
+        ) then coalesce(
+          (select occurrence.status from timegenie.task_occurrences occurrence
+           where occurrence.workspace_id=p_workspace_id and occurrence.task_id=task.id
+             and occurrence.occurrence_date=p_period_start+1),
+          task.status
+        )='open'
+        else task.status='open' end
+    ), included_tasks as (
+      with recursive ancestors as (
+        select task.id,task.parent_id from open_tasks task
+        union
+        select parent.id,parent.parent_id from timegenie.tasks parent
+        join ancestors child on child.parent_id=parent.id
+        where parent.workspace_id=p_workspace_id and parent.subject_id=p_subject_id
+          and parent.deleted_at is null
+      ) select id from ancestors
+    ), plan_tree as (
+      select task.id,task.title,0 as depth,
+             array[lpad(task.sort_order::text,20,'0')||':'||to_char(task.created_at,'YYYYMMDDHH24MISSUS')||':'||task.id::text] as order_path
+      from timegenie.tasks task join included_tasks included on included.id=task.id
+      where task.parent_id is null
+         or not exists(select 1 from included_tasks parent where parent.id=task.parent_id)
+      union all
+      select child.id,child.title,parent.depth+1,
+             parent.order_path||(lpad(child.sort_order::text,20,'0')||':'||to_char(child.created_at,'YYYYMMDDHH24MISSUS')||':'||child.id::text)
+      from plan_tree parent
+      join timegenie.tasks child on child.parent_id=parent.id
+      join included_tasks included on included.id=child.id
+      where child.workspace_id=p_workspace_id and child.subject_id=p_subject_id and child.deleted_at is null
+    ), plan_roots as (
+      select id,row_number() over (order by order_path) as root_index
+      from plan_tree where depth=0
+    )
+    select tree.title,tree.depth,tree.order_path,roots.root_index
+    from plan_tree tree left join plan_roots roots on roots.id=tree.id
+  ) line;
   select string_agg(report.markdown_content,E'\n\n' order by report.reference_date,report.id) into daily_collection
   from timegenie.reports report where report.workspace_id=p_workspace_id and report.subject_id=p_subject_id
     and report.report_type='daily' and report.reference_date between p_period_start and p_period_end

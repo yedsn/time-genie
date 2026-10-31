@@ -293,6 +293,7 @@ declare task_id uuid; occurrence_date_value date; done_value boolean;
 declare task_expected_version bigint; occurrence_expected_version bigint; instance_expected_version bigint;
 declare task_row timegenie.tasks%rowtype; occurrence_row timegenie.task_occurrences%rowtype;
 declare instance_row timegenie.tasks%rowtype; target_status text; completed_value timestamptz;
+declare plan_expected_version bigint; plan_value jsonb; plan_instance_id uuid;
 begin
   perform timegenie.assert_direct_v2_workspace(p_workspace_id,p_device_id,p_expected_epoch);
   request_value:=jsonb_build_object('expectedEpoch',p_expected_epoch,'payload',coalesce(p_payload,'{}'::jsonb));
@@ -341,6 +342,29 @@ begin
     if instance_row.status is distinct from target_status then
       update timegenie.tasks set status=target_status,completed_at=completed_value,
         updated_at=now(),updated_by_device_id=p_device_id,version=version+1 where id=instance_row.id;
+    end if;
+  end if;
+  -- Completing an occurrence also materializes it in that day's plan so the
+  -- today workspace and the daily report both show the finished item.
+  if done_value then
+    select plan.version into plan_expected_version from timegenie.task_day_plans plan
+    where plan.workspace_id=p_workspace_id and plan.task_id=task_id
+      and plan.work_date=occurrence_date_value;
+    plan_value:=timegenie.direct_cloud_day_plan_apply(
+      p_workspace_id,p_device_id,task_id,occurrence_date_value,'included',plan_expected_version
+    );
+    plan_instance_id:=nullif(plan_value->'instance'->>'id','')::uuid;
+    if plan_instance_id is not null then
+      update timegenie.tasks set status='done',completed_at=coalesce(completed_at,completed_value,now()),
+        updated_at=now(),updated_by_device_id=p_device_id,version=version+1
+      where workspace_id=p_workspace_id and id=plan_instance_id
+        and status='open' and deleted_at is null;
+      if found then
+        insert into timegenie.task_status_events(id,workspace_id,task_id,status,occurred_at,source_type)
+        values(gen_random_uuid(),p_workspace_id,plan_instance_id,'done',now(),'user');
+      end if;
+      select task.* into instance_row from timegenie.tasks task
+      where task.workspace_id=p_workspace_id and task.id=plan_instance_id;
     end if;
   end if;
   occurrence_value:=timegenie.direct_cloud_occurrence_record(p_workspace_id,task_id,occurrence_date_value);

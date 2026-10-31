@@ -678,6 +678,15 @@ pub struct DirectCloudReportPreviewQuery {
     pub template_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectCloudReportTaskSuggestionsQuery {
+    pub report_type: String,
+    pub reference_date: String,
+    pub subject_id: String,
+    pub include_task_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirectCloudTaskData {
@@ -868,6 +877,12 @@ pub struct DirectCloudReportPreviewData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DirectCloudReportTaskSuggestionsData {
+    pub tasks: Vec<crate::reports::ReportTaskSuggestionDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DirectCloudSharedConfigurationData {
     pub workspace: Value,
     pub settings: Value,
@@ -889,6 +904,8 @@ pub type DirectCloudReportDetailResponse = DirectCloudQueryResponse<DirectCloudR
 pub type DirectCloudReportTemplatesResponse =
     DirectCloudQueryResponse<DirectCloudReportTemplatesData>;
 pub type DirectCloudReportPreviewResponse = DirectCloudQueryResponse<DirectCloudReportPreviewData>;
+pub type DirectCloudReportTaskSuggestionsResponse =
+    DirectCloudQueryResponse<DirectCloudReportTaskSuggestionsData>;
 pub type DirectCloudSharedConfigurationResponse =
     DirectCloudQueryResponse<DirectCloudSharedConfigurationData>;
 

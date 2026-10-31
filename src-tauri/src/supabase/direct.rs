@@ -476,6 +476,24 @@ pub fn direct_cloud_report_preview(
     )
 }
 
+pub fn direct_cloud_report_task_suggestions(
+    database: &Database,
+    request: DirectCloudReportTaskSuggestionsQuery,
+) -> Result<DirectCloudReportTaskSuggestionsResponse, String> {
+    let context = direct_cloud_read_context(database)?;
+    direct_cloud_query(
+        database,
+        "direct_cloud_report_task_suggestions",
+        &context,
+        json!({
+            "p_report_type": request.report_type,
+            "p_reference_date": request.reference_date,
+            "p_subject_id": request.subject_id,
+            "p_include_task_ids": request.include_task_ids,
+        }),
+    )
+}
+
 fn direct_cloud_json_mutation(
     database: &Database,
     function: &str,

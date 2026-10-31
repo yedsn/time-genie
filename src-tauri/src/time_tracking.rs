@@ -496,10 +496,14 @@ fn transition_timer_with_cloud_operation(
         created_task = Some(task);
         id
     };
-    if created_task
-        .as_ref()
-        .is_some_and(|task| task.day_instance_date.is_none())
-    {
+    let target_is_source_task: bool = transaction
+        .query_row(
+            "SELECT day_instance_date IS NULL FROM tasks WHERE workspace_id=?1 AND id=?2 AND deleted_at IS NULL",
+            params![workspace_id, target_task_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if target_is_source_task {
         crate::today_plans::ensure_included_in_transaction(
             &transaction,
             &workspace_id,
@@ -699,6 +703,23 @@ fn start_timer_with_cloud_operation(
             &work_date,
             now,
         )?;
+        let task_is_source: bool = transaction
+            .query_row(
+                "SELECT day_instance_date IS NULL FROM tasks WHERE workspace_id=?1 AND id=?2 AND deleted_at IS NULL",
+                params![workspace_id, task_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if task_is_source {
+            crate::today_plans::ensure_included_in_transaction(
+                &transaction,
+                &workspace_id,
+                task_id,
+                &work_date,
+                now,
+                None,
+            )?;
+        }
     }
     crate::unassigned::clear_for_timer(&transaction, &workspace_id, now, false)?;
     transaction
@@ -3317,6 +3338,40 @@ mod tests {
     }
 
     #[test]
+    fn transition_to_existing_source_task_adds_it_to_today() {
+        let (database, _, task_id) = setup();
+        let result = transition(
+            &database,
+            TimerTransitionRequest {
+                client_request_id: Uuid::now_v7().to_string(),
+                current_entry_id: None,
+                current_entry_expected_version: None,
+                task_id: Some(task_id.clone()),
+                reopen_completed_task_version: None,
+                new_task: None,
+                note: None,
+            },
+        )
+        .unwrap();
+
+        let (state, instance_task_id): (String, Option<String>) = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT state,instance_task_id FROM task_day_plans WHERE task_id=?1 AND work_date=?2",
+                params![task_id, test_work_date()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "included");
+        assert!(instance_task_id.is_some());
+        assert_eq!(
+            result.active_entry.default_task_id.as_deref(),
+            Some(task_id.as_str())
+        );
+    }
+
+    #[test]
     fn transition_to_current_task_is_no_op() {
         let (database, _, task_id) = setup();
         let active = start_timer(
@@ -4822,6 +4877,33 @@ mod tests {
         assert_eq!(stopped.state, "ended");
         assert_eq!(stopped.allocations.len(), 1);
         assert_eq!(stopped.allocated_minutes, stopped.settlement_minutes);
+    }
+
+    #[test]
+    fn starting_source_task_timer_adds_it_to_today() {
+        let (database, _, task_id) = setup();
+        let started = start_timer(
+            &database,
+            TimerStartRequest {
+                task_id: Some(task_id.clone()),
+                note: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+
+        let (state, instance_task_id): (String, Option<String>) = database
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT state,instance_task_id FROM task_day_plans WHERE task_id=?1 AND work_date=?2",
+                params![task_id, test_work_date()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "included");
+        assert!(instance_task_id.is_some());
+        assert_eq!(started.default_task_id.as_deref(), Some(task_id.as_str()));
     }
 
     #[test]

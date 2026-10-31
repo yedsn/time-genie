@@ -1454,6 +1454,16 @@ fn set_task_status_with_cloud_operation(
                     request.occurrence_expected_version,
                     now,
                 )?;
+                if request.done {
+                    crate::today_plans::ensure_included_in_transaction(
+                        &transaction,
+                        &workspace_id,
+                        &request.id,
+                        occurrence_date,
+                        now,
+                        None,
+                    )?;
+                }
                 bump_revision(&transaction)?;
                 if let Some((state, operation_type)) = cloud_operation {
                     let entity_id =
@@ -1506,6 +1516,36 @@ fn set_task_status_with_cloud_operation(
             params![Uuid::now_v7().to_string(), workspace_id, request.id, if request.done { "done" } else { "open" }, now],
         )
         .map_err(|error| error.to_string())?;
+    if request.done && current.day_instance_date.is_none() {
+        let work_date = crate::work_calendar::current_work_date(&transaction, now)?;
+        let plan = crate::today_plans::ensure_included_in_transaction(
+            &transaction,
+            &workspace_id,
+            &request.id,
+            &work_date,
+            now,
+            None,
+        )?;
+        if let Some(instance_id) = plan.plan.instance_task_id.clone() {
+            let changed = transaction
+                .execute(
+                    "UPDATE tasks SET status = 'done', completed_at = COALESCE(completed_at, ?1),
+                       updated_at = ?1, version = version + 1
+                     WHERE workspace_id = ?2 AND id = ?3 AND status = 'open' AND deleted_at IS NULL",
+                    params![now, workspace_id, instance_id],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed > 0 {
+                transaction
+                    .execute(
+                        "INSERT INTO task_status_events(id, workspace_id, task_id, status, occurred_at, source_type, created_at)
+                         VALUES (?1, ?2, ?3, 'done', ?4, 'user', ?4)",
+                        params![Uuid::now_v7().to_string(), workspace_id, instance_id, now],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+    }
     bump_revision(&transaction)?;
     transaction.commit().map_err(|error| error.to_string())?;
     let connection = database.open()?;
@@ -4373,6 +4413,85 @@ mod tests {
         assert_eq!(occurrence_status, "done");
         assert_eq!(outbox_count, 0);
         assert_eq!(rule.version, 1);
+    }
+
+    #[test]
+    fn completing_a_task_adds_a_completed_today_instance() {
+        let database = database();
+        let connection = database.open().unwrap();
+        let subject_id: String = connection
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let work_date = crate::work_calendar::current_work_date(&connection, now_millis()).unwrap();
+        drop(connection);
+        let task = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                day_instance_date: None,
+                parent_id: None,
+                title: "完成后进入今日".to_string(),
+                planned_date: None,
+                estimate_minutes: Some(30),
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let done = set_task_status(
+            &database,
+            TaskStatusRequest {
+                id: task.id.clone(),
+                expected_version: task.version,
+                done: true,
+                occurrence_date: None,
+                occurrence_expected_version: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(done.status, "done");
+
+        let connection = database.open().unwrap();
+        let (state, instance_id): (String, Option<String>) = connection
+            .query_row(
+                "SELECT state, instance_task_id FROM task_day_plans WHERE task_id = ?1",
+                params![task.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "included");
+        let instance_id = instance_id.expect("完成后应创建今日实例");
+        let (status, instance_date, source_id): (String, Option<String>, Option<String>) =
+            connection
+                .query_row(
+                    "SELECT status, day_instance_date, day_instance_source_task_id
+                     FROM tasks WHERE id = ?1",
+                    params![instance_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(status, "done");
+        assert!(instance_date.is_some());
+        assert_eq!(source_id.as_deref(), Some(task.id.as_str()));
+        drop(connection);
+
+        let suggestions = crate::reports::suggest_report_tasks(
+            &database,
+            crate::reports::ReportTaskSuggestionRequest {
+                report_type: "daily".to_string(),
+                reference_date: work_date,
+                subject_id,
+                include_task_ids: Vec::new(),
+            },
+        )
+        .unwrap();
+        let suggestion = suggestions
+            .iter()
+            .find(|suggestion| suggestion.task_id == task.id)
+            .expect("完成事项应进入当天日报候选");
+        assert_eq!(suggestion.period_status, "completed");
+        assert!(suggestion.default_selected);
     }
 
     #[test]

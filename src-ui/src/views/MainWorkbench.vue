@@ -88,6 +88,14 @@ const subjectSalaryHourlyRate = ref(0);
 const subjectDailyReportDirectory = ref("");
 const subjectDialogTitle = computed(() => editingSubjectId.value ? "主体设置" : "添加主体");
 const weekdayLabels = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+const todayEyebrow = computed(() => {
+  const value = store.workspaceToday;
+  if (!value) return "";
+  const [year, month, day] = value.split("-").map(Number);
+  if (!year || !month || !day) return value;
+  const weekday = new Date(year, month - 1, day).getDay();
+  return `${value} · ${weekdayLabels[(weekday + 6) % 7]}`;
+});
 const subjectScheduleDraft = ref<WorkScheduleDay[]>(createDefaultWorkSchedule());
 const scheduleCopySource = ref(0);
 const scheduleCopyTargets = ref([1, 2, 3, 4]);
@@ -1683,7 +1691,7 @@ async function handleCompletedTaskDelete(task: Task) {
     <section class="content-shell">
       <header class="topbar">
         <div class="topbar-title">
-          <p class="eyebrow">2026-09-15 · Tuesday</p>
+          <p class="eyebrow">{{ todayEyebrow }}</p>
           <h1>{{ pages.find((page) => page.id === store.activePage)?.label }}工作台</h1>
         </div>
         <fieldset class="topbar-tools readonly-fieldset" :disabled="cloudBusinessReadOnly" :title="cloudBusinessReadOnly ? cloudReadOnlyReason : undefined">

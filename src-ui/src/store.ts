@@ -1833,6 +1833,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     selectedEntryId.value = entry.id;
     queryCoordinator.markMatchingStale("workspace");
     queryCoordinator.markMatchingStale("unassigned");
+    queryCoordinator.markMatchingStale("todayPlan");
     queryCoordinator.markMatchingStale("todayOverview");
     return true;
   }

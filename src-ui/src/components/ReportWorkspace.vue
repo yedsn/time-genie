@@ -1039,11 +1039,11 @@ function existingReportId(error: unknown) {
       </label>
 
       <div class="report-subject-tabs timer-task-subject-tabs" role="tablist" aria-label="报告主体筛选">
-        <button v-for="subject in store.subjects" :key="subject.id" v-hover-switch type="button" role="tab" :aria-selected="reportSubjectId === subject.id" :class="{ active: reportSubjectId === subject.id }" @click="selectReportSubject(subject.id)">{{ subject.name }}</button>
+        <button v-for="subject in store.subjects" :key="subject.id" type="button" role="tab" :aria-selected="reportSubjectId === subject.id" :class="{ active: reportSubjectId === subject.id }" @click="selectReportSubject(subject.id)">{{ subject.name }}</button>
       </div>
 
       <div class="report-filter-tabs" role="tablist" aria-label="报告类型筛选">
-        <button v-for="option in [{ value: 'all', label: '全部' }, { value: 'daily', label: '日报' }, { value: 'weekly', label: '周报' }, { value: 'monthly', label: '月报' }]" :key="option.value" v-hover-switch type="button" :class="[{ active: reportFilter === option.value }, option.value === 'all' ? 'type-all' : reportTypeClass(option.value as ReportType)]" @click="reportFilter = option.value as 'all' | ReportType"><span>{{ option.label }}</span><small>{{ reportCounts[option.value as keyof typeof reportCounts] }}</small></button>
+        <button v-for="option in [{ value: 'all', label: '全部' }, { value: 'daily', label: '日报' }, { value: 'weekly', label: '周报' }, { value: 'monthly', label: '月报' }]" :key="option.value" type="button" :class="[{ active: reportFilter === option.value }, option.value === 'all' ? 'type-all' : reportTypeClass(option.value as ReportType)]" @click="reportFilter = option.value as 'all' | ReportType"><span>{{ option.label }}</span><small>{{ reportCounts[option.value as keyof typeof reportCounts] }}</small></button>
       </div>
 
       <div v-if="filteredReports.length" ref="reportListRef" class="report-record-list" @scroll.passive="onReportListScroll">
@@ -1122,8 +1122,8 @@ function existingReportId(error: unknown) {
 
       <div class="daily-editor-modebar">
         <div class="report-mode-tabs" role="tablist" aria-label="报告编辑模式">
-          <button v-hover-switch :class="{ active: editorMode === 'edit' }" type="button" @click="editorMode = 'edit'"><FilePenLine :size="14" />编辑</button>
-          <button v-hover-switch :class="{ active: editorMode === 'preview' }" type="button" @click="editorMode = 'preview'">预览</button>
+          <button :class="{ active: editorMode === 'edit' }" type="button" @click="editorMode = 'edit'"><FilePenLine :size="14" />编辑</button>
+          <button :class="{ active: editorMode === 'preview' }" type="button" @click="editorMode = 'preview'">预览</button>
         </div>
         <span class="report-save-state" :class="{ dirty: hasUnsavedChanges }"><i></i>{{ hasUnsavedChanges ? '未保存修改' : '已保存' }}<small>{{ editorDraft.length }} 字符</small></span>
       </div>
@@ -1202,9 +1202,9 @@ function existingReportId(error: unknown) {
             <el-checkbox-group v-model="draftTaskIds" class="report-task-options">
               <el-checkbox v-for="task in visibleDraftTasks" :key="task.taskId" :value="task.taskId" :disabled="task.candidateRole === 'context'" :style="{ paddingLeft: `${taskDepth(task) * 18 + 10}px` }">
                 <span class="report-task-option-title"><i :class="task.periodStatus === 'completed' ? 'done' : task.periodStatus === 'active' ? 'active' : 'planned'"></i>{{ task.title }}</span>
-                <span class="report-task-option-meta"><template v-if="draftType === 'daily' && task.dailyEstimateMinutes">今日预计 {{ formatHours(task.dailyEstimateMinutes) }} · </template><template v-if="task.estimateMinutes">整体预计 {{ formatHours(task.estimateMinutes) }} · </template><template v-if="task.actualMinutes">实际 {{ formatHours(task.actualMinutes) }} · </template>{{ task.periodStatus === 'completed' ? '本期已完成' : task.periodStatus === 'active' ? '有执行记录' : task.periodStatus === 'context' ? '层级上下文' : '未执行' }}</span>
+                <span class="report-task-option-meta"><template v-if="draftType === 'daily' && task.dailyEstimateMinutes">今日预计 {{ formatHours(task.dailyEstimateMinutes) }} · </template><template v-if="task.estimateMinutes">整体预计 {{ formatHours(task.estimateMinutes) }} · </template><template v-if="task.actualMinutes">实际 {{ formatHours(task.actualMinutes) }} · </template>{{ task.periodStatus === 'completed' ? '本期已完成' : task.periodStatus === 'active' ? '有执行记录' : task.periodStatus === 'context' ? '层级上下文' : task.periodStatus === 'included' ? '手动加入' : '未执行' }}</span>
               </el-checkbox>
-              <div v-if="!visibleDraftTasks.length" class="report-task-empty">{{ draftTaskQuery ? '没有匹配的事项' : draftType === 'daily' ? '当天计划还没有事项' : '本周期还没有相关事项' }}</div>
+              <div v-if="!visibleDraftTasks.length" class="report-task-empty">{{ draftTaskQuery ? '没有匹配的事项' : draftType === 'daily' ? '当天还没有执行或完成的事项' : '本周期还没有相关事项' }}</div>
             </el-checkbox-group>
           </div>
         </section>
@@ -1247,7 +1247,7 @@ function existingReportId(error: unknown) {
       <div v-if="templateLoading" class="report-dialog-loading">正在加载模板...</div>
       <div v-else class="report-template-layout">
         <aside class="template-library-pane">
-          <div class="report-filter-tabs"><button v-for="type in (['daily', 'weekly', 'monthly'] as ReportType[])" :key="type" v-hover-switch type="button" :class="{ active: templateType === type }" @click="switchTemplateType(type)">{{ reportTypeLabel(type) }}</button></div>
+          <div class="report-filter-tabs"><button v-for="type in (['daily', 'weekly', 'monthly'] as ReportType[])" :key="type" type="button" :class="{ active: templateType === type }" @click="switchTemplateType(type)">{{ reportTypeLabel(type) }}</button></div>
           <button class="primary-button compact template-add-button" type="button" @click="newTemplate"><Plus :size="13" />新建模板</button>
           <button v-for="item in templates" :key="item.id" type="button" :class="['template-list-item', { active: selectedTemplateId === item.id }]" @click="selectTemplate(item)"><span class="template-list-copy"><strong>{{ item.name }}</strong><small>{{ item.description || '适用于全部主体' }}</small></span><span class="template-list-badges"><i v-if="item.isBuiltin" class="builtin">内置</i><i v-if="item.isDefault">默认</i></span></button>
         </aside>

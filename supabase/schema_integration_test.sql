@@ -302,6 +302,7 @@ begin
      or not has_function_privilege('authenticated', 'timegenie.direct_cloud_report_detail(uuid, uuid, uuid, bigint)', 'execute')
      or not has_function_privilege('authenticated', 'timegenie.direct_cloud_report_templates(uuid, uuid, text, bigint)', 'execute')
      or not has_function_privilege('authenticated', 'timegenie.direct_cloud_report_preview(uuid, uuid, text, date, uuid, uuid, bigint)', 'execute')
+     or not has_function_privilege('authenticated', 'timegenie.direct_cloud_report_task_suggestions(uuid, uuid, text, date, uuid, uuid[], bigint)', 'execute')
      or not has_function_privilege('authenticated', 'timegenie.direct_cloud_report_create(uuid, uuid, uuid, bigint, jsonb)', 'execute')
      or not has_function_privilege('authenticated', 'timegenie.direct_cloud_report_scope_update(uuid, uuid, uuid, bigint, jsonb)', 'execute')
      or not has_function_privilege('authenticated', 'timegenie.direct_cloud_report_content_save(uuid, uuid, uuid, bigint, jsonb)', 'execute')
@@ -3812,6 +3813,7 @@ declare
   allocated jsonb; allocated_retry jsonb; entry_id uuid; active_version bigint;
   stopped_version bigint; task_b_version bigint; allocation_count integer; allocation_minutes integer;
   task_a_status text; task_b_status text; entry_version bigint;
+  task_a_subject_id uuid; task_b_subject_id uuid; timer_plan_value jsonb;
   bootstrap jsonb; work_date_value date; state_value jsonb; task_list_value jsonb;
   running jsonb; running_version bigint; task_a_version bigint;
   transition_entry_id uuid; transition_expected_version bigint; allocation_entry_id uuid; allocation_expected_version bigint;
@@ -3859,6 +3861,20 @@ begin
      or started->'data'->'entry'->>'state' is distinct from 'running'
      or started->'data'->'entry'->>'defaultTaskId' is distinct from task_a::text then
     raise exception 'direct timer start is not idempotent or authoritative: % / %',started,start_retry;
+  end if;
+  task_a_subject_id:=(timegenie.direct_cloud_task_detail(
+    '20000000-0000-0000-0000-00000000000b','30000000-0000-0000-0000-00000000000b',task_a,1
+  )->'data'->'task'->>'subjectId')::uuid;
+  timer_plan_value:=timegenie.direct_cloud_today_plan(
+    '20000000-0000-0000-0000-00000000000b','30000000-0000-0000-0000-00000000000b',
+    task_a_subject_id,work_date_value,1
+  );
+  if not exists(
+    select 1 from jsonb_array_elements(timer_plan_value->'data'->'plans') plan
+    where plan->>'taskId'=task_a::text and plan->>'state'='included'
+      and nullif(plan->>'instanceTaskId','') is not null
+  ) then
+    raise exception 'direct timer start did not add the source task to today';
   end if;
   entry_id:=(started->'data'->'entry'->>'id')::uuid;
   active_version:=(started->'data'->'entry'->>'version')::bigint;
@@ -3920,6 +3936,20 @@ begin
      or transitioned->'data'->'activeEntry'->>'defaultTaskId' is distinct from task_b::text
      or transitioned->'data'->'activeEntry'->>'state' is distinct from 'running' then
     raise exception 'direct timer transition is not atomic or idempotent: % / %',transitioned,transition_retry;
+  end if;
+  task_b_subject_id:=(timegenie.direct_cloud_task_detail(
+    '20000000-0000-0000-0000-00000000000b','30000000-0000-0000-0000-00000000000b',task_b,1
+  )->'data'->'task'->>'subjectId')::uuid;
+  timer_plan_value:=timegenie.direct_cloud_today_plan(
+    '20000000-0000-0000-0000-00000000000b','30000000-0000-0000-0000-00000000000b',
+    task_b_subject_id,work_date_value,1
+  );
+  if not exists(
+    select 1 from jsonb_array_elements(timer_plan_value->'data'->'plans') plan
+    where plan->>'taskId'=task_b::text and plan->>'state'='included'
+      and nullif(plan->>'instanceTaskId','') is not null
+  ) then
+    raise exception 'direct timer transition did not add the target task to today';
   end if;
   entry_id:=(transitioned->'data'->'activeEntry'->>'id')::uuid;
   active_version:=(transitioned->'data'->'activeEntry'->>'version')::bigint;
@@ -5458,7 +5488,7 @@ declare protocol_value jsonb; context_value jsonb; upgraded jsonb; repeated json
   bootstrap_value jsonb; today_overview_value jsonb; expected_work_date text; task_list_value jsonb; task_detail_value jsonb;
   completed_page_one jsonb; completed_page_two jsonb; today_plan_value jsonb; tomorrow_plan_value jsonb;
   today_plan_repeat jsonb; tomorrow_plan_repeat jsonb; time_state_value jsonb; history_one jsonb; history_two jsonb;
-  report_page_one jsonb; report_page_two jsonb; report_detail_value jsonb; report_templates_value jsonb; report_preview_value jsonb; future_report_preview jsonb; future_hours_preview jsonb; weekly_preview_value jsonb;
+  report_page_one jsonb; report_page_two jsonb; report_detail_value jsonb; report_templates_value jsonb; report_task_suggestions_value jsonb; report_preview_value jsonb; future_report_preview jsonb; future_hours_preview jsonb; weekly_preview_value jsonb;
   report_created jsonb; report_create_retry jsonb; report_initial_regenerated jsonb; report_scope_updated jsonb; report_saved jsonb; report_save_retry jsonb;
   report_regenerated jsonb; report_deleted jsonb; report_delete_retry jsonb; report_mutation_detail jsonb;
   report_mutation_id uuid; report_snapshot_count integer; report_operation_probe jsonb;
@@ -6061,6 +6091,22 @@ begin
      or (status_probe->'task'->>'version')::bigint<>2
      or (status_probe->>'statusEventCount')::integer<>1 then
     raise exception 'direct task completion was not atomic or idempotent: % / %',status_done,status_probe;
+  end if;
+  status_probe:=timegenie.integration_direct_planning_probe(
+    '20000000-0000-0000-0000-00000000000a','63000000-0000-0000-0000-0000000000d1',
+    (now() at time zone 'Pacific/Kiritimati')::date
+  );
+  context_probe:=timegenie.integration_direct_planning_probe(
+    '20000000-0000-0000-0000-00000000000a',
+    nullif(status_probe->'plan'->>'instanceTaskId','')::uuid,
+    (now() at time zone 'Pacific/Kiritimati')::date
+  );
+  if status_probe->'plan'->>'state' is distinct from 'included'
+     or status_probe->'plan'->>'instanceTaskId' is null
+     or context_probe->'task'->>'status' is distinct from 'done'
+     or context_probe->'task'->>'dayInstanceSourceTaskId'
+       is distinct from '63000000-0000-0000-0000-0000000000d1' then
+    raise exception 'direct task completion did not add a completed today instance: % / %',status_probe,context_probe;
   end if;
   status_reopened:=timegenie.direct_cloud_task_set_status(
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a',
@@ -6744,6 +6790,17 @@ begin
      or exists(select 1 from jsonb_array_elements(report_templates_value->'data'->'templates') item where item->>'name'='已归档日报模板') then
     raise exception 'direct report template library contract is invalid: %',report_templates_value;
   end if;
+  report_task_suggestions_value:=timegenie.direct_cloud_report_task_suggestions(
+    '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a','daily',expected_work_date::date,
+    '51000000-0000-0000-0000-0000000000a1','{}'::uuid[],1
+  );
+  if not exists(select 1 from jsonb_array_elements(report_task_suggestions_value->'data'->'tasks') item
+      where item->>'taskId'='61000000-0000-0000-0000-0000000000a3' and item->>'periodStatus'='completed'
+        and (item->>'actualMinutes')::integer=50 and (item->>'defaultSelected')::boolean)
+     or exists(select 1 from jsonb_array_elements(report_task_suggestions_value->'data'->'tasks') item
+      where item->>'taskId'='61000000-0000-0000-0000-0000000000a6') then
+    raise exception 'direct report task suggestions contract is invalid: %',report_task_suggestions_value;
+  end if;
   report_preview_value:=timegenie.direct_cloud_report_preview(
     '20000000-0000-0000-0000-00000000000a','30000000-0000-0000-0000-00000000000a','daily',expected_work_date::date,
     '51000000-0000-0000-0000-0000000000a1','a1000000-0000-0000-0000-0000000000a1',1
@@ -6771,18 +6828,17 @@ begin
     '51000000-0000-0000-0000-0000000000a1','a1000000-0000-0000-0000-0000000000a2',1
   );
   if report_preview_value->'data'->>'subjectName' is distinct from '直连主体一'
-     or report_preview_value->'data'->>'markdown' not like '%叶子事项%'
-     or report_preview_value->'data'->>'markdown' not like '%叶子事项 <实际：50min>%'
+     or report_preview_value->'data'->>'markdown' not like '%1. 汇总事项%'
+     or report_preview_value->'data'->>'markdown' not like '%   - 🟢 叶子事项 <实际：50min>%'
      or report_preview_value->'data'->>'markdown' like '%归档日实例%'
      or report_preview_value->'data'->>'markdown' like '%无关进行中事项%'
      or report_preview_value->'data'->>'markdown' like '%{{%'
      or (report_preview_value->'data'->'context'->>'totalMinutes')::integer<>50
-     or future_hours_preview->'data'->>'markdown' not like '%叶子事项 <实际：1.1h>%'
-     or regexp_count(future_hours_preview->'data'->>'markdown','叶子事项 <实际：1.1h>')<>1
-     or future_report_preview->'data'->>'markdown' not like '%叶子事项 <实际：1h5min>%'
-     or regexp_count(future_report_preview->'data'->>'markdown','叶子事项 <实际：1h5min>')<>1
+     or future_hours_preview->'data'->>'markdown' not like '%   - 🔴 叶子事项 <实际：1.1h>%'
+     or regexp_count(future_hours_preview->'data'->>'markdown','   - 🔴 叶子事项 <实际：1.1h>')<>1
+     or future_report_preview->'data'->>'markdown' not like '%   - 🔴 叶子事项 <实际：1h5min>%'
+     or regexp_count(future_report_preview->'data'->>'markdown','   - 🔴 叶子事项 <实际：1h5min>')<>1
      or future_report_preview->'data'->>'markdown' like '%未来叶子事项实例%'
-     or future_report_preview->'data'->>'markdown' like '%无关进行中事项%'
      or weekly_preview_value->'data'->'context'->>'dailyCollection' not like '%已保存日报正文%'
      or weekly_preview_value->'data'->>'markdown' like '%{{日报合集}}%' then
     raise exception 'direct report preview contract is invalid: % / % / % / %',report_preview_value,future_report_preview,future_hours_preview,weekly_preview_value;

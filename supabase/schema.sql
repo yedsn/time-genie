@@ -3956,3 +3956,11 @@ notify pgrst, 'reload schema';
 -- Batch plan edits use the editor baseline, preserving later additions and
 -- supporting completed today instances while retaining version protection.
 \ir 20261029b_timegenie_plan_batch_baseline_scope.sql
+
+-- Starting or switching to an active source task also materializes it in the
+-- current work day's Today plan.
+\ir 20261031_timegenie_timer_adds_today_plan.sql
+
+-- Daily reports only include work completed or timed in the report period,
+-- with period-specific completion and activity status.
+\ir 20261031b_timegenie_daily_report_execution_scope.sql
