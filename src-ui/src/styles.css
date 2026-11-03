@@ -2338,6 +2338,25 @@ pre {
 .reminder-inline-controls .hover-row-action { opacity: 0; pointer-events: none; transition: opacity 120ms ease; }
 .reminder-row:hover .reminder-inline-controls .hover-row-action,
 .reminder-row.selected .reminder-inline-controls .hover-row-action { opacity: 1; pointer-events: auto; }
+.pending-reminder-row .reminder-inline-controls { display: grid; grid-template-columns: 111px 111px; }
+.task-position-controls, .task-secondary-controls { display: grid; grid-template-columns: repeat(4, 24px); align-items: center; gap: 5px; }
+.task-position-controls { opacity: 0; pointer-events: none; transition: opacity 120ms ease; }
+.pending-reminder-row:hover .task-position-controls,
+.pending-reminder-row:focus-within .task-position-controls { opacity: 1; pointer-events: auto; }
+.pending-reminder-row:focus-within .reminder-inline-controls .hover-row-action { opacity: 1; pointer-events: auto; }
+.task-secondary-controls .task-timer-action { grid-column: 1; grid-row: 1; }
+.task-secondary-controls .task-copy-action { grid-column: 2; grid-row: 1; }
+.task-secondary-controls .add-today-row-action, .task-secondary-controls .remove-today-row-action { grid-column: 3; grid-row: 1; }
+.task-secondary-controls .task-delete-action { grid-column: 4; grid-row: 1; }
+.reminder-inline-controls .task-move-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (max-width: 760px) {
+  .pending-reminder-row, .pending-reminder-row.child { grid-template-columns: 22px 28px minmax(0, 1fr); }
+  .pending-reminder-row .reminder-inline-controls { grid-column: 1 / -1; justify-self: end; }
+}
+@media (hover: none) {
+  .pending-reminder-row .task-position-controls { opacity: 1; pointer-events: auto; }
+}
+@media (prefers-reduced-motion: reduce) { .task-position-controls { transition: none; } }
 .recurrence-picker,
 .note-picker {
   display: inline-flex;

@@ -9,6 +9,25 @@ export type PlanTaskMoveIntent = {
   nextSiblingId?: string;
 };
 
+export function planTaskStepMoveIntent(
+  rows: readonly PlanTaskTreeItem[],
+  taskId: string,
+  direction: -1 | 1,
+): PlanTaskMoveIntent | undefined {
+  const moving = rows.find((task) => task.id === taskId);
+  if (!moving) return undefined;
+  const parentId = moving.parentId || undefined;
+  const siblings = rows.filter((task) => (task.parentId || undefined) === parentId);
+  const targetIndex = siblings.findIndex((task) => task.id === taskId) + direction;
+  if (targetIndex < 0 || targetIndex >= siblings.length) return undefined;
+  const remaining = siblings.filter((task) => task.id !== taskId);
+  return {
+    parentId,
+    previousSiblingId: remaining[targetIndex - 1]?.id,
+    nextSiblingId: remaining[targetIndex]?.id,
+  };
+}
+
 export function orderedPlanTaskTree<T extends PlanTaskTreeItem>(tasks: readonly T[]): T[] {
   const taskIds = new Set(tasks.map((task) => task.id));
   const children = new Map<string, T[]>();

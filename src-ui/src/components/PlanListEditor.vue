@@ -3,10 +3,10 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { ElMessage, ElMessageBox } from "element-plus";
 import { MdEditor } from "md-editor-v3";
 import "md-editor-v3/lib/style.css";
-import { CalendarDays, CheckCircle2, Circle, Clock3, Copy, CornerDownRight, DatabaseZap, FileInput, FilePenLine, GripVertical, IndentDecrease, IndentIncrease, ListMinus, ListPlus, MessageSquareText, Minus, Play, Plus, Radio, Repeat2, TimerReset, Trash2 } from "lucide-vue-next";
+import { ArrowDown, ArrowUp, CalendarDays, CheckCircle2, Circle, Clock3, Copy, CornerDownRight, DatabaseZap, FileInput, FilePenLine, GripVertical, IndentDecrease, IndentIncrease, ListMinus, ListPlus, MessageSquareText, Minus, Play, Plus, Radio, Repeat2, TimerReset, Trash2 } from "lucide-vue-next";
 import type { Task } from "../store";
 import { isActivePlanTask } from "../services/completedTaskHistoryCore";
-import { contextMenuPosition, hierarchicalTaskSelectionRows, orderedPlanTaskTree, orderedTaskSelectionWithAncestors, taskSubtreeIds, todayEstimateDraft, toggleTaskSelectionGroup } from "../services/planTaskInteractionCore";
+import { contextMenuPosition, hierarchicalTaskSelectionRows, orderedPlanTaskTree, orderedTaskSelectionWithAncestors, planTaskStepMoveIntent, taskSubtreeIds, todayEstimateDraft, toggleTaskSelectionGroup } from "../services/planTaskInteractionCore";
 import { createTaskTreeSortable } from "../services/taskTreeSortable";
 import type { ActualAdjustmentBatchRequest, ActualAdjustmentBatchResult, ActualAdjustmentSnapshotRecord, ActualAdjustmentSnapshotTaskRecord } from "../services/tauri";
 import { adjustQuickEstimateMinutes, parseQuickEstimateMinutes } from "../services/quickPlanEstimateCore";
@@ -100,6 +100,7 @@ const editingTodayEstimateId = ref("");
 const todayEstimateDraftValue = ref<number>();
 const levelChangedId = ref("");
 const isSorting = ref(false);
+const isMovingTask = ref(false);
 const temporaryTaskId = ref("");
 const listRenderVersion = ref(0);
 const recurrenceDialogOpen = ref(false);
@@ -231,6 +232,22 @@ const pendingRows = computed(() => mode.value === "today"
   : flatRows.value.filter((row) => isActivePlanTask({ status: row.task.status, recurring: Boolean(row.task.recurrence) })));
 const todayLoading = computed(() => mode.value === "today" && Boolean(props.loading));
 const visiblePendingRows = computed(() => todayLoading.value ? [] : pendingRows.value);
+const taskMoveAvailability = computed(() => {
+  const groups = new Map<string, Task[]>();
+  for (const { task } of visiblePendingRows.value) {
+    const parentId = task.parentId || "";
+    const siblings = groups.get(parentId) ?? [];
+    siblings.push(task);
+    groups.set(parentId, siblings);
+  }
+  const availability = new Map<string, { up: boolean; down: boolean }>();
+  for (const siblings of groups.values()) {
+    siblings.forEach((task, index) => {
+      availability.set(task.id, { up: index > 0, down: index < siblings.length - 1 });
+    });
+  }
+  return availability;
+});
 const todayPlannedIds = computed(() => new Set(scopedDisplayTasks.value
   .filter((task) => task.todayMember && task.dayInstanceSourceTaskId)
   .map((task) => task.dayInstanceSourceTaskId!)));
@@ -1154,6 +1171,7 @@ const treeSortable = createTaskTreeSortable({
   rowSelector: ".pending-reminder-row",
   handleSelector: ".drag-handle",
   taskIdAttribute: "data-task-id",
+  disabled: () => isMovingTask.value,
   subtreeIds: getSubtreeIds,
   parentId: (taskId) => editableTasks.value.find((task) => task.id === taskId)?.parentId,
   onStart() {
@@ -1192,6 +1210,29 @@ const todayImportSortable = createTaskTreeSortable({
 
 function mountSortable() {
   treeSortable.mount();
+}
+
+function canMoveTask(task: Task, direction: -1 | 1) {
+  return task.version > 0 && !isSorting.value && !isMovingTask.value
+    && Boolean(taskMoveAvailability.value.get(task.id)?.[direction === -1 ? "up" : "down"]);
+}
+
+async function moveTaskByStep(task: Task, direction: -1 | 1) {
+  if (!canMoveTask(task, direction)) return;
+  const intent = planTaskStepMoveIntent(visiblePendingRows.value.map((row) => row.task), task.id, direction);
+  if (!intent) return;
+  closeContextMenu();
+  isMovingTask.value = true;
+  treeSortable.destroy();
+  try {
+    await props.moveTask(task.id, intent.parentId, intent.previousSiblingId, intent.nextSiblingId);
+  } catch (error) {
+    ElMessage.error(typeof error === "string" ? error : error instanceof Error ? error.message : "事项移动失败");
+  } finally {
+    isMovingTask.value = false;
+    await nextTick();
+    mountSortable();
+  }
 }
 
 async function openInlineActualAdjustment(task: Task, surface: "list" | "today-import") {
@@ -1483,22 +1524,28 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <div class="reminder-inline-controls">
-            <button
-              v-if="isTodayMember(row.task) && row.task.status !== 'done' && row.task.selectable"
-              class="icon-button subtle hover-row-action task-timer-action"
-              :class="{ active: runningTaskId === row.task.id }"
-              :title="runningTaskId === row.task.id ? '当前事项正在计时' : runningTaskId ? '结束当前计时并切换到此事项' : '开始计时'"
-              @click.stop="emit('startTimer', row.task.id)"
-            >
-              <Radio v-if="runningTaskId === row.task.id" :size="14" />
-              <Play v-else :size="14" fill="currentColor" />
-            </button>
-            <button class="icon-button subtle hover-row-action" :title="canOutdent(row.task) ? '减少缩进（Shift+Tab）' : '当前已经是一级'" :disabled="!canOutdent(row.task)" @click.stop="changeIndent(row.task, 'outdent')"><IndentDecrease :size="14" /></button>
-            <button class="icon-button subtle hover-row-action" :title="canIndent(row.task) ? '增加缩进（Tab）' : '前面没有可作为上级的同级事项'" :disabled="!canIndent(row.task)" @click.stop="changeIndent(row.task, 'indent')"><IndentIncrease :size="14" /></button>
-            <button class="icon-button subtle hover-row-action" :title="getSubtreeIds(row.task.id).size > 1 ? `复制整组（共 ${getSubtreeIds(row.task.id).size} 项）` : '复制事项'" @click.stop="duplicateTask(row.task)"><Copy :size="14" /></button>
-            <button v-if="mode === 'active' && row.task.status === 'open' && row.task.selectable && !hasChildren(row.task.id) && !knownTodayMemberIds.has(row.task.id)" class="icon-button subtle hover-row-action add-today-row-action" title="加入今日" aria-label="加入今日" @click.stop="emit('addTodayTasks', [row.task.id])"><ListPlus :size="14" /></button>
-            <button v-if="mode === 'today' && isTodayMember(row.task)" class="icon-button subtle hover-row-action" title="移出今日" @click.stop="emit('removeToday', row.task.id)"><ListMinus :size="14" /></button>
-            <button class="icon-button subtle hover-row-action" title="删除" @click.stop="confirmDelete(row.task)"><Trash2 :size="14" /></button>
+            <div class="task-position-controls" role="group" aria-label="调整事项位置">
+              <button class="icon-button subtle task-move-action" type="button" title="上移（同级事项，子项随整组移动）" aria-label="上移" :disabled="!canMoveTask(row.task, -1)" @click.stop="moveTaskByStep(row.task, -1)"><ArrowUp :size="14" /></button>
+              <button class="icon-button subtle task-move-action" type="button" title="下移（同级事项，子项随整组移动）" aria-label="下移" :disabled="!canMoveTask(row.task, 1)" @click.stop="moveTaskByStep(row.task, 1)"><ArrowDown :size="14" /></button>
+              <button class="icon-button subtle task-move-action" type="button" aria-label="减少缩进" :title="canOutdent(row.task) ? '减少缩进（Shift+Tab）' : '当前已经是一级'" :disabled="!canOutdent(row.task)" @click.stop="changeIndent(row.task, 'outdent')"><IndentDecrease :size="14" /></button>
+              <button class="icon-button subtle task-move-action" type="button" aria-label="增加缩进" :title="canIndent(row.task) ? '增加缩进（Tab）' : '前面没有可作为上级的同级事项'" :disabled="!canIndent(row.task)" @click.stop="changeIndent(row.task, 'indent')"><IndentIncrease :size="14" /></button>
+            </div>
+            <div class="task-secondary-controls">
+              <button
+                v-if="isTodayMember(row.task) && row.task.status !== 'done' && row.task.selectable"
+                class="icon-button subtle hover-row-action task-timer-action"
+                :class="{ active: runningTaskId === row.task.id }"
+                :title="runningTaskId === row.task.id ? '当前事项正在计时' : runningTaskId ? '结束当前计时并切换到此事项' : '开始计时'"
+                @click.stop="emit('startTimer', row.task.id)"
+              >
+                <Radio v-if="runningTaskId === row.task.id" :size="14" />
+                <Play v-else :size="14" fill="currentColor" />
+              </button>
+              <button class="icon-button subtle hover-row-action task-copy-action" :title="getSubtreeIds(row.task.id).size > 1 ? `复制整组（共 ${getSubtreeIds(row.task.id).size} 项）` : '复制事项'" @click.stop="duplicateTask(row.task)"><Copy :size="14" /></button>
+              <button v-if="mode === 'active' && row.task.status === 'open' && row.task.selectable && !hasChildren(row.task.id) && !knownTodayMemberIds.has(row.task.id)" class="icon-button subtle hover-row-action add-today-row-action" title="加入今日" aria-label="加入今日" @click.stop="emit('addTodayTasks', [row.task.id])"><ListPlus :size="14" /></button>
+              <button v-if="mode === 'today' && isTodayMember(row.task)" class="icon-button subtle hover-row-action remove-today-row-action" title="移出今日" @click.stop="emit('removeToday', row.task.id)"><ListMinus :size="14" /></button>
+              <button class="icon-button subtle hover-row-action task-delete-action" title="删除" @click.stop="confirmDelete(row.task)"><Trash2 :size="14" /></button>
+            </div>
           </div>
         </div>
         <button

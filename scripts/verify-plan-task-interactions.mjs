@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { contextMenuPosition, effectiveTodayEstimate, hierarchicalTaskSelectionRows, orderedPlanTaskTree, orderedTaskSelectionWithAncestors, planTaskMoveIntent, taskDragTargetDepth, taskDragTargetInvalid, taskSubtreeIds, todayEstimateDraft, toggleTaskSelectionGroup } from "../.tmp-plan-task-interactions-test/planTaskInteractionCore.js";
+import { contextMenuPosition, effectiveTodayEstimate, hierarchicalTaskSelectionRows, orderedPlanTaskTree, orderedTaskSelectionWithAncestors, planTaskMoveIntent, planTaskStepMoveIntent, taskDragTargetDepth, taskDragTargetInvalid, taskSubtreeIds, todayEstimateDraft, toggleTaskSelectionGroup } from "../.tmp-plan-task-interactions-test/planTaskInteractionCore.js";
 
 const rows = [
   { id: "a" },
@@ -19,6 +19,24 @@ const orphan = { id: "orphan", parentId: "missing" };
 assert.deepEqual(orderedPlanTaskTree([orphan, rows[0], rows[1]]), [orphan, rows[0], rows[1]]);
 const grandchild = { id: "a11", parentId: "a1" };
 assert.deepEqual(orderedPlanTaskTree([grandchild, rows[1], rows[0]]).map((row) => row.id), ["a", "a1", "a11"]);
+assert.deepEqual(planTaskStepMoveIntent(rows, "a", 1), { parentId: undefined, previousSiblingId: "b", nextSiblingId: undefined });
+assert.deepEqual(planTaskStepMoveIntent(rows, "b", -1), { parentId: undefined, previousSiblingId: undefined, nextSiblingId: "a" });
+assert.deepEqual(planTaskStepMoveIntent(rows, "a1", 1), { parentId: "a", previousSiblingId: "a2", nextSiblingId: undefined });
+assert.deepEqual(planTaskStepMoveIntent(rows, "a2", -1), { parentId: "a", previousSiblingId: undefined, nextSiblingId: "a1" });
+for (const [taskId, direction] of [["a", -1], ["b", 1], ["a1", -1], ["a2", 1], ["b1", -1], ["b1", 1]]) {
+  assert.equal(planTaskStepMoveIntent(rows, taskId, direction), undefined);
+}
+assert.equal(planTaskStepMoveIntent(rows, "missing", 1), undefined);
+assert.equal(planTaskStepMoveIntent([], "a", -1), undefined);
+assert.equal(planTaskStepMoveIntent([rows[0]], "a", 1), undefined);
+const threeGroups = [...rows, { id: "c" }, { id: "c1", parentId: "c" }];
+const threeGroupsBefore = structuredClone(threeGroups);
+assert.deepEqual(planTaskStepMoveIntent(threeGroups, "a", 1), { parentId: undefined, previousSiblingId: "b", nextSiblingId: "c" });
+assert.deepEqual(planTaskStepMoveIntent(threeGroups, "c", -1), { parentId: undefined, previousSiblingId: "a", nextSiblingId: "b" });
+assert.deepEqual(planTaskStepMoveIntent([...rows, { id: "a3", parentId: "a" }], "a1", 1), { parentId: "a", previousSiblingId: "a2", nextSiblingId: "a3" });
+assert.deepEqual(planTaskStepMoveIntent([orphan, { id: "orphan2", parentId: "missing" }], "orphan", 1), { parentId: "missing", previousSiblingId: "orphan2", nextSiblingId: undefined });
+assert.deepEqual(planTaskStepMoveIntent([rows[0], { id: "root", parentId: "" }], "root", -1), { parentId: undefined, previousSiblingId: undefined, nextSiblingId: "a" });
+assert.deepEqual(threeGroups, threeGroupsBefore);
 assert.deepEqual(planTaskMoveIntent([rows[0], rows[2], rows[1], ...rows.slice(3)], "a2", new Set(["a2"]), 1, false), { parentId: "a", previousSiblingId: undefined, nextSiblingId: "a1" });
 assert.deepEqual(planTaskMoveIntent([rows[0], rows[1], rows[2], rows[3], rows[4]], "a1", new Set(["a1"]), 1, false), { parentId: "a", previousSiblingId: undefined, nextSiblingId: "a2" });
 assert.deepEqual(planTaskMoveIntent([rows[0], rows[2], rows[1], rows[3], rows[4]], "a2", new Set(["a2"]), 1, false), { parentId: "a", previousSiblingId: undefined, nextSiblingId: "a1" });

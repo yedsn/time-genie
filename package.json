@@ -27,6 +27,7 @@
         "test:today-plan:local-acceptance": "node scripts/verify-today-plan-local-acceptance.mjs",
         "test:execution-dialog-ui": "node scripts/verify-execution-dialog-ui.mjs",
         "test:plan-task-interactions": "tsc src-ui/src/services/planTaskInteractionCore.ts --outDir .tmp-plan-task-interactions-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-plan-task-interactions.mjs && node scripts/verify-plan-task-interactions-ui.mjs",
+        "test:task-position-controls-ui": "node scripts/verify-task-position-controls-browser.mjs",
         "test:plan-estimate-allocation": "tsc src-ui/src/services/quickPlanEstimateCore.ts --outDir .tmp-quick-plan-estimate-allocation-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-quick-plan-estimate-allocation.mjs && node scripts/verify-quick-plan-estimate-allocation-ui.mjs",
         "test:quick-plan-text-editing": "tsc src-ui/src/services/quickPlanTextCore.ts --outDir .tmp-quick-plan-text-editing-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-quick-plan-text-editing.mjs && node scripts/verify-quick-plan-text-editing-ui.mjs",
         "test:quick-actual-adjustment": "tsc src-ui/src/services/quickActualAdjustmentCore.ts --outDir .tmp-quick-actual-adjustment-test --target ES2020 --module ES2020 --moduleResolution Bundler --skipLibCheck && node scripts/verify-quick-actual-adjustment.mjs && node scripts/verify-quick-actual-adjustment-ui.mjs",
