@@ -132,6 +132,8 @@ end $$;
 \ir 20261023a_timegenie_direct_cloud_report_mutations.sql
 \ir 20261029_timegenie_report_preview_task_aggregation.sql
 \ir 20261029_timegenie_report_preview_task_aggregation.sql
+\ir 20261103_timegenie_daily_report_todo_lists.sql
+\ir 20261103_timegenie_daily_report_todo_lists.sql
 \ir 20261023b_timegenie_direct_cloud_report_template_mutations.sql
 \ir 20261023b_timegenie_direct_cloud_report_template_mutations.sql
 \ir 20261023c_timegenie_direct_cloud_shared_settings_mutations.sql
@@ -6795,8 +6797,8 @@ begin
     '51000000-0000-0000-0000-0000000000a1','{}'::uuid[],1
   );
   if not exists(select 1 from jsonb_array_elements(report_task_suggestions_value->'data'->'tasks') item
-      where item->>'taskId'='61000000-0000-0000-0000-0000000000a3' and item->>'periodStatus'='completed'
-        and (item->>'actualMinutes')::integer=50 and (item->>'defaultSelected')::boolean)
+      where item->>'taskId'='61000000-0000-0000-0000-0000000000a4' and item->>'periodStatus'='planned'
+        and (item->>'actualMinutes')::integer=0 and (item->>'defaultSelected')::boolean)
      or exists(select 1 from jsonb_array_elements(report_task_suggestions_value->'data'->'tasks') item
       where item->>'taskId'='61000000-0000-0000-0000-0000000000a6') then
     raise exception 'direct report task suggestions contract is invalid: %',report_task_suggestions_value;
@@ -6828,17 +6830,16 @@ begin
     '51000000-0000-0000-0000-0000000000a1','a1000000-0000-0000-0000-0000000000a2',1
   );
   if report_preview_value->'data'->>'subjectName' is distinct from '直连主体一'
-     or report_preview_value->'data'->>'markdown' not like '%1. 汇总事项%'
-     or report_preview_value->'data'->>'markdown' not like '%   - 🟢 叶子事项 <实际：50min>%'
-     or report_preview_value->'data'->>'markdown' like '%归档日实例%'
+     or report_preview_value->'data'->>'markdown' not like '%1. 🔴 归档日实例%'
+     or report_preview_value->'data'->>'markdown' like '%叶子事项%'
      or report_preview_value->'data'->>'markdown' like '%无关进行中事项%'
      or report_preview_value->'data'->>'markdown' like '%{{%'
-     or (report_preview_value->'data'->'context'->>'totalMinutes')::integer<>50
-     or future_hours_preview->'data'->>'markdown' not like '%   - 🔴 叶子事项 <实际：1.1h>%'
-     or regexp_count(future_hours_preview->'data'->>'markdown','   - 🔴 叶子事项 <实际：1.1h>')<>1
-     or future_report_preview->'data'->>'markdown' not like '%   - 🔴 叶子事项 <实际：1h5min>%'
-     or regexp_count(future_report_preview->'data'->>'markdown','   - 🔴 叶子事项 <实际：1h5min>')<>1
-     or future_report_preview->'data'->>'markdown' like '%未来叶子事项实例%'
+     or (report_preview_value->'data'->'context'->>'totalMinutes')::integer<>0
+     or future_hours_preview->'data'->>'markdown' not like '%1. 🔴 未来叶子事项实例 <实际：1.1h>%'
+     or regexp_count(future_hours_preview->'data'->>'markdown','未来叶子事项实例 <实际：1.1h>')<>1
+     or future_report_preview->'data'->>'markdown' not like '%1. 🔴 未来叶子事项实例 <实际：1h5min>%'
+     or regexp_count(future_report_preview->'data'->>'markdown','未来叶子事项实例 <实际：1h5min>')<>1
+     or future_report_preview->'data'->>'markdown' like '%🔴 叶子事项 <%'
      or weekly_preview_value->'data'->'context'->>'dailyCollection' not like '%已保存日报正文%'
      or weekly_preview_value->'data'->>'markdown' like '%{{日报合集}}%' then
     raise exception 'direct report preview contract is invalid: % / % / % / %',report_preview_value,future_report_preview,future_hours_preview,weekly_preview_value;
@@ -6885,7 +6886,7 @@ begin
      or nullif(report_created->'data'->'report'->>'inputRevisionHash','') is null
      or jsonb_array_length(report_created->'data'->'report'->'taskIds')<>1
      or report_created->'data'->'report'->>'markdown' is distinct from future_report_preview->'data'->>'markdown'
-     or report_created->'data'->'report'->>'markdown' not like '%叶子事项 <实际：1h5min>%'
+     or report_created->'data'->'report'->>'markdown' not like '%未来叶子事项实例 <实际：1h5min>%'
      or (report_database_probe->>'reportCount')::integer<>1
      or (report_database_probe->>'taskCount')::integer<>1
      or (report_database_probe->>'operationCount')::integer<>1 then
@@ -6897,8 +6898,8 @@ begin
     jsonb_build_object('reportId',report_mutation_id,'expectedVersion',1)
   );
   if report_initial_regenerated->'data'->'report'->>'markdown' is distinct from future_report_preview->'data'->>'markdown'
-     or regexp_count(report_initial_regenerated->'data'->'report'->>'markdown','叶子事项 <实际：1h5min>')<>1
-     or report_initial_regenerated->'data'->'report'->>'markdown' like '%未来叶子事项实例%'
+     or regexp_count(report_initial_regenerated->'data'->'report'->>'markdown','未来叶子事项实例 <实际：1h5min>')<>1
+     or report_initial_regenerated->'data'->'report'->>'markdown' like '%🔴 叶子事项 <%'
      or (report_initial_regenerated->'data'->'report'->>'generatedCount')::integer<>2
      or (report_initial_regenerated->'data'->'report'->>'version')::bigint<>2 then
     raise exception 'direct report initial regeneration changed preview aggregation: %',report_initial_regenerated;
@@ -8513,6 +8514,8 @@ reset role;
 \ir 20261024e_timegenie_direct_cloud_readonly_queries.sql
 \ir 20261029_timegenie_report_preview_task_aggregation.sql
 \ir 20261029_timegenie_report_preview_task_aggregation.sql
+\ir 20261103_timegenie_daily_report_todo_lists.sql
+\ir 20261103_timegenie_daily_report_todo_lists.sql
 
 insert into auth.users(id) values('fa000000-0000-0000-0000-000000000001')
 on conflict(id) do nothing;
@@ -8585,3 +8588,8 @@ select timegenie.direct_cloud_context(
   1
 );
 rollback;
+
+-- Earlier legacy migration replays restore the old source-required guard.
+-- Restore the deployed standalone-instance guard before current-report tests.
+\ir 20261025_timegenie_standalone_day_instance_guard.sql
+\ir daily_report_todo_lists_test.sql

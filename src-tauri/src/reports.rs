@@ -404,31 +404,71 @@ pub fn suggest_report_tasks(
 ) -> Result<Vec<ReportTaskSuggestionDto>, String> {
     let (period_start, period_end) =
         normalize_period(&request.report_type, &request.reference_date)?;
+    prepare_daily_report(
+        database,
+        &request.report_type,
+        &request.subject_id,
+        &period_start,
+    )?;
     let connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     ensure_subject(&connection, &workspace_id, &request.subject_id)?;
     let daily_estimate_date = (request.report_type == "daily").then_some(period_start.as_str());
-    let tasks = load_tasks(
+    let tasks = if request.report_type == "daily" {
+        load_daily_tasks(
+            &connection,
+            &workspace_id,
+            &request.subject_id,
+            &period_start,
+        )?
+    } else {
+        load_tasks(
+            &connection,
+            &workspace_id,
+            &request.subject_id,
+            daily_estimate_date,
+        )?
+    };
+    let actuals = report_actual_minutes(
         &connection,
         &workspace_id,
         &request.subject_id,
-        daily_estimate_date,
+        &request.report_type,
+        &period_start,
+        &period_end,
     )?;
-    let actuals = task_actual_minutes(&connection, &workspace_id, &period_start, &period_end)?;
-    let completed = completed_task_ids_for_period(
+    let completed = if request.report_type == "daily" {
+        tasks
+            .iter()
+            .filter(|task| task.status == "done")
+            .map(|task| task.id.clone())
+            .collect()
+    } else {
+        completed_task_ids_for_period(
+            &connection,
+            &workspace_id,
+            &request.subject_id,
+            &period_start,
+            &period_end,
+        )?
+    };
+    let daily_members = daily_report_member_ids(
         &connection,
         &workspace_id,
         &request.subject_id,
         &period_start,
-        &period_end,
     )?;
     let task_map: HashMap<_, _> = tasks.iter().map(|task| (task.id.clone(), task)).collect();
     let selectable: HashSet<String> = tasks
         .iter()
         .filter(|task| {
-            completed.contains(&task.id)
-                || actuals.get(&task.id).copied().unwrap_or(0) > 0
-                || request.include_task_ids.contains(&task.id)
+            if request.report_type == "daily" {
+                daily_members.contains(&task.id)
+            } else {
+                completed.contains(&task.id)
+                    || actuals.get(&task.id).copied().unwrap_or(0) > 0
+                    || request.include_task_ids.contains(&task.id)
+            }
         })
         .map(|task| task.id.clone())
         .collect();
@@ -478,7 +518,8 @@ pub fn suggest_report_tasks(
             daily_estimate_minutes: task.daily_estimate_minutes,
             sort_order: task.sort_order,
             period_status: period_status.to_string(),
-            default_selected: is_selectable && (period_completed || actual_minutes > 0),
+            default_selected: is_selectable
+                && (request.report_type == "daily" || period_completed || actual_minutes > 0),
             candidate_role: if is_selectable {
                 "selectable"
             } else {
@@ -498,6 +539,19 @@ fn auto_report_task_ids(
     period_start: &str,
     period_end: &str,
 ) -> Result<Vec<String>, String> {
+    if report_type == "daily" {
+        let members = daily_report_member_ids(connection, workspace_id, subject_id, period_start)?;
+        return Ok(tree_ordered_tasks(load_daily_tasks(
+            connection,
+            workspace_id,
+            subject_id,
+            period_start,
+        )?)
+        .into_iter()
+        .filter(|task| members.contains(&task.id))
+        .map(|task| task.id)
+        .collect());
+    }
     let tasks = load_tasks(
         connection,
         workspace_id,
@@ -707,6 +761,12 @@ fn create_report_with_cloud_operation(
     validate_operation_id(&request.client_request_id)?;
     let (period_start, period_end) =
         normalize_period(&request.report_type, &request.reference_date)?;
+    prepare_daily_report(
+        database,
+        &request.report_type,
+        &request.subject_id,
+        &period_start,
+    )?;
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     let device_id = device_id(&connection, &workspace_id)?;
@@ -738,7 +798,7 @@ fn create_report_with_cloud_operation(
             "REPORT_ALREADY_EXISTS: 当前日期或周期已有报告|{id}"
         ));
     }
-    let task_ids = if request.task_ids.is_empty() {
+    let task_ids = if request.report_type == "daily" || request.task_ids.is_empty() {
         auto_report_task_ids(
             &connection,
             &workspace_id,
@@ -803,6 +863,12 @@ fn update_report_scope_with_cloud_operation(
 ) -> Result<ReportDto, String> {
     let (period_start, period_end) =
         normalize_period(&request.report_type, &request.reference_date)?;
+    prepare_daily_report(
+        database,
+        &request.report_type,
+        &request.subject_id,
+        &period_start,
+    )?;
     let mut connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     ensure_subject(&connection, &workspace_id, &request.subject_id)?;
@@ -820,7 +886,7 @@ fn update_report_scope_with_cloud_operation(
             "REPORT_ALREADY_EXISTS: 当前日期或周期已有报告|{id}"
         ));
     }
-    let task_ids = if request.task_ids.is_empty() {
+    let task_ids = if request.report_type == "daily" || request.task_ids.is_empty() {
         auto_report_task_ids(
             &connection,
             &workspace_id,
@@ -934,10 +1000,28 @@ fn regenerate_report_with_cloud_operation(
     if current.version != request.expected_version {
         return Err("VERSION_CONFLICT: 报告已变化".to_string());
     }
+    prepare_daily_report(
+        database,
+        &current.report_type,
+        &current.subject_id,
+        &current.period_start,
+    )?;
     let now = now_millis();
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
+    let task_ids = if current.report_type == "daily" {
+        auto_report_task_ids(
+            &transaction,
+            &workspace_id,
+            &current.subject_id,
+            &current.report_type,
+            &current.period_start,
+            &current.period_end,
+        )?
+    } else {
+        current.task_ids.clone()
+    };
     let (template_id, markdown) = render_report(
         &transaction,
         &workspace_id,
@@ -946,8 +1030,23 @@ fn regenerate_report_with_cloud_operation(
         &current.subject_id,
         &current.period_start,
         &current.period_end,
-        &current.task_ids,
+        &task_ids,
     )?;
+    if current.report_type == "daily" {
+        transaction
+            .execute(
+                "DELETE FROM report_tasks WHERE report_id = ?1",
+                [&current.id],
+            )
+            .map_err(|error| error.to_string())?;
+        replace_report_tasks(
+            &transaction,
+            &workspace_id,
+            &current.id,
+            &current.subject_id,
+            &task_ids,
+        )?;
+    }
     let changed = transaction
         .execute(
             "UPDATE reports SET template_id = ?1, markdown_content = ?2, content_source = 'generated',
@@ -1437,7 +1536,18 @@ fn replace_report_tasks(
     subject_id: &str,
     task_ids: &[String],
 ) -> Result<(), String> {
-    let tasks = load_tasks(transaction, workspace_id, subject_id, None)?;
+    let (report_type, date): (String, String) = transaction
+        .query_row(
+            "SELECT report_type, period_start FROM reports WHERE id = ?1 AND workspace_id = ?2",
+            params![report_id, workspace_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    let tasks = if report_type == "daily" {
+        load_daily_tasks(transaction, workspace_id, subject_id, &date)?
+    } else {
+        load_tasks(transaction, workspace_id, subject_id, None)?
+    };
     let task_map: HashMap<_, _> = tasks.iter().map(|task| (task.id.clone(), task)).collect();
     let mut unique = HashSet::new();
     for (index, task_id) in task_ids
@@ -1487,21 +1597,44 @@ fn render_report(
         "minutes",
     )?;
     let duration_format = normalize_duration_format(&duration_format);
-    let tasks = load_tasks(
+    let tasks = if report_type == "daily" {
+        load_daily_tasks(connection, workspace_id, subject_id, period_start)?
+    } else {
+        load_tasks(
+            connection,
+            workspace_id,
+            subject_id,
+            (report_type == "daily").then_some(period_start),
+        )?
+    };
+    let actuals = report_actual_minutes(
         connection,
         workspace_id,
         subject_id,
-        (report_type == "daily").then_some(period_start),
-    )?;
-    let actuals = task_actual_minutes(connection, workspace_id, period_start, period_end)?;
-    let completed = completed_task_ids_for_period(
-        connection,
-        workspace_id,
-        subject_id,
+        report_type,
         period_start,
         period_end,
     )?;
-    let selected: HashSet<String> = task_ids.iter().cloned().collect();
+    let completed = if report_type == "daily" {
+        tasks
+            .iter()
+            .filter(|task| task.status == "done")
+            .map(|task| task.id.clone())
+            .collect()
+    } else {
+        completed_task_ids_for_period(
+            connection,
+            workspace_id,
+            subject_id,
+            period_start,
+            period_end,
+        )?
+    };
+    let selected: HashSet<String> = if report_type == "daily" {
+        daily_report_member_ids(connection, workspace_id, subject_id, period_start)?
+    } else {
+        task_ids.iter().cloned().collect()
+    };
     let total_minutes = if report_type == "weekly" || report_type == "monthly" {
         saved_daily_report_total_minutes(
             connection,
@@ -1518,15 +1651,13 @@ fn render_report(
             .sum()
     };
     let (today_items, tomorrow_plan) = if report_type == "daily" {
-        let tomorrow = (NaiveDate::parse_from_str(period_start, "%Y-%m-%d")
-            .map_err(|error| error.to_string())?
-            + Duration::days(1))
-        .format("%Y-%m-%d")
-        .to_string();
-        let tomorrow_tasks = load_tasks(connection, workspace_id, subject_id, Some(&tomorrow))?;
+        let mut tomorrow_tasks =
+            load_tasks_with_scope(connection, workspace_id, subject_id, None, true)?;
+        tomorrow_tasks.retain(|task| task.status == "open");
+        normalize_task_roots(&mut tomorrow_tasks);
         (
             render_daily_items(&tasks, &selected, &actuals, &completed, duration_format),
-            render_open_plan(&tomorrow_tasks, &tomorrow),
+            render_open_plan(&tomorrow_tasks, period_start),
         )
     } else {
         (String::new(), String::new())
@@ -1573,15 +1704,15 @@ fn render_report(
         format!(
             "- 累计用时：{}\n- 选中事项：{} 项\n- 已完成事项：{} 项\n- 工资估算：¥{salary_amount:.2}{}",
             format_report_duration(total_minutes, duration_format),
-            task_ids.len(),
-            completed_count(
+            selected.len(),
+            if report_type == "daily" { selected.intersection(&completed).count() as i64 } else { completed_count(
                 connection,
                 workspace_id,
                 &tasks,
                 &selected,
                 period_start,
                 period_end,
-            )?,
+            )? },
             reimbursement_summary
         )
     };
@@ -2175,13 +2306,14 @@ fn render_daily_items(
     let children = child_map(tasks);
     let mut lines = Vec::new();
     let roots = ordered_children(&children, None);
+    let mut root_index = 0;
     for root_id in roots {
         if subtree_included(&root_id, selected, actuals, completed, &children, &task_map) {
-            let index = lines.len() + 1;
+            root_index += 1;
             render_daily_task(
                 &root_id,
                 0,
-                Some(index),
+                Some(root_index),
                 selected,
                 actuals,
                 completed,
@@ -2247,9 +2379,6 @@ fn render_daily_task(
         return;
     }
     let actual = actuals.get(task_id).copied().unwrap_or(0);
-    if actual == 0 && !completed.contains(task_id) {
-        return;
-    }
     let icon = if completed.contains(task_id) {
         "🟢"
     } else {
@@ -2280,15 +2409,16 @@ fn render_open_plan(tasks: &[TaskRow], plan_date: &str) -> String {
     let children = child_map(tasks);
     let task_map: HashMap<_, _> = tasks.iter().map(|task| (task.id.clone(), task)).collect();
     let mut lines = Vec::new();
+    let mut root_index = 0;
     for root_id in ordered_children(&children, None) {
         if !subtree_open(&root_id, plan_date, &children, &task_map) {
             continue;
         }
-        let index = lines.len() + 1;
+        root_index += 1;
         render_open_task(
             &root_id,
             0,
-            Some(index),
+            Some(root_index),
             plan_date,
             &children,
             &task_map,
@@ -2336,11 +2466,136 @@ fn render_open_task(
     }
 }
 
+fn prepare_daily_report(
+    database: &Database,
+    report_type: &str,
+    subject_id: &str,
+    date: &str,
+) -> Result<(), String> {
+    if report_type == "daily" {
+        crate::today_plans::snapshot(
+            database,
+            crate::today_plans::TaskDayPlanSnapshotRequest {
+                subject_id: subject_id.to_string(),
+                work_date: date.to_string(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn daily_report_member_ids(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    date: &str,
+) -> Result<HashSet<String>, String> {
+    let mut statement = connection.prepare("SELECT id FROM tasks WHERE workspace_id=?1 AND subject_id=?2 AND day_instance_date=?3 AND day_instance_kind='member' AND deleted_at IS NULL").map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![workspace_id, subject_id, date], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<HashSet<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+fn normalize_task_roots(tasks: &mut [TaskRow]) {
+    let ids: HashSet<_> = tasks.iter().map(|task| task.id.clone()).collect();
+    for task in tasks {
+        if task.parent_id.as_ref().is_some_and(|id| !ids.contains(id)) {
+            task.parent_id = None;
+        }
+    }
+}
+
+fn load_daily_tasks(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    date: &str,
+) -> Result<Vec<TaskRow>, String> {
+    let mut statement = connection.prepare(
+        "SELECT t.id,t.parent_id,t.title,t.status,t.estimate_minutes,de.estimate_minutes,t.sort_order
+         FROM tasks t LEFT JOIN task_daily_estimates de ON de.workspace_id=t.workspace_id AND de.task_id=t.id AND de.work_date=?3
+         WHERE t.workspace_id=?1 AND t.subject_id=?2 AND t.day_instance_date=?3 AND t.deleted_at IS NULL
+         ORDER BY t.sort_order,t.created_at,t.id"
+    ).map_err(|error| error.to_string())?;
+    let mut tasks = statement
+        .query_map(params![workspace_id, subject_id, date], |row| {
+            Ok(TaskRow {
+                id: row.get(0)?,
+                parent_id: row.get(1)?,
+                title: row.get(2)?,
+                status: row.get(3)?,
+                estimate_minutes: row.get(4)?,
+                daily_estimate_minutes: row.get(5)?,
+                sort_order: row.get(6)?,
+                recurrence: None,
+                occurrence_status: None,
+                occurrence_origin: None,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    normalize_task_roots(&mut tasks);
+    Ok(tasks)
+}
+
+fn report_actual_minutes(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    report_type: &str,
+    start: &str,
+    end: &str,
+) -> Result<HashMap<String, i64>, String> {
+    if report_type != "daily" {
+        return task_actual_minutes(connection, workspace_id, start, end);
+    }
+    let mut statement = connection.prepare(
+        "SELECT COALESCE(instance.id,actual.task_id),SUM(actual.minutes) FROM (
+           SELECT a.task_id,a.minutes FROM time_allocations a JOIN time_entries e ON e.id=a.entry_id
+           WHERE a.workspace_id=?1 AND e.work_date=?3 AND e.deleted_at IS NULL
+           UNION ALL SELECT task_id,delta_minutes FROM actual_time_adjustments
+           WHERE workspace_id=?1 AND work_date=?3 AND deleted_at IS NULL
+         ) actual JOIN tasks t ON t.id=actual.task_id
+         LEFT JOIN tasks instance ON instance.workspace_id=t.workspace_id AND instance.subject_id=?2
+           AND instance.day_instance_source_task_id=t.id AND instance.day_instance_date=?3 AND instance.deleted_at IS NULL
+         WHERE t.workspace_id=?1 AND t.subject_id=?2
+         GROUP BY COALESCE(instance.id,actual.task_id)"
+    ).map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![workspace_id, subject_id, start], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<HashMap<_, _>, _>>()
+        .map_err(|error| error.to_string())
+}
+
 fn load_tasks(
     connection: &rusqlite::Connection,
     workspace_id: &str,
     subject_id: &str,
     daily_estimate_date: Option<&str>,
+) -> Result<Vec<TaskRow>, String> {
+    load_tasks_with_scope(
+        connection,
+        workspace_id,
+        subject_id,
+        daily_estimate_date,
+        false,
+    )
+}
+
+fn load_tasks_with_scope(
+    connection: &rusqlite::Connection,
+    workspace_id: &str,
+    subject_id: &str,
+    daily_estimate_date: Option<&str>,
+    source_only: bool,
 ) -> Result<Vec<TaskRow>, String> {
     let mut statement = connection
         .prepare(
@@ -2359,13 +2614,13 @@ fn load_tasks(
               AND instance_de.workspace_id = instance.workspace_id
               AND instance_de.work_date = ?3
              WHERE t.workspace_id = ?1 AND t.subject_id = ?2 AND t.deleted_at IS NULL
-               AND (t.day_instance_date IS NULL OR t.day_instance_source_task_id IS NULL)
+               AND (t.day_instance_date IS NULL OR (?4 = 0 AND t.day_instance_source_task_id IS NULL))
              ORDER BY t.sort_order, t.created_at",
         )
         .map_err(|error| error.to_string())?;
     let mut tasks = statement
         .query_map(
-            params![workspace_id, subject_id, daily_estimate_date],
+            params![workspace_id, subject_id, daily_estimate_date, source_only],
             |row| {
                 Ok(TaskRow {
                     id: row.get(0)?,
@@ -2477,10 +2732,7 @@ fn subtree_included(
     children: &HashMap<Option<String>, Vec<String>>,
     tasks: &HashMap<String, &TaskRow>,
 ) -> bool {
-    if tasks.contains_key(task_id)
-        && selected.contains(task_id)
-        && (completed.contains(task_id) || actuals.get(task_id).copied().unwrap_or(0) > 0)
-    {
+    if tasks.contains_key(task_id) && selected.contains(task_id) {
         return true;
     }
     ordered_children(children, Some(task_id))
@@ -2505,15 +2757,7 @@ fn subtree_open(
         .any(|child| subtree_open(child, plan_date, children, tasks))
 }
 
-fn task_effective_status(task: &TaskRow) -> &str {
-    task.occurrence_status.as_deref().unwrap_or(&task.status)
-}
-
-fn task_open_on_date(task: &TaskRow, date: &str) -> bool {
-    if let Some(rule) = task.recurrence.as_ref() {
-        return crate::recurring::rule_matches_date(rule, date).unwrap_or(false)
-            && task_effective_status(task) == "open";
-    }
+fn task_open_on_date(task: &TaskRow, _date: &str) -> bool {
     task.status == "open"
 }
 
@@ -2870,14 +3114,14 @@ const TEMPLATE_PLACEHOLDERS: &[ReportTemplatePlaceholderDto] = &[
     ReportTemplatePlaceholderDto {
         token: "{{今日事项}}",
         label: "今日事项",
-        description: "日报所选事项明细",
+        description: "待办-今日的完整事项列表，包含未执行事项",
         example: "1. 完成登录优化",
         report_types: &["daily"],
     },
     ReportTemplatePlaceholderDto {
         token: "{{明日计划}}",
         label: "明日计划",
-        description: "下一日待办事项",
+        description: "待办-进行中的完整事项列表",
         example: "1. 联调同步",
         report_types: &["daily"],
     },
@@ -3172,6 +3416,12 @@ pub fn preview_report(
 ) -> Result<String, String> {
     let (period_start, period_end) =
         normalize_period(&request.report_type, &request.reference_date)?;
+    prepare_daily_report(
+        database,
+        &request.report_type,
+        &request.subject_id,
+        &period_start,
+    )?;
     let connection = database.open()?;
     let workspace_id = workspace_id(&connection)?;
     ensure_subject(&connection, &workspace_id, &request.subject_id)?;
@@ -4305,6 +4555,134 @@ mod tests {
         (database, subject_id, task.id)
     }
 
+    #[test]
+    fn daily_report_mirrors_instance_tree_and_refreshes_members_on_regeneration() {
+        let (database, subject_id, source_id) = setup();
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        prepare_daily_report(&database, "daily", &subject_id, &date).unwrap();
+        let instance_id = report_instance_id(&database, &source_id, &date);
+        let connection = database.open().unwrap();
+        connection
+            .execute(
+                "UPDATE tasks SET title='今日独立标题',sort_order=10 WHERE id=?1",
+                [&instance_id],
+            )
+            .unwrap();
+        drop(connection);
+        let child = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                day_instance_date: Some(date.clone()),
+                parent_id: Some(instance_id.clone()),
+                title: "今日独立子项".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let standalone = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                day_instance_date: Some(date.clone()),
+                parent_id: None,
+                title: "今日未执行".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let connection = database.open().unwrap();
+        connection
+            .execute(
+                "UPDATE tasks SET sort_order=20 WHERE id=?1",
+                [&standalone.id],
+            )
+            .unwrap();
+        let workspace_id = workspace_id(&connection).unwrap();
+        assert!(load_tasks(&connection, &workspace_id, &subject_id, None)
+            .unwrap()
+            .iter()
+            .any(|task| task.id == standalone.id));
+        drop(connection);
+        let preview = preview_report(
+            &database,
+            ReportPreviewRequest {
+                report_type: "daily".into(),
+                reference_date: date.clone(),
+                subject_id: subject_id.clone(),
+                template_id: None,
+            },
+        )
+        .unwrap();
+        let report = create_report(
+            &database,
+            ReportCreateRequest {
+                report_type: "daily".into(),
+                reference_date: date.clone(),
+                subject_id: subject_id.clone(),
+                task_ids: vec![],
+                template_id: None,
+                client_request_id: Uuid::now_v7().to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(preview, report.markdown);
+        let today = preview.split("## 明日计划：").next().unwrap();
+        let plan = preview.split("## 明日计划：").nth(1).unwrap();
+        assert!(!plan.contains("今日未执行"));
+        assert!(!plan.contains("今日独立子项"));
+        assert!(
+            today.contains("1. 今日独立标题\n   - 🔴 今日独立子项"),
+            "{today}"
+        );
+        assert!(today.contains("2. 🔴 今日未执行"), "{today}");
+        assert!(!today.contains("生成日报事项"));
+        assert!(report.task_ids.contains(&child.id));
+        let added = create_task(
+            &database,
+            TaskCreateRequest {
+                subject_id: subject_id.clone(),
+                day_instance_date: Some(date.clone()),
+                parent_id: None,
+                title: "稍后加入今日".to_string(),
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET deleted_at=1 WHERE id=?1",
+                [&standalone.id],
+            )
+            .unwrap();
+        let regenerated = regenerate_report(
+            &database,
+            ReportVersionRequest {
+                report_id: report.id,
+                expected_version: report.version,
+            },
+        )
+        .unwrap();
+        assert!(regenerated.markdown.contains("稍后加入今日"));
+        assert!(!regenerated.markdown.contains("今日未执行"));
+        assert!(regenerated.task_ids.contains(&added.id));
+        assert!(!regenerated.task_ids.contains(&standalone.id));
+    }
+
     fn local_millis(value: &str) -> i64 {
         let timezone: chrono_tz::Tz = "Asia/Shanghai".parse().unwrap();
         timezone
@@ -4314,6 +4692,26 @@ mod tests {
             .single()
             .unwrap()
             .timestamp_millis()
+    }
+
+    fn add_report_today_member(database: &Database, source_id: &str, date: &str) {
+        crate::today_plans::set_day_plan_for_test(
+            database,
+            TaskDayPlanSetRequest {
+                task_id: source_id.to_string(),
+                work_date: date.to_string(),
+                state: "included".to_string(),
+                expected_version: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn report_instance_id(database: &Database, source_id: &str, date: &str) -> String {
+        database.open().unwrap().query_row(
+            "SELECT id FROM tasks WHERE day_instance_source_task_id=?1 AND day_instance_date=?2 AND deleted_at IS NULL",
+            params![source_id, date], |row| row.get(0),
+        ).unwrap()
     }
 
     fn insert_report_work_entry(
@@ -4677,7 +5075,7 @@ mod tests {
         .unwrap();
         let timed = suggestions
             .iter()
-            .find(|suggestion| suggestion.task_id == timed_task_id)
+            .find(|suggestion| suggestion.title == "生成日报事项")
             .unwrap();
         assert_eq!(timed.actual_minutes, 30);
         assert_eq!(timed.daily_estimate_minutes, Some(20));
@@ -4709,7 +5107,7 @@ mod tests {
     }
 
     #[test]
-    fn daily_report_candidates_only_include_executed_or_completed_items() {
+    fn daily_report_candidates_include_unexecuted_today_members() {
         let directory = tempdir().unwrap();
         let database =
             Database::initialize_at(directory.path().join("report-plan-members.sqlite3")).unwrap();
@@ -4796,19 +5194,19 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.title == planned.title && candidate.default_selected));
         assert!(!candidates
             .iter()
-            .any(|candidate| candidate.task_id == planned.id));
+            .any(|candidate| candidate.title == unplanned.title));
         assert!(!candidates
             .iter()
-            .any(|candidate| candidate.task_id == unplanned.id));
-        assert!(!candidates
-            .iter()
-            .any(|candidate| candidate.task_id == removed.id));
+            .any(|candidate| candidate.title == removed.title));
     }
 
     #[test]
-    fn daily_report_uses_period_activity_for_visibility_and_icons() {
+    fn daily_report_uses_today_members_for_visibility_and_icons() {
         let directory = tempdir().unwrap();
         let database =
             Database::initialize_at(directory.path().join("report-period-status.sqlite3")).unwrap();
@@ -4908,6 +5306,7 @@ mod tests {
         )
         .unwrap();
 
+        add_report_today_member(&database, &timed.id, &today);
         let candidates = suggest_report_tasks(
             &database,
             ReportTaskSuggestionRequest {
@@ -4922,7 +5321,7 @@ mod tests {
         assert_eq!(
             candidates
                 .iter()
-                .find(|item| item.task_id == timed.id)
+                .find(|item| item.title == timed.title)
                 .unwrap()
                 .period_status,
             "active"
@@ -4930,7 +5329,7 @@ mod tests {
         assert_eq!(
             candidates
                 .iter()
-                .find(|item| item.task_id == completed.id)
+                .find(|item| item.title == completed.title)
                 .unwrap()
                 .period_status,
             "completed"
@@ -4955,7 +5354,7 @@ mod tests {
     }
 
     #[test]
-    fn create_report_without_task_selection_uses_period_records() {
+    fn create_report_without_task_selection_uses_today_members() {
         let (database, subject_id, task_id) = setup();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let report = create_report(
@@ -4970,7 +5369,14 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(report.task_ids, vec![task_id.clone()]);
+        assert_eq!(
+            report.task_ids,
+            vec![report_instance_id(
+                &database,
+                &task_id,
+                &chrono::Local::now().format("%Y-%m-%d").to_string()
+            )]
+        );
         assert!(report.markdown.contains("🟢 生成日报事项"));
 
         let empty_day = (chrono::Local::now() - chrono::Duration::days(3))
@@ -5114,7 +5520,7 @@ mod tests {
         .unwrap();
         let candidate = candidates
             .iter()
-            .find(|item| item.task_id == task.id)
+            .find(|item| item.task_id == instance.id)
             .expect("重复事项应进入日报候选");
         assert_eq!(candidate.period_status, "completed");
         assert!(candidate.default_selected);
@@ -5210,7 +5616,7 @@ mod tests {
         .unwrap();
         let candidate = candidates
             .iter()
-            .find(|item| item.task_id == task.id)
+            .find(|item| item.task_id == instance.id)
             .expect("今日计划内事项应进入日报候选");
         assert_eq!(candidate.period_status, "completed");
         assert!(candidate.default_selected);
@@ -5308,7 +5714,7 @@ mod tests {
     }
 
     #[test]
-    fn report_candidates_include_period_completion_context_and_use_workspace_timezone() {
+    fn report_candidates_use_today_instance_completion_and_parent_context() {
         let directory = tempdir().unwrap();
         let database =
             Database::initialize_at(directory.path().join("report-candidates.sqlite3")).unwrap();
@@ -5404,6 +5810,17 @@ mod tests {
             .unwrap();
         drop(connection);
 
+        add_report_today_member(&database, &completed.id, "2026-10-15");
+        let completed_instance = report_instance_id(&database, &completed.id, "2026-10-15");
+        let parent_instance = report_instance_id(&database, &parent.id, "2026-10-15");
+        database
+            .open()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status='done',completed_at=1 WHERE id=?1",
+                [&completed_instance],
+            )
+            .unwrap();
         let candidates = suggest_report_tasks(
             &database,
             ReportTaskSuggestionRequest {
@@ -5417,18 +5834,18 @@ mod tests {
         assert!(!candidates.iter().any(|item| item.task_id == historical.id));
         let parent_candidate = candidates
             .iter()
-            .find(|item| item.task_id == parent.id)
+            .find(|item| item.task_id == parent_instance)
             .unwrap();
         assert_eq!(parent_candidate.candidate_role, "context");
         assert_eq!(parent_candidate.period_status, "context");
         assert!(!parent_candidate.default_selected);
         let completed_candidate = candidates
             .iter()
-            .find(|item| item.task_id == completed.id)
+            .find(|item| item.task_id == completed_instance)
             .unwrap();
         assert_eq!(
             completed_candidate.parent_id.as_deref(),
-            Some(parent.id.as_str())
+            Some(parent_instance.as_str())
         );
         assert_eq!(completed_candidate.period_status, "completed");
         assert!(completed_candidate.default_selected);
@@ -5517,7 +5934,7 @@ mod tests {
         let connection = database.open().unwrap();
         connection
             .execute(
-                "UPDATE tasks SET estimate_minutes = 120 WHERE id = ?1",
+                "UPDATE tasks SET estimate_minutes = 120 WHERE id = ?1 OR day_instance_source_task_id = ?1",
                 [&task_id],
             )
             .unwrap();
@@ -5622,6 +6039,7 @@ mod tests {
             },
         )
         .unwrap();
+        add_report_today_member(&database, &task.id, "2026-09-29");
         let report = create_report(
             &database,
             ReportCreateRequest {
@@ -5671,6 +6089,7 @@ mod tests {
             "INSERT INTO actual_time_adjustments(id,workspace_id,subject_id,task_id,work_date,delta_minutes,baseline_minutes,target_minutes,batch_id,created_at,updated_at,version) VALUES(?1,?2,?3,?4,'2026-09-29',22,0,22,?5,1,1,1)",
             params![Uuid::now_v7().to_string(), workspace_id, subject_id.clone(), task.id.clone(), Uuid::now_v7().to_string()],
         ).unwrap();
+        add_report_today_member(&database, &task.id, "2026-09-29");
         let report = create_report(
             &database,
             ReportCreateRequest {
@@ -5767,9 +6186,12 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(preview.matches("聚合日报事项 <实际：1h5min>").count(), 1);
-        assert!(preview.contains("聚合日报事项 <实际：1h5min>"));
-        assert!(!preview.contains("聚合日报事项实例"));
+        assert_eq!(
+            preview.matches("聚合日报事项实例 <实际：1h5min>").count(),
+            1
+        );
+        assert!(preview.contains("聚合日报事项实例 <实际：1h5min>"));
+        assert!(!preview.contains("🔴 聚合日报事项 <"));
         let report = create_report(
             &database,
             ReportCreateRequest {
@@ -5783,7 +6205,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.markdown, preview);
-        assert_eq!(report.task_ids, vec![task.id]);
+        assert_eq!(report.task_ids, vec![instance_id]);
     }
 
     #[test]
@@ -5899,7 +6321,7 @@ mod tests {
     }
 
     #[test]
-    fn recurring_workday_item_is_not_in_weekend_tomorrow_plan() {
+    fn recurring_workday_item_stays_in_in_progress_plan_on_weekends() {
         let directory = tempdir().unwrap();
         let database =
             Database::initialize_at(directory.path().join("recurring-weekend.sqlite3")).unwrap();
@@ -5954,7 +6376,7 @@ mod tests {
         )
         .unwrap();
         let tomorrow_section = markdown.split("## 明日计划：").nth(1).unwrap_or_default();
-        assert!(!tomorrow_section.contains("仅工作日事项"));
+        assert!(tomorrow_section.contains("仅工作日事项"));
     }
 
     #[test]

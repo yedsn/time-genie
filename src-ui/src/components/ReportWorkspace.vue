@@ -129,7 +129,7 @@ const draftSummary = computed(() => {
 const draftScopeSummary = computed(() => {
   const subjectName = store.subjects.find((subject) => subject.id === draftSubjectId.value)?.name ?? "";
   if (dialogMode.value === "create") {
-    return `${subjectName} · ${draftType.value === "daily" ? "自动汇总当天记录" : "自动汇总本期记录"}`;
+    return `${subjectName} · ${draftType.value === "daily" ? "今日事项取待办-今日，明日计划取待办-进行中" : "自动汇总本期记录"}`;
   }
   return `${subjectName} · ${draftSummary.value.total} 项 · ${formatHours(draftSummary.value.minutes)}`;
 });
@@ -564,7 +564,7 @@ async function saveReportDialog() {
     ElMessage.warning("请选择主体");
     return;
   }
-  if (dialogMode.value === "scope" && !draftTaskIds.value.length) {
+  if (dialogMode.value === "scope" && draftType.value !== "daily" && !draftTaskIds.value.length) {
     ElMessage.warning("请至少导入一个事项");
     return;
   }
@@ -575,7 +575,7 @@ async function saveReportDialog() {
       if (existingDraftReport.value) {
         try {
           await ElMessageBox.confirm(
-            "当前主体和周期已有报告。继续后会按本期记录重新生成，并覆盖原 Markdown 内容。",
+            draftType.value === "daily" ? "当前主体和日期已有日报。继续后会按待办-今日和待办-进行中重新生成，并覆盖原 Markdown 内容。" : "当前主体和周期已有报告。继续后会按本期记录重新生成，并覆盖原 Markdown 内容。",
             `覆盖原${reportTypeLabel(draftType.value)}`,
             {
               type: "warning",
@@ -1188,8 +1188,8 @@ function existingReportId(error: unknown) {
           </button>
         </section>
 
-        <section v-if="dialogMode === 'scope'" class="report-create-section report-import-section">
-          <header><span>2</span><div><strong>导入事项</strong><small>{{ draftType === 'daily' ? '当天计划事项' : '报告周期事项' }} · 已选择 {{ draftSummary.total }} 项，其中 {{ draftSummary.completed }} 项已完成</small></div></header>
+        <section v-if="dialogMode === 'scope' && draftType !== 'daily'" class="report-create-section report-import-section">
+          <header><span>2</span><div><strong>导入事项</strong><small>报告周期事项 · 已选择 {{ draftSummary.total }} 项，其中 {{ draftSummary.completed }} 项已完成</small></div></header>
           <div class="report-create-section-body">
             <div class="report-import-tools">
               <label><Search :size="13" /><input v-model="draftTaskQuery" type="search" placeholder="筛选事项" /></label>
@@ -1202,17 +1202,18 @@ function existingReportId(error: unknown) {
             <el-checkbox-group v-model="draftTaskIds" class="report-task-options">
               <el-checkbox v-for="task in visibleDraftTasks" :key="task.taskId" :value="task.taskId" :disabled="task.candidateRole === 'context'" :style="{ paddingLeft: `${taskDepth(task) * 18 + 10}px` }">
                 <span class="report-task-option-title"><i :class="task.periodStatus === 'completed' ? 'done' : task.periodStatus === 'active' ? 'active' : 'planned'"></i>{{ task.title }}</span>
-                <span class="report-task-option-meta"><template v-if="draftType === 'daily' && task.dailyEstimateMinutes">今日预计 {{ formatHours(task.dailyEstimateMinutes) }} · </template><template v-if="task.estimateMinutes">整体预计 {{ formatHours(task.estimateMinutes) }} · </template><template v-if="task.actualMinutes">实际 {{ formatHours(task.actualMinutes) }} · </template>{{ task.periodStatus === 'completed' ? '本期已完成' : task.periodStatus === 'active' ? '有执行记录' : task.periodStatus === 'context' ? '层级上下文' : task.periodStatus === 'included' ? '手动加入' : '未执行' }}</span>
+                <span class="report-task-option-meta"><template v-if="task.estimateMinutes">整体预计 {{ formatHours(task.estimateMinutes) }} · </template><template v-if="task.actualMinutes">实际 {{ formatHours(task.actualMinutes) }} · </template>{{ task.periodStatus === 'completed' ? '本期已完成' : task.periodStatus === 'active' ? '有执行记录' : task.periodStatus === 'context' ? '层级上下文' : task.periodStatus === 'included' ? '手动加入' : '未执行' }}</span>
               </el-checkbox>
-              <div v-if="!visibleDraftTasks.length" class="report-task-empty">{{ draftTaskQuery ? '没有匹配的事项' : draftType === 'daily' ? '当天还没有执行或完成的事项' : '本周期还没有相关事项' }}</div>
+              <div v-if="!visibleDraftTasks.length" class="report-task-empty">{{ draftTaskQuery ? '没有匹配的事项' : '本周期还没有相关事项' }}</div>
             </el-checkbox-group>
           </div>
         </section>
 
         <section v-else class="report-create-section report-preview-section">
-          <header><span>2</span><div><strong>报告预览</strong><small>{{ draftPreviewLoading ? '正在生成预览…' : '按当前日期、主体和模板自动汇总，可直接生成' }}</small></div></header>
+          <header><span>2</span><div><strong>{{ dialogMode === 'scope' ? '事项来源' : '报告预览' }}</strong><small>{{ draftType === 'daily' ? '今日事项取待办-今日完整列表，明日计划取待办-进行中完整列表；重新生成时刷新' : draftPreviewLoading ? '正在生成预览…' : '按当前日期、主体和模板自动汇总，可直接生成' }}</small></div></header>
           <div class="report-create-section-body report-preview-body">
-            <div v-if="draftPreviewError" class="report-preview-empty">{{ draftPreviewError }}</div>
+            <div v-if="dialogMode === 'scope'" class="report-preview-empty">日报按待办列表自动确定事项范围，无需手动勾选。保存范围后，点击重新生成更新正文。</div>
+            <div v-else-if="draftPreviewError" class="report-preview-empty">{{ draftPreviewError }}</div>
             <div v-else-if="draftPreviewLoading && !draftReportPreview" class="report-preview-empty">正在生成预览…</div>
             <div v-else-if="!draftReportPreview" class="report-preview-empty">这个周期还没有可汇总的记录</div>
             <MdPreview v-else :model-value="draftReportPreview" editor-id="report-draft-preview" language="zh-CN" theme="dark" preview-theme="github" code-theme="github" />

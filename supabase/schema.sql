@@ -3964,3 +3964,6 @@ notify pgrst, 'reload schema';
 -- Daily reports only include work completed or timed in the report period,
 -- with period-specific completion and activity status.
 \ir 20261031b_timegenie_daily_report_execution_scope.sql
+
+-- Daily sections mirror Today instances and in-progress source tasks.
+\ir 20261103_timegenie_daily_report_todo_lists.sql

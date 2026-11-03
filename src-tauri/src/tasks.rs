@@ -4488,8 +4488,11 @@ mod tests {
         .unwrap();
         let suggestion = suggestions
             .iter()
-            .find(|suggestion| suggestion.task_id == task.id)
-            .expect("完成事项应进入当天日报候选");
+            .find(|suggestion| suggestion.task_id == instance_id)
+            .expect("完成事项的今日实例应进入当天日报候选");
+        assert!(!suggestions
+            .iter()
+            .any(|suggestion| suggestion.task_id == task.id));
         assert_eq!(suggestion.period_status, "completed");
         assert!(suggestion.default_selected);
     }
