@@ -176,6 +176,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "remove_legacy_sync_runtime",
         sql: include_str!("../migrations/0032_remove_legacy_sync_runtime.sql"),
     },
+    Migration {
+        version: 33,
+        name: "task_priority",
+        sql: include_str!("../migrations/0033_task_priority.sql"),
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -710,6 +715,58 @@ mod tests {
             .unwrap();
         assert_eq!(migration_count, latest_migration_version());
         assert_eq!(workspace_count, 1);
+    }
+
+    #[test]
+    fn task_priority_migration_backfills_without_changing_tree_order() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("task-priority-upgrade.sqlite3");
+        let database = Database { path: path.clone() };
+        let mut connection = database.open().unwrap();
+        apply_migrations_through(&mut connection, Some(32)).unwrap();
+        ensure_initial_data(&mut connection).unwrap();
+        let before = connection
+            .prepare("SELECT id,parent_id,sort_order FROM tasks ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        apply_migrations(&mut connection).unwrap();
+        let after = connection
+            .prepare("SELECT id,parent_id,sort_order FROM tasks ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let invalid_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE priority <> 'normal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(invalid_count, 0);
+        assert!(connection
+            .execute(
+                "UPDATE tasks SET priority='invalid' WHERE id=(SELECT id FROM tasks LIMIT 1)",
+                []
+            )
+            .is_err());
     }
 
     #[test]

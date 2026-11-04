@@ -1439,7 +1439,7 @@ async function handleTaskRecurrence(
   }
 }
 
-async function handleTaskSave(taskId: string, field?: "title" | "plannedDate" | "estimate") {
+async function handleTaskSave(taskId: string, field?: "title" | "plannedDate" | "estimate" | "priority") {
   if (rejectCloudReadonlyMutation()) return false;
   try {
     if (store.planTaskTab === "today") {

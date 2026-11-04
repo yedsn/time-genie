@@ -622,7 +622,7 @@ fn load_confirmed_tasks(
     let mut statement = connection
         .prepare(
             "SELECT t.id, t.subject_id, t.parent_id, t.title, t.status, t.planned_date,
-                    t.estimate_minutes, t.note, t.project_name, t.solution_name, t.sort_order, t.completed_at, t.version
+                    t.estimate_minutes, t.note, t.project_name, t.solution_name, t.sort_order, t.completed_at, t.version, t.priority
              FROM plan_import_items i JOIN tasks t ON t.id = i.confirmed_task_id
              WHERE i.batch_id = ?1 ORDER BY i.source_line_no",
         )
@@ -644,6 +644,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskDto> {
         day_instance_kind: None,
         day_instance_source_task_id: None,
         title: row.get(3)?,
+        priority: row.get(13)?,
         status: row.get(4)?,
         planned_date: row.get(5)?,
         estimate_minutes: row.get(6)?,
@@ -676,7 +677,7 @@ fn load_task(connection: &rusqlite::Connection, id: &str) -> Result<TaskDto, Str
     connection
         .query_row(
             "SELECT id, subject_id, parent_id, title, status, planned_date,
-                    estimate_minutes, note, project_name, solution_name, sort_order, completed_at, version
+                    estimate_minutes, note, project_name, solution_name, sort_order, completed_at, version, priority
              FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
             [id],
             task_from_row,

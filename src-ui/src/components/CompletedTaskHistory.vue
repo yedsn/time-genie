@@ -3,6 +3,7 @@ import { computed } from "vue";
 import { CheckCircle2, ChevronLeft, ChevronRight, Clock3, CornerDownRight, LoaderCircle, RefreshCw, RotateCcw, Trash2 } from "lucide-vue-next";
 import { ElMessageBox } from "element-plus";
 import type { Task } from "../store";
+import { taskPriorityMeta } from "../services/taskPriority";
 
 const props = defineProps<{
   tasks: Task[];
@@ -100,14 +101,15 @@ async function confirmDelete(task: Task) {
       <span>普通事项完成后会出现在这里，重复事项的每日轮次不会进入历史。</span>
     </div>
     <div v-else class="completed-history-list">
-      <article v-for="task in tasks" :key="task.id" class="completed-history-row">
+      <article v-for="task in tasks" :key="task.id" class="completed-history-row" :class="`task-priority-${task.priority}`">
         <button class="completed-history-reopen" type="button" title="恢复为进行中" @click="emit('reopen', task)">
           <RotateCcw :size="16" />
         </button>
         <div class="completed-history-main">
-          <input v-model="task.title" aria-label="事项名称" @blur="finishTitleEdit($event, task)" @keydown.enter.prevent="blurTitle" />
+          <div class="completed-history-title"><input v-model="task.title" aria-label="事项名称" @blur="finishTitleEdit($event, task)" @keydown.enter.prevent="blurTitle" /></div>
           <div class="completed-history-meta">
             <span :title="parentPath(task)"><CornerDownRight :size="12" />{{ parentPath(task) }}</span>
+            <span class="completed-history-priority" :title="`优先级：${taskPriorityMeta(task.priority).label}`" :aria-label="`优先级：${taskPriorityMeta(task.priority).label}`">{{ taskPriorityMeta(task.priority).label }}</span>
             <span><CheckCircle2 :size="12" />{{ formatCompletedAt(task.completedAt) }}</span>
             <span><Clock3 :size="12" />累计 {{ formatMinutes(task.actual) }}</span>
           </div>

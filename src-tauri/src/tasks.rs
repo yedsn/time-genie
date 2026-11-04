@@ -18,6 +18,7 @@ pub struct TaskDto {
     pub day_instance_kind: Option<String>,
     pub day_instance_source_task_id: Option<String>,
     pub title: String,
+    pub priority: String,
     pub status: String,
     pub planned_date: Option<String>,
     pub estimate_minutes: Option<i64>,
@@ -212,6 +213,7 @@ pub struct TaskUpdateRequest {
     pub id: String,
     pub expected_version: i64,
     pub title: Option<String>,
+    pub priority: Option<String>,
     #[serde(default, deserialize_with = "deserialize_double_option")]
     pub parent_id: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_double_option")]
@@ -233,6 +235,7 @@ pub struct TodayRecurringInstanceUpdateRequest {
     pub instance_expected_version: i64,
     pub source_expected_version: i64,
     pub title: Option<String>,
+    pub priority: Option<String>,
     #[serde(default, deserialize_with = "deserialize_double_option")]
     pub planned_date: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_double_option")]
@@ -462,7 +465,7 @@ pub fn list_tasks(database: &Database, request: TaskListRequest) -> Result<TaskL
         .prepare(
             "SELECT id, subject_id, parent_id, title, status, planned_date,
                     estimate_minutes, note, project_name, solution_name, sort_order, completed_at, version,
-                    day_instance_date, day_instance_kind, day_instance_source_task_id
+                    day_instance_date, day_instance_kind, day_instance_source_task_id, priority
              FROM tasks
              WHERE workspace_id = ?1 AND deleted_at IS NULL
                AND day_instance_date IS NULL
@@ -548,7 +551,7 @@ pub(crate) fn list_day_instance_tasks(
         .prepare(
             "SELECT id, subject_id, parent_id, title, status, planned_date,
                     estimate_minutes, note, project_name, solution_name, sort_order, completed_at, version,
-                    day_instance_date, day_instance_kind, day_instance_source_task_id
+                    day_instance_date, day_instance_kind, day_instance_source_task_id, priority
              FROM tasks
              WHERE workspace_id = ?1 AND subject_id = ?2 AND deleted_at IS NULL
                AND day_instance_date = ?3
@@ -610,7 +613,7 @@ pub fn list_completed_task_page(
             "SELECT t.id, t.subject_id, t.parent_id, t.title, t.status, t.planned_date,
                     t.estimate_minutes, t.note, t.project_name, t.solution_name, t.sort_order,
                     t.completed_at, t.version, t.day_instance_date, t.day_instance_kind,
-                    t.day_instance_source_task_id
+                    t.day_instance_source_task_id, t.priority
              FROM tasks t
              WHERE t.workspace_id = ?1 AND t.subject_id = ?2
                AND t.status = 'done' AND t.deleted_at IS NULL AND t.day_instance_date IS NULL
@@ -1220,6 +1223,9 @@ fn update_task_with_cloud_operation(
     if let Some(title) = &request.title {
         validate_title(title)?;
     }
+    if let Some(priority) = &request.priority {
+        validate_priority(priority)?;
+    }
     if let Some(estimate) = request.estimate_minutes.flatten() {
         validate_estimate(Some(estimate))?;
     }
@@ -1250,16 +1256,18 @@ fn update_task_with_cloud_operation(
         .execute(
             "UPDATE tasks SET
                title = COALESCE(?1, title),
-               parent_id = CASE WHEN ?2 THEN ?3 ELSE parent_id END,
-               planned_date = CASE WHEN ?4 THEN ?5 ELSE planned_date END,
-               estimate_minutes = CASE WHEN ?6 THEN ?7 ELSE estimate_minutes END,
-               note = CASE WHEN ?8 THEN ?9 ELSE note END,
-               project_name = CASE WHEN ?10 THEN ?11 ELSE project_name END,
-               solution_name = CASE WHEN ?12 THEN ?13 ELSE solution_name END,
-               updated_at = ?14, version = version + 1
-             WHERE id = ?15 AND workspace_id = ?16 AND deleted_at IS NULL AND version = ?17",
+               priority = COALESCE(?2, priority),
+               parent_id = CASE WHEN ?3 THEN ?4 ELSE parent_id END,
+               planned_date = CASE WHEN ?5 THEN ?6 ELSE planned_date END,
+               estimate_minutes = CASE WHEN ?7 THEN ?8 ELSE estimate_minutes END,
+               note = CASE WHEN ?9 THEN ?10 ELSE note END,
+               project_name = CASE WHEN ?11 THEN ?12 ELSE project_name END,
+               solution_name = CASE WHEN ?13 THEN ?14 ELSE solution_name END,
+               updated_at = ?15, version = version + 1
+             WHERE id = ?16 AND workspace_id = ?17 AND deleted_at IS NULL AND version = ?18",
             params![
                 request.title,
+                request.priority,
                 request.parent_id.is_some(),
                 request.parent_id.flatten(),
                 request.planned_date.is_some(),
@@ -1301,6 +1309,9 @@ fn update_today_recurring_instance_with_cloud_operation(
     if let Some(title) = &request.title {
         validate_title(title)?;
     }
+    if let Some(priority) = &request.priority {
+        validate_priority(priority)?;
+    }
     if let Some(estimate) = request.estimate_minutes.flatten() {
         validate_estimate(Some(estimate))?;
     }
@@ -1330,6 +1341,7 @@ fn update_today_recurring_instance_with_cloud_operation(
 
     let now = now_millis();
     let title = request.title.as_deref();
+    let priority = request.priority.as_deref();
     let planned_date = request
         .planned_date
         .as_ref()
@@ -1347,14 +1359,16 @@ fn update_today_recurring_instance_with_cloud_operation(
         .execute(
             "UPDATE tasks SET
                title = COALESCE(?1, title),
-               planned_date = CASE WHEN ?2 THEN ?3 ELSE planned_date END,
-               estimate_minutes = CASE WHEN ?4 THEN ?5 ELSE estimate_minutes END,
-               note = CASE WHEN ?6 THEN ?7 ELSE note END,
-               project_name = CASE WHEN ?8 THEN ?9 ELSE project_name END,
-               updated_at = ?10, version = version + 1
-             WHERE id = ?11 AND workspace_id = ?12 AND version = ?13 AND deleted_at IS NULL",
+               priority = COALESCE(?2, priority),
+               planned_date = CASE WHEN ?3 THEN ?4 ELSE planned_date END,
+               estimate_minutes = CASE WHEN ?5 THEN ?6 ELSE estimate_minutes END,
+               note = CASE WHEN ?7 THEN ?8 ELSE note END,
+               project_name = CASE WHEN ?9 THEN ?10 ELSE project_name END,
+               updated_at = ?11, version = version + 1
+             WHERE id = ?12 AND workspace_id = ?13 AND version = ?14 AND deleted_at IS NULL",
             params![
                 title,
+                priority,
                 request.planned_date.is_some(),
                 planned_date,
                 request.estimate_minutes.is_some(),
@@ -1975,13 +1989,13 @@ fn duplicate_task_subtree_with_cloud_operation(
                     id, workspace_id, subject_id, parent_id, title, status, planned_date,
                     estimate_minutes, note, project_name, solution_name, source_type, source_ref,
                     sort_order, completed_at, created_at, updated_at, version,
-                    day_instance_date, day_instance_kind
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'manual', ?12, ?13, NULL, ?14, ?14, 1, ?15, ?16)",
+                    day_instance_date, day_instance_kind, priority
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'manual', ?12, ?13, NULL, ?14, ?14, 1, ?15, ?16, ?17)",
                 params![
                     id, workspace_id, task.subject_id, parent_id, title, "open", task.planned_date,
                     task.estimate_minutes, task.note, task.project_name, task.solution_name, task.id,
                     task.sort_order + 1, now, root.day_instance_date,
-                    root.day_instance_date.as_ref().map(|_| "member")
+                    root.day_instance_date.as_ref().map(|_| "member"), task.priority
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -2506,6 +2520,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskDto> {
         day_instance_kind: row.get(14)?,
         day_instance_source_task_id: row.get(15)?,
         title: row.get(3)?,
+        priority: row.get(16)?,
         status: row.get(4)?,
         planned_date: row.get(5)?,
         estimate_minutes: row.get(6)?,
@@ -3029,7 +3044,7 @@ fn load_task(connection: &rusqlite::Connection, id: &str) -> Result<TaskDto, Str
         .query_row(
             "SELECT id, subject_id, parent_id, title, status, planned_date,
                     estimate_minutes, note, project_name, solution_name, sort_order, completed_at, version,
-                    day_instance_date, day_instance_kind, day_instance_source_task_id
+                    day_instance_date, day_instance_kind, day_instance_source_task_id, priority
              FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
             [id],
             task_from_row,
@@ -3207,6 +3222,14 @@ pub(crate) fn validate_title(title: &str) -> Result<(), String> {
         Err("VALIDATION_ERROR: 事项名称不能为空".to_string())
     } else {
         Ok(())
+    }
+}
+
+fn validate_priority(priority: &str) -> Result<(), String> {
+    if matches!(priority, "urgent" | "high" | "normal" | "low") {
+        Ok(())
+    } else {
+        Err("VALIDATION_ERROR: 事项优先级无效".to_string())
     }
 }
 
@@ -4304,6 +4327,7 @@ mod tests {
                 id: task.id.clone(),
                 expected_version: task.version,
                 title: Some("云端事务修改事项 - 已更新".to_string()),
+                priority: None,
                 parent_id: None,
                 planned_date: None,
                 estimate_minutes: Some(Some(45)),
@@ -4525,6 +4549,7 @@ mod tests {
                 id: task.id.clone(),
                 expected_version: task.version,
                 title: None,
+                priority: None,
                 parent_id: None,
                 planned_date: Some(Some("2026-09-28".to_string())),
                 estimate_minutes: Some(Some(90)),
@@ -4542,6 +4567,7 @@ mod tests {
                 id: task.id.clone(),
                 expected_version: scheduled.version,
                 title: None,
+                priority: None,
                 parent_id: None,
                 planned_date: Some(None),
                 estimate_minutes: Some(None),
@@ -4776,6 +4802,7 @@ mod tests {
                 id: recurring_base.id,
                 expected_version: recurring_base.version + 1,
                 title: None,
+                priority: None,
                 parent_id: None,
                 planned_date: None,
                 estimate_minutes: Some(Some(30)),
@@ -4961,6 +4988,38 @@ mod tests {
         let root = create_test_task(&database, &subject_id, None, "根事项");
         let child = create_test_task(&database, &subject_id, Some(root.id.clone()), "子事项");
         let grandchild = create_test_task(&database, &subject_id, Some(child.id.clone()), "孙事项");
+        let root = update_task(
+            &database,
+            TaskUpdateRequest {
+                id: root.id,
+                expected_version: root.version,
+                title: None,
+                priority: Some("urgent".to_string()),
+                parent_id: None,
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        let child = update_task(
+            &database,
+            TaskUpdateRequest {
+                id: child.id,
+                expected_version: child.version,
+                title: None,
+                priority: Some("low".to_string()),
+                parent_id: None,
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
 
         let duplicate = duplicate_task_subtree(
             &database,
@@ -4972,6 +5031,8 @@ mod tests {
         .unwrap();
         assert_eq!(duplicate.tasks.len(), 3);
         assert_eq!(duplicate.tasks[0].title, "根事项 - 副本");
+        assert_eq!(duplicate.tasks[0].priority, "urgent");
+        assert_eq!(duplicate.tasks[1].priority, "low");
 
         assert!(reorder_task(
             &database,
@@ -4990,6 +5051,7 @@ mod tests {
                 id: child.id.clone(),
                 expected_version: child.version,
                 title: Some("更新后的子事项".to_string()),
+                priority: None,
                 parent_id: None,
                 planned_date: None,
                 estimate_minutes: None,
@@ -5925,6 +5987,7 @@ mod tests {
                 id: task.id.clone(),
                 expected_version: task.version,
                 title: None,
+                priority: None,
                 parent_id: None,
                 planned_date: None,
                 estimate_minutes: None,
@@ -5942,6 +6005,7 @@ mod tests {
                 id: task.id.clone(),
                 expected_version: task.version,
                 title: None,
+                priority: None,
                 parent_id: None,
                 planned_date: None,
                 estimate_minutes: None,
@@ -5959,6 +6023,7 @@ mod tests {
                 id: task.id.clone(),
                 expected_version: added.version,
                 title: None,
+                priority: None,
                 parent_id: None,
                 planned_date: None,
                 estimate_minutes: None,
@@ -6768,6 +6833,7 @@ mod tests {
                 instance_expected_version: second_instance.version,
                 source_expected_version: source.version + 1,
                 title: Some("不应保存".to_string()),
+                priority: None,
                 planned_date: None,
                 estimate_minutes: None,
                 note: None,
@@ -6790,6 +6856,7 @@ mod tests {
                 instance_expected_version: second_instance.version,
                 source_expected_version: source.version,
                 title: Some("未来新标题".to_string()),
+                priority: None,
                 planned_date: Some(Some("2099-01-02".to_string())),
                 estimate_minutes: Some(Some(75)),
                 note: Some(Some("未来备注".to_string())),
@@ -6837,5 +6904,105 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn task_priority_updates_are_validated_and_preserve_manual_order() {
+        let database = database();
+        let subject_id: String = database
+            .open()
+            .unwrap()
+            .query_row("SELECT id FROM subjects LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let first = create_test_task(&database, &subject_id, None, "第一项");
+        let second = create_test_task(&database, &subject_id, None, "第二项");
+        assert_eq!(first.priority, "normal");
+        let before_ids = list_tasks(
+            &database,
+            TaskListRequest {
+                subject_id: Some(subject_id.clone()),
+                include_completed: Some(false),
+                planned_date: None,
+                today_date: None,
+                today_only: None,
+                daily_estimate_date: None,
+                query: None,
+            },
+        )
+        .unwrap()
+        .tasks
+        .into_iter()
+        .map(|task| task.id)
+        .collect::<Vec<_>>();
+        let updated = update_task(
+            &database,
+            TaskUpdateRequest {
+                id: second.id.clone(),
+                expected_version: second.version,
+                title: None,
+                priority: Some("urgent".to_string()),
+                parent_id: None,
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.priority, "urgent");
+        assert_eq!(updated.sort_order, second.sort_order);
+        let after_ids = list_tasks(
+            &database,
+            TaskListRequest {
+                subject_id: Some(subject_id),
+                include_completed: Some(false),
+                planned_date: None,
+                today_date: None,
+                today_only: None,
+                daily_estimate_date: None,
+                query: None,
+            },
+        )
+        .unwrap()
+        .tasks
+        .into_iter()
+        .map(|task| task.id)
+        .collect::<Vec<_>>();
+        assert_eq!(before_ids, after_ids);
+        assert!(update_task(
+            &database,
+            TaskUpdateRequest {
+                id: updated.id.clone(),
+                expected_version: updated.version,
+                title: None,
+                priority: Some("invalid".to_string()),
+                parent_id: None,
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None
+            }
+        )
+        .unwrap_err()
+        .contains("优先级无效"));
+        assert!(update_task(
+            &database,
+            TaskUpdateRequest {
+                id: updated.id,
+                expected_version: second.version,
+                title: None,
+                priority: Some("low".to_string()),
+                parent_id: None,
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None
+            }
+        )
+        .unwrap_err()
+        .contains("VERSION_CONFLICT"));
     }
 }

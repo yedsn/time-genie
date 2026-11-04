@@ -3,11 +3,12 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { ElMessage, ElMessageBox } from "element-plus";
 import { MdEditor } from "md-editor-v3";
 import "md-editor-v3/lib/style.css";
-import { ArrowDown, ArrowUp, CalendarDays, CheckCircle2, Circle, Clock3, Copy, CornerDownRight, DatabaseZap, FileInput, FilePenLine, GripVertical, IndentDecrease, IndentIncrease, ListMinus, ListPlus, MessageSquareText, Minus, Play, Plus, Radio, Repeat2, TimerReset, Trash2 } from "lucide-vue-next";
+import { ArrowDown, ArrowUp, CalendarDays, Check, CheckCircle2, Circle, Clock3, Copy, CornerDownRight, DatabaseZap, FileInput, FilePenLine, GripVertical, IndentDecrease, IndentIncrease, ListMinus, ListPlus, MessageSquareText, Minus, Play, Plus, Radio, Repeat2, TimerReset, Trash2 } from "lucide-vue-next";
 import type { Task } from "../store";
 import { isActivePlanTask } from "../services/completedTaskHistoryCore";
 import { contextMenuPosition, hierarchicalTaskSelectionRows, orderedPlanTaskTree, orderedTaskSelectionWithAncestors, planTaskStepMoveIntent, taskSubtreeIds, todayEstimateDraft, toggleTaskSelectionGroup } from "../services/planTaskInteractionCore";
 import { createTaskTreeSortable } from "../services/taskTreeSortable";
+import { TASK_PRIORITIES, taskPriorityMeta } from "../services/taskPriority";
 import type { ActualAdjustmentBatchRequest, ActualAdjustmentBatchResult, ActualAdjustmentSnapshotRecord, ActualAdjustmentSnapshotTaskRecord } from "../services/tauri";
 import { adjustQuickEstimateMinutes, parseQuickEstimateMinutes } from "../services/quickPlanEstimateCore";
 import { actualAdjustmentSummary, eligibleActualAdjustmentParents, parentTargetTotal, parseActualMinutes, type ActualAdjustmentDraft, type ActualAdjustmentNewTaskDraft } from "../services/quickActualAdjustmentCore";
@@ -46,7 +47,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   select: [id: string];
-  save: [id: string, field?: "title" | "plannedDate" | "estimate"];
+  save: [id: string, field?: "title" | "plannedDate" | "estimate" | "priority"];
   importPlan: [targetKind: "backlog" | "day_instance"];
   syncSeaTable: [];
   add: [];
@@ -382,6 +383,7 @@ function syncEditableTask(task: Task) {
   source.planDate = task.planDate;
   source.estimate = task.estimate;
   source.project = task.project;
+  source.priority = task.priority;
 }
 
 function prepareSubtreeDrag(taskId: string) {
@@ -511,9 +513,15 @@ function finishEstimateEditor(task: Task) {
   emit("save", task.id, "estimate");
 }
 
-function saveEditableTask(task: Task, field?: "plannedDate") {
+function saveEditableTask(task: Task, field?: "plannedDate" | "priority") {
   syncEditableTask(task);
   emit("save", task.id, field);
+}
+
+function setTaskPriority(task: Task, priority: Task["priority"]) {
+  if (task.priority === priority) return;
+  task.priority = priority;
+  saveEditableTask(task, "priority");
 }
 
 async function openTodayEstimateEditor(task: Task) {
@@ -1405,6 +1413,7 @@ onBeforeUnmount(() => {
         <div
           class="reminder-row pending-reminder-row"
           :class="[
+            `task-priority-${row.task.priority}`,
             {
               child: row.depth > 0,
               selected: row.task.id === selectedId,
@@ -1431,7 +1440,22 @@ onBeforeUnmount(() => {
             <input :data-task-input="row.task.id" v-model="row.task.title" :placeholder="row.depth ? '新子项' : '新待办'" @focus="selectTask(row.task)" @blur="finishTaskEdit(row.task)" @keydown.tab="handleTitleTab($event, row.task)" />
             <div class="reminder-meta">
               <span class="task-level-label"><CornerDownRight v-if="row.depth" :size="12" />{{ row.depth + 1 }}级</span>
-              <span class="meta-picker" :class="{ filled: row.task.planDate }" title="设置预计开始日期" @click.stop="openNativePicker(row.task.id)">
+              <el-dropdown class="priority-dropdown" trigger="click" placement="bottom-start" popper-class="priority-picker-popper" @command="(priority: Task['priority']) => setTaskPriority(row.task, priority)" @click.stop>
+                <button class="meta-picker priority-picker" :class="taskPriorityMeta(row.task.priority).className" type="button" :title="`优先级：${taskPriorityMeta(row.task.priority).label}`" :aria-label="`${row.task.title}优先级：${taskPriorityMeta(row.task.priority).label}`">
+                  <Radio :size="12" aria-hidden="true" />
+                  <span>{{ taskPriorityMeta(row.task.priority).label }}</span>
+                </button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item v-for="option in TASK_PRIORITIES" :key="option.value" :command="option.value" :class="[option.className, { selected: row.task.priority === option.value }]">
+                      <span class="priority-option-dot" aria-hidden="true"></span>
+                      <span>{{ option.label }}</span>
+                      <Check v-if="row.task.priority === option.value" :size="13" aria-hidden="true" />
+                    </el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
+              <span class="meta-picker start-date-picker" :class="{ filled: row.task.planDate }" title="设置预计开始日期" @click.stop="openNativePicker(row.task.id)">
                 <input :data-date-input="row.task.id" v-model="row.task.planDate" aria-label="预计开始日期" tabindex="-1" type="date" @change="saveEditableTask(row.task, 'plannedDate')" />
                 <CalendarDays :size="12" />{{ row.task.planDate || '未设置开始日期' }}
               </span>

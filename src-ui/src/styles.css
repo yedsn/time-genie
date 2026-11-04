@@ -3761,3 +3761,38 @@ pre {
 @media (max-width: 760px) {
   .theme-picker { grid-template-columns: 1fr 1fr; }
 }
+.task-priority-mark { display: none; }
+.task-priority-urgent, .task-priority-high, .task-priority-normal, .task-priority-low, .priority-urgent, .priority-high, .priority-normal, .priority-low { --task-priority-color: var(--blue); }
+.task-priority-urgent { --task-priority-color: var(--red); }
+.task-priority-high { --task-priority-color: var(--amber); }
+.task-priority-normal { --task-priority-color: var(--blue); }
+.task-priority-low { --task-priority-color: var(--muted); }
+.priority-urgent { --task-priority-color: var(--red); }
+.priority-high { --task-priority-color: var(--amber); }
+.priority-normal { --task-priority-color: var(--blue); }
+.priority-low { --task-priority-color: var(--muted); }
+.pending-reminder-row::before, .timer-task-row::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; border-radius: 3px; background: var(--task-priority-color); }
+.pending-reminder-row::before { display: none; }
+.pending-reminder-row .priority-picker, .timer-task-priority-editor select { color: var(--task-priority-color); }
+.priority-dropdown { flex: 0 0 auto; margin-right: -2px; font-size: inherit; }
+.priority-dropdown .el-tooltip__trigger { display: inline-flex; outline: 0; }
+.priority-picker { min-height: 22px; inline-size: max-content; display: inline-flex !important; flex: 0 0 auto; align-items: center; flex-wrap: nowrap; gap: 4px; border: 0; padding: 2px 0; color: var(--task-priority-color); background: transparent; font-family: inherit; font-size: inherit; font-weight: inherit; line-height: 1; white-space: nowrap; cursor: pointer; }
+.completed-history-priority::before, .timer-task-priority-editor label::before { content: ""; width: 6px; height: 6px; flex: 0 0 6px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 13%, transparent); }
+.priority-picker:hover { color: color-mix(in srgb, var(--task-priority-color) 82%, var(--text)); }
+.priority-picker > svg { flex: none; }
+.priority-picker > span { flex: 0 0 auto; white-space: nowrap; }
+.priority-picker-popper.el-popper { --el-bg-color-overlay: var(--popover-bg); --el-border-color-light: var(--line); min-width: 112px; border-color: var(--line); border-radius: 10px; background: var(--popover-bg); box-shadow: 0 14px 36px var(--shadow-color); }
+.priority-picker-popper .el-dropdown-menu { min-width: 110px; padding: 5px; background: transparent; }
+.priority-picker-popper .el-dropdown-menu__item { min-height: 31px; display: grid; grid-template-columns: 8px 1fr 13px; align-items: center; gap: 8px; border-radius: 6px; padding: 0 9px; color: var(--text-soft); font-size: 12px; }
+.priority-picker-popper .el-dropdown-menu__item:not(.is-disabled):focus,
+.priority-picker-popper .el-dropdown-menu__item:not(.is-disabled):hover { color: var(--text); background: var(--surface-hover); }
+.priority-picker-popper .el-dropdown-menu__item.selected { color: var(--task-priority-color); background: color-mix(in srgb, var(--task-priority-color) 11%, transparent); }
+.priority-picker-popper .el-dropdown-menu__item > svg { justify-self: end; }
+.priority-option-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--task-priority-color); box-shadow: 0 0 0 2px color-mix(in srgb, var(--task-priority-color) 12%, transparent); }
+.completed-history-title { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.completed-history-title input { min-width: 0; flex: 1; }
+.completed-history-row { position: relative; }
+.completed-history-row::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; border-radius: 3px; background: var(--task-priority-color, var(--blue)); }
+.completed-history-priority { color: var(--task-priority-color, var(--blue)) !important; cursor: help; }
+.timer-task-priority-editor label { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--task-priority-color, var(--blue)); }
+.timer-task-priority-editor select { border: 0; background: transparent; color: inherit; font: inherit; }

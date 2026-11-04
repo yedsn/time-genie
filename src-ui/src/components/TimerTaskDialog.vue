@@ -16,6 +16,7 @@ import {
 import { contextMenuPosition, hierarchicalTaskSelectionRows, orderedTaskSelectionWithAncestors, taskSubtreeIds, toggleTaskSelectionGroup } from "../services/planTaskInteractionCore";
 import { createTaskTreeSortable } from "../services/taskTreeSortable";
 import { parseActualMinutes } from "../services/quickActualAdjustmentCore";
+import { TASK_PRIORITIES } from "../services/taskPriority";
 import { readRememberedPanelSubjectId, rememberPanelSubjectId } from "../services/executionPanelSubjectPreference";
 import {
   beginTimerDialogSave,
@@ -75,7 +76,7 @@ const rowContextMenuTop = ref(0);
 const todayPickerOpen = ref(false);
 const todayPickerQuery = ref("");
 const todayPickerSelected = ref<string[]>([]);
-const moreDrafts = reactive<Record<string, { estimate: string; planDate: string; recurrence: "none" | "daily" | "weekdays" | "weekly"; recurrenceStart: string; recurrenceWeekdays: number[] }>>({});
+const moreDrafts = reactive<Record<string, { estimate: string; planDate: string; priority: Task["priority"]; recurrence: "none" | "daily" | "weekdays" | "weekly"; recurrenceStart: string; recurrenceWeekdays: number[] }>>({});
 const weekdayLabels = ["一", "二", "三", "四", "五", "六", "日"];
 
 const activeTask = computed(() => [...store.todayPlanTasks, ...store.tasks].find((task) => task.id === store.runningEntry?.defaultTask));
@@ -99,6 +100,7 @@ function snapshotTaskToPanelTask(task: ActualAdjustmentSnapshotTaskRecord): Pane
     dayInstanceKind: task.dayInstanceKind,
     dayInstanceSourceTaskId: task.dayInstanceSourceTaskId,
     title: task.title,
+    priority: task.priority ?? "normal",
     project: live?.project ?? "",
     planDate: task.plannedDate,
     estimate: task.estimateMinutes,
@@ -872,6 +874,7 @@ function moreDraftFor(task: Task) {
   return moreDrafts[task.id] ??= {
     estimate: task.estimate == null ? "" : String(task.estimate),
     planDate: task.planDate ?? "",
+    priority: task.priority ?? "normal",
     recurrence: task.recurrence?.frequency ?? "none",
     recurrenceStart: task.recurrence?.effectiveStart ?? store.workspaceToday,
     recurrenceWeekdays: task.recurrence?.weekdaysMask
@@ -909,6 +912,7 @@ async function saveMore(task: PanelTask) {
       subjectId: task.subjectId,
       expectedVersion: task.version,
       title: currentTitle,
+      priority: draft.priority,
       plannedDate: draft.planDate || undefined,
       estimateMinutes: estimate === undefined ? undefined : Math.round(estimate),
       note: currentNote,
@@ -1121,7 +1125,7 @@ function formatTime(timestamp: number) {
           <div class="timer-task-actions timer-task-new-hint"><span>{{ newTask.targetId ? (newTask.placement === 'before' ? '插入上方' : '插入下方') : '新增事项' }}</span></div>
         </div>
 
-        <div v-for="(row, rowIndex) in rows" :key="row.task.id" class="timer-task-row" :data-timer-task-id="row.task.id" :data-depth="row.depth" :style="{ order: rowIndex >= newTaskInsertIndex && newTask.open ? rowIndex + 1 : rowIndex }" :class="[{ parent: row.hasChildren, child: row.depth > 0, recent: recentTaskId === row.task.id, active: store.runningEntry?.defaultTask === row.task.id, completed: row.task.completedToday }, `state-${actionFor(row.task, row.hasChildren).mode}`]">
+        <div v-for="(row, rowIndex) in rows" :key="row.task.id" class="timer-task-row" :data-timer-task-id="row.task.id" :data-depth="row.depth" :style="{ order: rowIndex >= newTaskInsertIndex && newTask.open ? rowIndex + 1 : rowIndex }" :class="[`task-priority-${row.task.priority}`, { parent: row.hasChildren, child: row.depth > 0, recent: recentTaskId === row.task.id, active: store.runningEntry?.defaultTask === row.task.id, completed: row.task.completedToday }, `state-${actionFor(row.task, row.hasChildren).mode}`]">
           <div class="timer-task-name-cell" :style="{ '--task-depth': String(row.depth) }">
             <button class="timer-task-drag-handle" type="button" :disabled="Boolean(query.trim())" :class="{ active: rowContextTaskId === row.task.id }" :title="query.trim() ? '清空搜索后调整顺序和层级' : '拖动排序；右键可复制、插入或删除事项'" :aria-label="`${row.task.title}拖动排序，右键打开行菜单`" @pointerdown="prepareSubtreeDrag(row.task.id)" @contextmenu="openRowContextMenu($event, row.task)"><GripVertical :size="14" /></button>
             <button v-if="presentation.showAllocation" class="timer-task-complete-check" :class="{ completed: !row.hasChildren && allocationDraft(row.task.id, row.task.title).completeTask }" type="button" :disabled="row.hasChildren" :title="row.hasChildren ? '父事项不能直接完成' : '保存归属时同时完成事项'" :aria-label="row.hasChildren ? `${row.task.title}为父事项，不能直接完成` : `${row.task.title}保存归属时完成`" :aria-pressed="row.hasChildren ? undefined : allocationDraft(row.task.id, row.task.title).completeTask" @click="allocationDraft(row.task.id, row.task.title).completeTask = !allocationDraft(row.task.id, row.task.title).completeTask">
@@ -1176,6 +1180,7 @@ function formatTime(timestamp: number) {
 
             <el-popover :visible="moreTaskId === row.task.id" placement="bottom-end" :width="330" trigger="click" @update:visible="moreTaskId = $event ? row.task.id : ''">
               <template #reference><button class="icon-button subtle" type="button" :aria-label="`${row.task.title}更多操作`" title="更多操作"><MoreHorizontal :size="15" /></button></template>
+              <div v-if="moreTaskId === row.task.id" class="timer-task-priority-editor"><label><span>优先级</span><select v-model="moreDraftFor(row.task).priority" :aria-label="`${row.task.title}优先级`"><option v-for="option in TASK_PRIORITIES" :key="option.value" :value="option.value">{{ option.label }}</option></select></label></div>
               <div class="timer-task-more-popover"><strong>{{ row.task.title }}</strong><label><span>整体预计</span><div><input v-model="moreDraftFor(row.task).estimate" inputmode="numeric" /><small>分钟</small></div></label><label><span>预计开始</span><input v-model="moreDraftFor(row.task).planDate" type="date" /></label><label v-if="!row.hasChildren && store.tasks.some((task) => task.id === row.task.id)"><span>重复设置</span><select v-model="moreDraftFor(row.task).recurrence"><option value="none">不重复</option><option value="daily">每天</option><option value="weekdays">工作日</option><option value="weekly">每周</option></select></label><label v-if="!row.hasChildren && store.tasks.some((task) => task.id === row.task.id) && moreDraftFor(row.task).recurrence !== 'none'"><span>生效日期</span><input v-model="moreDraftFor(row.task).recurrenceStart" type="date" /></label><div v-if="!row.hasChildren && store.tasks.some((task) => task.id === row.task.id) && moreDraftFor(row.task).recurrence === 'weekly'" class="timer-task-weekdays"><span>重复星期</span><div><label v-for="(label, index) in weekdayLabels" :key="label"><input v-model="moreDraftFor(row.task).recurrenceWeekdays" type="checkbox" :value="index" />{{ label }}</label></div></div><small v-if="row.task.completedToday && !store.tasks.some((task) => task.id === row.task.id)">继续事项后可修改重复设置</small><div class="timer-task-more-actions"><button v-if="row.task.status !== 'done'" class="secondary-button compact" type="button" @click="completeTask(row.task)"><CheckCircle2 :size="13" />完成</button><button class="danger-button compact" type="button" @click="deleteTask(row.task)"><Trash2 :size="13" />删除</button><span></span><button class="primary-button compact" type="button" @click="saveMore(row.task)">保存设置</button></div></div>
             </el-popover>
           </div>

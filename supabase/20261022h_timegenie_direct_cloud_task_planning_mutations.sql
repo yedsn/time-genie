@@ -100,6 +100,7 @@ begin
         day_instance_kind='member',title=instance_row.title,
         planned_date=instance_row.planned_date,estimate_minutes=instance_row.estimate_minutes,
         note=instance_row.note,project_name=instance_row.project_name,
+        priority=instance_row.priority,
         solution_name=instance_row.solution_name,updated_at=now(),
         updated_by_device_id=p_device_id,version=version+1
       where id=source_row.id;
@@ -118,6 +119,7 @@ begin
         day_instance_kind='member',title=source_row.title,
         planned_date=source_row.planned_date,estimate_minutes=source_row.estimate_minutes,
         note=source_row.note,project_name=source_row.project_name,
+        priority=source_row.priority,
         solution_name=source_row.solution_name,updated_at=now(),
         updated_by_device_id=p_device_id,version=version+1
       where id=instance_row.id;
@@ -160,13 +162,13 @@ begin
   end if;
   insert into timegenie.tasks(
     id,workspace_id,subject_id,parent_id,title,status,planned_date,estimate_minutes,
-    note,project_name,solution_name,source_type,sort_order,completed_at,
+    note,priority,project_name,solution_name,source_type,sort_order,completed_at,
     created_by_device_id,updated_by_device_id,day_instance_date,
     day_instance_kind,day_instance_source_task_id
   ) values(
     instance_id,p_workspace_id,source_row.subject_id,parent_instance_id,source_row.title,
     case when completed_value is null then 'open' else 'done' end,
-    source_row.planned_date,source_row.estimate_minutes,source_row.note,
+    source_row.planned_date,source_row.estimate_minutes,source_row.note,source_row.priority,
     source_row.project_name,source_row.solution_name,source_row.source_type,
     source_row.sort_order,completed_value,p_device_id,p_device_id,p_work_date,
     p_expected_kind,p_source_task_id

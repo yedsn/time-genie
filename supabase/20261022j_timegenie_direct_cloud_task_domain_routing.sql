@@ -125,7 +125,7 @@ set search_path=timegenie,extensions,pg_catalog as $$
 declare request_value jsonb; cached jsonb; result_value jsonb;
 declare instance_id uuid; instance_expected_version bigint; source_expected_version bigint;
 declare instance_row timegenie.tasks%rowtype; source_row timegenie.tasks%rowtype;
-declare title_value text; estimate_value integer; note_value text; project_value text;
+declare title_value text; priority_value text; estimate_value integer; note_value text; project_value text;
 begin
   perform timegenie.assert_direct_v2_workspace(p_workspace_id,p_device_id,p_expected_epoch);
   request_value:=jsonb_build_object('expectedEpoch',p_expected_epoch,'payload',coalesce(p_payload,'{}'::jsonb));
@@ -156,11 +156,13 @@ begin
     raise exception 'VALIDATION_ERROR: 来源事项不是有效的重复计划';
   end if;
   if p_payload ? 'title' then title_value:=btrim(coalesce(p_payload->>'title','')); if title_value='' then raise exception 'VALIDATION_ERROR: 事项名称不能为空'; end if; end if;
+  if p_payload ? 'priority' then priority_value:=coalesce(nullif(p_payload->>'priority',''),'normal'); if priority_value not in ('urgent','high','normal','low') then raise exception 'VALIDATION_ERROR: 事项优先级无效'; end if; end if;
   if p_payload ? 'estimateMinutes' and p_payload->'estimateMinutes'<>'null'::jsonb then estimate_value:=(p_payload->>'estimateMinutes')::integer; if estimate_value<=0 then raise exception 'VALIDATION_ERROR: 预计用时必须大于 0 分钟'; end if; end if;
   if p_payload ? 'note' then note_value:=nullif(btrim(p_payload->>'note'),''); end if;
   if p_payload ? 'projectName' then project_value:=nullif(btrim(p_payload->>'projectName'),''); end if;
   update timegenie.tasks set
     title=case when p_payload ? 'title' then title_value else title end,
+    priority=case when p_payload ? 'priority' then priority_value else priority end,
     planned_date=case when p_payload ? 'plannedDate' then nullif(p_payload->>'plannedDate','')::date else planned_date end,
     estimate_minutes=case when p_payload ? 'estimateMinutes' then estimate_value else estimate_minutes end,
     note=case when p_payload ? 'note' then note_value else note end,
@@ -213,12 +215,12 @@ begin
     new_id:=gen_random_uuid();
     new_parent:=case when item.id=root_id then item.parent_id else nullif(id_map->>item.parent_id::text,'')::uuid end;
     insert into timegenie.tasks(
-      id,workspace_id,subject_id,parent_id,title,status,planned_date,estimate_minutes,note,
+      id,workspace_id,subject_id,parent_id,title,priority,status,planned_date,estimate_minutes,note,
       project_name,solution_name,source_type,source_ref,sort_order,created_by_device_id,
       updated_by_device_id,day_instance_date,day_instance_kind
     ) values(
       new_id,p_workspace_id,item.subject_id,new_parent,
-      case when item.id=root_id then item.title||' - 副本' else item.title end,'open',
+      case when item.id=root_id then item.title||' - 副本' else item.title end,item.priority,'open',
       item.planned_date,item.estimate_minutes,item.note,item.project_name,item.solution_name,
       'manual',item.id::text,item.sort_order+1,p_device_id,p_device_id,
       item.day_instance_date,case when item.day_instance_date is null then null else 'member' end

@@ -98,10 +98,10 @@ begin
 
     if nullif(item->>'taskId','') is null then
       insert into timegenie.tasks(
-        id,workspace_id,subject_id,parent_id,title,status,source_type,sort_order,
+        id,workspace_id,subject_id,parent_id,title,priority,status,source_type,sort_order,
         created_by_device_id,updated_by_device_id,day_instance_date,day_instance_kind
       ) values(
-        task_id,p_workspace_id,subject_id,parent_id,title_value,'open','manual',order_value,
+        task_id,p_workspace_id,subject_id,parent_id,title_value,'normal','open','manual',order_value,
         p_device_id,p_device_id,day_instance_date,case when day_instance_date is null then null else 'member' end
       );
       created_ids:=array_append(created_ids,task_id); created_count:=created_count+1;

@@ -25,7 +25,7 @@ set search_path=timegenie,extensions,pg_catalog as $$
     'id',task.id,'subjectId',task.subject_id,'parentId',task.parent_id,
     'dayInstanceDate',task.day_instance_date,'dayInstanceKind',task.day_instance_kind,
     'dayInstanceSourceTaskId',task.day_instance_source_task_id,
-    'title',task.title,'status',task.status,'plannedDate',task.planned_date,
+    'title',task.title,'priority',task.priority,'status',task.status,'plannedDate',task.planned_date,
     'estimateMinutes',task.estimate_minutes,'note',task.note,
     'projectName',task.project_name,'solutionName',task.solution_name,
     'sourceType',task.source_type,'sortOrder',task.sort_order,
@@ -298,17 +298,18 @@ set search_path=timegenie,extensions,pg_catalog as $$
 #variable_conflict use_variable
 declare request_value jsonb; cached jsonb; result_value jsonb; after_value jsonb;
 declare task_id uuid; subject_id uuid; parent_id uuid; day_date date; parent_date date;
-declare task_title text; estimate_value integer; sort_value integer; source_value text;
+declare task_title text; priority_value text; estimate_value integer; sort_value integer; source_value text;
 begin
   perform timegenie.assert_direct_v2_workspace(p_workspace_id,p_device_id,p_expected_epoch);
   request_value:=jsonb_build_object('expectedEpoch',p_expected_epoch,'payload',coalesce(p_payload,'{}'::jsonb));
   perform pg_advisory_xact_lock(hashtextextended(p_workspace_id::text||':'||p_operation_id::text,0));
   cached:=timegenie.direct_cloud_operation_result(p_workspace_id,p_operation_id,'direct_task_create',request_value); if cached is not null then return cached; end if;
   task_id:=nullif(p_payload->>'id','')::uuid; subject_id:=nullif(p_payload->>'subjectId','')::uuid; parent_id:=nullif(p_payload->>'parentId','')::uuid;
-  task_title:=btrim(coalesce(p_payload->>'title','')); day_date:=nullif(p_payload->>'dayInstanceDate','')::date;
+  task_title:=btrim(coalesce(p_payload->>'title','')); priority_value:=coalesce(nullif(p_payload->>'priority',''),'normal'); day_date:=nullif(p_payload->>'dayInstanceDate','')::date;
   estimate_value:=nullif(p_payload->>'estimateMinutes','')::integer; source_value:=coalesce(nullif(p_payload->>'sourceType',''),'manual');
   if task_id is null or subject_id is null or task_title='' then raise exception 'VALIDATION_ERROR: 事项标识、主体和名称不能为空'; end if;
   if estimate_value is not null and estimate_value<=0 then raise exception 'VALIDATION_ERROR: 预计用时必须大于 0 分钟'; end if;
+  if priority_value not in ('urgent','high','normal','low') then raise exception 'VALIDATION_ERROR: 事项优先级无效'; end if;
   if source_value not in('manual','obsidian_import','timer_quick_create','migration') then raise exception 'VALIDATION_ERROR: 事项来源无效'; end if;
   if exists(select 1 from timegenie.tasks where workspace_id=p_workspace_id and id=task_id) then raise exception 'VERSION_CONFLICT: 事项标识已存在'; end if;
   perform 1 from timegenie.subjects where workspace_id=p_workspace_id and id=subject_id and deleted_at is null for update;
@@ -324,8 +325,8 @@ begin
     end if;
   end if;
   if sort_value is null then select coalesce(max(task.sort_order),0)+10 into sort_value from timegenie.tasks task where task.workspace_id=p_workspace_id and task.subject_id=subject_id and task.parent_id is not distinct from parent_id and task.day_instance_date is not distinct from day_date and task.deleted_at is null; end if;
-  insert into timegenie.tasks(id,workspace_id,subject_id,parent_id,title,status,planned_date,estimate_minutes,note,project_name,solution_name,source_type,sort_order,created_by_device_id,updated_by_device_id,day_instance_date,day_instance_kind)
-  values(task_id,p_workspace_id,subject_id,parent_id,task_title,'open',nullif(p_payload->>'plannedDate','')::date,estimate_value,nullif(btrim(p_payload->>'note'),''),nullif(btrim(p_payload->>'projectName'),''),nullif(btrim(p_payload->>'solutionName'),''),source_value,sort_value,p_device_id,p_device_id,day_date,case when day_date is null then null else 'member' end);
+  insert into timegenie.tasks(id,workspace_id,subject_id,parent_id,title,priority,status,planned_date,estimate_minutes,note,project_name,solution_name,source_type,sort_order,created_by_device_id,updated_by_device_id,day_instance_date,day_instance_kind)
+  values(task_id,p_workspace_id,subject_id,parent_id,task_title,priority_value,'open',nullif(p_payload->>'plannedDate','')::date,estimate_value,nullif(btrim(p_payload->>'note'),''),nullif(btrim(p_payload->>'projectName'),''),nullif(btrim(p_payload->>'solutionName'),''),source_value,sort_value,p_device_id,p_device_id,day_date,case when day_date is null then null else 'member' end);
   after_value:=(select to_jsonb(task) from timegenie.tasks task where task.id=task_id);
   result_value:=timegenie.direct_cloud_mutation_response(p_workspace_id,p_device_id,p_operation_id,jsonb_build_object('task',timegenie.direct_cloud_task_project(p_workspace_id,task_id)),array['tasks'],p_expected_epoch);
   perform timegenie.record_direct_cloud_operation(p_workspace_id,p_operation_id,p_device_id,'direct_task_create',request_value,result_value);
@@ -339,7 +340,7 @@ create or replace function timegenie.direct_cloud_task_update(
 set search_path=timegenie,extensions,pg_catalog as $$
 #variable_conflict use_variable
 declare request_value jsonb; cached jsonb; result_value jsonb; before_value jsonb; after_value jsonb;
-declare task_id uuid; expected_version bigint; task_row timegenie.tasks%rowtype; title_value text; estimate_value integer; parent_value uuid;
+declare task_id uuid; expected_version bigint; task_row timegenie.tasks%rowtype; title_value text; priority_value text; estimate_value integer; parent_value uuid;
 begin
   perform timegenie.assert_direct_v2_workspace(p_workspace_id,p_device_id,p_expected_epoch);
   request_value:=jsonb_build_object('expectedEpoch',p_expected_epoch,'payload',coalesce(p_payload,'{}'::jsonb));
@@ -351,6 +352,7 @@ begin
   if task_row.deleted_at is not null then raise exception 'ENTITY_DELETED: 事项已删除'; end if;
   if task_row.version<>expected_version then raise exception 'VERSION_CONFLICT: expected %, current %',expected_version,task_row.version; end if;
   if p_payload ? 'title' then title_value:=btrim(coalesce(p_payload->>'title','')); if title_value='' then raise exception 'VALIDATION_ERROR: 事项名称不能为空'; end if; end if;
+  if p_payload ? 'priority' then priority_value:=coalesce(nullif(p_payload->>'priority',''),'normal'); if priority_value not in ('urgent','high','normal','low') then raise exception 'VALIDATION_ERROR: 事项优先级无效'; end if; end if;
   if p_payload ? 'estimateMinutes' and p_payload->'estimateMinutes'<>'null'::jsonb then estimate_value:=(p_payload->>'estimateMinutes')::integer; if estimate_value<=0 then raise exception 'VALIDATION_ERROR: 预计用时必须大于 0 分钟'; end if; end if;
   if p_payload ? 'parentId' then
     parent_value:=nullif(p_payload->>'parentId','')::uuid;
@@ -362,6 +364,7 @@ begin
   before_value:=to_jsonb(task_row);
   update timegenie.tasks set
     title=case when p_payload ? 'title' then title_value else title end,
+    priority=case when p_payload ? 'priority' then priority_value else priority end,
     planned_date=case when p_payload ? 'plannedDate' then nullif(p_payload->>'plannedDate','')::date else planned_date end,
     estimate_minutes=case when p_payload ? 'estimateMinutes' then estimate_value else estimate_minutes end,
     note=case when p_payload ? 'note' then nullif(btrim(p_payload->>'note'),'') else note end,

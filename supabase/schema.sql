@@ -114,6 +114,7 @@ create table if not exists timegenie.tasks (
   subject_id uuid not null references timegenie.subjects(id),
   parent_id uuid references timegenie.tasks(id),
   title text not null check (length(trim(title)) > 0),
+  priority text not null default 'normal' check (priority in ('urgent','high','normal','low')),
   status text not null default 'open' check (status in ('open', 'done')),
   planned_date date,
   planned_time time,
@@ -3849,6 +3850,7 @@ notify pgrst, 'reload schema';
 
 -- Direct-v2 subject and task mutations with expected-version concurrency,
 -- hierarchy validation, subtree soft deletion and operation history.
+\ir 20261104_timegenie_task_priority.sql
 \ir 20261022g_timegenie_direct_cloud_subject_task_mutations.sql
 
 -- Direct-v2 daily estimates and today plans, including atomic batch writes and

@@ -2123,6 +2123,7 @@ mod tests {
             day_instance_kind: None,
             day_instance_source_task_id: None,
             title: "任务一".to_string(),
+            priority: "normal".to_string(),
             status: "open".to_string(),
             planned_date: None,
             estimate_minutes: Some(90),

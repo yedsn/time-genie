@@ -310,7 +310,7 @@ begin
     'id',task_row.id,'subjectId',task_row.subject_id,'parentId',task_row.parent_id,
     'dayInstanceDate',task_row.day_instance_date,'dayInstanceKind',task_row.day_instance_kind,
     'dayInstanceSourceTaskId',task_row.day_instance_source_task_id,
-    'title',task_row.title,'status',task_row.status,'plannedDate',task_row.planned_date,
+    'title',task_row.title,'priority',task_row.priority,'status',task_row.status,'plannedDate',task_row.planned_date,
     'estimateMinutes',task_row.estimate_minutes,'note',task_row.note,
     'projectName',task_row.project_name,'solutionName',task_row.solution_name,
     'sortOrder',task_row.sort_order,

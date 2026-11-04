@@ -483,6 +483,10 @@ pub struct CloudWorkspaceSnapshotPreview {
     pub completed_at: Option<String>,
 }
 
+fn default_task_priority() -> String {
+    "normal".to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudStorageError {
@@ -697,6 +701,8 @@ pub struct DirectCloudTaskData {
     pub day_instance_kind: Option<String>,
     pub day_instance_source_task_id: Option<String>,
     pub title: String,
+    #[serde(default = "default_task_priority")]
+    pub priority: String,
     pub status: String,
     pub planned_date: Option<String>,
     pub estimate_minutes: Option<i64>,
@@ -919,6 +925,7 @@ impl From<DirectCloudTaskData> for crate::tasks::TaskDto {
             day_instance_kind: value.day_instance_kind,
             day_instance_source_task_id: value.day_instance_source_task_id,
             title: value.title,
+            priority: value.priority,
             status: value.status,
             planned_date: value.planned_date,
             estimate_minutes: value.estimate_minutes,
@@ -1365,6 +1372,7 @@ pub fn direct_cloud_task_create_for_command(
             "parentId": request.parent_id,
             "dayInstanceDate": request.day_instance_date,
             "title": request.title,
+            "priority": "normal",
             "plannedDate": request.planned_date,
             "estimateMinutes": request.estimate_minutes,
             "note": request.note,
@@ -1390,6 +1398,7 @@ pub fn direct_cloud_task_create_positioned_for_command(
             "parentId": request.parent_id,
             "dayInstanceDate": request.day_instance_date,
             "title": request.title,
+            "priority": "normal",
             "plannedDate": request.planned_date,
             "estimateMinutes": request.estimate_minutes,
             "note": request.note,
@@ -1415,6 +1424,9 @@ pub fn direct_cloud_task_update_for_command(
     );
     if let Some(value) = request.title {
         payload.insert("title".to_string(), json!(value));
+    }
+    if let Some(value) = request.priority {
+        payload.insert("priority".to_string(), json!(value));
     }
     if let Some(value) = request.parent_id {
         payload.insert("parentId".to_string(), json!(value));
@@ -8717,6 +8729,7 @@ mod tests {
                 id: task_id.to_string(),
                 expected_version: 1,
                 title: Some("设备 A 已保存".to_string()),
+                priority: None,
                 parent_id: None,
                 planned_date: None,
                 estimate_minutes: None,
@@ -8742,6 +8755,7 @@ mod tests {
                         id: task_id.to_string(),
                         expected_version: 1,
                         title: Some("设备 B 陈旧标题".to_string()),
+                        priority: None,
                         parent_id: None,
                         planned_date: None,
                         estimate_minutes: None,

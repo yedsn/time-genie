@@ -113,6 +113,8 @@ import {
 import { DirectCloudQueryCoordinator, directCloudQueryKey } from "./services/directCloudQueryCoordinatorCore";
 import { recordWorkbenchNavigationMetric } from "./services/workbenchNavigationMetrics";
 import { applyCreatedTask, collectTaskSubtreeIds, removeTaskSubtree, upsertAuthoritativeTask } from "./services/taskMutationStateCore";
+import { TaskSubmissionCoordinator, type TaskSubmissionContext } from "./services/taskSubmissionCoordinatorCore";
+import { mergeAuthoritativeTaskWithLatestDraft } from "./services/taskSaveStateCore";
 
 export type TaskStatus = "open" | "done";
 
@@ -133,6 +135,7 @@ export type Task = {
   dayInstanceKind?: "member" | "context";
   dayInstanceSourceTaskId?: string;
   title: string;
+  priority: TaskRecord["priority"];
   project: string;
   planDate?: string;
   estimate?: number;
@@ -177,6 +180,23 @@ export type TaskCompletionResult = {
   subjectId: string;
   direction: "completed" | "reopened";
   completedCount: number;
+};
+
+type TaskSaveSnapshot = {
+  subjectId: string;
+  parentId?: string;
+  dayInstanceDate?: string;
+  title: string;
+  priority: TaskRecord["priority"];
+  plannedDate?: string;
+  estimateMinutes?: number;
+  todayEstimateMinutes?: number;
+  note?: string;
+  projectName?: string;
+  quickCreate?: boolean;
+  previousSiblingId?: string;
+  nextSiblingId?: string;
+  recurringScope?: "future-title" | "future-estimate";
 };
 
 export type BatchCompletionResult = {
@@ -337,7 +357,9 @@ export const useWorkdayStore = defineStore("workday", () => {
       void recordDirectCloudClientMetric(mapped).catch(() => undefined);
     }
   });
-  const savingTaskIds = new Set<string>();
+  const taskSubmissionCoordinator = new TaskSubmissionCoordinator<TaskSaveSnapshot, string | false>(250);
+  const todaySaveRefreshPromises = new WeakMap<Promise<string | false>, Promise<string | false>>();
+  const todaySaveRefreshByTaskId = new Map<string, Promise<string | false>>();
   const workspaceLoaded = ref(false);
   const workspaceLoading = ref(false);
   const todayMinutes = computed(() => entries.reduce((sum, entry) => {
@@ -575,6 +597,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       dayInstanceKind: task.dayInstanceKind,
       dayInstanceSourceTaskId: task.dayInstanceSourceTaskId,
       title: task.title,
+      priority: task.priority ?? "normal",
       project: task.projectName ?? "",
       planDate: task.plannedDate,
       estimate: task.estimateMinutes,
@@ -1052,6 +1075,35 @@ export const useWorkdayStore = defineStore("workday", () => {
     Object.assign(task, preserveTaskDerivedState(toUiTask(record), task));
   }
 
+  function taskSaveSnapshot(task: Task): TaskSaveSnapshot {
+    return {
+      subjectId: task.subjectId,
+      parentId: task.parentId,
+      dayInstanceDate: task.dayInstanceDate,
+      title: task.title,
+      priority: task.priority ?? "normal",
+      plannedDate: task.planDate,
+      estimateMinutes: task.estimate,
+      todayEstimateMinutes: task.todayEstimate,
+      note: task.note,
+      projectName: task.project,
+      quickCreate: task.quickCreate,
+      previousSiblingId: task.createPreviousSiblingId,
+      nextSiblingId: task.createNextSiblingId,
+    };
+  }
+
+  function taskRecordWithLatestDraft(record: TaskRecord, current: Task | undefined, snapshot: TaskSaveSnapshot) {
+    return mergeAuthoritativeTaskWithLatestDraft(record, current ? {
+      title: current.title,
+      priority: current.priority,
+      plannedDate: current.planDate,
+      estimateMinutes: current.estimate,
+      note: current.note,
+      projectName: current.project,
+    } : undefined, snapshot);
+  }
+
   function applyActualSnapshotTask(task: Task, snapshot: ActualAdjustmentSnapshotTaskRecord) {
     task.status = snapshot.status;
     task.completedAt = snapshot.completedAt;
@@ -1346,6 +1398,8 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function saveCompletedTask(task: Task) {
+    task.id = await flushTaskSubmission(task.id);
+    task.version = tasks.find((item) => item.id === task.id)?.version ?? task.version;
     const updated = await updateTaskRecord({
       id: task.id,
       expectedVersion: task.version,
@@ -1354,6 +1408,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       estimateMinutes: task.estimate ?? null,
       note: task.note ?? null,
       projectName: task.project || null,
+      priority: task.priority,
     });
     const index = completedTasks.findIndex((item) => item.id === updated.id);
     if (index >= 0) completedTasks.splice(index, 1, preserveTaskDerivedState(toUiTask(updated), completedTasks[index]));
@@ -1362,6 +1417,8 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function deleteCompletedTask(task: Task) {
+    task.id = await flushTaskSubtree(task.id, tasks);
+    task.version = tasks.find((item) => item.id === task.id)?.version ?? task.version;
     await deleteTaskSubtree(task.id, task.version);
     completedTasks.splice(0, completedTasks.length, ...completedTasks.filter((item) => item.id !== task.id));
     markDerivedDomainsStale(["tasks"]);
@@ -1388,6 +1445,8 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function commitTaskToggle(task: Task): Promise<TaskCompletionResult | undefined> {
+    const persistedTaskId = await flushTaskSubmission(task.id);
+    task = tasks.find((item) => item.id === persistedTaskId) ?? task;
     if (task.version <= 0) return;
     const direction = task.status === "done" ? "reopened" : "completed";
     const optimisticStatus: TaskStatus = direction === "completed" ? "done" : "open";
@@ -1448,6 +1507,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     taskId: string,
     recurrence?: { frequency: RecurrenceRuleRecord["frequency"]; weekdaysMask?: number; effectiveStart: string },
   ) {
+    taskId = await flushTaskSubmission(taskId);
     const task = tasks.find((item) => item.id === taskId);
     if (!task || task.version <= 0) return;
     const todayDate = await ensureWorkspaceCalendar();
@@ -1480,7 +1540,7 @@ export const useWorkdayStore = defineStore("workday", () => {
 
   function addTask(title = "", subjectId = selectedSubjectId.value) {
     const subject = subjects.find((item) => item.id === subjectId) ?? selectedSubject.value;
-    const task: Task = { id: createTaskId(), subjectId: subject?.id ?? defaultSubjectId, title, project: subject?.name ?? "默认", actual: 0, directMinutes: 0, status: "open", sortOrder: Number.MAX_SAFE_INTEGER, version: 0, selectable: true, executionState: "not_started" };
+    const task: Task = { id: createTaskId(), subjectId: subject?.id ?? defaultSubjectId, title, priority: "normal", project: subject?.name ?? "默认", actual: 0, directMinutes: 0, status: "open", sortOrder: Number.MAX_SAFE_INTEGER, version: 0, selectable: true, executionState: "not_started" };
     tasks.push(task);
     selectedTaskId.value = task.id;
     return task.id;
@@ -1495,6 +1555,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       subjectId: parent.subjectId,
       parentId,
       title,
+      priority: parent.priority,
       project: parent.project,
       planDate: parent.planDate,
       actual: 0,
@@ -1528,6 +1589,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       subjectId: target.subjectId,
       parentId: target.parentId,
       title: "",
+      priority: target.priority,
       project: target.project,
       planDate: target.planDate,
       actual: 0,
@@ -1561,6 +1623,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function deleteTask(taskId: string) {
+    taskId = await flushTaskSubtree(taskId, tasks);
     const deletedTask = tasks.find((task) => task.id === taskId);
     if (deletedTask?.version) await deleteTaskSubtree(deletedTask.id, deletedTask.version);
     const idsToDelete = removeTaskSubtree(tasks, taskId);
@@ -1571,60 +1634,80 @@ export const useWorkdayStore = defineStore("workday", () => {
     if (deletedTask?.version) markDerivedDomainsStale(["tasks"]);
   }
 
-  async function saveTask(taskId: string): Promise<string | false> {
-    const task = tasks.find((item) => item.id === taskId);
-    if (!task || !task.title.trim()) return false;
-    if (savingTaskIds.has(taskId)) return false;
-    savingTaskIds.add(taskId);
-    try {
-      const todayDate = await ensureWorkspaceCalendar();
-      if (task.version <= 0) {
-        const create = task.quickCreate
-          ? createQuickTaskRecord
-          : task.createPreviousSiblingId || task.createNextSiblingId
-            ? createPositionedTask
-            : createTaskRecord;
-        const created = await create({
-          subjectId: task.subjectId,
-          parentId: task.parentId,
-          title: task.title,
-          plannedDate: task.planDate,
-          estimateMinutes: task.estimate,
-          note: task.note,
-          projectName: task.project,
-          ...(task.quickCreate ? {} : {
-            previousSiblingId: task.createPreviousSiblingId,
-            nextSiblingId: task.createNextSiblingId,
-          }),
-        });
-        const oldId = task.id;
-        selectedTaskId.value = applyCreatedTask({
-          tasks,
-          draftId: oldId,
-          authoritative: toUiTask(created),
-          selectedTaskId: selectedTaskId.value,
-        });
-        if (task.todayEstimate) {
-          const estimate = await setTaskDailyEstimate(created.id, todayDate, task.todayEstimate);
-          applyDailyEstimate(created.id, estimate.estimateMinutes, estimate.version);
-        }
-        markDerivedDomainsStale(["tasks"]);
-        return created.id;
+  async function persistTaskSnapshot(snapshot: TaskSaveSnapshot, context: TaskSubmissionContext): Promise<string | false> {
+    const task = tasks.find((item) => item.id === context.taskId);
+    if (!task || !snapshot.title.trim()) return false;
+    const todayDate = await ensureWorkspaceCalendar();
+    if (task.version <= 0) {
+      const create = snapshot.quickCreate
+        ? createQuickTaskRecord
+        : snapshot.previousSiblingId || snapshot.nextSiblingId
+          ? createPositionedTask
+          : createTaskRecord;
+      let created = await create({
+        subjectId: snapshot.subjectId,
+        parentId: snapshot.parentId,
+        title: snapshot.title,
+        priority: snapshot.priority,
+        plannedDate: snapshot.plannedDate,
+        estimateMinutes: snapshot.estimateMinutes,
+        note: snapshot.note,
+        projectName: snapshot.projectName,
+        ...(snapshot.quickCreate ? {} : {
+          previousSiblingId: snapshot.previousSiblingId,
+          nextSiblingId: snapshot.nextSiblingId,
+        }),
+      });
+      if (snapshot.priority !== "normal" && created.priority !== snapshot.priority) {
+        created = await updateTaskRecord({ id: created.id, expectedVersion: created.version, priority: snapshot.priority });
       }
-      replaceTask(await updateTaskRecord({
-        id: task.id,
-        expectedVersion: task.version,
-        title: task.title,
-        plannedDate: task.planDate ?? null,
-        estimateMinutes: task.estimate ?? null,
-        note: task.note ?? null,
-        projectName: task.project || null,
-      }));
+      const oldId = task.id;
+      context.rebindTaskId(created.id);
+      selectedTaskId.value = applyCreatedTask({
+        tasks,
+        draftId: oldId,
+        authoritative: toUiTask(taskRecordWithLatestDraft(created, task, snapshot)),
+        selectedTaskId: selectedTaskId.value,
+      });
+      if (snapshot.todayEstimateMinutes) {
+        const estimate = await setTaskDailyEstimate(created.id, todayDate, snapshot.todayEstimateMinutes);
+        applyDailyEstimate(created.id, estimate.estimateMinutes, estimate.version);
+      }
       markDerivedDomainsStale(["tasks"]);
-      return task.id;
-    } finally {
-      savingTaskIds.delete(taskId);
+      return created.id;
     }
+    const updated = await updateTaskRecord({
+      id: task.id,
+      expectedVersion: task.version,
+      title: snapshot.title,
+      plannedDate: snapshot.plannedDate ?? null,
+      estimateMinutes: snapshot.estimateMinutes ?? null,
+      note: snapshot.note ?? null,
+      projectName: snapshot.projectName || null,
+      priority: snapshot.priority,
+    });
+    replaceTask(taskRecordWithLatestDraft(updated, tasks.find((item) => item.id === task.id), snapshot));
+    markDerivedDomainsStale(["tasks"]);
+    return task.id;
+  }
+
+  function saveTask(taskId: string): Promise<string | false> {
+    const task = tasks.find((item) => item.id === taskId);
+    if (!task || !task.title.trim()) return Promise.resolve(false);
+    return taskSubmissionCoordinator.schedule(taskId, taskSaveSnapshot(task), persistTaskSnapshot);
+  }
+
+  async function flushTaskSubmission(taskId: string) {
+    const result = await taskSubmissionCoordinator.flush(taskId);
+    const todayRefresh = todaySaveRefreshByTaskId.get(taskId);
+    if (todayRefresh) await todayRefresh;
+    return typeof result === "string" ? result : taskId;
+  }
+
+  async function flushTaskSubtree(taskId: string, source: Task[]) {
+    const ids = collectTaskSubtreeIds(source, taskId);
+    const results = await Promise.all([...ids].map((id) => flushTaskSubmission(id)));
+    return results[0] ?? taskId;
   }
 
   function addQuickTask(title = "", subjectId = selectedSubjectId.value) {
@@ -1651,6 +1734,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function duplicateTask(taskId: string) {
+    taskId = await flushTaskSubmission(taskId);
     const ordered = buildVisibleTaskList(tasks);
     const source = ordered.find((task) => task.id === taskId);
     if (!source) return;
@@ -1663,6 +1747,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function duplicateSingleTask(taskId: string) {
+    taskId = await flushTaskSubmission(taskId);
     const ordered = buildVisibleTaskList(tasks);
     const source = ordered.find((task) => task.id === taskId);
     if (!source || source.version <= 0) return;
@@ -1675,6 +1760,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     draft.planDate = source.planDate;
     draft.estimate = source.estimate;
     draft.note = source.note;
+    draft.priority = source.priority;
     const savedTaskId = await saveTask(draftId);
     if (!savedTaskId) throw new Error("事项复制失败");
     return savedTaskId;
@@ -1701,6 +1787,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function reorderTask(taskId: string, beforeId?: string, afterId?: string, parentId?: string) {
+    taskId = await flushTaskSubmission(taskId);
     if (!beforeId && !afterId) return;
     const ordered = buildVisibleTaskList(tasks);
     const moving = ordered.find((task) => task.id === taskId);
@@ -1724,6 +1811,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function indentTask(taskId: string) {
+    taskId = await flushTaskSubmission(taskId);
     const ordered = buildVisibleTaskList(tasks);
     const index = ordered.findIndex((task) => task.id === taskId);
     const moving = ordered[index];
@@ -1738,6 +1826,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function outdentTask(taskId: string) {
+    taskId = await flushTaskSubmission(taskId);
     const ordered = buildVisibleTaskList(tasks);
     const moving = ordered.find((task) => task.id === taskId);
     if (!moving?.parentId) return;
@@ -1813,6 +1902,7 @@ export const useWorkdayStore = defineStore("workday", () => {
 
   async function persistTimerTask(taskId?: string) {
     if (!taskId) return undefined;
+    taskId = await flushTaskSubmission(taskId);
     const task = [...todayPlanTasks, ...tasks].find((item) => item.id === taskId);
     if (!task) return undefined;
     if (task.version > 0) return task.id;
@@ -1882,6 +1972,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function movePlanTask(taskId: string, parentId?: string, previousSiblingId?: string, nextSiblingId?: string) {
+    taskId = await flushTaskSubmission(taskId);
     const moving = tasks.find((task) => task.id === taskId);
     if (!moving || moving.version <= 0) return;
     const ordered = buildVisibleTaskList(tasks);
@@ -1917,6 +2008,9 @@ export const useWorkdayStore = defineStore("workday", () => {
     previousSiblingId?: string,
     nextSiblingId?: string,
   ) {
+    taskId = await flushTaskSubmission(taskId);
+    const currentTask = [...todayPlanTasks, ...tasks].find((task) => task.id === taskId);
+    expectedVersion = currentTask?.version ?? expectedVersion;
     const moved = await moveTaskRecord({
       id: taskId,
       expectedVersion,
@@ -1974,6 +2068,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function saveTaskNote(taskId: string, note: string) {
+    taskId = await flushTaskSubmission(taskId);
     const task = tasks.find((item) => item.id === taskId);
     if (!task || task.version <= 0) return;
     const normalized = note.trim() || undefined;
@@ -1986,6 +2081,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function saveTaskTodayEstimate(taskId: string, estimateMinutes?: number) {
+    taskId = await flushTaskSubmission(taskId);
     const task = tasks.find((item) => item.id === taskId);
     if (!task || task.version <= 0) return;
     const todayDate = await ensureWorkspaceCalendar();
@@ -2071,6 +2167,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       dayInstanceDate: workspaceToday.value || undefined,
       dayInstanceKind: "member",
       title,
+      priority: "normal",
       project: subject?.name ?? "默认",
       actual: 0,
       directMinutes: 0,
@@ -2095,6 +2192,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       dayInstanceDate: parent.dayInstanceDate ?? (workspaceToday.value || undefined),
       dayInstanceKind: "member",
       title,
+      priority: parent.priority,
       project: parent.project,
       planDate: parent.planDate,
       actual: 0,
@@ -2130,6 +2228,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       dayInstanceDate: target.dayInstanceDate ?? (workspaceToday.value || undefined),
       dayInstanceKind: "member",
       title: "",
+      priority: target.priority,
       project: target.project,
       planDate: target.planDate,
       actual: 0,
@@ -2161,81 +2260,127 @@ export const useWorkdayStore = defineStore("workday", () => {
     return next;
   }
 
-  async function saveTodayTask(taskId: string): Promise<string | false> {
-    const task = todayPlanTask(taskId);
-    if (!task || !task.title.trim()) return false;
-    if (savingTaskIds.has(taskId)) return false;
-    savingTaskIds.add(taskId);
-    try {
-      const workDate = await ensureWorkspaceCalendar();
-      const subjectId = task.subjectId;
-      if (task.version <= 0) {
-        const create = task.quickCreate
-          ? createQuickTaskRecord
-          : task.createPreviousSiblingId || task.createNextSiblingId
-            ? createPositionedTask
-            : createTaskRecord;
-        const created = await create({
-          subjectId,
-          parentId: task.parentId,
-          dayInstanceDate: workDate,
-          title: task.title,
-          plannedDate: task.planDate,
-          estimateMinutes: task.estimate,
-          note: task.note,
-          projectName: task.project,
-          ...(task.quickCreate ? {} : {
-            previousSiblingId: task.createPreviousSiblingId,
-            nextSiblingId: task.createNextSiblingId,
-          }),
-        });
-        const oldId = task.id;
-        selectedTaskId.value = applyCreatedTask({
-          tasks: todayPlanTasks,
-          draftId: oldId,
-          authoritative: toUiTask(created),
-          selectedTaskId: selectedTaskId.value,
-        });
-        markDerivedDomainsStale(["tasks"]);
-        await reloadTodayPlanForSubject(subjectId);
-        return created.id;
+  async function persistTodayTaskSnapshot(snapshot: TaskSaveSnapshot, context: TaskSubmissionContext): Promise<string | false> {
+    const task = todayPlanTask(context.taskId);
+    if (!task || !snapshot.title.trim()) return false;
+    const workDate = await ensureWorkspaceCalendar();
+    if (task.version <= 0) {
+      const create = snapshot.quickCreate
+        ? createQuickTaskRecord
+        : snapshot.previousSiblingId || snapshot.nextSiblingId
+          ? createPositionedTask
+          : createTaskRecord;
+      let created = await create({
+        subjectId: snapshot.subjectId,
+        parentId: snapshot.parentId,
+        dayInstanceDate: workDate,
+        title: snapshot.title,
+        priority: snapshot.priority,
+        plannedDate: snapshot.plannedDate,
+        estimateMinutes: snapshot.estimateMinutes,
+        note: snapshot.note,
+        projectName: snapshot.projectName,
+        ...(snapshot.quickCreate ? {} : {
+          previousSiblingId: snapshot.previousSiblingId,
+          nextSiblingId: snapshot.nextSiblingId,
+        }),
+      });
+      if (snapshot.priority !== "normal" && created.priority !== snapshot.priority) {
+        created = await updateTaskRecord({ id: created.id, expectedVersion: created.version, priority: snapshot.priority });
       }
-      replaceTodayTask(await updateTaskRecord({
-        id: task.id,
-        expectedVersion: task.version,
-        title: task.title,
-        plannedDate: task.planDate ?? null,
-        estimateMinutes: task.estimate ?? null,
-        note: task.note ?? null,
-        projectName: task.project || null,
-      }));
+      const oldId = task.id;
+      context.rebindTaskId(created.id);
+      selectedTaskId.value = applyCreatedTask({
+        tasks: todayPlanTasks,
+        draftId: oldId,
+        authoritative: toUiTask(taskRecordWithLatestDraft(created, task, snapshot)),
+        selectedTaskId: selectedTaskId.value,
+      });
       markDerivedDomainsStale(["tasks"]);
-      await reloadTodayPlanForSubject(subjectId);
-      return task.id;
-    } finally {
-      savingTaskIds.delete(taskId);
+      return created.id;
     }
+    if (snapshot.recurringScope) {
+      const source = task.dayInstanceSourceTaskId
+        ? tasks.find((candidate) => candidate.id === task.dayInstanceSourceTaskId)
+        : undefined;
+      if (source?.recurrence) {
+        const result = await updateTodayRecurringTask({
+          instanceId: task.id,
+          instanceExpectedVersion: task.version,
+          sourceExpectedVersion: source.version,
+          ...(snapshot.recurringScope === "future-title"
+            ? { title: snapshot.title }
+            : { estimateMinutes: snapshot.estimateMinutes ?? null }),
+        });
+        replaceTodayTask(taskRecordWithLatestDraft(result.instance, todayPlanTask(task.id), snapshot));
+        replaceTask(result.source);
+        markDerivedDomainsStale(["tasks"]);
+        return result.instance.id;
+      }
+    }
+    const updated = await updateTaskRecord({
+      id: task.id,
+      expectedVersion: task.version,
+      title: snapshot.title,
+      plannedDate: snapshot.plannedDate ?? null,
+      estimateMinutes: snapshot.estimateMinutes ?? null,
+      note: snapshot.note ?? null,
+      projectName: snapshot.projectName || null,
+      priority: snapshot.priority,
+    });
+    replaceTodayTask(taskRecordWithLatestDraft(updated, todayPlanTask(task.id), snapshot));
+    markDerivedDomainsStale(["tasks"]);
+    return task.id;
+  }
+
+  function scheduleTodayTaskSave(taskId: string, recurringScope?: TaskSaveSnapshot["recurringScope"]) {
+    const task = todayPlanTask(taskId);
+    if (!task || !task.title.trim()) return Promise.resolve<string | false>(false);
+    return taskSubmissionCoordinator.schedule(taskId, { ...taskSaveSnapshot(task), recurringScope }, persistTodayTaskSnapshot);
+  }
+
+  function saveTodayTask(taskId: string): Promise<string | false> {
+    const task = todayPlanTask(taskId);
+    const scheduled = scheduleTodayTaskSave(taskId);
+    if (!task || todaySaveRefreshPromises.has(scheduled)) return todaySaveRefreshPromises.get(scheduled) ?? scheduled;
+    const refreshed = scheduled.then(async (savedId) => {
+      if (savedId) {
+        await reloadTodayPlanForSubject(task.subjectId);
+        todaySaveRefreshByTaskId.set(savedId, refreshed);
+      }
+      return savedId;
+    });
+    todaySaveRefreshPromises.set(scheduled, refreshed);
+    todaySaveRefreshByTaskId.set(taskId, refreshed);
+    void refreshed.then(
+      () => { if (todaySaveRefreshByTaskId.get(taskId) === refreshed) todaySaveRefreshByTaskId.delete(taskId); },
+      () => { if (todaySaveRefreshByTaskId.get(taskId) === refreshed) todaySaveRefreshByTaskId.delete(taskId); },
+    );
+    return refreshed;
   }
 
   async function saveTodayTaskToFuture(taskId: string, field: "title" | "estimate"): Promise<string | false> {
-    const draft = todayPlanTask(taskId);
-    const source = draft?.dayInstanceSourceTaskId
-      ? tasks.find((task) => task.id === draft.dayInstanceSourceTaskId)
-      : undefined;
-    if (!draft || !source?.recurrence) return await saveTodayTask(taskId);
-    const result = await updateTodayRecurringTask({
-      instanceId: draft.id,
-      instanceExpectedVersion: draft.version,
-      sourceExpectedVersion: source.version,
-      ...(field === "title" ? { title: draft.title } : { estimateMinutes: draft.estimate ?? null }),
+    const task = todayPlanTask(taskId);
+    const scheduled = scheduleTodayTaskSave(taskId, field === "title" ? "future-title" : "future-estimate");
+    if (!task || todaySaveRefreshPromises.has(scheduled)) return todaySaveRefreshPromises.get(scheduled) ?? scheduled;
+    const refreshed = scheduled.then(async (savedId) => {
+      if (savedId) {
+        await reloadTodayPlanForSubject(task.subjectId);
+        todaySaveRefreshByTaskId.set(savedId, refreshed);
+      }
+      return savedId;
     });
-    replaceTodayTask(result.instance);
-    replaceTask(result.source);
-    markDerivedDomainsStale(["tasks"]);
-    return result.instance.id;
+    todaySaveRefreshPromises.set(scheduled, refreshed);
+    todaySaveRefreshByTaskId.set(taskId, refreshed);
+    void refreshed.then(
+      () => { if (todaySaveRefreshByTaskId.get(taskId) === refreshed) todaySaveRefreshByTaskId.delete(taskId); },
+      () => { if (todaySaveRefreshByTaskId.get(taskId) === refreshed) todaySaveRefreshByTaskId.delete(taskId); },
+    );
+    return refreshed;
   }
 
   async function deleteTodayTask(taskId: string) {
+    taskId = await flushTaskSubtree(taskId, todayPlanTasks);
     const deletedTask = todayPlanTask(taskId);
     if (!deletedTask) return;
     if (deletedTask.version > 0) await deleteTaskSubtree(deletedTask.id, deletedTask.version);
@@ -2247,6 +2392,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function saveTodayTaskNote(taskId: string, note: string) {
+    taskId = await flushTaskSubmission(taskId);
     const task = todayPlanTask(taskId);
     if (!task || task.version <= 0) return;
     const normalized = note.trim() || undefined;
@@ -2260,6 +2406,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function saveTodayTaskNoteToFuture(taskId: string, note: string) {
+    taskId = await flushTaskSubmission(taskId);
     const task = todayPlanTask(taskId);
     if (!task || task.version <= 0) return;
     const source = task?.dayInstanceSourceTaskId
@@ -2278,6 +2425,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function saveTodayTaskTodayEstimate(taskId: string, estimateMinutes?: number) {
+    taskId = await flushTaskSubmission(taskId);
     const task = todayPlanTask(taskId);
     if (!task || task.version <= 0) return;
     const todayDate = await ensureWorkspaceCalendar();
@@ -2287,6 +2435,8 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function commitTodayTaskToggle(task: Task): Promise<TaskCompletionResult | undefined> {
+    const persistedTaskId = await flushTaskSubmission(task.id);
+    task = todayPlanTask(persistedTaskId) ?? task;
     if (task.version <= 0) return;
     const target = todayPlanTask(task.id);
     if (!target) return;
@@ -2319,6 +2469,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function moveTodayTask(taskId: string, parentId?: string, previousSiblingId?: string, nextSiblingId?: string) {
+    taskId = await flushTaskSubmission(taskId);
     const moving = todayPlanTask(taskId);
     if (!moving || moving.version <= 0) return;
     const ordered = buildVisibleTaskList(todayPlanTasks);
@@ -2347,6 +2498,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function changeTodayTaskParent(taskId: string, newParentId?: string) {
+    taskId = await flushTaskSubmission(taskId);
     const moving = todayPlanTask(taskId);
     if (!moving || moving.version <= 0) return;
     replaceTodayTask(await changeTaskParent(moving.id, moving.version, newParentId));
@@ -2354,6 +2506,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function indentTodayTask(taskId: string) {
+    taskId = await flushTaskSubmission(taskId);
     const ordered = buildVisibleTaskList(todayPlanTasks);
     const index = ordered.findIndex((task) => task.id === taskId);
     const moving = ordered[index];
@@ -2365,6 +2518,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function outdentTodayTask(taskId: string) {
+    taskId = await flushTaskSubmission(taskId);
     const moving = todayPlanTask(taskId);
     if (!moving?.parentId) return;
     const parent = todayPlanTask(moving.parentId);
@@ -2373,6 +2527,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function duplicateTodayTask(taskId: string) {
+    taskId = await flushTaskSubmission(taskId);
     const source = todayPlanTask(taskId);
     if (!source || source.version <= 0) return;
     const result = await duplicateTaskSubtree(source.id, source.version);
@@ -2383,6 +2538,7 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function duplicateSingleTodayTask(taskId: string) {
+    taskId = await flushTaskSubmission(taskId);
     const source = todayPlanTask(taskId);
     if (!source || source.version <= 0) return;
     const draftId = addTodayTaskRelative(source.id, "after");
@@ -2394,6 +2550,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     draft.planDate = source.planDate;
     draft.estimate = source.estimate;
     draft.note = source.note;
+    draft.priority = source.priority;
     const savedTaskId = await saveTodayTask(draftId);
     if (!savedTaskId) throw new Error("事项复制失败");
     return savedTaskId;
@@ -2422,6 +2579,8 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function saveExecutionTaskTitle(taskId: string, expectedVersion: number, title: string, subjectId: string, applyToFuture = false) {
+    taskId = await flushTaskSubmission(taskId);
+    expectedVersion = ([...todayPlanTasks, ...tasks].find((task) => task.id === taskId)?.version) ?? expectedVersion;
     const instance = todayPlanTask(taskId);
     const source = applyToFuture && instance?.dayInstanceSourceTaskId
       ? tasks.find((task) => task.id === instance.dayInstanceSourceTaskId)
@@ -2439,6 +2598,8 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function saveExecutionTaskNote(taskId: string, expectedVersion: number, note: string, subjectId: string, applyToFuture = false) {
+    taskId = await flushTaskSubmission(taskId);
+    expectedVersion = ([...todayPlanTasks, ...tasks].find((task) => task.id === taskId)?.version) ?? expectedVersion;
     const instance = todayPlanTask(taskId);
     const source = applyToFuture && instance?.dayInstanceSourceTaskId
       ? tasks.find((task) => task.id === instance.dayInstanceSourceTaskId)
@@ -2460,11 +2621,14 @@ export const useWorkdayStore = defineStore("workday", () => {
     subjectId: string;
     expectedVersion: number;
     title: string;
+    priority?: TaskRecord["priority"];
     plannedDate?: string;
     estimateMinutes?: number;
     note?: string;
     projectName?: string;
   }, applyToFuture = false) {
+    task.id = await flushTaskSubmission(task.id);
+    task.expectedVersion = ([...todayPlanTasks, ...tasks].find((candidate) => candidate.id === task.id)?.version) ?? task.expectedVersion;
     const instance = todayPlanTask(task.id);
     const source = applyToFuture && instance?.dayInstanceSourceTaskId
       ? tasks.find((candidate) => candidate.id === instance.dayInstanceSourceTaskId)
@@ -2491,6 +2655,7 @@ export const useWorkdayStore = defineStore("workday", () => {
       estimateMinutes: task.estimateMinutes ?? null,
       note: task.note?.trim() || null,
       projectName: task.projectName?.trim() || null,
+      priority: task.priority,
       });
       replaceTask(updated);
     }
@@ -2499,6 +2664,8 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function deleteExecutionTask(taskId: string, expectedVersion: number, subjectId: string) {
+    taskId = await flushTaskSubtree(taskId, todayPlanTasks);
+    expectedVersion = ([...todayPlanTasks, ...tasks].find((task) => task.id === taskId)?.version) ?? expectedVersion;
     await deleteTaskSubtree(taskId, expectedVersion);
     const removeIds = getTodaySubtreeIds(taskId);
     for (let index = todayPlanTasks.length - 1; index >= 0; index -= 1) {
@@ -2603,6 +2770,11 @@ export const useWorkdayStore = defineStore("workday", () => {
   }
 
   async function transitionTimer(target: { taskId: string; reopenCompletedTaskVersion?: number } | { newTask: TimerTransitionNewTaskRequest }, note = ""): Promise<TimerTransitionResultRecord> {
+    if ("taskId" in target) {
+      const taskId = await flushTaskSubmission(target.taskId);
+      const task = [...todayPlanTasks, ...tasks].find((item) => item.id === taskId);
+      target = { taskId, reopenCompletedTaskVersion: task?.status === "done" ? task.version : target.reopenCompletedTaskVersion };
+    }
     const current = runningEntry.value;
     markTimeDataChanged();
     const result = await transitionTimerRecord({

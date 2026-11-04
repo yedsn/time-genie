@@ -533,6 +533,7 @@ export type TaskRecord = {
   dayInstanceKind?: "member" | "context";
   dayInstanceSourceTaskId?: string;
   title: string;
+  priority: "urgent" | "high" | "normal" | "low";
   status: "open" | "done";
   plannedDate?: string;
   estimateMinutes?: number;
@@ -596,7 +597,7 @@ export type ActualTimeAdjustmentRecord = {
 };
 
 export type ActualAdjustmentSnapshotTaskRecord = {
-  id: string; subjectId: string; parentId?: string; title: string; note?: string; status: "open" | "done"; completedAt?: number; completedToday: boolean;
+  id: string; subjectId: string; parentId?: string; title: string; priority?: TaskRecord["priority"]; note?: string; status: "open" | "done"; completedAt?: number; completedToday: boolean;
   dayInstanceDate?: string; dayInstanceKind?: "member" | "context"; dayInstanceSourceTaskId?: string;
   plannedDate?: string; estimateMinutes?: number; todayEstimateMinutes?: number; dailyEstimateVersion?: number; sortOrder: number;
   version: number; isLeaf: boolean; selectable: boolean; directMinutes: number; totalMinutes: number;
@@ -1086,6 +1087,7 @@ export async function createTask(request: {
   parentId?: string;
   dayInstanceDate?: string;
   title: string;
+  priority?: TaskRecord["priority"];
   plannedDate?: string;
   estimateMinutes?: number;
   note?: string;
@@ -1101,6 +1103,7 @@ export async function updateTask(request: {
   id: string;
   expectedVersion: number;
   title?: string;
+  priority?: TaskRecord["priority"];
   parentId?: string | null;
   plannedDate?: string | null;
   estimateMinutes?: number | null;
@@ -1201,6 +1204,7 @@ export async function updateTodayRecurringTask(request: {
   instanceExpectedVersion: number;
   sourceExpectedVersion: number;
   title?: string;
+  priority?: TaskRecord["priority"];
   plannedDate?: string | null;
   estimateMinutes?: number | null;
   note?: string | null;

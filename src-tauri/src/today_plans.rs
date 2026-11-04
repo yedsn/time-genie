@@ -119,6 +119,7 @@ struct SourceTaskRow {
     subject_id: String,
     parent_id: Option<String>,
     title: String,
+    priority: String,
     planned_date: Option<String>,
     estimate_minutes: Option<i64>,
     note: Option<String>,
@@ -144,7 +145,7 @@ fn load_source_task(
     transaction
         .query_row(
             "SELECT subject_id,parent_id,title,planned_date,estimate_minutes,note,
-                    project_name,solution_name,source_type,sort_order,
+                    project_name,solution_name,source_type,sort_order,priority,
                     day_instance_date,day_instance_kind,day_instance_source_task_id
              FROM tasks WHERE workspace_id=?1 AND id=?2 AND deleted_at IS NULL",
             params![workspace_id, task_id],
@@ -161,10 +162,11 @@ fn load_source_task(
                         solution_name: row.get(7)?,
                         source_type: row.get(8)?,
                         sort_order: row.get(9)?,
+                        priority: row.get(10)?,
                     },
-                    row.get(10)?,
                     row.get(11)?,
                     row.get(12)?,
+                    row.get(13)?,
                 ))
             },
         )
@@ -369,9 +371,9 @@ fn ensure_instance_recursive(
             transaction
                 .execute(
                     "UPDATE tasks SET day_instance_kind='member',title=?1,note=?2,project_name=?3,
-                       solution_name=?4,estimate_minutes=?5,planned_date=?6,updated_at=?7,version=version+1
-                     WHERE id=?8 AND workspace_id=?9 AND deleted_at IS NULL",
-                    params![source.title,source.note,source.project_name,source.solution_name,source.estimate_minutes,source.planned_date,now,instance_id,workspace_id],
+                       solution_name=?4,estimate_minutes=?5,planned_date=?6,priority=?7,updated_at=?8,version=version+1
+                     WHERE id=?9 AND workspace_id=?10 AND deleted_at IS NULL",
+                    params![source.title,source.note,source.project_name,source.solution_name,source.estimate_minutes,source.planned_date,source.priority,now,instance_id,workspace_id],
                 )
                 .map_err(|error| error.to_string())?;
         }
@@ -452,12 +454,12 @@ fn ensure_instance_recursive(
             "INSERT INTO tasks(
                id,workspace_id,subject_id,parent_id,title,status,planned_date,estimate_minutes,note,
                project_name,solution_name,source_type,source_ref,sort_order,completed_at,created_at,updated_at,version,
-               day_instance_date,day_instance_kind,day_instance_source_task_id
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL,?13,?14,?15,?15,1,?16,?17,?18)",
+               day_instance_date,day_instance_kind,day_instance_source_task_id,priority
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL,?13,?14,?15,?15,1,?16,?17,?18,?19)",
             params![id,workspace_id,source.subject_id,parent_instance_id,source.title,
                 if is_done { "done" } else { "open" },source.planned_date,source.estimate_minutes,
                 source.note,source.project_name,source.solution_name,source.source_type,
-                source.sort_order,completed_at,now,work_date,expected_kind,source_task_id],
+                source.sort_order,completed_at,now,work_date,expected_kind,source_task_id,source.priority],
         )
         .map_err(|error| error.to_string())?;
     if expected_kind == "member" {
@@ -1333,6 +1335,22 @@ mod tests {
             },
         )
         .unwrap();
+        let parent = crate::tasks::update_task(
+            &database,
+            crate::tasks::TaskUpdateRequest {
+                id: parent.id,
+                expected_version: parent.version,
+                title: None,
+                priority: Some("urgent".to_string()),
+                parent_id: None,
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
+            },
+        )
+        .unwrap();
         let child = crate::tasks::create_task(
             &database,
             TaskCreateRequest {
@@ -1345,6 +1363,22 @@ mod tests {
                 note: Some("子事项备注".to_string()),
                 project_name: Some("项目乙".to_string()),
                 solution_name: Some("方案乙".to_string()),
+            },
+        )
+        .unwrap();
+        let child = crate::tasks::update_task(
+            &database,
+            crate::tasks::TaskUpdateRequest {
+                id: child.id,
+                expected_version: child.version,
+                title: None,
+                priority: Some("high".to_string()),
+                parent_id: None,
+                planned_date: None,
+                estimate_minutes: None,
+                note: None,
+                project_name: None,
+                solution_name: None,
             },
         )
         .unwrap();
@@ -1407,6 +1441,7 @@ mod tests {
             Some(child.id.as_str())
         );
         assert_eq!(instance.title, child.title);
+        assert_eq!(instance.priority, "high");
         assert_eq!(instance.planned_date, child.planned_date);
         assert_eq!(instance.estimate_minutes, child.estimate_minutes);
         assert_eq!(instance.note, child.note);
@@ -1421,6 +1456,7 @@ mod tests {
             Some(parent.id.as_str())
         );
         assert_eq!(context.title, parent.title);
+        assert_eq!(context.priority, "urgent");
 
         let connection = database.open().unwrap();
         let source_estimate_count: i64 = connection
@@ -2042,6 +2078,7 @@ mod tests {
                 id: first_instance.id.clone(),
                 expected_version: first_instance.version,
                 title: Some("今日改名".to_string()),
+                priority: None,
                 parent_id: None,
                 planned_date: None,
                 estimate_minutes: None,
@@ -2057,6 +2094,7 @@ mod tests {
                 id: first_instance.id.clone(),
                 expected_version: first_instance.version + 1,
                 title: None,
+                priority: None,
                 parent_id: None,
                 planned_date: None,
                 estimate_minutes: Some(Some(55)),
@@ -2119,6 +2157,7 @@ mod tests {
                 id: child.id.clone(),
                 expected_version: child.version,
                 title: Some("来源改名".to_string()),
+                priority: None,
                 parent_id: None,
                 planned_date: None,
                 estimate_minutes: None,

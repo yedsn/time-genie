@@ -68,7 +68,7 @@ function isOverdue(row: Task) {
     >
       <el-table-column label="今日事项" fixed="left" width="280">
         <template #default="{ row }">
-          <div class="task-fixed-name" :class="{ 'is-child': row.parentId }" :data-task-id="row.id">
+          <div class="task-fixed-name" :class="[{ 'is-child': row.parentId }, `task-priority-${row.priority}`]" :data-task-id="row.id">
             <button class="check-button" :title="row.status === 'done' ? '标记为计划中' : '标记为完成'" @click.stop="emit('toggle', getSourceTask(row), $event)">
               <CheckCircle2 v-if="row.status === 'done'" :size="18" />
               <Circle v-else :size="18" />
