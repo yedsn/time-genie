@@ -1968,6 +1968,7 @@ export const useWorkdayStore = defineStore("workday", () => {
     queryCoordinator.markMatchingStale("unassigned");
     queryCoordinator.markMatchingStale("timeHistory");
     queryCoordinator.markMatchingStale("todayOverview");
+    void loadUnassignedState(false, true);
     return stopped.id;
   }
 
